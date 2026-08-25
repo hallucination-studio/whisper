@@ -5,6 +5,11 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+// ESP32-S3 and ESP32-C6 CSI firmware uses the 2.4 GHz Wi-Fi channels 1..=14;
+// this is a hardware reachability bound, not a country-specific regulatory policy.
+const ESP32_WIFI_CHANNEL_MIN: u16 = 1;
+const ESP32_WIFI_CHANNEL_MAX: u16 = 14;
+
 use ciborium::ser::into_writer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1468,6 +1473,12 @@ fn build_sensors(values: Vec<RawSensor>) -> Result<BTreeMap<SensorId, SensorConf
         if raw.firmware.trim().is_empty() {
             return Err(invalid("sensors[].firmware", "must not be empty"));
         }
+        if raw.adr018.multi_path {
+            return Err(invalid(
+                "sensors[].adr018.multi_path",
+                "must be false because the first-slice firmware has a fixed single-path wire layout",
+            ));
+        }
         let expected_peer_ip = raw
             .expected_peer_ip
             .parse::<IpAddr>()
@@ -1575,10 +1586,11 @@ fn build_links(
                 id: transmitter.to_string(),
             });
         }
-        if !sensors.contains_key(&receiver) {
-            return Err(ConfigError::UnknownReference { kind: "sensor", id: receiver.to_string() });
-        }
-        let channel_policy = build_channel_policy(raw.channel_policy)?;
+        let sensor = sensors.get(&receiver).ok_or_else(|| ConfigError::UnknownReference {
+            kind: "sensor",
+            id: receiver.to_string(),
+        })?;
+        let channel_policy = build_channel_policy(raw.channel_policy, sensor.hardware_kind)?;
         let link = LinkConfig {
             id: id.clone(),
             space,
@@ -1597,13 +1609,30 @@ fn build_links(
     Ok(output)
 }
 
-fn build_channel_policy(raw: RawChannelPolicy) -> Result<ChannelPolicy, ConfigError> {
+fn build_channel_policy(
+    raw: RawChannelPolicy,
+    hardware_kind: HardwareKind,
+) -> Result<ChannelPolicy, ConfigError> {
     let RawChannelPolicy { allowed, expected } = raw;
     if allowed.is_empty() || allowed.contains(&0) {
         return Err(invalid(
             "links[].channel_policy",
             "allowed channels must be non-empty and positive",
         ));
+    }
+    if matches!(hardware_kind, HardwareKind::Esp32S3 | HardwareKind::Esp32C6) {
+        if allowed.iter().any(|channel| !is_esp32_wifi_channel(*channel)) {
+            return Err(invalid(
+                "links[].channel_policy.allowed",
+                "must contain only ESP32 Wi-Fi channels in 1..=14",
+            ));
+        }
+        if expected.is_some_and(|channel| !is_esp32_wifi_channel(channel)) {
+            return Err(invalid(
+                "links[].channel_policy.expected",
+                "must be an ESP32 Wi-Fi channel in 1..=14",
+            ));
+        }
     }
     let set: BTreeSet<u16> = allowed.iter().copied().collect();
     if set.len() != allowed.len() {
@@ -1613,6 +1642,10 @@ fn build_channel_policy(raw: RawChannelPolicy) -> Result<ChannelPolicy, ConfigEr
         return Err(invalid("links[].channel_policy.expected", "must be one of allowed channels"));
     }
     Ok(ChannelPolicy { allowed: allowed.into_boxed_slice(), expected })
+}
+
+fn is_esp32_wifi_channel(channel: u16) -> bool {
+    (ESP32_WIFI_CHANNEL_MIN..=ESP32_WIFI_CHANNEL_MAX).contains(&channel)
 }
 
 fn build_routes(

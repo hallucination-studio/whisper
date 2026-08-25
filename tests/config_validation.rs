@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
-use world::{RouteError, parse_config};
+use world::{ConfigError, RouteError, parse_config};
 
 fn valid_source() -> String {
     std::fs::read_to_string(format!(
@@ -87,6 +87,35 @@ fn configuration_rejects_ambiguous_route_channel_and_candidate_shadow() {
     assert!(parse_config(&duplicate_route).is_err());
     assert!(parse_config(&source.replacen("channel = 1", "channel = 6", 1)).is_err());
     assert!(parse_config(&source.replacen("mode = \"disabled\"", "mode = \"shadow\"", 1)).is_err());
+}
+
+#[test]
+fn configuration_rejects_unreachable_esp32_wifi_channel() {
+    let source = valid_source().replacen(
+        "allowed = [6, 11]\nexpected = 6",
+        "allowed = [6, 36]\nexpected = 6",
+        1,
+    );
+    let error = parse_config(&source).expect_err("channel 36 is unreachable on ESP32 Wi-Fi");
+    assert!(matches!(
+        error,
+        ConfigError::Invalid { field, reason }
+            if field == "links[].channel_policy.allowed"
+                && reason == "must contain only ESP32 Wi-Fi channels in 1..=14"
+    ));
+}
+
+#[test]
+fn configuration_rejects_multi_path_capability_without_wire_order() {
+    let source = valid_source().replacen("multi_path = false", "multi_path = true", 1);
+    let error = parse_config(&source).expect_err("multi-path wire order is not declared");
+    assert!(matches!(
+        error,
+        ConfigError::Invalid { field, reason }
+            if field == "sensors[].adr018.multi_path"
+                && reason
+                    == "must be false because the first-slice firmware has a fixed single-path wire layout"
+    ));
 }
 
 #[test]

@@ -7,8 +7,8 @@ use ciborium::ser::into_writer;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::identity::HardwareKind;
-use super::time::TimeQuality;
+use super::identity::{DecoderVersion, HardwareKind, RadioLinkId, SensorId, SessionId};
+use super::time::{FrameTiming, TimeQuality};
 
 /// An error found while constructing a native CSI layout.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -697,6 +697,222 @@ pub enum CsiCaptureError {
         /// Number of samples supplied by the capture.
         actual: usize,
     },
+}
+
+/// The session ordering and decoder identity attached to a decoded observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct InputReceipt {
+    session: SessionId,
+    record_seq: u64,
+    decoder_version: DecoderVersion,
+}
+
+impl InputReceipt {
+    /// Combines validated session and decoder identities with the session order.
+    #[must_use]
+    pub(crate) fn new(
+        session: SessionId,
+        record_seq: u64,
+        decoder_version: DecoderVersion,
+    ) -> Self {
+        Self { session, record_seq, decoder_version }
+    }
+
+    /// Returns the source session.
+    #[must_use]
+    pub(crate) const fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// Returns the total session record sequence.
+    #[must_use]
+    pub(crate) const fn record_seq(&self) -> u64 {
+        self.record_seq
+    }
+
+    /// Returns the decoder version.
+    #[must_use]
+    pub(crate) const fn decoder_version(&self) -> &DecoderVersion {
+        &self.decoder_version
+    }
+}
+
+/// Typed radio facts shared by Wi-Fi CSI decoders.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct RadioMetadata {
+    channel: Option<u16>,
+    centre_frequency_hz: Option<u64>,
+    bandwidth_hz: Option<u64>,
+    ppdu: Option<PpduKind>,
+    rssi_dbm: i8,
+    noise_floor_dbm: i8,
+}
+
+/// An error found while constructing typed radio metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Each variant names the known radio quantity that was rejected"
+)]
+pub(crate) enum RadioMetadataError {
+    /// A known channel was zero.
+    #[error("known radio channel must be non-zero")]
+    ZeroChannel,
+    /// A known centre frequency was zero.
+    #[error("known radio centre frequency must be non-zero")]
+    ZeroCentreFrequency,
+    /// A known bandwidth was zero.
+    #[error("known radio bandwidth must be non-zero")]
+    ZeroBandwidth,
+}
+
+impl RadioMetadata {
+    /// Constructs metadata after rejecting zero-valued known quantities.
+    pub(crate) const fn try_new(
+        channel: Option<u16>,
+        centre_frequency_hz: Option<u64>,
+        bandwidth_hz: Option<u64>,
+        ppdu: Option<PpduKind>,
+        rssi_dbm: i8,
+        noise_floor_dbm: i8,
+    ) -> Result<Self, RadioMetadataError> {
+        if matches!(channel, Some(0)) {
+            return Err(RadioMetadataError::ZeroChannel);
+        }
+        if matches!(centre_frequency_hz, Some(0)) {
+            return Err(RadioMetadataError::ZeroCentreFrequency);
+        }
+        if matches!(bandwidth_hz, Some(0)) {
+            return Err(RadioMetadataError::ZeroBandwidth);
+        }
+        Ok(Self { channel, centre_frequency_hz, bandwidth_hz, ppdu, rssi_dbm, noise_floor_dbm })
+    }
+
+    /// Returns the configured channel when known.
+    #[must_use]
+    pub(crate) const fn channel(self) -> Option<u16> {
+        self.channel
+    }
+
+    /// Returns the centre frequency in hertz when known.
+    #[must_use]
+    pub(crate) const fn centre_frequency_hz(self) -> Option<u64> {
+        self.centre_frequency_hz
+    }
+
+    /// Returns the bandwidth in hertz when known.
+    #[must_use]
+    pub(crate) const fn bandwidth_hz(self) -> Option<u64> {
+        self.bandwidth_hz
+    }
+
+    /// Returns the PPDU kind when known.
+    #[must_use]
+    pub(crate) const fn ppdu(self) -> Option<PpduKind> {
+        self.ppdu
+    }
+
+    /// Returns the received signal strength in dBm.
+    #[must_use]
+    pub(crate) const fn rssi_dbm(self) -> i8 {
+        self.rssi_dbm
+    }
+
+    /// Returns the noise floor in dBm.
+    #[must_use]
+    pub(crate) const fn noise_floor_dbm(self) -> i8 {
+        self.noise_floor_dbm
+    }
+}
+
+/// A typed dynamic CSI observation after route/profile resolution.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct CsiObservation {
+    input: InputReceipt,
+    sensor: SensorId,
+    hardware: HardwareKind,
+    link: RadioLinkId,
+    device_sequence: u32,
+    timing: FrameTiming,
+    radio: RadioMetadata,
+    profile: CaptureProfileId,
+    csi: CsiCapture,
+}
+
+impl CsiObservation {
+    /// Combines validated identity, timing, radio, profile, and CSI values.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The envelope constructor mirrors its nine architecture-defined fields"
+    )]
+    pub(crate) fn new(
+        input: InputReceipt,
+        sensor: SensorId,
+        hardware: HardwareKind,
+        link: RadioLinkId,
+        device_sequence: u32,
+        timing: FrameTiming,
+        radio: RadioMetadata,
+        profile: CaptureProfileId,
+        csi: CsiCapture,
+    ) -> Self {
+        Self { input, sensor, hardware, link, device_sequence, timing, radio, profile, csi }
+    }
+
+    /// Returns the input receipt.
+    #[must_use]
+    pub(crate) const fn input(&self) -> &InputReceipt {
+        &self.input
+    }
+
+    /// Returns the resolved receiving sensor.
+    #[must_use]
+    pub(crate) const fn sensor(&self) -> &SensorId {
+        &self.sensor
+    }
+
+    /// Returns the resolved hardware family.
+    #[must_use]
+    pub(crate) const fn hardware(&self) -> HardwareKind {
+        self.hardware
+    }
+
+    /// Returns the resolved radio link.
+    #[must_use]
+    pub(crate) const fn link(&self) -> &RadioLinkId {
+        &self.link
+    }
+
+    /// Returns the device sequence number.
+    #[must_use]
+    pub(crate) const fn device_sequence(&self) -> u32 {
+        self.device_sequence
+    }
+
+    /// Returns the frame timing and provenance.
+    #[must_use]
+    pub(crate) const fn timing(&self) -> &FrameTiming {
+        &self.timing
+    }
+
+    /// Returns typed radio metadata.
+    #[must_use]
+    pub(crate) const fn radio(&self) -> RadioMetadata {
+        self.radio
+    }
+
+    /// Returns the resolved capture profile identity.
+    #[must_use]
+    pub(crate) const fn profile(&self) -> CaptureProfileId {
+        self.profile
+    }
+
+    /// Returns the dynamic CSI capture.
+    #[must_use]
+    pub(crate) const fn csi(&self) -> &CsiCapture {
+        &self.csi
+    }
 }
 
 fn validate_profile_descriptor(descriptor: &ProfileDescriptor) -> Result<(), ProfileError> {

@@ -6,11 +6,12 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::csi::{
     AcquisitionCapabilities, AcquisitionMode, CaptureProfile, ComplexOrder, CsiCapture, CsiLayout,
-    CsiPath, CsiSampleAxis, IqSample, LtfMerge, LtfSelection, PhaseState, ProfileCatalog,
-    ProfileDescriptor, ProfileError, SampleEncoding, SampleOrder, ValidityDialect,
+    CsiObservation, CsiPath, CsiSampleAxis, InputReceipt, IqSample, LtfMerge, LtfSelection,
+    PhaseState, PpduKind, ProfileCatalog, ProfileDescriptor, ProfileError, RadioMetadata,
+    RadioMetadataError, SampleEncoding, SampleOrder, ValidityDialect,
 };
-use crate::domain::identity::HardwareKind;
-use crate::domain::time::TimeQuality;
+use crate::domain::identity::{DecoderVersion, HardwareKind, RadioLinkId, SensorId, SessionId};
+use crate::domain::time::{EventTimeSource, FrameTiming, SessionTime, TimeQuality};
 
 fn profile_descriptor() -> ProfileDescriptor {
     let layout = CsiLayout::try_new(
@@ -41,6 +42,22 @@ fn profile_descriptor() -> ProfileDescriptor {
         time_quality: TimeQuality::ReceiveOnly,
         clock_domain: None,
     }
+}
+
+fn observation_capture() -> CsiCapture {
+    let layout = CsiLayout::try_new(
+        vec![CsiPath::RawPathOrdinal(0)],
+        CsiSampleAxis::try_opaque(2).expect("axis"),
+        SampleOrder::PathThenSample,
+    )
+    .expect("layout");
+    CsiCapture::try_new(
+        layout,
+        vec![IqSample::new(1, 2); 2],
+        SampleEncoding::try_new(16, 1, 1, ComplexOrder::RealImaginary).expect("encoding"),
+        PhaseState::Unavailable,
+    )
+    .expect("capture")
 }
 
 #[test]
@@ -111,6 +128,83 @@ fn csi_capture_requires_exact_sample_length() {
 }
 
 #[test]
+fn radio_metadata_rejects_zero_known_values() {
+    assert!(matches!(
+        RadioMetadata::try_new(Some(0), None, None, None, -42, -90),
+        Err(RadioMetadataError::ZeroChannel)
+    ));
+    assert!(matches!(
+        RadioMetadata::try_new(None, Some(0), None, None, -42, -90),
+        Err(RadioMetadataError::ZeroCentreFrequency)
+    ));
+    assert!(matches!(
+        RadioMetadata::try_new(None, None, Some(0), None, -42, -90),
+        Err(RadioMetadataError::ZeroBandwidth)
+    ));
+}
+
+#[test]
+fn csi_observation_roundtrips_all_fields() {
+    let input = InputReceipt::new(
+        SessionId::new("session").expect("session"),
+        17,
+        DecoderVersion::new("decoder-v1").expect("decoder"),
+    );
+    let sensor = SensorId::new("sensor").expect("sensor");
+    let link = RadioLinkId::new("link").expect("link");
+    let timing = FrameTiming::try_new(
+        SessionTime::from_nanos(8),
+        None,
+        SessionTime::from_nanos(8),
+        EventTimeSource::ReceiveOnly,
+        None,
+        3,
+    )
+    .expect("timing");
+    let radio = RadioMetadata::try_new(
+        Some(6),
+        Some(2_437_000_000),
+        Some(20_000_000),
+        Some(PpduKind::Ht),
+        -42,
+        -90,
+    )
+    .expect("radio metadata");
+    let profile = crate::domain::csi::CaptureProfileId::from_bytes([0xA5; 32]);
+    let csi = observation_capture();
+    let observation = CsiObservation::new(
+        input.clone(),
+        sensor.clone(),
+        HardwareKind::Esp32S3,
+        link.clone(),
+        12,
+        timing.clone(),
+        radio,
+        profile,
+        csi.clone(),
+    );
+
+    assert_eq!(observation.input(), &input);
+    assert_eq!(observation.input().session(), input.session());
+    assert_eq!(observation.input().record_seq(), 17);
+    assert_eq!(observation.input().decoder_version(), input.decoder_version());
+    assert_eq!(observation.sensor(), &sensor);
+    assert_eq!(observation.hardware(), HardwareKind::Esp32S3);
+    assert_eq!(observation.link(), &link);
+    assert_eq!(observation.device_sequence(), 12);
+    assert_eq!(observation.timing(), &timing);
+    assert_eq!(observation.radio(), radio);
+    assert_eq!(observation.radio().channel(), Some(6));
+    assert_eq!(observation.radio().centre_frequency_hz(), Some(2_437_000_000));
+    assert_eq!(observation.radio().bandwidth_hz(), Some(20_000_000));
+    assert_eq!(observation.radio().ppdu(), Some(PpduKind::Ht));
+    assert_eq!(observation.radio().rssi_dbm(), -42);
+    assert_eq!(observation.radio().noise_floor_dbm(), -90);
+    assert_eq!(observation.profile(), profile);
+    assert_eq!(observation.csi(), &csi);
+}
+
+#[test]
 fn intel_three_by_three_by_thirty_has_270_distinct_native_coordinates() {
     let paths: Vec<_> = (0..3)
         .flat_map(|tx| (0..3).map(move |rx| CsiPath::TxRx { tx_stream: tx, rx_chain: rx }))
@@ -135,6 +229,32 @@ fn intel_three_by_three_by_thirty_has_270_distinct_native_coordinates() {
     let unique: std::collections::BTreeSet<_> = coordinates.iter().copied().collect();
     assert_eq!(coordinates.len(), 270);
     assert_eq!(unique.len(), 270);
+
+    let observation = CsiObservation::new(
+        InputReceipt::new(
+            SessionId::new("intel-session").expect("session"),
+            4,
+            DecoderVersion::new("intel-decoder").expect("decoder"),
+        ),
+        SensorId::new("intel-sensor").expect("sensor"),
+        HardwareKind::Intel5300,
+        RadioLinkId::new("intel-link").expect("link"),
+        9,
+        FrameTiming::try_new(
+            SessionTime::from_nanos(2),
+            None,
+            SessionTime::from_nanos(2),
+            EventTimeSource::ReceiveOnly,
+            None,
+            0,
+        )
+        .expect("timing"),
+        RadioMetadata::try_new(None, None, None, None, -50, -95).expect("radio metadata"),
+        crate::domain::csi::CaptureProfileId::from_bytes([0xCC; 32]),
+        capture,
+    );
+    assert_eq!(observation.hardware(), HardwareKind::Intel5300);
+    assert_eq!(observation.csi().coordinates().len(), 270);
 }
 
 #[test]

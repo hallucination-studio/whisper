@@ -108,7 +108,7 @@ he_tagging = true
 csi_acquire = "wifi-csi"
 ltf_selection = "he"
 ltf_merge = "firmware-defined"
-validity_dialect = "explicit-flag"
+validity_dialect = "missing-frame-validity"
 multi_path = false
 
 [[links]]
@@ -136,8 +136,8 @@ provisioned = true
 fixed_source_mac_filter = true
 
 [links.channel_policy]
-allowed = [36, 40]
-expected = 36
+allowed = [6, 11]
+expected = 6
 
 [[routes]]
 peer = "192.0.2.10"
@@ -153,4 +153,4 @@ node_id = 2
 link = "link-b"
 peak_packets_per_second = 100
 maximum_valid_datagram_bytes = 4096
-channel = 36
+channel = 6
