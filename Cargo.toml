@@ -1,0 +1,26 @@
+[package]
+name = "world"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "A deterministic, replayable RF world model"
+license = "MIT"
+
+# Isolate this single package from the unrelated parent workspace.
+[workspace]
+
+[dependencies]
+ciborium = "0.2.2"
+mimalloc = "0.1.48"
+serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+toml = "0.9.5"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
