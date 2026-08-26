@@ -2,7 +2,7 @@
 
 - 状态：开发基线（Development Baseline）
 - 适用范围：本仓库
-- 当前采集端：ESP32 ADR-018 CSI
+- 当前采集端：自有 ESP32 native-frame CSI 固件（不兼容 ADR-018/RuView wire）
 - 已知后续采集端：Intel 5300 CSI
 
 本文档定义一套架构，不按 `v1`、`v2` 复制目录或分叉领域类型。“首个开发切片”只限制现在实现哪些能力，不建立一套将来需要推倒的临时架构。
@@ -48,13 +48,13 @@
 | adapter / encoder / core / head | 模型内部组件 | 默认可独立训练、部署或注册的多个模型 |
 | teacher / student | 一次可选蒸馏实验中，来源 checkpoint 与目标 checkpoint 的临时角色 | 架构层、服务、模块、类型、bundle 或长期产品身份 |
 
-“大/小”只描述规模或资源成本，不表示权威、兼容关系或必然存在的蒸馏关系。parser、conditioning recipe、threshold、fusion rule、receipt、baseline state、artifact 容器和评估报告不得笼统称为模型。代码中的统计路径统一使用 `estimator.rs`、`BaselineEstimator`、`EstimatorStep` 和 `EstimatorError`；在真实神经路径落地前，不预建 `Teacher*`、`Student*`、通用 `Model` trait 或 registry。
+“大/小”只描述规模或资源成本，不表示权威、兼容关系或必然存在的蒸馏关系。parser、conditioning recipe、threshold、fusion rule、receipt、baseline state、artifact 容器和评估报告不得笼统称为模型。代码中的统计路径统一使用 `estimator.rs`、`BaselineEstimator`、`LinkStepEvidence` 和 `EstimatorError`；在真实神经路径落地前，不预建 `Teacher*`、`Student*`、通用 `Model` trait 或 registry。
 
 ## 2. 不可违反的约束
 
 ### 2.1 字节事实只有一份
 
-权威事实源是收到的 UDP datagram 及其接收上下文，记为 `CapturedPacket`。解码后的 `CsiObservation`、conditioned feature、baseline 和世界状态都是可重算的派生物。
+权威事实源是**通过 data-plane admission 的完整加密 UDP datagram**及其接收上下文，记为 `CapturedPacket`。任意 socket bytes 不是事实：未知 peer、认证失败、replay、超限和超 rate 的输入只进入有界 `IngressHealth` 计数，绝不无限写盘。解码后的 `CsiObservation`、conditioned feature、baseline 和世界状态都是可重算的派生物。
 
 ```text
 CapturedPacket                         authoritative
@@ -74,12 +74,12 @@ CapturedPacket                         authoritative
 
 ### 2.3 CSI 是链路观测
 
-CSI 描述 transmitter 到 receiver 的传播链路。进入统计估计或神经推理路径的观测必须具有 `RadioLinkId`；仅有 `node_id` 或 receiver ID 的数据不能混入别的链路。
+CSI 描述 transmitter 到 receiver 的传播链路。进入统计估计或神经推理路径的观测必须具有 `RadioLinkId`；仅有 `device_id` 或 receiver ID 的数据不能混入别的链路。
 
 ### 2.4 未知不是错误，错误也不是未知
 
 - 数据不足、baseline 未就绪、时间质量不足或覆盖不足产生 `Unknown(reason)`。
-- malformed packet、配置冲突、CRC 损坏和存储失败产生分类错误与健康指标。
+- 认证/重放/入站预算失败、malformed packet、配置冲突、CRC-32C 损坏和存储失败产生分类错误与健康指标。
 - 禁止把解析失败包装成一个“UNKNOWN observation”送入统计估计或神经推理路径。
 
 ### 2.5 时间、坐标、质量和来源不能隐式丢失
@@ -100,12 +100,16 @@ CSI 描述 transmitter 到 receiver 的传播链路。进入统计估计或神�
 UDP socket / session reader
           │
           ▼
+size + peer + route + AEAD + replay admission
+          │
+          ├── reject -> bounded IngressHealth only
+          ▼
 CapturedPacket + total record order
           │
           ├── append session ─────────────────────────────┐
           │       append 成功才继续                        │
           ▼                                                │ replay
-single ESP32 wire dispatcher                               │
+single native-frame dispatcher                              │
           │                                                │
           ▼                                                │
 Registry identity/link resolution                          │
@@ -155,7 +159,7 @@ src/
 │   └── world.rs           Knowledge、belief、snapshot、receipt
 ├── capture.rs             CapturedPacket；不打开 socket
 ├── config.rs              TOML、EffectiveConfig、Registry、全量校验
-├── esp32.rs               唯一 ADR-018/ADR-110 dispatcher 与 resolver
+├── wire.rs                唯一 native-frame dispatcher、校验与 resolver
 ├── session.rs             append/read/recovery/container
 ├── timeline.rs            sequence、profile、epoch、watermark、window
 ├── conditioning.rs        可审计的原生坐标特征
@@ -179,7 +183,7 @@ module         may depend on
 domain         pure value/hash/serialization support only; no runtime or I/O
 capture        domain
 config         domain
-esp32          capture + config + domain
+wire           capture + config + domain
 session        capture + domain
 timeline       domain
 conditioning   domain + timeline
@@ -195,10 +199,10 @@ main           app
 强制规则：
 
 - `domain` 不依赖 Tokio、HTTP、文件、ESP32、神经模型 backend 或 UI。
-- `esp32` 不拥有 socket、文件或世界状态；同一协议只有一个 decoder。
+- `wire` 不拥有 socket、文件、密钥持久化或世界状态；同一 wire schema 只有一个 decoder。`app` 在 session append 前拥有固定 header、peer allowlist、AEAD 和 replay admission。
 - `timeline`、`conditioning`、`estimator` 不读取系统时钟、网络、配置文件或全局变量。
 - `estimator` 不依赖 `server`、`view`、`session` 或 ESP32 wire 类型。
-- `candidate` 不读取 session、socket 或生产 Engine；app 只按序转交 Engine 生成的 `CandidateInput`。未来 frozen encoder 通过准入后，Engine 才额外转交同 receipt 的单个 `ConditionedStream`，不能让 app 自行重算。
+- future candidate 代码不读取 socket 或生产 Engine；经过独立批准后，它只从 sealed-session faithful replay 的 `LinkStepEvidence` 私有派生输入，app 不得重算。未来 frozen encoder 也不能改变 V1 EngineOutput 或让 app 自行重算。
 - `server` 不持有 `&mut Engine`，只能查询 read store 或发送 command。
 - `app` 只组合和治理生命周期，不复制领域计算。
 - 模块间使用具体类型；首个切片没有 `FrameDecoder`、`WorldModel`、`StorageBackend`、`ViewProjector`、`Clock` trait、registry factory 或 DI container。
@@ -220,6 +224,13 @@ struct SensorId(Box<str>);
 struct TransmitterId(Box<str>);
 struct RadioLinkId(Box<str>);
 struct SessionId(Box<str>);
+struct DeviceId(u64);                 // provisioned, never derived from a MAC
+struct KeyEpoch(NonZeroU16);
+struct BootGeneration(NonZeroU32);
+struct DeviceEpoch {
+    device: DeviceId,
+    boot_generation: BootGeneration,
+}
 ```
 
 `HardwareKind` 至少能区分 `Esp32S3`、`Esp32C6`、`Intel5300`。首个切片加载 Intel 采集配置时返回 `UnsupportedHardware`，不能假装已经实现。
@@ -243,15 +254,13 @@ struct RadioLink {
 
 ### 5.3 ESP32 路由
 
-ADR-018 的 `node_id: u8` 不是全局设备身份，而且 wire 不含 source MAC。`Registry` 用配置中的 route 将 `(node_id, expected_peer_ip)` 绑定到 `SensorId`，再依据 source contract 决定能否绑定 `RadioLinkId`：
+自有 wire 带有 provisioned `device_id`、持久 `boot_generation` 和每个 CSI frame 的 driver-reported source MAC；它不把 node number、peer port 或 MAC 的推测值当成全局身份。v1 的 `HeaderRoute` 只用配置中的精确 `(device_id, expected_peer_ip, key_epoch)` 选择 key/admission record；AEAD 后该 record 建立 `SensorId`，认证后的 `DecodedRoute` 才依据**每帧 source MAC**和 radio facts 绑定 `RadioLinkId`：
 
-- peer 地址匹配时按精确 route 解析；source port 不作为稳定身份；
-- 没配置 peer 时，同一个 `node_id` 只能有一条无歧义 route；
-- 同一 peer/node 指向多个 sensor/link 是启动错误；
-- 未登记来源先写入 session，再以 `UnknownRoute` 拒绝，不能进入 baseline；
-- inference-eligible route 必须登记单一 transmitter，并声明该 node 已 provision 专用源或启用固定 source-MAC filter；由于 wire 不能证明该 MAC，证据等级为 `ConfiguredUnverified`。
-- 未 provision、可能混有多个 transmitter 的 packet 为 `UnresolvedSource`：首个切片只保留 raw session bytes 和 reject health，排除 recent SignalView、baseline/world，不能塞进 `unknown-transmitter-*` 假装成稳定链路。真实诊断需求出现后再增加 source-key query。
-- packet/profile 的实测 channel 必须满足 link 的 `channel_policy`，否则 `RouteRadioMismatch`；channel hopping 仍可形成多个 profile，而不是改变物理 link 身份。
+- `expected_peer_ip` 是首版必填的 host admission allowlist；source port 不作为稳定身份。同一 peer/device 或 device/sensor/link 的重复映射是启动错误，不存在 wildcard route。
+- 尚未注册 device、peer 不匹配、未知 key epoch、认证失败、replay 或超过入站预算的 bytes 在 durable append 前拒绝，只增加有界 `IngressHealth`；它们不是 session raw packet。
+- 已认证 device 但 build/capability/source MAC 未被当前 session manifest 接受时，按每 device 的已认证 rate 上限写入 raw packet，并以 `UnexpectedArtifact`、`UnknownSourceMac` 或 `RouteRadioMismatch` 拒绝进入 timeline/estimator。
+- inference-eligible route 必须同时匹配 provisioned `device_id`、expected peer、认证 key epoch 和 link 的 `expected_transmitter_mac`。固件 Wi-Fi filter 只是减少无关 capture；host 必须再次检查 payload 中的 driver-reported MAC。没有该证据的 frame 为 `UnresolvedSource`，不能伪造稳定 link。
+- packet/profile 的实测 channel、bandwidth、PHY/LTF facts 必须满足 link 的 `channel_policy` 和 route capability，否则 `RouteRadioMismatch`；channel hopping 仍可形成多个 profile，而不是改变物理 link 身份。
 
 ### 5.4 配置是 session 的输入
 
@@ -259,25 +268,28 @@ TOML 至少定义：
 
 ```text
 deployment id
-capture bind, max_datagram_bytes, socket_buffer_bytes
+capture bind, max_datagram_bytes, socket_buffer_bytes,
+        max_ingress_packets_per_second, max_authenticated_bytes_per_second
+control capability_announce_period, health_report_period
 session directory, retention, flush policy
+secret_root path (not key bytes)
 window width, step, allowed_lateness, inactive_after
-sequence reorder_horizon, probable_restart_after
+sequence reorder_horizon, replay_window_packets
 conditioning recipe and amplitude scale
 quality minimum_frames, coverage, gap, jitter, time_quality
 baseline learning minimum_windows/minimum_valid_exposure, EW time_constant
 baseline update gate, stale_after, stable/change thresholds
 performance capture max_rss, snapshot_deadline, thread limits
-candidate mode: disabled | shadow; when enabled require artifact/report digests,
-          max_artifact_bytes, max_learning_lag and candidate thread/RSS budgets
 spaces[]
 transmitters[]
-sensors[]: id, hardware_kind, node_id, expected_peer_ip, firmware, adr018 capabilities
-links[]: id, space, transmitter, receiver, source contract, channel policy
-routes[]: peer/node/link resolution, peak_packets_per_second, maximum_valid_datagram_bytes
+sensors[]: id, hardware_kind, device_id, expected_peer_ip, firmware build digest,
+           key epoch, native-frame capability digest, maximum frame/plaintext bytes
+links[]: id, space, transmitter, receiver, expected_transmitter_mac, channel policy
+routes[]: exact peer/device/link resolution, peak_packets_per_second,
+          maximum_valid_datagram_bytes, authenticated byte/rate budgets
 ```
 
-每条 route 的 peak 必须来自固件配置或实机观测再留明确余量，`maximum_valid_datagram_bytes <= max_datagram_bytes`。所有非显然数值都使用带单位的名称，并记录来源与改动影响。运行中不热更新影响推理的配置；修改后开启新 session。`EffectiveConfig` 的完整快照和 digest 写入 manifest。
+每条 route 的 peak、最大 plaintext/datagram bytes 和 admission byte/rate budget 必须来自固件配置或实机观测再留明确余量，`maximum_valid_datagram_bytes <= max_datagram_bytes`，且 capability 的最大 CSI body 必须装入一个 UDP datagram。所有非显然数值都使用带单位的名称，并记录来源与改动影响。运行中不热更新影响推理的配置、key epoch 或 route；修改后开启新 session。`EffectiveConfig` 的完整快照和 digest 写入 manifest，明文 key 永不写入 config 或 session。
 
 ## 6. 字节事实源与 session 契约
 
@@ -291,11 +303,11 @@ struct CapturedPacket {
     receive_utc_ns: i64,          // 仅展示/跨文件定位
     peer: SocketAddr,
     wire_format: WireFormat,
-    bytes: Box<[u8]>,
+    bytes: Box<[u8]>,             // exact authenticated encrypted datagram
 }
 ```
 
-`record_seq` 是 packet 和 control command 共用的 session 总序。monotonic time 负责排序与窗口，UTC 不能参与核心顺序。
+`CapturedPacket` 只能由通过 peer/route/AEAD/replay admission 的输入构造；decrypted body 只在内存中交给 decoder，不再写第二份。`record_seq` 是 packet 和 control command 共用的 session 总序。monotonic time 负责排序与窗口，UTC 不能参与核心顺序。
 
 ### 6.2 容器格式
 
@@ -306,12 +318,12 @@ file header
 ├── magic: "RFWSESS\0"
 ├── container_version: u16 little-endian
 ├── manifest_len: u32 little-endian
-├── manifest_crc32: u32
+├── manifest_crc32c: u32 little-endian
 └── manifest: named-field CBOR
 
 record*
 ├── body_len: u32 little-endian
-├── body_crc32: u32
+├── body_crc32c: u32 little-endian
 └── body: named-field CBOR SessionRecord
 ```
 
@@ -324,26 +336,20 @@ struct SessionManifest {
     application_version: String,
     build_fingerprint: [u8; 32],
     decoder_version: String,
+    wire_admission: Vec<WireAdmissionPin>,
     conditioning_version: String,
     algorithm_version: String,
     initial_baselines: Vec<BaselineSnapshot>,
-    shadow_selection: Option<ShadowSelectionPin>,
 }
 
-struct ShadowSelectionPin {
-    candidate: SessionArtifactPin,
-    evaluation_report: SessionArtifactPin,
-}
-
-struct SessionArtifactPin {
-    kind: SessionArtifactKind,
-    digest: [u8; 32],
-    byte_len: u64,
-}
-
-enum SessionArtifactKind {
-    Candidate,
-    CandidateEvaluationReport,
+struct WireAdmissionPin {
+    wire_version: u8,
+    device_id: DeviceId,
+    key_epoch: KeyEpoch,
+    firmware_build_digest: [u8; 32],
+    capability_digest: [u8; 32],
+    maximum_plaintext_bytes: u16,
+    transport_datagram_budget_bytes: u16,
 }
 
 struct SessionRecord {
@@ -373,33 +379,33 @@ struct TargetedBaselineCommand {
 
 `CapturedPacket` 是 decoder 使用的完整内存 view，由 record envelope + `Packet` body 组合，不在磁盘中重复序列化 total order/time。reader 必须验证 `record_seq` 从 0 开始严格递增且唯一，`at` 不倒退。
 
-CBOR 使用 named fields 和严格 schema；不能依赖 Rust enum 的偶然内存布局。`config_digest`/`build_fingerprint` 对各自 canonical bytes 取 SHA-256，artifact/report digest 对原始文件 bytes 取 SHA-256，并随 fixed fixtures 测试；digest 用于内容身份，不替代 CRC 的损坏检测。`shadow_selection` 在 CPU 演化切片前恒为 `None`；启用后必须先校验 candidate/report 的 kind、schema、大小、report 指向 candidate 的单向 digest 关系和原始 bytes 摘要，以 temp + sync + atomic rename + directory fsync 把两者 durable 写入 `data_root/artifacts/<digest>`，再创建 manifest。candidate 不反向引用 report。它只是按摘要读取的 session attachment，不提供搜索、tag、latest 或 registry API。缺少 selection attachment 时，production semantic replay 仍继续并明确报告 `ShadowUnavailable`；只有请求 shadow replay/evaluation 才失败。当前实现只读当前 container version，第二个真实版本出现后才写迁移器。
+CBOR 使用 named fields 和严格 schema；不能依赖 Rust enum 的偶然内存布局。`config_digest`/`build_fingerprint` 对各自 canonical bytes 取 SHA-256，并随 fixed fixtures 测试；digest 用于内容身份，不替代 CRC-32C 的磁盘损坏检测或 AEAD 的网络认证。session CRC 固定为 CRC-32C/Castagnoli（reflected polynomial `0x82F63B78`，init/xorout `0xffff_ffff`，`"123456789" -> 0xe3069283`），little-endian 写入，覆盖对应 manifest/body bytes。`wire_admission` pin 是 replay 所需的非秘密设备/build/capability 事实，明文 key 只在独立 secret store 中按 device/key epoch 保留。首个切片只读写当前 container version；第二个真实 container 版本出现后才写迁移器，不为 candidate 或 artifact 预留字段。
 
 ### 6.3 写入、恢复与保留
 
 ```text
 data_root/
 ├── sessions/
-├── artifacts/<sha256-hex>
-├── state/selected-shadow.cbor
+├── state/admission.cbor
+├── state/current-baseline.cbor
 └── locks/runtime.lock
 ```
 
-`capture` 从读取 `selected-shadow`、验证两个 pin 到创建 session manifest，始终持有同一个 OS advisory exclusive lock。`learn-ar1`、`evaluate-candidate`、`select-shadow`、`rollback-shadow`、managed `data_root` 上的 replay/export/import，以及 retention/attachment GC 首实现也必须取得该 lock 并持有到完成；获取失败就明确拒绝，不使用会遗留 stale 状态的 create/delete sentinel。selection sidecar 使用 temp + sync + atomic rename + parent-directory fsync。这样 capture、reader、retention、离线 learner 和选择操作不会竞态；出现真实并发读取需求后才升级 shared lock/session lease。
+`capture` 从读取 current baseline 到创建 session manifest 始终持有同一个 OS advisory exclusive lock；写入 baseline snapshot、rotation 和 retention 也由同一进程顺序执行。获取失败就明确拒绝，不使用会遗留 stale 状态的 create/delete sentinel。出现真实的并发读写需求后，才设计 shared lock 或 session lease。
 
-- packet 必须 append 成功、由 writer 接管 bytes 后才能 decode 和改变世界状态。
+- 只有通过 fixed-header、peer、`HeaderRoute`、AEAD、anti-replay、payload-size 和 per-peer/per-device rate admission 的 packet 才可创建 `CapturedPacket`；其 exact encrypted bytes 必须 append 成功、由 writer 接管后才能 decode 和改变世界状态。未通过 admission 的 traffic 只更新内存中有界、按原因聚合的 health counters。
+- `state/admission.cbor` 是非秘密、有界 replay checkpoint：每个已登记 `(device_id, key_epoch)` 只保存已认证的最高 `boot_generation`、该 generation 的最大 `message_seq` 和配置窗口内的 seen bitmap。它不是第二事实源：启动时先加载 checkpoint，再扫描 active session 已落盘 `Packet` header 重建窗口，完成前不绑定 socket；session rotation 或正常 shutdown 在 `Closed` 已 sync 后以 temp + sync + atomic rename 更新 checkpoint。provisioning 同时创建一个已 sync 的空 checkpoint；任何缺失/损坏都 fail closed，清除它必须以 fresh key epoch 重新 provision，不能把 replay protection 静默归零。
 - `BeginLearning`、`Commit`、`Freeze`、`Resume`、`ActivateSnapshot` 全部先写 session 再执行。`ActivateSnapshot` 的不可变 baseline snapshot 完整嵌入 command record，不能只引用 session 外部 revision。
 - 没有 packet 但需要关闭窗口或判定 stream inactive 时，先写 `TimelineAdvance` 再调用 `Engine::advance_to`；replay 按同一记录推进，不能重新依赖墙钟。
 - manifest 包含所有影响结果的配置和初始 baseline，replay 不依赖“当前磁盘配置”。
 - 末尾 body 不完整表示 crash tail：恢复之前所有完整记录并明确报告 `RecoveredTruncatedTail`。
-- 完整 body 的 CRC 不匹配表示中间损坏：带 byte offset 失败，不静默跳过。
+- 完整 body 的 CRC-32C 不匹配表示中间损坏：带 byte offset 失败，不静默跳过。
 - reader 在分配前检查配置硬上限 `max_manifest_bytes` 和 `max_record_bytes`；声明长度超限直接失败，不能由损坏的 `u32` 触发巨额分配。
 - graceful shutdown 写 `Closed`、flush 并 sync；没有 footer 仍可扫描恢复。
-- baseline snapshot 是不可变 revision 文件；当前指针用原子 rename 替换。
+- state/current baseline 是完整 snapshot；更新以 temp + sync + atomic rename 完成，每个 session manifest 仍嵌入它开始时的 snapshot。
 - retention 只删除最旧且已关闭的 session，绝不删除 active session。
-- 删除 attachment 前扫描所有 retained manifest；任何 `SessionArtifactPin` 仍引用的 digest 都不能删除。首实现不维护可漂移的 refcount database。
 
-session 同时配置 `max_session_duration` 和 `max_session_bytes`。达到任一上限时暂停新输入，并在 record boundary 执行：`append Closed -> Engine::finish -> sync old session -> 写/sync 清除 session-local stale timer 且 adaptation_armed=false 的 BaselineSnapshot -> 新 manifest 嵌入该 snapshot -> 恢复输入`。crash-recovered 文件恢复完整前缀后标记 recovery-sealed/read-only，绝不继续 append；从该前缀通过同一 finish/snapshot handoff 开启新 session。retention 可删除已 Closed 或 recovery-sealed、且不是当前 active 的文件。
+session 同时配置 `max_session_duration` 和 `max_session_bytes`。达到任一上限时暂停新输入，并在 record boundary 执行：`append Closed -> Engine::finish -> sync old session -> atomic sync replay checkpoint -> 写/sync 清除 session-local stale timer 且 adaptation_armed=false 的 BaselineSnapshot -> 新 manifest 嵌入该 snapshot -> 恢复输入`。crash-recovered 文件恢复完整前缀后标记 recovery-sealed/read-only，绝不继续 append；从该前缀通过同一 finish/snapshot handoff 开启新 session。retention 可删除已 Closed 或 recovery-sealed、且不是当前 active 的文件。
 
 `append` 只保证 bytes 已进入 writer，不等于已经抗断电。writer 维护 `durable_through_record_seq`；首个切片在发布每个 closed-window snapshot 前对其全部证据执行 `sync_data`，baseline command 也在应用前 sync。失败即停止 capture。这样已经对外发布的 semantic state 总能从持久前缀重放；若实测每窗口 sync 造成丢包，再依据 durability 指标批量化，不能暗中降低保证。
 
@@ -407,70 +413,151 @@ session 同时配置 `max_session_duration` 和 `max_session_bytes`。达到任�
 
 ### 6.4 faithful replay
 
-首个切片只实现 `faithful replay`。manifest 的 build fingerprint、decoder、conditioning 和 algorithm 必须与当前 executable 完全匹配；不匹配就拒绝，并提示使用原 build，不能靠字符串 registry 假装旧实现仍存在。
+首个切片只实现 `faithful replay`。manifest 的 build fingerprint、wire admission pin、decoder、conditioning 和 algorithm 必须与当前 executable 完全匹配，且 secret store 中必须仍可取得对应 device/key epoch 的 replay key；任一项不匹配就拒绝，并提示使用原 build/key retention policy，不能靠字符串 registry 假装旧实现仍存在。
 
 未来若确有 parser 修复或研究需要，可增加显式 `reinterpret`，用新的输出 namespace 重新解释旧 bytes；它不得声称是原 session 的相同结论，也不属于首个 CLI。
 
-## 7. ESP32 wire 边界
+## 7. ESP32 firmware image 与 native-frame wire 边界
 
-### 7.1 唯一 dispatcher
+首版固件是自有 ESP-IDF application，**不实现 ADR-018、不兼容 RuView datagram，也不保留其 magic registry**。它按本节和 upstream ESP-IDF contract 重新实现，不链接、复制或保留 `oldRu/RuView/firmware` 的 source。`RfFrameV2` 只提供三个可吸收的语义：原生样本不被派生视图覆盖、validity 显式、相位状态声明；它的任意-rank Rust 内存对象、浮点 layout、geometry、quality、evidence 和 provenance 字段不是 firmware ABI。
 
-```rust
-fn decode_esp32_datagram(bytes: &[u8]) -> Result<Esp32Packet, DecodeError>;
+### 7.1 固件职责、威胁边界与明确拒绝
 
-enum Esp32Packet {
-    Csi(Adr018Csi),
-    ClockAnchor(Adr110Sync),
-    Unsupported { magic: u32 },
-}
+固件只负责 `Wi-Fi CSI capture -> bounded snapshot pool -> native encoder -> authenticated UDP -> health/watchdog`。它不做 baseline、world inference、canonical tensor、人体/姿态/人数判断、在线训练或 host-side calibration。固件镜像和 runtime datagram 是不同 artifact；runtime packet 绝不是可执行更新载体。
+
+明确拒绝：
+
+- ADR-018 的 `0xC511...` magic、20-byte header、sibling magic registry、`128-pair` 经验值和兼容 parser；
+- RuView 的 `RfFrameV2` 任意 rank、`Vec<Complex64>`、浮点 metadata、逐帧 geometry/evidence，及其 OTA/密钥模型；
+- `56 x 8` canonical tensor，或按 raw length 推断 tone、带宽、PPDU、Tx/Rx、LTF 或相干时间；
+- CRC 当作身份、完整性或 replay 防护；CRC-32C 只保留给已落盘 session record 的随机损坏检测；
+- 生产端口上的 unauthenticated/trusted-LAN fallback、IP fragmentation、application fragmentation、静默截断、静默补零和未限定 TLV extension。
+
+每台设备有 provisioned、部署内唯一的 `device_id:u64` 和每个非零 `key_epoch` 对应的一把随机 32-byte AES key。生产固件只从受 flash encryption 保护的 NVS `provision` namespace 取得 key；不定义含混的 eFuse-derived key API。v1 host secret store 是 deployment 配置只指向的受控本地目录，app 用标准文件 I/O 从 `secret_root/<device_id>/<key_epoch>.key` 读取恰好 32 bytes，其中两个目录名是其 canonical unsigned decimal encoding；目录由部署者保护，key bytes 从不进入 TOML、session 或 log。测试只使用独立 temporary secret root 和 fixture key。这里不定义 provider trait、环境变量 fallback 或旧 key format parser。`device_id` 不是 MAC，也不是可由 node number 推导的值。peer allowlist 是 DoS 收敛措施，不是身份认证。所有 production wire message 都有认证和 replay admission；test decoder 不能监听 production endpoint。
+
+ESP32-S3 v1 的采集输入也必须明确，而不是假设附近总有可用 CSI。设备只作为 2.4 GHz station 关联到 provisioned 的专用 BSSID，且在 association 后设置 `WIFI_PS_NONE`、关闭 promiscuous mode、关闭 channel hopping 与 BLE coexistence。它只接受 `wifi_csi_info_t.mac == provisioned BSSID` 且 `dmac == station MAC` 的 callback；此 BSSID 是 wire 中的 `source_mac`，不是 collector 的 IP 或 Ethernet MAC。collector 在同一专用 WLAN 向设备 provisioned 的 UDP probe port 发送普通、受速率限制的 unicast UDP datagram，固件的低优先级 socket task 只接收并丢弃 probe payload。probe 不是第二个 frame grammar，payload 不解析、不写入 CSI record，也不从 `capture_seq` 推断 probe loss。部署用 station MAC 做 DHCP reservation，使 `HeaderRoute` 的精确 peer IP 可在 session manifest 中固定。
+
+固定 CSI 配置是 capability 的一部分：`lltf_en=true`、`htltf_en=true`、`stbc_htltf2_en=true`、`ltf_merge_en=false`、`channel_filter_en=false`、`manu_scale=false`、`dump_ack_en=false`。关闭 `ltf_merge_en` 和 `channel_filter_en`，避免把 LLTF/HT-LTF 平均或相邻 carrier 平滑后的派生值伪装成 driver bytes；其余值使所有可用 S3 LTF 由同一确定配置产生。未关联、未绑定 probe socket、配置不匹配或来源 MAC 不匹配时不产生 `CsiDataV1`。
+
+### 7.2 传输和外层 envelope
+
+UDP endpoint + route manifest 是协议选择器，不使用 magic number 路由。v1 datagram 是固定 32-byte header、ciphertext 和 16-byte tag，所有整数 little-endian，数组按原 byte order；禁止 C struct padding 或 `memcpy` 作为 serialization：
+
+```text
+0       wire_version:u8                == 1
+1       message_kind:u8                1=Capabilities, 2=CsiData, 3=Health
+2..3    header_bytes:u16               == 32
+4..11   device_id:u64                  provisioned opaque identity
+12..13  key_epoch:u16                  enrolled non-zero key generation
+14..15  reserved_a:u16                 == 0
+16..19  boot_generation:u32            non-zero persistent monotonic generation
+20..27  message_seq:u64                starts at 1; never wraps in a generation
+28..29  ciphertext_bytes:u16
+30..31  reserved_b:u16                 == 0
+32..    ciphertext[ciphertext_bytes]
+...     aead_tag:[u8; 16]
 ```
 
-同一 UDP 端口的 sibling magic 必须先分类。ADR-018 raw CSI magic 为 `0xC5110001`；`0xC5110002..=0xC5110007` 首版记录为已识别但不支持；ADR-110 clock anchor magic 为 `0xC511A110`。
+`AES-256-GCM` authenticates and encrypts the body. Header bytes `0..32` are AAD; nonce is exactly `boot_generation:u32 LE || message_seq:u64 LE`. The sender allocates a fresh `message_seq` before every sealing attempt, including a later failed UDP send; it never retries by resealing with the old nonce. `boot_generation` is incremented, committed and reread from NVS before any message may leave the device. A device that cannot commit a new generation, has a zero/wrapped `message_seq`, reaches a wrapped `boot_generation`, or lacks an active key must fail closed and send no CSI. This prevents nonce reuse across reset/power loss; NVS erase requires re-provisioning under a fresh key epoch, not a silent generation reset.
 
-decoder 必须：
+There is no wire CRC, magic, fragment index or payload extension. Before AEAD, app derives only `HeaderRoute` from configured datagram budget, exact peer IP and the clear `(device_id, key_epoch)`: it supplies the exact key lookup and that route's byte/rate/replay limits. It does not use ciphertext as metadata, and it cannot decide link/source identity. After AEAD and replay admission, the decoder derives `DecodedRoute` from authenticated `source_mac` plus channel/PHY/LTF facts and the configured link policy; only this step may resolve sensor/link/profile or reject a source/radio mismatch. Duplicate or too-old messages are rejected, controlled reordering within that window is admitted, and a lower/reused boot generation is rejected. The tag covers identity, version, kind, sequence and body, so a valid ciphertext cannot be transplanted to another header. Unknown `wire_version` is rejected before persistence; an unknown v1 `message_kind` is authenticated, rate-bounded and recorded as `UnknownKind`, but its body is never interpreted.
 
-- 检查 magic、最小 header、声明长度、endianness 和尾随 bytes；
-- 检查 antenna/path 和 declared CSI sample count 大于零；
-- 使用 checked multiplication 验证 payload 大小，不允许整数溢出；
-- 限制 `max_datagram_bytes` 和配置允许的维度上限；
-- 要求 `consumed == received`，不静默接受尾随数据；
-- 保留原始 I/Q、sequence、RSSI、PPDU、flags 和协议给出的 radio metadata；
-- 不调用 `Utc::now()`、monotonic clock 或随机数；时间全部来自 `CapturedPacket`；
-- 对任意截断前缀返回 `DecodeError`，不 panic。
+`default_transport_datagram_budget_bytes = 1200` includes the 32-byte header and 16-byte tag. It is a conservative default below IPv6's 1280-byte minimum MTU after IPv6/UDP overhead, not an RF shape constant. A deployment tunnel may set a lower bound; raising it requires recorded packet-path validation. Firmware checks the maximum encoded capability at boot and host checks the same value in route config. A supported v1 capture must fit one datagram; otherwise that acquisition profile is rejected at configuration time. This deliberately removes partially specified reassembly and both IP/application fragmentation from v1.
 
-当前 firmware 的 ADR-018 头按下面的 20 bytes 解码；以实际 serializer 为准，而不是沿用旧文档的错误单位：
+### 7.3 CSI data body: preserve driver facts, do not invent a tensor
 
-| bytes | wire value | 领域语义 |
-| --- | --- | --- |
-| 0..3 | `u32 LE` magic | `0xC5110001` |
-| 4 | `u8` node | 仅用于 route |
-| 5 | `u8` antenna/path count | 只映射 `RawPathOrdinal`，不证明 Tx/Rx |
-| 6..7 | `u16 LE` firmware 所称 `n_subcarriers` | 实际仅为每 path 的 complex-pair count；不能保证一项对应一个物理 tone |
-| 8..11 | `u32 LE` frequency | firmware 实写 MHz；零为 Unknown，转换 Hz 用 checked multiplication |
-| 12..15 | `u32 LE` sequence | node 级全局序列，不是 profile 序列 |
-| 16 | `i8` RSSI | dBm，按 firmware 契约 |
-| 17 | `i8` noise floor | dBm，按 firmware 契约 |
-| 18 | raw extension byte | 只有 route 声明 `he_tagging=true` 才解释 PPDU；否则 Unknown |
-| 19 | raw extension byte | 同上；保留全部 bits，未知 bits 不丢失 |
-| 20.. | ESP-IDF CSI complex pairs | 当前官方顺序为 `[imaginary, real]`；decoder 映射 `q=first, i=second`，长度严格匹配 path × declared sample count × 2 |
+After AEAD verification, `CsiDataV1` is one ordered grammar, not a generic map:
 
-route 的 `Adr018Capabilities` 至少显式声明 firmware dialect、`he_tagging`、CSI acquire/LTF 配置和 frame-validity capability。bytes 18..19 为零不能证明 tagging 存在：它也可能是旧 firmware reserved-zero。未声明 tagging 时 PPDU/bandwidth 均为 Unknown；任何情况下都禁止用 sample count 推断 PPDU、带宽、LTF block 或 path 语义。
+```text
+capability_digest:[u8; 32]       SHA-256 of canonical immutable capture capability
+capture_seq:u64                  increments for every eligible driver callback, including later drops
+driver_rx_timestamp_us:u32       exact rx_ctrl timestamp value; target-defined and may wrap
+callback_tick_us:u64             esp_timer boot-relative delivery tick, not claimed PHY capture time
+source_mac:[u8; 6]               driver-reported source MAC only
+radio_rx_s3_v1                   fixed ESP32-S3 RX facts
+first_invalid_bytes:u8           0 or 4, copied from driver fact
+trailing_invalid_bytes:u8        0 or 2, exact alignment bytes excluded from logical samples
+ltf_block_count:u8               1..=3
+raw_csi_bytes:u16 | complex_sample_count:u16
+block[ltf_block_count]           { ltf_kind:u8, reserved:u8 == 0, sample_count:u16, raw_offset_bytes:u16 }
+raw_csi[raw_csi_bytes]           exact ESP-IDF bytes, never reordered
+```
 
-firmware 只是复制 ESP-IDF `info->buf`，没有序列化 `first_word_invalid`。旧 ADR-018 dialect 因此保守把 buffer 最前两个 complex pairs 标为 invalid（raw bytes 仍保留）；缺少所需 frame-validity flag 的 C6/HE dialect首个切片为 `InferenceIneligible::MissingFrameValidity`，只产生 reject health，不进入 baseline/world。固件补充显式 validity 后才放开。不能复用 RuView parser 的 `[I,Q]` 命名或把所有 pair 默认 valid。
+`radio_rx_s3_v1` has this exact field order: `channel:u8 | secondary:u8 | phy:u8 | bandwidth:u8 | stbc:u8 | rssi_dbm:i8 | noise_floor_dbm:i8 | rate:u8 | mcs:u8 | rx_antenna:u8`.
 
-当前 firmware 实际发送单 path。若 header 的 path count 不为 1，而 route 没有声明并通过 fixture 验证 multi-path sample order，则为 `InferenceIneligible::UnknownPathLayout`；不能仅根据 count 假定 path-major 排列。
+- `secondary` is `0=None`, `1=Above`, `2=Below`; `phy` is exactly `1=NonHt`, `2=Ht`; `bandwidth` is `1=20MHz`, `2=40MHz`; `stbc` is `0=No`, `1=Yes`. Other values are malformed. `NonHt` requires `20MHz`, `None` and `No`; `Ht/20MHz` requires `None`; `Ht/40MHz` requires `Above` or `Below`.
+- `rate` is ESP-IDF `rx_ctrl.rate` for `NonHt` and `0` for `Ht`; `mcs` is `rx_ctrl.mcs` for `Ht` and `0` for `NonHt`; `rx_antenna` is `rx_ctrl.ant` and is `0` or `1`. There is no generic presence bitmap in this one-target wire. Channel, PHY, bandwidth, STBC, RSSI, noise, timestamp and antenna are required facts; a firmware/driver profile that cannot prove any required value does not emit `CsiDataV1` and increments `encode_reject`.
 
-### 7.2 ADR-018 能知道和不能知道的事
+The `capability_digest` binds the ESP32-S3 target/revision, ESP-IDF Wi-Fi ABI, fixed acquisition configuration, clock semantics, maximum sizes, transport budget and sample encoding. An S3 v1 body permits only `1=LLTF`、`2=HTLTF`、`3=StbcHtLtf`, in that driver order. `NonHt` has only LLTF; `Ht` has LLTF then HTLTF; STBC adds StbcHtLtf. VHT/HE LTFs, VHT/HE PHY values and a second raw path are not V1 values. A digest change creates a new profile and must be allowed by host configuration before it is admitted.
 
-现有帧没有可靠 hardware ID、boot ID、发送方 MAC 和 per-frame capture ticks。因此首个切片：
+ESP-IDF supplies each CSI complex pair as `[imaginary, real]` signed 8-bit bytes. v1 keeps that byte order in `raw_csi` and maps it at the host boundary to `IqSample { i: real, q: imaginary }`; it has no scale field and no float. `raw_csi` includes `first_invalid_bytes`; `complex_sample_count` counts every complete pair from raw byte offset zero, including those initial invalid pairs. Blocks begin at raw offset zero, are in driver-reported order, strictly increase and are contiguous; their `sample_count` sum is `complex_sample_count`. Only `trailing_invalid_bytes` are outside the logical pair count, so `raw_csi_bytes == 2 * complex_sample_count + trailing_invalid_bytes`. ESP-IDF v5.4's S3 table caps `raw_csi_bytes` at 612 and therefore `complex_sample_count` at 306; the largest legal `CsiDataV1` plaintext is 705 bytes, including its three blocks. These are transport/capacity limits, not a canonical RF shape. Unknown or ambiguous driver layouts are configuration errors, not opaque data to be guessed later.
 
-- 设备和 link 来自 Registry route；
-- boot generation 是 `HostInferred`，不能表述为硬件确认；
-- event time 默认为主机 receive monotonic time；
-- ADR-110 可以记录和诊断，但不能通过 sequence × 假定 FPS 宣称相干同步；
-- firmware 增加 stable ID、boot ID、TX ID 和 capture ticks 后，才升级时间/身份质量。
+ESP32-S3 exposes no per-sample validity bitmap and no whole-frame validity flag, so V1 does not invent either. `first_invalid_bytes == 4` explicitly marks the first two logical pairs as invalid; they remain in the first block and `complex_sample_count`. `trailing_invalid_bytes` is retained as raw bytes but creates no logical pair. All other logical pairs are driver-provided CSI bytes; consumers must not infer additional invalidity from value zero, block size or a familiar count. The original bytes remain in `CapturedPacket`; the typed view carries this explicit leading-invalid fact.
 
-ADR-018 的所有 path 在首个 decoder 中一律映射 `RawPathOrdinal`。即使 firmware 当前常见 count 为 1，也不能提升成 `TxRx`；只有 Intel 等协议真正提供 TX/RX 坐标时才使用 `CsiPath::TxRx`。
+`driver_rx_timestamp_us` and `callback_tick_us` are deliberately distinct. The first is a target/IDF driver field whose epoch, wrap and relation to PHY reception are described only by the capability; the latter measures callback delivery in the boot clock. Neither is UTC, cross-device synchronized, or proof of PHY capture instant. `CapturedPacket` receive-monotonic time remains the v1 ordering authority; a future clock mapping/correlation capability is separately measured before any `ClockCorrected` or coherent phase claim. ESP32-S3 v1 `phase_state` is always `Raw`; `Calibrated` requires a future capability with a physical reference, calibration receipt and measured error bound.
+
+### 7.4 Control bodies, capability admission and health
+
+`CapabilitiesV1` and `HealthV1` consume normal `message_seq`; neither uses a sentinel sequence. `CapabilitiesV1` is `capability_digest:[u8;32] | descriptor_bytes:u16 | descriptor[descriptor_bytes]`. The digest is SHA-256 of the descriptor bytes alone. The descriptor has a fixed prefix:
+
+```text
+descriptor_version:u8 == 1 | target_kind:u8 == 1(Esp32S3)
+source_iq_order:u8 == 1(ImaginaryReal) | output_encoding:u8 == 1(SignedI8)
+sample_axis:u8 == 1(OpaqueOrdinal) | sample_order:u8 == 1(PathThenSample)
+phase_state:u8 == 1(Raw) | driver_rx_timestamp_bits:u8 == 32
+capture_config:u8 == 0x07(all three LTFs, no merge/filter/manual scale/ACK dump)
+max_raw_csi_bytes:u16 == 612 | max_csi_plaintext_bytes:u16 == 705 | datagram_budget_bytes:u16
+firmware_build_digest:[u8;32] | idf_wifi_abi_digest:[u8;32]
+```
+
+The descriptor has no extensions: its byte count is fixed and trailing bytes are malformed. Its only role is to bind this exact S3/IDF/Capture configuration to the build; it is not a dynamic layout registry or future-target negotiation surface.
+
+ESP-IDF S3 v1 proves one raw receive path, so host always maps it to `RawPathOrdinal(0)`. This is a target fact, not a system-wide fixed tensor: a future firmware that can prove multi-path ordering needs a new capability schema and its own fixtures before it may emit it.
+
+Capabilities is emitted after boot and periodically at a configured rate. It never dynamically negotiates a parser: host accepts a capability only when its route manifest already pins both `firmware_build_digest` and `capability_digest`. A `CsiDataV1` becomes semantically decodable only after a matching `CapabilitiesV1` has been durably recorded earlier in the same `(device_id, key_epoch, boot_generation)` epoch. An authenticated CSI packet received first remains a bounded raw record with `CapabilityUnavailable`; faithful replay preserves that rejection rather than retroactively reinterpreting it.
+
+`HealthV1` is also authenticated and rate-limited. Its fixed body is `capability_digest:[u8;32] | callback_tick_us:u64 | capture_seen:u64 | queue_drop_no_slot:u64 | queue_drop_full:u64 | oversize_reject:u64 | encode_reject:u64 | send_failure:u64 | pool_high_water_slots:u16 | callback_max_us:u32 | encoder_max_us:u32`. Counts are monotonic within `boot_generation`; a counter gap is observable rather than converted into invented CSI. Control messages can be lost, so a later health report contains total counters, and CSI `capture_seq` exposes capture-side gaps independently of UDP transport loss.
+
+### 7.5 Callback, pool and throughput contract
+
+ESP-IDF executes the CSI callback in the Wi-Fi task. The callback owns no heap, lock that can block, logging, crypto, serialization, UDP call, checksum, calibration or inference. It performs only:
+
+```text
+validate pointer, `len <= 612`, provisioned BSSID/destination MAC and fixed radio enum
+-> assign capture_seq and callback_tick_us
+-> allocate one preallocated slot non-blockingly
+-> copy scalar metadata and the complete CSI buffer
+-> enqueue the slot index non-blockingly
+-> otherwise drop the complete frame and increment one explicit counter
+```
+
+`capture_seq` starts at 1, is allocated before slot acquisition and never wraps. An otherwise eligible callback with no free slot or queue capacity consumes one sequence number, so its gap remains observable. Slots have a compile-time `slot_bytes` for the 612-byte S3 maximum plus copied metadata, not a guessed pair count. One lower-priority encoder/sender task owns dequeued slots, all `CapabilitiesV1`/`HealthV1` emission, `message_seq`, sealing and UDP send. Other tasks only post slot indexes or counter/period flags; none can seal or allocate a transport sequence. The task validates the target-specific block layout, constructs at most a 705-byte `CsiDataV1` into a preallocated output buffer, encrypts, sends one datagram, records success/failure counters and releases the slot. It never emits a partial buffer. A bounded FreeRTOS queue carries slot indexes; slot ownership is `Free -> Capturing -> Ready -> Encoding -> Free` and is asserted in test builds.
+
+Every supported board/target/IDF profile must have a checked-in budget record before release: internal RAM/PSRAM availability, `raw_csi_bytes` maximum, slot count and slot bytes, output buffer, lwIP packet pressure, task stacks, watchdog margin, configured packet rate, measured callback p99/max, encoder p99/max and sustained drop counters. V1 fixes one bootstrap profile: `esp32s3`, ESP32-S3-DevKitC-1-compatible, display-less, 8 MB QSPI flash and no PSRAM dependency. It builds only in `espressif/idf@sha256:f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb` (ESP-IDF v5.4); no host ESP-IDF installation is a build input. Host flashing uses `esptool==5.3.1`. Before its first flash, `python -m esptool --chip esp32s3 --port <port> chip-id` and `flash-id` must record an ESP32-S3 and 8 MB flash. The currently detected CP2102N UART is only a candidate port, not that proof. A failed probe is a hard stop, not a fallback to a RuView image, 4 MB layout, display profile or second target. v1 then supports exactly this target/board profile; a second target is unsupported until it has its own record and real-target soak. The configuration is unsupported until its worst legal CSI frame fits both slot and datagram budget. This is the only place capacity numbers belong; no document or host domain type treats a fixture size as physics.
+
+### 7.6 Firmware image, provisioning and OTA
+
+The firmware lives in a new `firmware/esp32-native-frame/` ESP-IDF project. It starts as one standard ESP-IDF `main` component; capture, probe receive, encoding and transport only split into source modules when the code actually needs it. It has its own `sdkconfig.defaults` and this fixed 8 MB `partitions.csv`; neither is copied from RuView:
+
+```text
+nvs,      data, nvs,  0x11000, 0x7000, encrypted
+otadata,  data, ota,  0x18000, 0x2000, encrypted
+phy_init, data, phy,  0x1a000, 0x1000, encrypted
+ota_0,    app,  ota_0,0x20000, 0x300000,
+ota_1,    app,  ota_1,0x320000,0x300000,
+```
+
+The partition-table offset is `0x10000`, leaving bootloader room required by Secure Boot/flash encryption; the unallocated tail is not an application store. Build runs in the pinned Docker image with `idf.py set-target esp32s3 && idf.py build`. Initial development/factory flashing uses `python -m esptool` against the build-generated flash arguments only after the required probe, then uses `verify_flash` on the same ranges; never hand-copy a RuView binary, partition table or addresses. A reproducible signed **shared image manifest** binds `target`, board revision, `firmware_version`, security profile, build image digest, `build_digest`, `wire_schema_version`, one capability descriptor digest, partition-table digest and release key id. It contains neither `device_id` nor a transport key.
+
+Each device receives a separate generated `provision.bin` in the encrypted `nvs` partition before first secure boot. It contains `device_id`, active `key_epoch`, AES key, station SSID/password/BSSID/channel, probe port, collector endpoint and the one capability digest. The independent `runtime` NVS namespace contains only persistent `boot_generation`. Startup validates the provisioning record, recomputes the descriptor, persists and rereads the next boot generation, then waits for association and the probe socket before emitting `CapabilitiesV1`; any failure fails closed. Host configuration pins only non-secret identity/build/capability facts in `WireAdmissionPin`; it never stores the AES key or Wi-Fi password in TOML/session data.
+
+There are two security gates, not two runtime protocols. Development builds may use a disposable test provisioning record solely for board/vector work and are never allowed production credentials. A release build enables ESP-IDF Secure Boot v2, flash encryption release mode, encrypted NVS and signed OTA rollback; provisioning and eFuse activation are an explicit irreversible factory ceremony. After release activation, normal field update is the signed ESP-IDF OTA path, not `esptool write_flash`. The CSI UDP envelope never carries an image. Image, capability or key-epoch changes open a new host session; key overlap and firmware compatibility fallbacks are not implicit v1 behavior.
+
+### 7.7 唯一 host decoder 与拒绝条件
+
+`app` owns size/peer checks, `HeaderRoute` lookup, exact key loading, AEAD verification and replay admission before a raw datagram becomes a `CapturedPacket`; `wire` owns exactly one cleartext grammar and post-AEAD `DecodedRoute`/profile resolution. The decoder checks fixed header/body length, version/kind, zero reserved bits, every arithmetic bound before allocation, capability admission, radio enum/domain, S3 LTF block order, `first_invalid_bytes`/trailing-byte accounting, raw-byte accounting and exact consumption. Unknown version, bad tag, replay, unknown key, unsupported capability, malformed body and route conflict are distinct typed rejects. A datagram that passed pre-decode data-plane admission is session-recorded; a later decoded-route reject remains a classified raw record but never becomes an observation. No second ADR/RuView parser exists.
+
+After resolution, authenticated `device_id` establishes sensor identity; `boot_generation` establishes the device epoch; `capture_seq` is source capture sequence; `message_seq` remains transport/replay sequence. A profile may only be constructed from the capability and explicit driver facts. Raw length, block count, `source_mac`, IQ bytes or a matching test fixture never elevate an opaque ordinal to a physical tone, Tx/Rx path, transmitter identity or coherent clock.
 
 ## 8. 类型化动态 CSI 契约
 
@@ -505,14 +592,14 @@ struct IqSample {
 struct CsiCapture {
     layout: CsiLayout,
     samples: Box<[IqSample]>,
-    encoding: SampleEncoding,        // signed bits、scale、complex convention
+    encoding: SampleEncoding,        // signed bits and declared source-byte convention
     phase_state: PhaseState,
 }
 ```
 
 `CsiCapture::try_new` 必须验证：path/sample axis 非空；已知物理坐标无非法重复；complex sample 数严格等于 `paths × axis length`；乘法不溢出；坐标和 sample order 一致。
 
-ADR-018 没有发送真实 IEEE tone index，也可能把多个 LTF block 拼在同一 buffer，因此只能使用 `OpaqueSampleOrdinal`。不能按长度伪造 `-N/2..N/2`，不能仅按 count 猜带宽或 MHz，UI 只能显示 “opaque CSI sample ordinal”，不能称为 subcarrier/tone。Intel 等协议提供真实 index 时才使用 `IeeeToneIndex`。
+自有 CSI frame 首版只声明 `OpaqueSampleOrdinal`；只有固件明确发送并验证了物理 tone 坐标时，才使用 `IeeeToneIndex` 或 `FrequencyHz`。不能按长度伪造 `-N/2..N/2`，不能仅按 count 猜带宽或 MHz，UI 只能显示 “opaque CSI sample ordinal”，不能称为 subcarrier/tone。Intel 等协议提供真实 index 时才使用 `IeeeToneIndex`。
 
 解码并完成 Registry 绑定后的领域记录为：
 
@@ -522,7 +609,8 @@ struct CsiObservation {
     sensor: SensorId,
     hardware: HardwareKind,
     link: RadioLinkId,
-    device_sequence: u32,
+    device_epoch: DeviceEpoch,
+    capture_sequence: u64,
     timing: FrameTiming,
     radio: RadioMetadata,
     profile: CaptureProfileId,
@@ -530,24 +618,24 @@ struct CsiObservation {
 }
 ```
 
-`CsiObservation` 不保存未知硬件的万能 metadata map；ADR-018 未提供的字段使用类型化 `Unknown/Option`，不能推测。
+`CsiObservation` 不保存未知硬件的万能 metadata map；wire 未提供的字段使用类型化 `Unknown/Option`，不能推测。
 
 ### 8.2 CaptureProfile 是兼容边界
 
 ```text
 CaptureProfile descriptor
 ├── hardware kind + firmware/decoder version
-├── wire-layout/acquisition capability ID
-│   └── complex order, LTF selection/merge, validity dialect
+├── native-frame schema/acquisition capability ID
+│   └── complex order, sample axis/order, validity and phase state
 ├── channel/centre frequency/bandwidth: known or unknown
 ├── PPDU/PHY metadata: known or unknown
 ├── CsiLayout: path semantics + CsiSampleAxis + sample order
-├── SampleEncoding and scale convention
+├── raw integer encoding and source-byte convention
 ├── phase capability/state
 └── time capability/clock domain
 ```
 
-descriptor 的字段只使用整数、枚举和显式 `Known/Unknown`；sample scale 编码为经过约分的整数 numerator/denominator，不使用 float 作为 identity。`CaptureProfileId([u8; 32])` 是 canonical-CBOR descriptor 的 SHA-256；遇到同 ID 但 descriptor 不同必须作为致命冲突。所有 `BTreeMap`、stream、baseline 和 API key 使用 ID，descriptor 由 Registry/profile catalog 查询。
+descriptor 的字段只使用整数、枚举和显式 `Known/Unknown`；ESP v1 原始整数没有 scale wire field，领域中的任何后续幅值变换只属于 versioned conditioning recipe，不使用 float 作为 profile identity。`CaptureProfileId([u8; 32])` 是 canonical-CBOR descriptor 的 SHA-256；遇到同 ID 但 descriptor 不同必须作为致命冲突。所有 `BTreeMap`、stream、baseline 和 API key 使用 ID，descriptor 由 Registry/profile catalog 查询。
 
 静态 `Registry` 只保存部署配置；运行期发现的 descriptor 由 ingest task 独占的具体 `ProfileCatalog` 管理：
 
@@ -564,9 +652,9 @@ impl ProfileCatalog {
 
 `intern` 先验证 descriptor，再 canonical encode/hash，并检查同 ID descriptor 完全相等。live 与 replay 按相同 record 顺序调用它；read store 接收 immutable catalog snapshot，供 API 将 opaque ID 展开为原生坐标/metadata。它不是 adapter registry，也没有 trait。
 
-`StreamKey = (SensorId, RadioLinkId, CaptureProfileId)`；`StreamId = (StreamKey, HostEpoch)`。profile 任一兼容字段改变就切新流、新窗口和新 baseline；probable restart 切 `HostEpoch`；旧 profile 不丢弃，也不升级、padding 或合并成“最密网格”。API 使用 session 内稳定的 opaque `StreamId`，而不是让客户端传完整 profile 结构。
+`StreamKey = (SensorId, RadioLinkId, CaptureProfileId)`；`StreamInstanceId = (StreamKey, DeviceEpoch)`。profile 任一兼容字段改变就切新流、新窗口和新 baseline；经认证的 `boot_generation` 变化切新 stream instance 并禁止窗口跨越启动边界。旧 profile 不丢弃，也不升级、padding 或合并成“最密网格”。API 使用 session 内稳定的 opaque `StreamInstanceId`，而不是让客户端传完整 profile 结构。
 
-注意 sequence domain 比 stream/profile 更早：当前 firmware 的 `s_sequence` 是 node 全局计数。`SequenceSourceKey = (resolved route/SensorId, HostEpoch)`，Timeline 必须先在该 key 上分类 sequence，再把 observation 分入 link/profile stream。HT、HE 或 channel profile 交错不能制造假 gap；无法看到的 sequence 只记为 source-level gap，不能归因给某个 profile。
+sequence domain 比 stream/profile 更早：`SequenceSourceKey = DeviceEpoch`，Timeline 必须先在该 key 上分类 `capture_seq`，再把 observation 分入 link/profile stream。已支持 PHY 或 channel profile 的交错不能制造假 gap；无法看到的 sequence 只记为 source-level gap，不能归因给某个 profile。`DeviceEpoch` 来自已认证 header，绝不由序号回退或静默超时猜测。
 
 baseline 兼容 key 为：
 
@@ -612,7 +700,7 @@ struct FrameTiming {
 
 ### 9.2 sequence 和 epoch
 
-每个 `SequenceSourceKey` 独立跟踪 `u32` sequence，使用 serial-number wrapping 比较，输出：
+每个 `SequenceSourceKey` 独立跟踪不允许 wrap 的 `u64 capture_seq`，输出：
 
 ```text
 First
@@ -620,11 +708,9 @@ InOrder
 Gap { missing }
 Duplicate
 Reordered { distance }
-Wrapped
-ProbableRestart { reason, host_epoch }
 ```
 
-近距离回退属于 reorder；从高值跨到低值且符合 wrapping 半区间属于 wrap；长时间 inactive 后大幅回退到低值可判为 `ProbableRestart`。所有启发式阈值在配置中带单位，并标记 `HostInferred`。随后才按 profile 分流；sequence health 属于 source，profile window 只携带与自身相关的 frame/missing-time 事实。
+近距离回退属于 reorder；超过 `reorder_horizon` 的旧值作为 late/reordered input 处理，不能变成一次伪造的 epoch change。`capture_seq` 到达 `u64::MAX` 前 firmware 必须停止 CSI 并报告 health；新的 `boot_generation` 才建立新的 source epoch。随后才按 profile 分流；sequence health 属于 source，profile window 只携带与自身相关的 frame/missing-time 事实。相同 `DeviceEpoch` 内 `callback_tick_us` 回退只产生 `DeviceTickRegressed` health，不能改变 epoch 或宣称 clock correction。
 
 ### 9.3 watermark 和窗口
 
@@ -653,7 +739,7 @@ global watermark     = min(watermark of active streams)
 ```text
 ConditionedWindow
 ├── window ID + interval
-└── streams: BTreeMap<StreamId, ConditionedStream>
+└── streams: BTreeMap<StreamInstanceId, ConditionedStream>
     ├── profile ID
     ├── coordinates[]: CsiPath × CsiSampleCoordinate
     ├── per-coordinate observed log amplitude
@@ -677,7 +763,7 @@ struct ConditioningReceipt {
     version: ConditioningVersion,
     first_record_seq: u64,
     last_record_seq: u64,
-    stream: StreamId,
+    stream: StreamInstanceId,
     window: WindowId,
     included_coordinates: u32,
     excluded: BTreeMap<ExclusionReason, u32>,
@@ -746,11 +832,11 @@ AND event_time_source >= ReceiveOnly
 AND source/link/profile resolved and compatible
 ```
 
-每个谓词及实测值进入 `LinkQuality`。首个 ADR-018 非相干估计器接受 ReceiveOnly；coherent algorithm 另行要求更高 capability。
+每个谓词及实测值进入 `LinkQuality`。首个非相干估计器接受 `ReceiveOnly`；coherent algorithm 另行要求更高 capability。
 
 `variance_floor`、EW time constant、分位数、coordinate maturity、质量阈值和 link 状态阈值均按 `(link, profile, baseline revision)` 固化并记录。不同 link/profile 的原始 score 不假定可比较。默认值只能来自首批 calibration 数据和可复现实验，不能复制论文或 RuView 的常数。
 
-`BaselineContractId` 是对 residual 定义、预测/标准化公式、数值精度和 incumbent eligibility 语义的 canonical 配置取 SHA-256；它写入 BaselineSnapshot、evidence 和 CandidateInput。它不包含学习得到的 mean/variance、`BaselineRevision` 或 state sequence，因此 rotation/持久化不会改变 contract；任何会改变 residual 含义或训练门控的配置/算法修改必须产生新 ID。
+`BaselineContractId` 是对 residual 定义、预测/标准化公式、数值精度和 incumbent eligibility 语义的 canonical 配置取 SHA-256；它写入 BaselineSnapshot 和 evidence，未来 candidate 自己的 sealed-session contract 必须引用它。它不包含学习得到的 mean/variance、`BaselineRevision` 或 state sequence，因此 rotation/持久化不会改变 contract；任何会改变 residual 含义或训练门控的配置/算法修改必须产生新 ID。
 
 ### 11.3 baseline 生命周期和污染门控
 
@@ -771,8 +857,8 @@ Active ── Freeze ──> Frozen
 - 系统不能判断学习现场是不是“正常”；只有显式 `Commit` 才把 mature learning revision 变成 Active。
 - Active 中严格按 `predict -> score -> decide -> optionally update -> snapshot` 执行。
 - low quality、missing、time uncertainty、non-finite、profile mismatch、stale、frozen 或高 deviation 都拒绝更新。
-- ADR-018 的 `ReceiveOnly` 对首个切片的单 link estimator 和非相干 belief fusion 是允许的；gap/jitter/coverage 进入质量门槛。它只禁止要求 capture-time 或 coherence 的算法，不能被笼统实现为“所有 ESP32 时间不合格”。
-- `ProbableRestart` 关闭旧 HostEpoch 并将相应 baseline 标为 `Stale::ProbableRestart`；只有记录过的 Resume、BeginLearning 或 ActivateSnapshot 才允许再次适应。
+- `ReceiveOnly` 对首个切片的单 link estimator 和非相干 belief fusion 是允许的；gap/jitter/coverage 进入质量门槛。它只禁止要求 capture-time 或 coherence 的算法，不能被笼统实现为“所有 ESP32 时间不合格”。
+- 新的 `DeviceEpoch` 关闭旧的 sequence/window instance，并使跨 epoch 的 temporal cursor 失效；它本身不改变 baseline compatibility，也不把设备重启静默解释为 baseline 失效。是否更新仍由本窗 quality、gap 和显式 baseline command 决定。
 - Active 只在 deviation 低于 `adaptation_gate` 时缓慢适应；显著变化不能被立即学成正常。
 - `Stale` 不静默重建；需要兼容 baseline、记录过的 Resume、BeginLearning 或 ActivateSnapshot。
 - `stale_after` 只使用当前 session 起点或最近 eligible evidence 的 monotonic age；baseline snapshot 不保存 UTC 用于自动 stale。新 session 重新开始该 timer。
@@ -859,7 +945,7 @@ stable/change 是环境判断，RF dynamics 是带单位的信号动态诊断，
 2. 排除无 Active baseline、stale、时间/质量不足的 profile belief，并记录 exclusion。
 3. 每个 profile 使用自己 `(link, profile, baseline revision)` 的 `stable_threshold/changing_threshold` 先得到 status；原始 score 不跨 profile/link 比较。
 4. 在同一个 `RadioLinkId` 内先保守归约 profiles：任一 Changing 为 link Changing；全部 eligible profile Stable 为 link Stable；其余为 link Unknown。
-5. space coverage 只数 distinct eligible `RadioLinkId`，同一物理 link 的 HT/HE profile 不能冒充两条覆盖链路。数量不足时为 `Unknown::InsufficientCoverage`。
+5. space coverage 只数 distinct eligible `RadioLinkId`，同一物理 link 的不同 PHY/channel profile 不能冒充两条覆盖链路。数量不足时为 `Unknown::InsufficientCoverage`。
 6. 任一 eligible physical link 为 `Changing` 时，space 为 `Changing`。
 7. 所有 eligible physical link 均为 `Stable` 时，space 为 `Stable`；其他组合为 `Unknown::AmbiguousEvidence`。始终保留每个 profile/link 的 status、原始 score 和 exclusion。
 
@@ -889,7 +975,7 @@ struct EvidenceReceipt {
 
 snapshot 内保存紧凑 receipt 和计数；精确坐标证据由 snapshot-pinned 查询从 bounded read store 返回 `CsiPath × CsiSampleAxis`、observed、predicted、signed residual、exact included mask、excluded reason 和 baseline revision，超出保留范围则由 faithful replay 重算。这样既能回答具体哪些坐标参与，又不把每个 snapshot 膨胀成完整信号副本。
 
-`BaselineEstimator::step` 在同一次评分中使用 pre-update state 产生 transient `CoordinateEvidence`。Engine 再把 timeline continuity 与 incumbent decision 合成 `CandidateInput`；app 只能按序转交，不能重算 eligibility。`EngineOutput` 携带 candidate inputs 和 snapshot，app 可把 evidence 放进 bounded snapshot-pinned read store，closed-session learner 可在 faithful replay 时直接消费；它不另写一份 derived session log。
+`BaselineEstimator::step` 在同一次评分中使用 pre-update state 产生 transient `CoordinateEvidence` 和 `LinkStepEvidence`。Engine 只聚合 snapshot 并返回这些 evidence；app 可把它们放进 bounded snapshot-pinned read store，不能重算 eligibility，也不另写一份 derived session log。未来若经过独立批准才引入 candidate，它只能从 sealed-session faithful replay 的 `LinkStepEvidence` 私有派生输入；V1 的 Engine/API/session 不公开或保存 candidate input。
 
 ```rust
 struct CoordinateEvidence {
@@ -903,7 +989,7 @@ struct CoordinateEvidence {
 }
 
 struct LinkStepEvidence {
-    stream: StreamId,
+    stream: StreamInstanceId,
     link_profile: LinkProfileKey,
     baseline_contract: BaselineContractId,
     baseline_revision: Option<BaselineRevision>,
@@ -915,43 +1001,13 @@ struct LinkStepEvidence {
     coordinates: Vec<CoordinateEvidence>,
 }
 
-struct EstimatorStep {
+struct EngineOutput {
     snapshot: WorldSnapshot,
     links: Vec<LinkStepEvidence>,
 }
-
-struct CandidateInputId {
-    session: SessionId,
-    stream: StreamId,
-    window: WindowId,
-}
-
-struct CandidateInput {
-    id: CandidateInputId,
-    deployment: DeploymentId,
-    conditioning_version: ConditioningVersion,
-    link_profile: LinkProfileKey,
-    predecessor: Option<CandidateInputId>,
-    window_contract: WindowContractId,
-    baseline_contract: BaselineContractId,
-    baseline_revision: Option<BaselineRevision>,
-    scored_against_baseline_state_sequence: Option<u64>,
-    eligibility: CandidateEligibility,
-    coordinates: Vec<CoordinateEvidence>,
-}
-
-enum CandidateEligibility {
-    Eligible,
-    Rejected { reasons: Vec<CandidateRejection> },
-}
-
-struct EngineOutput {
-    snapshot: WorldSnapshot,
-    candidate_inputs: Vec<CandidateInput>,
-}
 ```
 
-`standardized_residual` 就是第 11.2 节用本窗 **更新前** baseline state 算出的 `r_t`；candidate 不得从 signed residual、mean 或 variance 重算。`CandidateEligibility::Eligible` 只表示当前窗同时满足 `AdaptationAccepted`、link status 为 `Known(Stable)`、source gap 为 0，且至少一个未排除的 finite standardized residual，并保证 `baseline_revision.is_some()`。每个 `coordinates` 按 `(CsiPath, CsiSampleCoordinate)` 严格递增且无重复，`EngineOutput.candidate_inputs` 按 `CandidateInputId` 稳定排序。`predecessor=Some(id)` 只在 timeline 证明前窗与当前窗属于同 session/stream/revision/WindowContractId 且连续时产生；首窗或任何边界为 `None` 并只允许 seed cursor。Unknown、Changing、gap、rejected window 均给出 typed reason 并清 cursor。
+`standardized_residual` 就是第 11.2 节用本窗 **更新前** baseline state 算出的 `r_t`；V1 不从 signed residual、mean 或 variance 另算候选输入。每个 `coordinates` 按 `(CsiPath, CsiSampleCoordinate)` 严格递增且无重复。future candidate 的 predecessor/eligibility/cursor 规则属于其自身的 sealed-session contract，不能倒灌进 V1 EngineOutput。
 
 首个切片只保存可核查事实和统计 contribution，不引入 SHAP。UI 的 residual 是直接证据；未来 latent heatmap 只能标为模型 attribution，不能标为 RF 世界事实。
 
@@ -987,7 +1043,7 @@ struct SignalQuery {
 }
 
 struct SignalTile {
-    stream: StreamId,
+    stream: StreamInstanceId,
     profile: CaptureProfileId,
     time_axis: Vec<SessionTime>,
     path_axis: Vec<CsiPath>,
@@ -1000,7 +1056,7 @@ struct SignalTile {
 }
 ```
 
-查询结果是 `Vec<SignalTile>`，每个 StreamId/profile 一个 tile；未指定 profile 时可返回多个 tile，但不把它们凑成一个矩阵。`None`/missing span 表示缺失，零是合法测量值，二者不能混用。
+查询结果是 `Vec<SignalTile>`，每个 `StreamInstanceId` 一个 tile；未指定 profile 时可返回多个 tile，但不把它们凑成一个矩阵。`None`/missing span 表示缺失，零是合法测量值，二者不能混用。
 
 I、Q 和 amplitude 缩小时以 viewport 的 `max_time_buckets` 现算 min/max/mean/RMS/count；放大后返回原生点。wrapped phase 在首个切片只允许 raw，不做线性 min/mean/RMS；超过 point budget 返回 422 并要求缩小范围。明确 circular aggregation 及其 receipt 后才能下采样 phase。
 
@@ -1012,7 +1068,7 @@ I、Q 和 amplitude 缩小时以 viewport 的 `max_time_buckets` 现算 min/max/
 
 - topology 和 link/profile selector；
 - 按设备/profile 分面的 time × native CSI-coordinate 图；
-- sequence gap、restart、rate、jitter、profile、baseline command 时间线；
+- sequence gap、device-epoch boundary、rate、jitter、profile、baseline command 时间线；
 - 每条 link 的 predicted vs observed、deviation、RF dynamics、quality；
 - space 的 Stable/Changing/UNKNOWN、link contributions 和 exclusion reason；
 - baseline lifecycle、maturity、revision 和最近 decision。
@@ -1041,9 +1097,10 @@ WebSocket 不持续发送整个历史或 giant world payload。慢客户端丢 d
 
 ```text
 recv/select packet or baseline command
+  -> size + fixed-header parse + HeaderRoute(peer/device/key epoch) + exact key lookup + AEAD + replay admission
   -> assign record_seq and session time
   -> SessionWriter::append().await
-  -> decode/resolve
+  -> decode admitted cleartext + DecodedRoute(source MAC/radio facts) / resolve
   -> Engine::push() / command() / advance_to()
   -> update bounded read store
   -> try_send small live notification
@@ -1059,14 +1116,15 @@ recv/select packet or baseline command
 
 ### 14.2 shutdown
 
-shutdown 顺序固定：停止接受新 command 和 socket receive；处理已经接收的输入；append `Closed(record_seq, at)`；以该记录调用 `Engine::finish(at)` 关闭剩余 window；flush + `sync_data` session；把 baseline snapshot 写入 temp 并 sync；atomic rename current pointer 并 fsync 所在目录；最后关闭 HTTP/WS。baseline snapshot 必须记录 source session、last durable record seq 和内容 digest，任何 current pointer 都不能领先 durable session。
+shutdown 顺序固定：停止接受新 command 和 socket receive；处理已经接收的输入；append `Closed(record_seq, at)`；以该记录调用 `Engine::finish(at)` 关闭剩余 window；flush + `sync_data` session；把 replay checkpoint 写入 temp 并 sync；atomic rename + fsync 所在目录；把 baseline snapshot 写入 temp 并 sync；atomic rename current pointer 并 fsync 所在目录；最后关闭 HTTP/WS。baseline snapshot 必须记录 source session、last durable record seq 和内容 digest，任何 current pointer 都不能领先 durable session。
 
 ### 14.3 错误策略
 
 | 情况 | 行为 |
 | --- | --- |
-| bad magic/length/count/overflow/trailing bytes | raw 已记录；增加 decode reject；继续 |
-| 未登记 peer/node/link | raw 已记录；拒绝进入 timeline/estimator |
+| 未登记 peer、未知 version/key、bad tag、replay 或 admission budget | 不写 raw；只增加有界 IngressHealth |
+| 已认证后 body length/count/overflow/trailing 或 unsupported capability | raw 已记录；增加 decode reject；继续 |
+| 已认证但 source MAC/channel/PHY 不满足 route | raw 已记录；拒绝进入 timeline/estimator |
 | route/ID/config 冲突 | 启动失败 |
 | late/duplicate | 分类并排除；不重写历史状态 |
 | session append/flush 失败 | 立即停止 capture |
@@ -1084,21 +1142,25 @@ shutdown 顺序固定：停止接受新 command 和 socket receive；处理已�
 以下是实现边界，不要求现在把所有类型公开给外部 crate：
 
 ```rust
-struct Esp32Decoder;
+struct NativeFrameDecoder;
 
-impl Esp32Decoder {
+impl NativeFrameDecoder {
     fn decode_and_resolve(
         &self,
         packet: &CapturedPacket,
+        header: &WireHeaderV1,
+        plaintext: &[u8],
         registry: &Registry,
+        capabilities: &mut CapabilityCatalog,
         profiles: &mut ProfileCatalog,
     ) -> Result<DecodedInput, IngestError>;
 }
 
 enum DecodedInput {
+    Capabilities(CapabilityReceipt),
     Csi(CsiObservation),
-    ClockAnchor(ClockAnchorObservation),
-    Unsupported { magic: u32 },
+    Health(DeviceHealth),
+    UnknownKind { kind: u8 },
 }
 
 fn condition(
@@ -1117,7 +1179,7 @@ struct BaselineEstimator;
 
 impl BaselineEstimator {
     fn step(&mut self, window: &ConditionedWindow)
-        -> Result<EstimatorStep, EstimatorError>;
+        -> Result<LinkStepEvidence, EstimatorError>;
     fn command(&mut self, command: &TargetedBaselineCommand)
         -> Result<(), EstimatorError>;
     fn snapshot(&self) -> BaselineSnapshot;
@@ -1240,7 +1302,7 @@ beta'(c) = clamp(
 
 ```text
 PairCursorKey =
-  (SessionId, StreamId, BaselineRevision, WindowContractId,
+  (SessionId, StreamInstanceId, BaselineRevision, WindowContractId,
    CsiPath, native CsiSampleCoordinate)
 
 ArParameterKey =
@@ -1255,7 +1317,7 @@ cursor 只保存上一 eligible residual/时间，任何 session/epoch/revision/
 
 seal 时只按稳定 key 顺序写入达到 minimum pairs 的坐标；未 ready 或运行时新出现的坐标 abstain，并回到 incumbent prediction。artifact 的 coordinate 数受兼容 CaptureProfile 的动态上限和 `max_artifact_bytes` 双重约束。
 
-训练 pair 必须来自相邻、相同 session/stream/baseline revision/WindowContractId 的 eligible window；`StreamId` 已包含 HostEpoch，不能再存一份可能冲突的 epoch。gap、restart、profile change、baseline revision change、low quality、Changing 或被 incumbent gate 拒绝的 window 会清除上一 residual，不能成为 target。candidate 不能使用自己的输出决定训练 eligibility。
+训练 pair 必须来自相邻、相同 session/stream instance/baseline revision/WindowContractId 的 eligible window；`StreamInstanceId` 已包含 `DeviceEpoch`，不能再存一份可能冲突的 epoch。gap、device-epoch change、profile change、baseline revision change、low quality、Changing 或被 incumbent gate 拒绝的 window 会清除上一 residual，不能成为 target。candidate 不能使用自己的输出决定训练 eligibility。
 
 每个 CandidateInput 的顺序语义固定为：
 
@@ -1318,9 +1380,9 @@ world rollback-shadow <previous-candidate> <its-evaluation-report>
 - `learn-ar1` 只读取正常关闭或 recovery-sealed 的 immutable session，并复用 replay 的 decoder、timeline、conditioning 和 pinned baseline decision；不能订阅 live mutable window。
 - 这是 nearline continual learning：新鲜度下限受 session rotation 周期和 catch-up time 限制，不承诺每窗立即改权重。`learning_lag` 必须可见；不能为了降低它频繁 rotation，导致第 11.3 节的 `adaptation_armed=false` 反复跳过更新。
 - 首实现与 `capture` 排他运行，不提供并发开关、pause IPC 或后台 worker。真有并发新鲜度需求后，先设计 session lease 和协作暂停，再通过联合负载测试；不能只靠 OS priority 偷跑。
-- `learn-ar1/evaluate-candidate` 把 immutable candidate/report 写到调用者指定路径；重复训练写新文件，不覆盖旧文件。只有 `select-shadow/rollback-shadow` 验证二者后才把它们导入 content store，并原子更新 selected sidecar。GC 只保护 retained manifest 和当前 selected sidecar 引用的 digest；其他输入文件由调用者管理。不建 new/previous 指针或 registry。
-- shadow artifact 在 session 开始前确定，durable 存入第 6.2 节的 content-addressed attachment 并由 manifest pin 住。缺失或摘要不符时拒绝启用；同一 live session 内不换 artifact。导出 session 时必须连同 pinned artifact 一起导出。
-- `select-shadow/rollback-shadow` 首实现只在取得 runtime lock 后成功，验证 report 指向 candidate，并原子更新下一 session 的 `ShadowSelectionPin`；不为它增加进程间控制面。若正在 capture，明确拒绝并要求先完成 shutdown。
+- CPU 演化 scope 开始时才创建新的 container version、content store 和显式 `ShadowSelectionPin`；v1 session、config 和 state directory 保持不变。`learn-ar1/evaluate-candidate` 把 immutable candidate/report 写到调用者指定路径；重复训练写新文件，不覆盖旧文件。只有 `select-shadow/rollback-shadow` 验证二者后才导入该 scope 的 content store，并原子更新 selected sidecar。GC 只保护 retained v2 manifest 和当前 selected sidecar 引用的 digest；其他输入文件由调用者管理。不建 new/previous 指针或 registry。
+- shadow artifact 只在该 v2 session 开始前确定，durable 存入其 content-addressed attachment 并由 manifest pin 住。缺失或摘要不符时拒绝启用；同一 live session 内不换 artifact。导出 session 时必须连同 pinned artifact 一起导出。
+- `select-shadow/rollback-shadow` 首实现只在取得 runtime lock 后成功，验证 report 指向 candidate，并原子更新下一 v2 session 的 `ShadowSelectionPin`；不为它增加进程间控制面。若正在 capture，明确拒绝并要求先完成 shutdown。
 - 训练 checkpoint 不是 production artifact；optimizer state 不进入 capture。
 
 最小 `CandidateManifest` 包含：
@@ -1500,7 +1562,7 @@ one ConditionedStream + incumbent evidence
     -> native-coordinate next-window forecast
 ```
 
-- mutable state 按 `(SessionId, StreamId, ArtifactDigest)` 隔离；session/HostEpoch/profile/artifact、conditioning/baseline/window contract 或 BaselineRevision 改变，以及 gap、shadow skip、rejected input、predecessor mismatch 都立即 reset。immutable parameter artifact 仍可在 compatibility contract 相同的 session 间复用。
+- mutable state 按 `(SessionId, StreamInstanceId, ArtifactDigest)` 隔离；session/`DeviceEpoch`/profile/artifact、conditioning/baseline/window contract 或 BaselineRevision 改变，以及 gap、shadow skip、rejected input、predecessor mismatch 都立即 reset。immutable parameter artifact 仍可在 compatibility contract 相同的 session 间复用。
 - hidden state 不持久化；live/replay 都从 pinned session 输入重算。
 - CPU 部署模型不做 learned cross-link fusion；production room state 仍走第 12 节的保守规则。
 - unsupported profile、token budget overflow、non-finite、backend/deadline failure 一律 abstain 并退回统计底座。
@@ -1671,9 +1733,9 @@ ExampleGroup: deployment + space + physical episode/interval
 
 | 来源 | 可吸收 | 首个切片拒绝/延后 |
 | --- | --- | --- |
-| RuView ADR-018/firmware/actual code | wire 常量、sibling packet 分类、严格边界 fixture、原始 complex bytes、running EW statistics 思路 | `56 × 8`、错误 `[I,Q]`/假 tone 语义、任意 rank tensor、重复 parser/全局 lock/假 UI；`sensing-server/src/trainer.rs:800-936` 与 `wifi-densepose-train/src/rapid_adapt.rs:178-240` 对全参数 central finite differences；`wifi-densepose-nn/benches/inference_bench.rs:30-100` 是 MockBackend；`main.rs:7834-7864` 吞掉具体 load error、只打印通用提示并自动退 synthetic/56；并存 Burn/tch/Candle/ORT |
+| RuView `RfFrameV2` / firmware / actual code | native samples 不被 canonical 覆盖、显式 validity、phase state、source receipt 和派生视图边界；用于反例审阅 wire magic、固定 shape、重复 parser、全局 lock、假 UI | ADR-018 `0xC511...` magic、20-byte header、`128-pair` datagram、`56 × 8`、含混的 I/Q 命名/假 tone 语义、任意 rank wire、逐包 geometry/evidence、`sensing-server/src/trainer.rs:800-936` 与 `wifi-densepose-train/src/rapid_adapt.rs:178-240` 的全参数 central finite differences；`wifi-densepose-nn/benches/inference_bench.rs:30-100` 是 MockBackend；`main.rs:7834-7864` 吞掉具体 load error、只打印通用提示并自动退 synthetic/56；并存 Burn/tch/Candle/ORT |
 | RuView HAL/ontology/training schema | 设备能力与 measurement schema 应显式、训练输入必须有版本和 receipt | `ruview-hal/src/modality.rs` 预枚举 CSI/BLE/UWB/mmWave/camera/lidar/IMU 的万能 modality；只用 `unit + dimensions` 丢失物理轴；ontology observation 不携带真实 measurement；训练侧把 CSI 另行 reshape 为 `[B,3,48,48]` |
-| [ESP-IDF Wi-Fi CSI contract](https://github.com/espressif/esp-idf/blob/master/docs/en/api-guides/wifi-driver/wifi-vendor-features.rst) | `[imaginary, real]` 顺序、first-word validity、LTF/acquire 配置决定 buffer 语义 | 把 ADR 的 pair count 无条件叫物理 subcarrier，或继承 RuView 的 `[I,Q]` 解析 |
+| [ESP-IDF v5.4 ESP32-S3 Wi-Fi CSI contract](https://docs.espressif.com/projects/esp-idf/en/v5.4/esp32s3/api-guides/wifi.html#wi-fi-channel-state-information) | `[imaginary, real]` 顺序、first-word validity、三种 S3 LTF、S3 buffer 上限和 callback 约束决定 buffer 语义 | 把 ADR 的 pair count 无条件叫物理 subcarrier，或继承 RuView 的 `[I,Q]` 解析 |
 | [The Universal Language of CSI](https://arxiv.org/abs/2607.09727) / [WiLLM](https://github.com/cjychenjiayi/WiLLM)，Zotero `SNQMXYRW` | device/dataset-specific frontend 与 shared representation 分层值得验证 | amplitude-only dataset adapter、固定 latent、dataset CNN/Transformer 作为运行时契约；该工作未替本系统解决 live mixed-device time/link fusion、baseline 污染、uncertainty 和 replay |
 | OpenCSI，Zotero `2L4VHI3X` | per-link baseline、maturity/reliability、校准状态、低成熟度 abstain、packet-rate 分桶 | 把单一 Z-score 或论文固定秒数/阈值当作所有设备通用常数 |
 | CSI-Bench，Zotero `FULL46UK`；data-leakage review `XMUTVCW4` | manifest、按 deployment/session/device 分组、split-before-window/preprocess | 随机 frame split、同场景少标签结果冒充跨环境泛化 |
@@ -1694,24 +1756,24 @@ ExampleGroup: deployment + space + physical episode/interval
 
 ### 22.1 parser 与事实源
 
-1. ADR-018 64/128/256 等真实动态长度 fixture 均保留原始 opaque sample 数量；测试数字是 fixture，不是领域常量。
-2. 对每个合法 datagram 的所有截断前缀调用 decoder，均返回错误且不 panic。
-3. 零维度、超大维度、乘法溢出、错误 payload 长度和 trailing bytes 被拒绝。
-4. unsupported sibling magic 与 malformed packet 分类不同。
-5. parser 修改后可从 `CapturedPacket` 重新解释旧 session；原 wire bytes 不变。
+1. 自有 native-frame 的多个非等长 fixture 均保留原始 opaque sample 数量；没有 `128-pair` 特例，测试数字不是领域常量。
+2. C/firmware/Rust 对相同 32-byte header、nonce、AAD、ciphertext/tag、capability descriptor 和 I/Q body 产生固定 golden bytes；篡改 header、ciphertext 或 tag 必须失败。
+3. 对每个合法 datagram 的所有截断前缀调用 admission/decoder，均返回错误且不 panic；zero `boot_generation`/`message_seq`、零 count、超限、乘法溢出、错误 body 长度、reserved bit、block offset、first-word/trailing bytes 被拒绝。
+4. unknown version、authenticated unknown kind、bad tag/replay、unsupported capability 与 authenticated malformed body 分类不同；不存在 wire CRC 或 magic registry。
+5. CSI 在同 epoch 中缺少先前 durable capability 时保持 `CapabilityUnavailable`；parser 修改后也不改变该 live/replay 决定，原 encrypted wire bytes 不变。
 
 ### 22.2 身份、timeline 与多设备
 
-6. 同一 `node_id` 来自不同 peer 时按配置隔离或拒绝，不能串 baseline。
-7. 两个设备相同 sequence 互不影响。
-8. wrap、gap、duplicate、reorder 和 probable restart 各有确定结果。
-9. node sequence `1,2,3` 对应交错 profile A/B/A 时 source 无 gap，profile B 不伪造缺帧。
+6. 同一 `device_id` 来自不同 peer 时按配置隔离或拒绝，不能串 baseline。
+7. 两个设备相同 `message_seq`/`capture_seq` 互不影响；同一 `(device_id, key_epoch, boot_generation)` 的重复、过旧、受允许的重排和较低 boot generation 各有确定 admission 结果；host restart 或 session rotation 后，同一已认证旧 datagram 仍被拒绝。
+8. `DeviceEpoch`、gap、duplicate 和 reorder 各有确定结果；v1 不实现 counter wrap 或从序号/超时猜测 epoch change。
+9. 同一 epoch 的 capture sequence `1,2,3` 对应交错 profile A/B/A 时 source 无 gap，profile B 不伪造缺帧。
 10. inactive stream 不永久卡住 global watermark；无 packet 的已发布窗口可由 `TimelineAdvance` replay。
 11. late/missing 形成明确 gap/`None`，绝不变成零 I/Q。
 12. 两种 profile 同时存在时独立窗口、baseline、查询和显示，不丢“较稀”布局。
-13. 未声明 HE tagging 时 bytes 18..19 不被解释；frequency 按 MHz checked 转 Hz；ADR path 永远是 RawPathOrdinal，sample axis 永远是 OpaqueSampleOrdinal。
-14. ADR `[Im,Re]` 映射为 `q=first/i=second`，前两个 pair 被排除；缺 frame-validity 的 C6 dialect inference-ineligible。
-15. 相同 bytes/count 但不同 LTF selection/merge 或 validity dialect 生成不同 ProfileId，拒绝 baseline 复用。
+13. v1 不存在 extension、fragment 或 `sample_rate_hz`；不能按 raw length 推断 tone、frequency、bandwidth、PPDU 或 Tx/Rx，sample axis 默认 `OpaqueSampleOrdinal`。
+14. ESP-IDF raw `(imaginary,real)` 映射、`first_word_invalid` 的前四字节和末尾 alignment bytes 严格按 wire 合同执行；无效样本不补零、不按值猜测。
+15. 相同 samples/count 但不同 axis/order/encoding/phase/validity descriptor 生成不同 ProfileId，拒绝 baseline 复用。
 16. 未 provision 单一 transmitter 的 route 为 UnresolvedSource，不能进入 baseline；channel policy mismatch 被拒绝。
 
 ### 22.3 baseline、world 与 replay
@@ -1727,9 +1789,9 @@ ExampleGroup: deployment + space + physical episode/interval
 
 ### 22.4 session、API 与 UI
 
-25. session roundtrip、长度上限、record_seq、CRC 损坏、截断尾部 recovery-seal 和 rotation 均有测试；monotonic time 重置后 session-local timer/armed state 重置，rotation live/replay 等价。
+25. session roundtrip、长度上限、record_seq、CRC-32C 损坏、截断尾部 recovery-seal 和 rotation 均有测试；monotonic time 重置后 session-local timer/armed state 重置，rotation live/replay 等价。
 26. append/flush 失败停止 capture；view queue 满只影响 delivery 并有指标。
-27. oversized UDP datagram 被完整接收后明确拒绝，不能伪装成普通 truncated packet。
+27. oversized UDP datagram 被完整接收后明确拒绝，不能伪装成普通 truncated packet；unknown peer/version/key、bad tag、replay 与 admission budget 不写 raw，仅更新有界 health。
 28. SignalView 同时查询不同 sample-coordinate 数，返回各自原生语义。
 29. viewport 聚合保留 min/max/mean/RMS/count 和 missing span；phase 超预算拒绝而非线性聚合。
 30. snapshot evidence 返回 exact coordinate mask/observed/predicted/residual 和 baseline state sequence。
@@ -1754,7 +1816,7 @@ ExampleGroup: deployment + space + physical episode/interval
 44. frozen encoder 到来后 FP32 与任何 INT8 候选分别实测；量化未改善 latency/RSS 或产生质量回归时仍选 FP32。
 45. capture active 时 shadow 选择/回滚被拒绝；停止后选择只对新 session 生效，candidate/report 两个 pin 随 session export/retention/replay；所有 managed-data replay/export/import/GC 与 capture 争用同一 runtime lock 时一方明确拒绝；无标签 loss 不能启用生产语义。
 46. 至少跨两次 rotation 的 soak 中 learning lag、RSS、queue 和 artifact 数量受 retention 上限约束；GC 不删除 retained manifest 的 pin，rotation 后 baseline adaptation 行为与 faithful replay 一致。
-47. rotation 改变 BaselineRevision 但不改变 BaselineContractId 时旧 artifact 仍命中；新 session/ProbableRestart 后首个 eligible input 只 seed cursor，Stale 时 abstain。
+47. rotation 改变 BaselineRevision 但不改变 BaselineContractId 时旧 artifact 仍命中；新 session 或 `DeviceEpoch` 后首个 eligible input 只 seed cursor，Stale 时 abstain。
 48. Intel `3 × 3 × 30` evidence 生成 270 个不同 `(CsiPath, coordinate)` parameter key；不得把九条 path 合并。
 49. residual、gate、eligibility 或 WindowContract 任一字段改变都会产生新 contract ID 并拒绝旧 artifact。
 50. 坐标 A 在中间 eligible 窗 missing、坐标 B 持续有效时，A 恢复后的首窗只能 seed，B 仍可配 pair；coordinates/input 的稳定排序和无重复构造校验失败时拒绝。
@@ -1790,11 +1852,11 @@ ExampleGroup: deployment + space + physical episode/interval
 顺序按风险从事实边界向外推进，不先搭空 UI 或模型框架：
 
 1. `domain + config`：ID、Registry、CsiLayout/CaptureProfile 构造校验和 Intel 形状内存测试。
-2. `capture + session + esp32`：字节记录、唯一 dispatcher、fixtures、CRC/recovery、capture/replay CLI。
+2. `capture + session + wire`：data-plane admission、字节记录、唯一 decoder、fixtures、CRC-32C/recovery、capture/replay CLI。
 3. `timeline`：profile partition、sequence/epoch、watermark、window、gap 和 actual delta-t。
 4. `conditioning + estimator + engine`：显式 receipt、EW prediction、gate、baseline command、world aggregation、deterministic replay。
 5. `view + server + web`：先完成动态 SignalView contract，再做一页二维诊断 UI。
-6. 端到端多 ESP32 soak/replay：磁盘吞吐、UDP gap、慢 WS、restart 和 baseline poisoning。
+6. 端到端多 ESP32 soak/replay：磁盘吞吐、UDP gap、慢 WS、reboot 和 baseline poisoning。
 7. 在声明的参考 CPU 上建立统计 estimator 性能事实；加入具体 `candidate.rs`，实现 native-coordinate AR(1)、closed-session `learn-ar1/evaluate-candidate`、artifact 和 bounded shadow，不添加 ML runtime。
 8. 通过 AR candidate 的 time-forward holdout、deterministic replay、shadow 干扰、rotation/learning-lag、runtime-lock 排他和 shadow 选择/回滚准入。
 9. 只有积累足够 sealed ESP32 corpus 后，才在外部 GPU 进程做单 profile RF 预训练模型 spike；它使用一个 concrete continuous adapter、一条 shared causal core 和 native-coordinate forecast head，产出 `PretrainedModelArtifact` 与独立评估，不先实现 `EpisodePack`/MoT/generator，也不给 Rust 增加 GPU feature 或训练框架。
