@@ -8,7 +8,7 @@ use super::csi::{CaptureProfileId, CsiPath, CsiSampleCoordinate};
 use super::identity::{
     AlgorithmVersion, BaselineContractId, BaselineRevision, BaselineStateSequence,
     BuildFingerprint, ConditioningVersion, DecoderVersion, DeploymentId, LinkProfileKey,
-    RadioLinkId, SensorId, SessionId, SnapshotId, SpaceId, StreamId, WindowId,
+    RadioLinkId, SensorId, SessionId, SnapshotId, SpaceId, StreamInstanceId, WindowId,
 };
 use super::time::{TimeInterval, TimeQuality};
 
@@ -75,7 +75,7 @@ pub enum UnknownReason {
     MissingData,
     /// The profile does not match the active contract.
     ProfileMismatch,
-    /// The baseline became too old or crossed a restart boundary.
+    /// The baseline became too old or incompatible with the active contract.
     Stale,
     /// The baseline was explicitly frozen.
     Frozen,
@@ -97,8 +97,6 @@ pub enum StableOrChanging {
 /// Typed reasons for a baseline becoming stale.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum BaselineStaleReason {
-    /// The stream crossed a probable host restart boundary.
-    ProbableRestart,
     /// The active revision exceeded its configured age.
     Age,
     /// A compatible contract was no longer available.
@@ -218,7 +216,7 @@ impl BaselineCoordinate {
         if variance < 0.0 {
             return Err(WorldValueError::NegativeVariance { path, coordinate });
         }
-        if count == 0 || accepted_exposure_ns == 0 {
+        if count < 2 || accepted_exposure_ns == 0 {
             return Err(WorldValueError::EmptyBaselineCoordinate { path, coordinate });
         }
         Ok(Self { path, coordinate, count, mean, variance, accepted_exposure_ns })
@@ -280,8 +278,10 @@ pub enum WorldValueError {
         /// Native sample coordinate.
         coordinate: CsiSampleCoordinate,
     },
-    /// A persisted coordinate had no accepted samples or exposure.
-    #[error("baseline coordinate {path:?}/{coordinate:?} must have samples and exposure")]
+    /// A persisted coordinate had fewer than two accepted samples or no exposure.
+    #[error(
+        "baseline coordinate {path:?}/{coordinate:?} must have at least two samples and exposure"
+    )]
     EmptyBaselineCoordinate {
         /// Native path coordinate.
         path: CsiPath,
@@ -415,7 +415,7 @@ impl BaselineSnapshot {
         }
         let mut previous: Option<(CsiPath, CsiSampleCoordinate)> = None;
         for coordinate in &coordinates {
-            if coordinate.count == 0 || coordinate.accepted_exposure_ns == 0 {
+            if coordinate.count < 2 || coordinate.accepted_exposure_ns == 0 {
                 return Err(WorldValueError::EmptyBaselineCoordinate {
                     path: coordinate.path,
                     coordinate: coordinate.coordinate,
@@ -925,7 +925,7 @@ impl LinkDiagnostics {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LinkStepEvidence {
     /// Stream whose window was scored.
-    stream: StreamId,
+    stream: StreamInstanceId,
     /// Link/profile baseline key.
     link_profile: LinkProfileKey,
     /// Baseline contract.
@@ -953,7 +953,7 @@ impl LinkStepEvidence {
         reason = "the evidence record contains one complete scored-window contract"
     )]
     pub fn try_new(
-        stream: StreamId,
+        stream: StreamInstanceId,
         link_profile: LinkProfileKey,
         baseline_contract: BaselineContractId,
         baseline_revision: Option<BaselineRevision>,
@@ -1000,7 +1000,7 @@ impl LinkStepEvidence {
 
 #[expect(dead_code, reason = "consumed by work-package 3.3 estimator/evidence")]
 impl LinkStepEvidence {
-    pub(crate) const fn stream(&self) -> &StreamId {
+    pub(crate) const fn stream(&self) -> &StreamInstanceId {
         &self.stream
     }
 
@@ -1479,5 +1479,36 @@ impl WorldSnapshot {
     #[must_use]
     pub const fn receipt(&self) -> &DerivationReceipt {
         &self.receipt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseline_snapshot_rejects_single_sample_coordinate() {
+        let coordinate = BaselineCoordinate {
+            path: CsiPath::RawPathOrdinal(0),
+            coordinate: CsiSampleCoordinate::OpaqueSampleOrdinal(0),
+            count: 1,
+            mean: 0.0,
+            variance: 0.0,
+            accepted_exposure_ns: 1,
+        };
+        let result = BaselineSnapshot::try_new(
+            DeploymentId::new("deployment").expect("deployment"),
+            SpaceId::new("space").expect("space"),
+            LinkProfileKey::new(
+                RadioLinkId::new("link").expect("link"),
+                CaptureProfileId::from_bytes([1; 32]),
+            ),
+            ConditioningVersion::new("conditioning").expect("conditioning"),
+            BaselineRevision::new(1),
+            BaselineContractId::from_bytes([2; 32]),
+            vec![coordinate],
+        );
+
+        assert!(matches!(result, Err(WorldValueError::EmptyBaselineCoordinate { .. })));
     }
 }

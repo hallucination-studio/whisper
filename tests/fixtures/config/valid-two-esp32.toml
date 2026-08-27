@@ -5,6 +5,7 @@ id = "lab"
 bind = "127.0.0.1:9000"
 max_datagram_bytes = 4096
 socket_buffer_bytes = 65535
+secret_root = "./data/secrets"
 
 [session]
 directory = "./data/sessions"
@@ -21,7 +22,6 @@ step_ns = 1000000000
 allowed_lateness_ns = 100000000
 inactive_after_ns = 5000000000
 reorder_horizon = 64
-probable_restart_after_ns = 30000000000
 
 [conditioning]
 version = "amplitude-v1"
@@ -67,9 +67,6 @@ max_rss_bytes = 536870912
 max_cpu_threads = 4
 snapshot_deadline_ns = 400000000
 
-[candidate]
-mode = "disabled"
-
 [[spaces]]
 id = "room"
 
@@ -82,44 +79,31 @@ id = "tx-b"
 [[sensors]]
 id = "sensor-a"
 hardware_kind = "esp32-s3"
-node_id = 1
+device_id = 1
+key_epoch = 1
 expected_peer_ip = "192.0.2.10"
-firmware = "adr018-s3-1"
-
-[sensors.adr018]
-firmware_dialect = "esp-idf"
-he_tagging = false
-csi_acquire = "wifi-csi"
-ltf_selection = "legacy"
-ltf_merge = "none"
-validity_dialect = "first-word-invalid"
-multi_path = false
+firmware_build_digest = "0101010101010101010101010101010101010101010101010101010101010101"
+capability_digest = "0202020202020202020202020202020202020202020202020202020202020202"
+maximum_raw_csi_bytes = 612
+maximum_plaintext_bytes = 705
 
 [[sensors]]
 id = "sensor-b"
-hardware_kind = "esp32-c6"
-node_id = 2
+hardware_kind = "esp32-s3"
+device_id = 2
+key_epoch = 1
 expected_peer_ip = "192.0.2.11"
-firmware = "adr018-c6-1"
-
-[sensors.adr018]
-firmware_dialect = "esp-idf-he"
-he_tagging = true
-csi_acquire = "wifi-csi"
-ltf_selection = "he"
-ltf_merge = "firmware-defined"
-validity_dialect = "missing-frame-validity"
-multi_path = false
+firmware_build_digest = "0303030303030303030303030303030303030303030303030303030303030303"
+capability_digest = "0404040404040404040404040404040404040404040404040404040404040404"
+maximum_raw_csi_bytes = 612
+maximum_plaintext_bytes = 705
 
 [[links]]
 id = "link-a"
 space = "room"
 transmitter = "tx-a"
 receiver = "sensor-a"
-
-[links.source_contract]
-provisioned = true
-fixed_source_mac_filter = false
+expected_transmitter_mac = "02:00:00:00:00:0a"
 
 [links.channel_policy]
 allowed = [1, 6]
@@ -130,10 +114,7 @@ id = "link-b"
 space = "room"
 transmitter = "tx-b"
 receiver = "sensor-b"
-
-[links.source_contract]
-provisioned = true
-fixed_source_mac_filter = true
+expected_transmitter_mac = "02:00:00:00:00:0b"
 
 [links.channel_policy]
 allowed = [6, 11]
@@ -141,16 +122,20 @@ expected = 6
 
 [[routes]]
 peer = "192.0.2.10"
-node_id = 1
+device_id = 1
+key_epoch = 1
 link = "link-a"
 peak_packets_per_second = 100
 maximum_valid_datagram_bytes = 2048
-channel = 1
+maximum_authenticated_bytes_per_second = 204800
+replay_window_packets = 64
 
 [[routes]]
 peer = "192.0.2.11"
-node_id = 2
+device_id = 2
+key_epoch = 1
 link = "link-b"
 peak_packets_per_second = 100
 maximum_valid_datagram_bytes = 4096
-channel = 6
+maximum_authenticated_bytes_per_second = 409600
+replay_window_packets = 64

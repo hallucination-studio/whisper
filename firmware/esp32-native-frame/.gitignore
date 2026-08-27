@@ -1,0 +1,10 @@
+/build/
+/sdkconfig
+/sdkconfig.old
+/tests/build/
+/tests/sdkconfig
+/tests/sdkconfig.old
+/provision.csv
+/provision.bin
+/tests/provision.bin
+/tests/production-qemu-flash.bin

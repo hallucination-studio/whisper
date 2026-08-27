@@ -1,12 +1,12 @@
 //! Strongly typed identities used to keep independent RF sources separate.
 
 use std::fmt;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::str::FromStr;
 
 use serde::Serialize;
 
 use super::csi::CaptureProfileId;
-use super::time::HostEpoch;
 
 /// Hardware families understood by the configuration and profile contracts.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -36,6 +36,12 @@ pub enum IdError {
     /// The supplied value was not a usable identifier.
     #[error("{kind} must not be empty or whitespace-only")]
     Invalid {
+        /// Human-readable identity category.
+        kind: &'static str,
+    },
+    /// A generation or key epoch was zero even though zero is reserved.
+    #[error("{kind} must be non-zero")]
+    Zero {
         /// Human-readable identity category.
         kind: &'static str,
     },
@@ -105,6 +111,115 @@ string_id!(SessionId, "session id");
 string_id!(ConditioningVersion, "conditioning version");
 string_id!(DecoderVersion, "decoder version");
 string_id!(AlgorithmVersion, "algorithm version");
+
+/// A provisioned opaque device identity, never derived from a MAC address.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct DeviceId(u64);
+
+impl DeviceId {
+    /// Creates a device identity from its provisioned value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the provisioned numeric identity.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// A non-zero enrolled key generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct KeyEpoch(NonZeroU16);
+
+impl KeyEpoch {
+    /// Creates a key epoch, rejecting the reserved zero value.
+    pub const fn try_new(value: u16) -> Result<Self, IdError> {
+        match NonZeroU16::new(value) {
+            Some(value) => Ok(Self(value)),
+            None => Err(IdError::Zero { kind: "key epoch" }),
+        }
+    }
+
+    /// Returns the enrolled key generation.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for KeyEpoch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
+
+/// A non-zero persistent device boot generation used for nonce separation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct BootGeneration(NonZeroU32);
+
+impl BootGeneration {
+    /// Creates a boot generation, rejecting the reserved zero value.
+    pub const fn try_new(value: u32) -> Result<Self, IdError> {
+        match NonZeroU32::new(value) {
+            Some(value) => Ok(Self(value)),
+            None => Err(IdError::Zero { kind: "boot generation" }),
+        }
+    }
+
+    /// Returns the persistent boot generation.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for BootGeneration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
+
+/// A device identity qualified by its authenticated boot generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct DeviceEpoch {
+    device: DeviceId,
+    boot_generation: BootGeneration,
+}
+
+impl DeviceEpoch {
+    /// Combines a device identity with an already validated boot generation.
+    #[must_use]
+    pub const fn new(device: DeviceId, boot_generation: BootGeneration) -> Self {
+        Self { device, boot_generation }
+    }
+
+    /// Returns the device identity.
+    #[must_use]
+    pub const fn device(self) -> DeviceId {
+        self.device
+    }
+
+    /// Returns the authenticated boot generation.
+    #[must_use]
+    pub const fn boot_generation(self) -> BootGeneration {
+        self.boot_generation
+    }
+}
+
+impl fmt::Display for DeviceEpoch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.device, self.boot_generation)
+    }
+}
 
 /// A physical transmitter-to-receiver CSI link.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -274,7 +389,7 @@ impl LinkProfileKey {
     }
 }
 
-/// A stream key before host-inferred restart epochs are applied.
+/// A stream key before an authenticated device epoch is applied.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct StreamKey {
     sensor: SensorId,
@@ -308,18 +423,18 @@ impl StreamKey {
     }
 }
 
-/// A stream key qualified by a host-inferred restart epoch.
+/// A stream key qualified by an authenticated device epoch.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct StreamId {
+pub struct StreamInstanceId {
     key: StreamKey,
-    epoch: HostEpoch,
+    device_epoch: DeviceEpoch,
 }
 
-impl StreamId {
+impl StreamInstanceId {
     /// Creates a stream identity.
     #[must_use]
-    pub fn new(key: StreamKey, epoch: HostEpoch) -> Self {
-        Self { key, epoch }
+    pub fn new(key: StreamKey, device_epoch: DeviceEpoch) -> Self {
+        Self { key, device_epoch }
     }
 
     /// Returns the unqualified stream key.
@@ -328,10 +443,10 @@ impl StreamId {
         &self.key
     }
 
-    /// Returns the host epoch.
+    /// Returns the authenticated device epoch.
     #[must_use]
-    pub const fn epoch(&self) -> HostEpoch {
-        self.epoch
+    pub const fn device_epoch(&self) -> DeviceEpoch {
+        self.device_epoch
     }
 }
 

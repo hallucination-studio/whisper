@@ -10,7 +10,10 @@ use crate::domain::csi::{
     PhaseState, PpduKind, ProfileCatalog, ProfileDescriptor, ProfileError, RadioMetadata,
     RadioMetadataError, SampleEncoding, SampleOrder, ValidityDialect,
 };
-use crate::domain::identity::{DecoderVersion, HardwareKind, RadioLinkId, SensorId, SessionId};
+use crate::domain::identity::{
+    BootGeneration, DecoderVersion, DeviceEpoch, DeviceId, HardwareKind, RadioLinkId, SensorId,
+    SessionId,
+};
 use crate::domain::time::{EventTimeSource, FrameTiming, SessionTime, TimeQuality};
 
 fn profile_descriptor() -> ProfileDescriptor {
@@ -23,7 +26,7 @@ fn profile_descriptor() -> ProfileDescriptor {
     ProfileDescriptor {
         hardware: HardwareKind::Esp32S3,
         firmware: "esp32-s3-fw".into(),
-        decoder_version: "adr018-v1".into(),
+        decoder_version: "native-frame-v1".into(),
         capability_id: "capture-v1".into(),
         acquisition: AcquisitionCapabilities {
             mode: AcquisitionMode::WifiCsi,
@@ -35,6 +38,8 @@ fn profile_descriptor() -> ProfileDescriptor {
         centre_frequency_hz: Some(2_412_000_000),
         bandwidth_hz: Some(20_000_000),
         ppdu: None,
+        secondary_channel: None,
+        stbc: None,
         layout,
         encoding: SampleEncoding::try_new(16, 2, 4, ComplexOrder::RealImaginary)
             .expect("valid reduced scale"),
@@ -144,6 +149,21 @@ fn radio_metadata_rejects_zero_known_values() {
 }
 
 #[test]
+fn capture_profile_rejects_zero_known_radio_values() {
+    let mut descriptor = profile_descriptor();
+    descriptor.channel = Some(0);
+    assert!(matches!(CaptureProfile::try_new(descriptor), Err(ProfileError::ZeroChannel)));
+
+    let mut descriptor = profile_descriptor();
+    descriptor.centre_frequency_hz = Some(0);
+    assert!(matches!(CaptureProfile::try_new(descriptor), Err(ProfileError::ZeroCentreFrequency)));
+
+    let mut descriptor = profile_descriptor();
+    descriptor.bandwidth_hz = Some(0);
+    assert!(matches!(CaptureProfile::try_new(descriptor), Err(ProfileError::ZeroBandwidth)));
+}
+
+#[test]
 fn csi_observation_roundtrips_all_fields() {
     let input = InputReceipt::new(
         SessionId::new("session").expect("session"),
@@ -177,7 +197,9 @@ fn csi_observation_roundtrips_all_fields() {
         sensor.clone(),
         HardwareKind::Esp32S3,
         link.clone(),
+        DeviceEpoch::new(DeviceId::new(7), BootGeneration::try_new(2).expect("boot")),
         12,
+        13,
         timing.clone(),
         radio,
         profile,
@@ -191,7 +213,9 @@ fn csi_observation_roundtrips_all_fields() {
     assert_eq!(observation.sensor(), &sensor);
     assert_eq!(observation.hardware(), HardwareKind::Esp32S3);
     assert_eq!(observation.link(), &link);
-    assert_eq!(observation.device_sequence(), 12);
+    assert_eq!(observation.device_epoch().device(), DeviceId::new(7));
+    assert_eq!(observation.device_epoch().boot_generation().get(), 2);
+    assert_eq!(observation.capture_sequence(), 12);
     assert_eq!(observation.timing(), &timing);
     assert_eq!(observation.radio(), radio);
     assert_eq!(observation.radio().channel(), Some(6));
@@ -239,7 +263,9 @@ fn intel_three_by_three_by_thirty_has_270_distinct_native_coordinates() {
         SensorId::new("intel-sensor").expect("sensor"),
         HardwareKind::Intel5300,
         RadioLinkId::new("intel-link").expect("link"),
+        DeviceEpoch::new(DeviceId::new(8), BootGeneration::try_new(1).expect("boot")),
         9,
+        10,
         FrameTiming::try_new(
             SessionTime::from_nanos(2),
             None,
@@ -286,7 +312,7 @@ fn sample_scale_is_reduced_and_profile_digest_covers_compatibility_fields() {
 }
 
 #[test]
-fn profile_fixture_bytes_and_digest_are_stable() {
+fn profile_fixture_bytes_and_digest_follow_canonical_map_order() {
     let profile = CaptureProfile::try_new(profile_descriptor()).expect("profile");
     let bytes = profile.canonical_bytes().expect("canonical bytes");
     let encoded = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();

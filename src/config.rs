@@ -5,19 +5,22 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-// ESP32-S3 and ESP32-C6 CSI firmware uses the 2.4 GHz Wi-Fi channels 1..=14;
-// this is a hardware reachability bound, not a country-specific regulatory policy.
-const ESP32_WIFI_CHANNEL_MIN: u16 = 1;
-const ESP32_WIFI_CHANNEL_MAX: u16 = 14;
-
 use ciborium::ser::into_writer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::domain::route::{AdmissionLimits, HeaderRoute};
 use crate::domain::{
-    AcquisitionMode, ConditioningVersion, DeploymentId, HardwareKind, IdError, LtfMerge,
-    LtfSelection, RadioLinkId, SensorId, SpaceId, TransmitterId, ValidityDialect,
+    ConditioningVersion, DeploymentId, DeviceId, HardwareKind, IdError, KeyEpoch, RadioLinkId,
+    SensorId, SpaceId, TransmitterId,
 };
+
+/// The largest raw CSI buffer admitted by the ESP32-S3 native-frame profile.
+const MAX_S3_RAW_CSI_BYTES: u16 = 612;
+/// The largest authenticated cleartext body admitted by the native-frame profile.
+const MAX_S3_PLAINTEXT_BYTES: u16 = 705;
+/// The fixed native-frame header and authentication tag overhead.
+const NATIVE_FRAME_OVERHEAD_BYTES: u16 = 32 + 16;
 
 /// Errors returned while reading or validating configuration.
 #[derive(Debug, thiserror::Error)]
@@ -52,19 +55,21 @@ pub enum ConfigError {
         /// Unresolved identity.
         id: String,
     },
-    /// A route could not be made unambiguous.
-    #[error("ambiguous route for node {node_id} and peer {peer}")]
+    /// A route identity was repeated or could not be made exact.
+    #[error("ambiguous route for peer {peer}, device {device_id}, and key epoch {key_epoch}")]
     AmbiguousRoute {
-        /// Receiver node identifier.
-        node_id: u8,
-        /// Conflicting peer address or wildcard marker.
+        /// Peer address in the conflicting route.
         peer: String,
+        /// Device identity in the conflicting route.
+        device_id: u64,
+        /// Key epoch in the conflicting route.
+        key_epoch: u16,
     },
-    /// A route/channel contract conflicts with its link.
-    #[error("route for node {node_id} conflicts with channel policy")]
+    /// A route's radio policy conflicts with the referenced link.
+    #[error("route for peer {peer} conflicts with link radio policy")]
     ChannelPolicyConflict {
-        /// Receiver node identifier.
-        node_id: u8,
+        /// Peer address in the conflicting route.
+        peer: String,
     },
     /// A configured hardware family has no first-slice decoder.
     #[error("unsupported hardware {hardware} for sensor {sensor}")]
@@ -74,9 +79,18 @@ pub enum ConfigError {
         /// Hardware family that has no first-slice decoder.
         hardware: HardwareKind,
     },
-    /// The candidate mode is intentionally not available in this slice.
-    #[error("candidate mode {0:?} is unsupported; only \"disabled\" is accepted")]
-    UnsupportedCandidateMode(String),
+    /// A configured digest was not exactly 32 bytes of hexadecimal data.
+    #[error("invalid {field}: expected exactly 64 hexadecimal characters")]
+    InvalidDigest {
+        /// Configuration field containing the digest.
+        field: &'static str,
+    },
+    /// A configured MAC address was not exactly six octets.
+    #[error("invalid {field}: expected six hexadecimal octets")]
+    InvalidMac {
+        /// Configuration field containing the MAC address.
+        field: &'static str,
+    },
     /// Canonical CBOR encoding unexpectedly failed.
     #[error("canonical configuration encoding failed: {0}")]
     CanonicalEncoding(String),
@@ -104,13 +118,11 @@ pub fn parse_config(source: &str) -> Result<EffectiveConfig, ConfigError> {
 }
 
 /// Reads, parses, and validates a configuration file.
-#[expect(dead_code, reason = "consumed by work-package 2.2 application startup")]
+#[expect(dead_code, reason = "consumed by the application startup work package")]
 pub fn load_config(path: impl AsRef<Path>) -> Result<EffectiveConfig, ConfigError> {
-    let source = fs::read_to_string(path).map_err(ConfigError::Read)?;
-    parse_config(&source)
+    parse_config(&fs::read_to_string(path).map_err(ConfigError::Read)?)
 }
 
-/// A deserializable configuration input. Use [`parse_config`] for validation.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -124,7 +136,6 @@ struct RawConfig {
     view: Option<RawView>,
     server: Option<RawServer>,
     performance: Option<RawPerformance>,
-    candidate: Option<RawCandidate>,
     #[serde(default)]
     spaces: Vec<RawIdEntry>,
     #[serde(default)]
@@ -145,16 +156,11 @@ struct RawDeployment {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawIdEntry {
-    id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawCapture {
     bind: String,
     max_datagram_bytes: u32,
     socket_buffer_bytes: u32,
+    secret_root: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,7 +190,6 @@ struct RawWindow {
     allowed_lateness_ns: u64,
     inactive_after_ns: u64,
     reorder_horizon: u32,
-    probable_restart_after_ns: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,22 +261,13 @@ struct RawPerformance {
     snapshot_deadline_ns: u64,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCandidate {
-    #[serde(default = "default_candidate_mode")]
-    mode: String,
-}
-
-fn default_candidate_mode() -> String {
-    "disabled".to_owned()
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
 enum RawHardwareKind {
+    #[serde(rename = "esp32-s3")]
     Esp32S3,
+    #[serde(rename = "esp32-c6")]
     Esp32C6,
+    #[serde(rename = "intel-5300")]
     Intel5300,
 }
 
@@ -290,23 +286,19 @@ impl From<RawHardwareKind> for HardwareKind {
 struct RawSensor {
     id: String,
     hardware_kind: RawHardwareKind,
-    node_id: u8,
+    device_id: u64,
+    key_epoch: u16,
     expected_peer_ip: String,
-    firmware: String,
-    adr018: RawAdr018,
+    firmware_build_digest: String,
+    capability_digest: String,
+    maximum_raw_csi_bytes: u16,
+    maximum_plaintext_bytes: u16,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAdr018 {
-    firmware_dialect: String,
-    he_tagging: bool,
-    csi_acquire: String,
-    ltf_selection: String,
-    ltf_merge: String,
-    validity_dialect: String,
-    #[serde(default)]
-    multi_path: bool,
+struct RawIdEntry {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,35 +308,29 @@ struct RawLink {
     space: String,
     transmitter: String,
     receiver: String,
-    source_contract: RawSourceContract,
+    expected_transmitter_mac: String,
     channel_policy: RawChannelPolicy,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawSourceContract {
-    provisioned: bool,
-    fixed_source_mac_filter: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawChannelPolicy {
-    allowed: Vec<u16>,
+    allowed: Vec<u8>,
     #[serde(default)]
-    expected: Option<u16>,
+    expected: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRoute {
-    peer: Option<String>,
-    node_id: u8,
+    peer: String,
+    device_id: u64,
+    key_epoch: u16,
     link: String,
     peak_packets_per_second: u32,
-    maximum_valid_datagram_bytes: u32,
-    #[serde(default)]
-    channel: Option<u16>,
+    maximum_valid_datagram_bytes: u16,
+    maximum_authenticated_bytes_per_second: u64,
+    replay_window_packets: u16,
 }
 
 /// Validated deployment identity.
@@ -361,12 +347,13 @@ impl Deployment {
     }
 }
 
-/// Validated capture limits and bind address.
+/// Validated capture limits, bind address, and secret-store root.
 #[derive(Clone, Debug, Serialize)]
 pub struct CaptureConfig {
     bind: SocketAddr,
     max_datagram_bytes: u32,
     socket_buffer_bytes: u32,
+    secret_root: PathBuf,
 }
 
 impl CaptureConfig {
@@ -375,15 +362,23 @@ impl CaptureConfig {
     pub fn bind(&self) -> SocketAddr {
         self.bind
     }
+
     /// Returns the application datagram limit.
     #[must_use]
     pub const fn max_datagram_bytes(&self) -> u32 {
         self.max_datagram_bytes
     }
+
     /// Returns the receive-buffer size.
     #[must_use]
     pub const fn socket_buffer_bytes(&self) -> u32 {
         self.socket_buffer_bytes
+    }
+
+    /// Returns the configured secret-store root without exposing key bytes.
+    #[must_use]
+    pub fn secret_root(&self) -> &Path {
+        &self.secret_root
     }
 }
 
@@ -399,7 +394,7 @@ pub struct SessionConfig {
     flush_policy: FlushPolicy,
 }
 
-#[expect(dead_code, reason = "consumed by work-package 2.x session persistence")]
+#[expect(dead_code, reason = "consumed by later session work packages")]
 impl SessionConfig {
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
@@ -447,10 +442,9 @@ pub struct WindowConfig {
     allowed_lateness_ns: u64,
     inactive_after_ns: u64,
     reorder_horizon: u32,
-    probable_restart_after_ns: u64,
 }
 
-#[expect(dead_code, reason = "consumed by work-package 3.1 windowing")]
+#[expect(dead_code, reason = "consumed by later timeline work package")]
 impl WindowConfig {
     pub(crate) const fn width_ns(&self) -> u64 {
         self.width_ns
@@ -471,10 +465,6 @@ impl WindowConfig {
     pub(crate) const fn reorder_horizon(&self) -> u32 {
         self.reorder_horizon
     }
-
-    pub(crate) const fn probable_restart_after_ns(&self) -> u64 {
-        self.probable_restart_after_ns
-    }
 }
 
 /// Validated native-coordinate conditioning recipe and rational scale.
@@ -486,7 +476,7 @@ pub struct ConditioningConfig {
     scale_denominator: u32,
 }
 
-#[expect(dead_code, reason = "consumed by work-package 3.2 conditioning")]
+#[expect(dead_code, reason = "consumed by later conditioning work package")]
 impl ConditioningConfig {
     pub(crate) const fn version(&self) -> &ConditioningVersion {
         &self.version
@@ -522,7 +512,7 @@ pub struct QualityConfig {
     minimum_time_quality: TimeQualityConfig,
 }
 
-#[expect(dead_code, reason = "consumed by work-package 3.3 quality evaluation")]
+#[expect(dead_code, reason = "consumed by later estimator work package")]
 impl QualityConfig {
     pub(crate) const fn minimum_frames(&self) -> u32 {
         self.minimum_frames
@@ -572,7 +562,7 @@ pub struct BaselineConfig {
     stale_after_ns: u64,
 }
 
-#[expect(dead_code, reason = "consumed by work-package 3.3 baseline evaluation")]
+#[expect(dead_code, reason = "consumed by later estimator work package")]
 impl BaselineConfig {
     pub(crate) const fn minimum_learning_windows(&self) -> u32 {
         self.minimum_learning_windows
@@ -635,7 +625,7 @@ pub struct ViewConfig {
     max_signal_points: u64,
 }
 
-#[expect(dead_code, reason = "consumed by work-package 4.x view delivery")]
+#[expect(dead_code, reason = "consumed by later view work package")]
 impl ViewConfig {
     pub(crate) const fn recent_range_ns(&self) -> u64 {
         self.recent_range_ns
@@ -659,7 +649,7 @@ pub struct ServerConfig {
     websocket_queue_capacity: u32,
 }
 
-#[expect(dead_code, reason = "consumed by work-package 4.x server delivery")]
+#[expect(dead_code, reason = "consumed by later server work package")]
 impl ServerConfig {
     pub(crate) const fn bind(&self) -> SocketAddr {
         self.bind
@@ -686,7 +676,7 @@ pub struct PerformanceConfig {
     snapshot_deadline_ns: u64,
 }
 
-#[expect(dead_code, reason = "consumed by application performance work")]
+#[expect(dead_code, reason = "consumed by later application work package")]
 impl PerformanceConfig {
     pub(crate) const fn max_rss_bytes(&self) -> u64 {
         self.max_rss_bytes
@@ -701,13 +691,6 @@ impl PerformanceConfig {
     }
 }
 
-/// Candidate settings; only disabled exists in this first slice.
-#[derive(Clone, Copy, Debug, Serialize)]
-pub enum CandidateMode {
-    /// No candidate learner or shadow path is enabled.
-    Disabled,
-}
-
 /// A configured space.
 #[derive(Clone, Debug, Serialize)]
 pub struct SpaceConfig {
@@ -720,221 +703,189 @@ pub struct TransmitterConfig {
     id: TransmitterId,
 }
 
-/// Explicit source contract for a physical link.
-#[derive(Clone, Debug, Serialize)]
-pub struct SourceContract {
-    provisioned: bool,
-    fixed_source_mac_filter: bool,
-}
-
-impl SourceContract {
-    /// Reports whether the route has enough configured source evidence for inference.
-    #[must_use]
-    pub const fn inference_eligible(&self) -> bool {
-        self.provisioned || self.fixed_source_mac_filter
-    }
-}
-
-/// Channel policy for one physical link.
+/// A channel allowlist for one physical link.
 #[derive(Clone, Debug, Serialize)]
 pub struct ChannelPolicy {
-    allowed: Box<[u16]>,
-    expected: Option<u16>,
+    allowed: Box<[u8]>,
+    expected: Option<u8>,
 }
 
-#[expect(dead_code, reason = "consumed by the work-package 1.2 decoder")]
+#[allow(dead_code)]
 impl ChannelPolicy {
-    pub(crate) fn allowed(&self) -> &[u16] {
+    /// Returns channels allowed by this link.
+    #[must_use]
+    pub(crate) fn allowed(&self) -> &[u8] {
         &self.allowed
     }
-    pub(crate) const fn expected(&self) -> Option<u16> {
+
+    /// Returns the expected channel, when the deployment pins one.
+    #[must_use]
+    pub(crate) const fn expected(&self) -> Option<u8> {
         self.expected
     }
 }
 
-/// A configured sensor and its wire capability declaration.
+/// A configured sensor and its native-frame admission pins.
 #[derive(Clone, Debug, Serialize)]
 pub struct SensorConfig {
     id: SensorId,
     hardware_kind: HardwareKind,
-    node_id: u8,
+    device_id: DeviceId,
+    key_epoch: KeyEpoch,
     expected_peer_ip: IpAddr,
-    firmware: String,
-    adr018: Adr018Capabilities,
+    firmware_build_digest: [u8; 32],
+    capability_digest: [u8; 32],
+    maximum_raw_csi_bytes: u16,
+    maximum_plaintext_bytes: u16,
 }
 
-#[expect(dead_code, reason = "consumed by the work-package 1.2 decoder")]
+#[expect(dead_code, reason = "consumed by the native-frame decoder and session work")]
 impl SensorConfig {
     pub(crate) const fn id(&self) -> &SensorId {
         &self.id
     }
+
     pub(crate) const fn hardware_kind(&self) -> HardwareKind {
         self.hardware_kind
     }
-    pub(crate) const fn node_id(&self) -> u8 {
-        self.node_id
+
+    pub(crate) const fn device_id(&self) -> DeviceId {
+        self.device_id
     }
+
+    pub(crate) const fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+
     pub(crate) const fn expected_peer_ip(&self) -> IpAddr {
         self.expected_peer_ip
     }
-    pub(crate) fn firmware(&self) -> &str {
-        &self.firmware
+
+    pub(crate) const fn firmware_build_digest(&self) -> [u8; 32] {
+        self.firmware_build_digest
     }
-    pub(crate) const fn adr018(&self) -> &Adr018Capabilities {
-        &self.adr018
+
+    pub(crate) const fn capability_digest(&self) -> [u8; 32] {
+        self.capability_digest
+    }
+
+    pub(crate) const fn maximum_raw_csi_bytes(&self) -> u16 {
+        self.maximum_raw_csi_bytes
+    }
+
+    pub(crate) const fn maximum_plaintext_bytes(&self) -> u16 {
+        self.maximum_plaintext_bytes
     }
 }
 
-/// Explicit ADR-018 capability declaration.
-#[derive(Clone, Debug, Serialize)]
-pub struct Adr018Capabilities {
-    firmware_dialect: FirmwareDialect,
-    he_tagging: bool,
-    csi_acquire: AcquisitionMode,
-    ltf_selection: LtfSelection,
-    ltf_merge: LtfMerge,
-    validity_dialect: ValidityDialect,
-    multi_path: bool,
-}
-
-#[expect(dead_code, reason = "consumed by the work-package 1.2 decoder")]
-impl Adr018Capabilities {
-    pub(crate) const fn firmware_dialect(&self) -> FirmwareDialect {
-        self.firmware_dialect
-    }
-    pub(crate) const fn he_tagging(&self) -> bool {
-        self.he_tagging
-    }
-    pub(crate) const fn csi_acquire(&self) -> AcquisitionMode {
-        self.csi_acquire
-    }
-    pub(crate) const fn ltf_selection(&self) -> LtfSelection {
-        self.ltf_selection
-    }
-    pub(crate) const fn ltf_merge(&self) -> LtfMerge {
-        self.ltf_merge
-    }
-    pub(crate) const fn validity_dialect(&self) -> ValidityDialect {
-        self.validity_dialect
-    }
-    pub(crate) const fn multi_path(&self) -> bool {
-        self.multi_path
-    }
-}
-
-/// Supported ADR-018 firmware dialects.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub enum FirmwareDialect {
-    /// ESP-IDF legacy/HT CSI dialect.
-    EspIdf,
-    /// ESP-IDF HE/C6 dialect.
-    EspIdfHe,
-}
-
-/// A physical transmitter-to-receiver link.
+/// A physical transmitter-to-receiver link with authenticated source policy.
 #[derive(Clone, Debug, Serialize)]
 pub struct LinkConfig {
     id: RadioLinkId,
     space: SpaceId,
     transmitter: TransmitterId,
     receiver: SensorId,
-    source_contract: SourceContract,
+    expected_transmitter_mac: [u8; 6],
     channel_policy: ChannelPolicy,
 }
 
-#[expect(dead_code, reason = "consumed by the work-package 1.2 decoder")]
+#[expect(dead_code, reason = "consumed by the native-frame decoder and topology views")]
 impl LinkConfig {
     pub(crate) const fn id(&self) -> &RadioLinkId {
         &self.id
     }
+
     pub(crate) const fn space(&self) -> &SpaceId {
         &self.space
     }
+
     pub(crate) const fn transmitter(&self) -> &TransmitterId {
         &self.transmitter
     }
+
     pub(crate) const fn receiver(&self) -> &SensorId {
         &self.receiver
     }
-    pub(crate) const fn source_contract(&self) -> &SourceContract {
-        &self.source_contract
+
+    pub(crate) const fn expected_transmitter_mac(&self) -> [u8; 6] {
+        self.expected_transmitter_mac
     }
+
     pub(crate) const fn channel_policy(&self) -> &ChannelPolicy {
         &self.channel_policy
     }
-    /// Reports whether the configured source contract can be used for inference.
-    #[must_use]
-    pub fn inference_eligible(&self) -> bool {
-        self.source_contract.inference_eligible()
-    }
 }
 
-/// A route binding node/peer wire identity to one link.
+/// A route binding exact peer/device/key identity to one link.
 #[derive(Clone, Debug, Serialize)]
 pub struct RouteConfig {
-    peer: Option<IpAddr>,
-    node_id: u8,
+    peer: IpAddr,
+    device_id: DeviceId,
+    key_epoch: KeyEpoch,
     link: RadioLinkId,
-    peak_packets_per_second: u32,
-    maximum_valid_datagram_bytes: u32,
-    channel: Option<u16>,
+    admission_limits: AdmissionLimits,
 }
 
-#[expect(dead_code, reason = "consumed by the work-package 1.2 decoder")]
+#[expect(dead_code, reason = "consumed by the native-frame decoder and session work")]
 impl RouteConfig {
-    pub(crate) const fn peer(&self) -> Option<IpAddr> {
+    pub(crate) const fn peer(&self) -> IpAddr {
         self.peer
     }
-    pub(crate) const fn node_id(&self) -> u8 {
-        self.node_id
+
+    pub(crate) const fn device_id(&self) -> DeviceId {
+        self.device_id
     }
+
+    pub(crate) const fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+
     pub(crate) const fn link(&self) -> &RadioLinkId {
         &self.link
     }
-    pub(crate) const fn peak_packets_per_second(&self) -> u32 {
-        self.peak_packets_per_second
-    }
-    pub(crate) const fn maximum_valid_datagram_bytes(&self) -> u32 {
-        self.maximum_valid_datagram_bytes
-    }
-    pub(crate) const fn channel(&self) -> Option<u16> {
-        self.channel
+
+    pub(crate) const fn admission_limits(&self) -> AdmissionLimits {
+        self.admission_limits
     }
 }
 
-/// A route resolution result with no socket or I/O ownership.
+/// A route resolution result with no socket or secret ownership.
 #[derive(Clone, Debug)]
-pub struct ResolvedRoute<'a> {
+pub(crate) struct ResolvedRoute<'a> {
     /// Sensor selected by the route's link receiver.
-    pub sensor: &'a SensorConfig,
+    pub(crate) sensor: &'a SensorConfig,
     /// Physical link selected by the route.
-    pub link: &'a LinkConfig,
-    /// Exact route entry selected by node and peer.
-    pub route: &'a RouteConfig,
+    pub(crate) link: &'a LinkConfig,
+    /// Exact route entry selected by peer/device/key identity.
+    pub(crate) route: &'a RouteConfig,
 }
 
-/// Errors returned by runtime route lookup.
+/// Errors returned by exact route lookup.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RouteError {
-    /// No configured route matched node and peer.
-    #[error("unknown route for node {node_id} and peer {peer}")]
+    /// No configured route matched all three pre-authentication identity facts.
+    #[error("unknown route for peer {peer}, device {device_id}, and key epoch {key_epoch}")]
     Unknown {
-        /// Receiver node identifier.
-        node_id: u8,
-        /// Incoming peer address.
+        /// Incoming peer IP address.
         peer: IpAddr,
+        /// Authenticated header device identity.
+        device_id: DeviceId,
+        /// Authenticated header key epoch.
+        key_epoch: KeyEpoch,
     },
-    /// More than one route matched.
-    #[error("ambiguous route for node {node_id} and peer {peer}")]
+    /// More than one exact route matched.
+    #[error("ambiguous route for peer {peer}, device {device_id}, and key epoch {key_epoch}")]
     Ambiguous {
-        /// Receiver node identifier.
-        node_id: u8,
-        /// Incoming peer address.
+        /// Incoming peer IP address.
         peer: IpAddr,
+        /// Authenticated header device identity.
+        device_id: DeviceId,
+        /// Authenticated header key epoch.
+        key_epoch: KeyEpoch,
     },
 }
 
-/// Static deployment registry used by the decoder and later timeline.
+/// Static deployment registry used by the wire decoder and later timeline.
 #[derive(Clone, Debug, Serialize)]
 pub struct Registry {
     spaces: BTreeMap<SpaceId, SpaceConfig>,
@@ -945,45 +896,53 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Resolves an incoming `(peer, node_id)` without using source ports.
-    pub fn resolve_route(
+    /// Selects only pre-authentication peer, device, key, and budget facts.
+    pub(crate) fn resolve_header_route(
         &self,
         peer: IpAddr,
-        node_id: u8,
+        device_id: DeviceId,
+        key_epoch: KeyEpoch,
+    ) -> Result<HeaderRoute, RouteError> {
+        let route = self.find_route(peer, device_id, key_epoch)?;
+        Ok(HeaderRoute::new(peer, device_id, key_epoch, route.admission_limits))
+    }
+
+    /// Resolves sensor and link identity only after authenticated header facts exist.
+    pub(crate) fn resolve_authenticated_route(
+        &self,
+        header_route: HeaderRoute,
     ) -> Result<ResolvedRoute<'_>, RouteError> {
-        let exact: Vec<&RouteConfig> = self
-            .routes
-            .iter()
-            .filter(|route| route.node_id == node_id && route.peer == Some(peer))
-            .collect();
-        let wildcard: Vec<&RouteConfig> = self
-            .routes
-            .iter()
-            .filter(|route| {
-                if route.node_id != node_id || route.peer.is_some() {
-                    return false;
-                }
-                self.links
-                    .get(&route.link)
-                    .and_then(|link| self.sensors.get(&link.receiver))
-                    .is_some_and(|sensor| sensor.expected_peer_ip == peer)
-            })
-            .collect();
-        let route = if exact.len() == 1 {
-            exact[0]
-        } else if exact.len() > 1 {
-            return Err(RouteError::Ambiguous { node_id, peer });
-        } else if wildcard.len() == 1 {
-            wildcard[0]
-        } else if wildcard.len() > 1 {
-            return Err(RouteError::Ambiguous { node_id, peer });
-        } else {
-            return Err(RouteError::Unknown { node_id, peer });
-        };
-        let link = self.links.get(&route.link).ok_or(RouteError::Unknown { node_id, peer })?;
-        let sensor =
-            self.sensors.get(&link.receiver).ok_or(RouteError::Unknown { node_id, peer })?;
+        let peer = header_route.peer();
+        let device_id = header_route.device();
+        let key_epoch = header_route.key_epoch();
+        let route = self.find_route(peer, device_id, key_epoch)?;
+        let link = self.links.get(&route.link).ok_or(RouteError::Unknown {
+            peer,
+            device_id,
+            key_epoch,
+        })?;
+        let sensor = self.sensors.get(&link.receiver).ok_or(RouteError::Unknown {
+            peer,
+            device_id,
+            key_epoch,
+        })?;
         Ok(ResolvedRoute { sensor, link, route })
+    }
+
+    fn find_route(
+        &self,
+        peer: IpAddr,
+        device_id: DeviceId,
+        key_epoch: KeyEpoch,
+    ) -> Result<&RouteConfig, RouteError> {
+        let mut matched = self.routes.iter().filter(|route| {
+            route.peer == peer && route.device_id == device_id && route.key_epoch == key_epoch
+        });
+        let route = matched.next().ok_or(RouteError::Unknown { peer, device_id, key_epoch })?;
+        if matched.next().is_some() {
+            return Err(RouteError::Ambiguous { peer, device_id, key_epoch });
+        }
+        Ok(route)
     }
 
     /// Returns all configured sensors.
@@ -991,12 +950,14 @@ impl Registry {
     pub const fn sensors(&self) -> &BTreeMap<SensorId, SensorConfig> {
         &self.sensors
     }
+
     /// Returns all configured links.
     #[must_use]
     pub const fn links(&self) -> &BTreeMap<RadioLinkId, LinkConfig> {
         &self.links
     }
-    /// Returns all configured routes in file order.
+
+    /// Returns all configured exact routes in file order.
     #[must_use]
     pub fn routes(&self) -> &[RouteConfig] {
         &self.routes
@@ -1016,18 +977,16 @@ pub struct EffectiveConfig {
     view: ViewConfig,
     server: ServerConfig,
     performance: PerformanceConfig,
-    candidate: CandidateMode,
     registry: Registry,
     #[serde(skip)]
     digest: [u8; 32],
 }
 
 impl EffectiveConfig {
-    /// Validates raw configuration and computes its canonical digest.
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
-        let RawDeployment { id } = raw.deployment.ok_or_else(|| missing("deployment.id"))?;
         let deployment = Deployment {
-            id: DeploymentId::new(id).map_err(|error| ConfigError::id("deployment.id", error))?,
+            id: DeploymentId::new(raw.deployment.ok_or_else(|| missing("deployment.id"))?.id)
+                .map_err(|error| ConfigError::id("deployment.id", error))?,
         };
         let capture = build_capture(raw.capture.ok_or_else(|| missing("capture"))?)?;
         let session = build_session(raw.session.ok_or_else(|| missing("session"))?)?;
@@ -1042,7 +1001,6 @@ impl EffectiveConfig {
             raw.performance.ok_or_else(|| missing("performance"))?,
             window.step_ns,
         )?;
-        let candidate = build_candidate(raw.candidate)?;
         let registry = build_registry(
             raw.spaces,
             raw.transmitters,
@@ -1051,6 +1009,7 @@ impl EffectiveConfig {
             raw.routes,
             capture.max_datagram_bytes,
         )?;
+
         let mut config = Self {
             deployment,
             capture,
@@ -1062,12 +1021,10 @@ impl EffectiveConfig {
             view,
             server,
             performance,
-            candidate,
             registry,
             digest: [0; 32],
         };
-        let bytes = config.canonical_bytes()?;
-        config.digest = Sha256::digest(bytes).into();
+        config.digest = Sha256::digest(config.canonical_bytes()?).into();
         Ok(config)
     }
 
@@ -1076,75 +1033,81 @@ impl EffectiveConfig {
     pub const fn deployment(&self) -> &Deployment {
         &self.deployment
     }
+
     /// Returns capture settings.
     #[must_use]
     pub const fn capture(&self) -> &CaptureConfig {
         &self.capture
     }
+
     /// Returns session settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by work-package 2.x session persistence")]
+    #[expect(dead_code, reason = "consumed by later session work packages")]
     pub(crate) const fn session(&self) -> &SessionConfig {
         &self.session
     }
+
     /// Returns window settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by work-package 3.1 windowing")]
+    #[expect(dead_code, reason = "consumed by later timeline work package")]
     pub(crate) const fn window(&self) -> &WindowConfig {
         &self.window
     }
-    /// Returns the conditioning recipe and declared rational scale.
+
+    /// Returns conditioning settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by work-package 3.2 conditioning")]
+    #[expect(dead_code, reason = "consumed by later conditioning work package")]
     pub(crate) const fn conditioning(&self) -> &ConditioningConfig {
         &self.conditioning
     }
+
     /// Returns quality settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by work-package 3.3 quality evaluation")]
+    #[expect(dead_code, reason = "consumed by later estimator work package")]
     pub(crate) const fn quality(&self) -> &QualityConfig {
         &self.quality
     }
+
     /// Returns baseline settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by work-package 3.3 baseline evaluation")]
+    #[expect(dead_code, reason = "consumed by later estimator work package")]
     pub(crate) const fn baseline(&self) -> &BaselineConfig {
         &self.baseline
     }
+
     /// Returns view settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by work-package 4.x view delivery")]
+    #[expect(dead_code, reason = "consumed by later view work package")]
     pub(crate) const fn view(&self) -> &ViewConfig {
         &self.view
     }
+
     /// Returns server settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by work-package 4.x server delivery")]
+    #[expect(dead_code, reason = "consumed by later server work package")]
     pub(crate) const fn server(&self) -> &ServerConfig {
         &self.server
     }
-    /// Returns performance settings.
+
+    /// Returns process performance settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by application performance work")]
+    #[expect(dead_code, reason = "consumed by later application work package")]
     pub(crate) const fn performance(&self) -> &PerformanceConfig {
         &self.performance
     }
-    /// Returns candidate mode.
-    #[must_use]
-    #[expect(dead_code, reason = "consumed by the candidate work package")]
-    pub(crate) const fn candidate(&self) -> CandidateMode {
-        self.candidate
-    }
+
     /// Returns the validated topology registry.
     #[must_use]
     pub const fn registry(&self) -> &Registry {
         &self.registry
     }
+
     /// Returns the SHA-256 of canonical effective configuration bytes.
     #[must_use]
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
     }
+
     /// Returns canonical CBOR bytes used by [`Self::digest`].
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ConfigError> {
         let mut bytes = Vec::new();
@@ -1167,16 +1130,20 @@ fn parse_socket(field: &'static str, value: &str) -> Result<SocketAddr, ConfigEr
 }
 
 fn build_capture(raw: RawCapture) -> Result<CaptureConfig, ConfigError> {
-    if raw.max_datagram_bytes == 0 || raw.max_datagram_bytes > 65_535 {
+    if raw.max_datagram_bytes == 0 || raw.max_datagram_bytes > u32::from(u16::MAX) {
         return Err(invalid("capture.max_datagram_bytes", "must be in 1..=65535"));
     }
     if raw.socket_buffer_bytes < raw.max_datagram_bytes {
         return Err(invalid("capture.socket_buffer_bytes", "must cover max_datagram_bytes"));
     }
+    if raw.secret_root.trim().is_empty() {
+        return Err(invalid("capture.secret_root", "must not be empty"));
+    }
     Ok(CaptureConfig {
         bind: parse_socket("capture.bind", &raw.bind)?,
         max_datagram_bytes: raw.max_datagram_bytes,
         socket_buffer_bytes: raw.socket_buffer_bytes,
+        secret_root: PathBuf::from(raw.secret_root),
     })
 }
 
@@ -1195,10 +1162,6 @@ fn build_session(raw: RawSession) -> Result<SessionConfig, ConfigError> {
     {
         return Err(invalid("session", "manifest/record limits exceed max_session_bytes"));
     }
-    let flush_policy = match raw.flush_policy {
-        RawFlushPolicy::EveryRecord => FlushPolicy::EveryRecord,
-        RawFlushPolicy::Window => FlushPolicy::Window,
-    };
     Ok(SessionConfig {
         directory: PathBuf::from(raw.directory),
         max_manifest_bytes: raw.max_manifest_bytes,
@@ -1206,7 +1169,10 @@ fn build_session(raw: RawSession) -> Result<SessionConfig, ConfigError> {
         max_session_duration_ns: raw.max_session_duration_ns,
         max_session_bytes: raw.max_session_bytes,
         retention_max_sessions: raw.retention_max_sessions,
-        flush_policy,
+        flush_policy: match raw.flush_policy {
+            RawFlushPolicy::EveryRecord => FlushPolicy::EveryRecord,
+            RawFlushPolicy::Window => FlushPolicy::Window,
+        },
     })
 }
 
@@ -1215,11 +1181,10 @@ fn build_window(raw: RawWindow) -> Result<WindowConfig, ConfigError> {
         || raw.step_ns == 0
         || raw.step_ns < raw.width_ns
         || raw.inactive_after_ns == 0
-        || raw.probable_restart_after_ns == 0
     {
         return Err(invalid(
             "window",
-            "width/step must be positive and non-overlapping; durations must be positive",
+            "width/step must be positive and non-overlapping; inactive_after_ns must be positive",
         ));
     }
     Ok(WindowConfig {
@@ -1228,29 +1193,24 @@ fn build_window(raw: RawWindow) -> Result<WindowConfig, ConfigError> {
         allowed_lateness_ns: raw.allowed_lateness_ns,
         inactive_after_ns: raw.inactive_after_ns,
         reorder_horizon: raw.reorder_horizon,
-        probable_restart_after_ns: raw.probable_restart_after_ns,
     })
 }
 
 fn build_conditioning(raw: RawConditioning) -> Result<ConditioningConfig, ConfigError> {
-    if raw.version.trim().is_empty() || raw.recipe.trim().is_empty() {
-        return Err(invalid("conditioning", "version and recipe must not be empty"));
+    if raw.version.trim().is_empty() || raw.recipe != "log1p-hypot" {
+        return Err(invalid(
+            "conditioning",
+            "version must be non-empty and recipe must be log1p-hypot",
+        ));
     }
     if raw.scale_numerator == 0 || raw.scale_denominator == 0 {
         return Err(invalid("conditioning", "scale numerator and denominator must be positive"));
     }
     let divisor = gcd(raw.scale_numerator, raw.scale_denominator);
-    let version = ConditioningVersion::new(raw.version)
-        .map_err(|error| ConfigError::id("conditioning.version", error))?;
-    let recipe = match raw.recipe.as_str() {
-        "log1p-hypot" => ConditioningRecipe::LogOnePlusHypot,
-        other => {
-            return Err(invalid("conditioning.recipe", format!("unsupported recipe {other:?}")));
-        }
-    };
     Ok(ConditioningConfig {
-        version,
-        recipe,
+        version: ConditioningVersion::new(raw.version)
+            .map_err(|error| ConfigError::id("conditioning.version", error))?,
+        recipe: ConditioningRecipe::LogOnePlusHypot,
         scale_numerator: raw.scale_numerator / divisor,
         scale_denominator: raw.scale_denominator / divisor,
     })
@@ -1271,16 +1231,15 @@ fn build_quality(raw: RawQuality) -> Result<QualityConfig, ConfigError> {
     }
     validate_fraction("quality.minimum_coordinate_coverage", raw.minimum_coordinate_coverage)?;
     validate_fraction("quality.maximum_gap_ratio", raw.maximum_gap_ratio)?;
-    let minimum_time_quality = match raw.minimum_time_quality {
-        RawTimeQuality::ReceiveOnly => TimeQualityConfig::ReceiveOnly,
-        RawTimeQuality::ClockCorrected => TimeQualityConfig::ClockCorrected,
-    };
     Ok(QualityConfig {
         minimum_frames: raw.minimum_frames,
         minimum_coordinate_coverage: raw.minimum_coordinate_coverage,
         maximum_gap_ratio: raw.maximum_gap_ratio,
         maximum_receive_jitter_ns: raw.maximum_receive_jitter_ns,
-        minimum_time_quality,
+        minimum_time_quality: match raw.minimum_time_quality {
+            RawTimeQuality::ReceiveOnly => TimeQualityConfig::ReceiveOnly,
+            RawTimeQuality::ClockCorrected => TimeQualityConfig::ClockCorrected,
+        },
     })
 }
 
@@ -1385,14 +1344,6 @@ fn build_performance(raw: RawPerformance, step_ns: u64) -> Result<PerformanceCon
     })
 }
 
-fn build_candidate(raw: Option<RawCandidate>) -> Result<CandidateMode, ConfigError> {
-    let mode = raw.map_or_else(default_candidate_mode, |value| value.mode);
-    if mode != "disabled" {
-        return Err(ConfigError::UnsupportedCandidateMode(mode));
-    }
-    Ok(CandidateMode::Disabled)
-}
-
 fn validate_fraction(field: &'static str, value: f64) -> Result<(), ConfigError> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         return Err(invalid(field, "must be finite and within 0..=1"));
@@ -1461,105 +1412,59 @@ fn build_transmitters(
 
 fn build_sensors(values: Vec<RawSensor>) -> Result<BTreeMap<SensorId, SensorConfig>, ConfigError> {
     let mut output = BTreeMap::new();
+    let mut device_ids = BTreeSet::new();
     for raw in values {
         let id = SensorId::new(raw.id).map_err(|error| ConfigError::id("sensors[].id", error))?;
         let hardware_kind = raw.hardware_kind.into();
-        if hardware_kind == HardwareKind::Intel5300 {
+        if hardware_kind != HardwareKind::Esp32S3 {
             return Err(ConfigError::UnsupportedHardware {
                 sensor: id.to_string(),
                 hardware: hardware_kind,
             });
         }
-        if raw.firmware.trim().is_empty() {
-            return Err(invalid("sensors[].firmware", "must not be empty"));
-        }
-        if raw.adr018.multi_path {
-            return Err(invalid(
-                "sensors[].adr018.multi_path",
-                "must be false because the first-slice firmware has a fixed single-path wire layout",
-            ));
+        let device_id = DeviceId::new(raw.device_id);
+        let key_epoch = KeyEpoch::try_new(raw.key_epoch)
+            .map_err(|error| ConfigError::id("sensors[].key_epoch", error))?;
+        if !device_ids.insert(device_id) {
+            return Err(ConfigError::Duplicate { kind: "device", id: device_id.to_string() });
         }
         let expected_peer_ip = raw
             .expected_peer_ip
             .parse::<IpAddr>()
             .map_err(|error| invalid("sensors[].expected_peer_ip", error.to_string()))?;
-        let firmware_dialect = parse_firmware_dialect(&raw.adr018.firmware_dialect)?;
-        let csi_acquire = parse_acquisition_mode(&raw.adr018.csi_acquire)?;
-        let ltf_selection = parse_ltf_selection(&raw.adr018.ltf_selection)?;
-        let ltf_merge = parse_ltf_merge(&raw.adr018.ltf_merge)?;
-        let validity_dialect = parse_validity_dialect(&raw.adr018.validity_dialect)?;
+        if raw.maximum_raw_csi_bytes == 0 || raw.maximum_raw_csi_bytes > MAX_S3_RAW_CSI_BYTES {
+            return Err(invalid(
+                "sensors[].maximum_raw_csi_bytes",
+                format!("must be in 1..={MAX_S3_RAW_CSI_BYTES}"),
+            ));
+        }
+        if raw.maximum_plaintext_bytes == 0 || raw.maximum_plaintext_bytes > MAX_S3_PLAINTEXT_BYTES
+        {
+            return Err(invalid(
+                "sensors[].maximum_plaintext_bytes",
+                format!("must be in 1..={MAX_S3_PLAINTEXT_BYTES}"),
+            ));
+        }
+        let firmware_build_digest =
+            parse_digest("sensors[].firmware_build_digest", &raw.firmware_build_digest)?;
+        let capability_digest =
+            parse_digest("sensors[].capability_digest", &raw.capability_digest)?;
         let sensor = SensorConfig {
             id: id.clone(),
             hardware_kind,
-            node_id: raw.node_id,
+            device_id,
+            key_epoch,
             expected_peer_ip,
-            firmware: raw.firmware,
-            adr018: Adr018Capabilities {
-                firmware_dialect,
-                he_tagging: raw.adr018.he_tagging,
-                csi_acquire,
-                ltf_selection,
-                ltf_merge,
-                validity_dialect,
-                multi_path: raw.adr018.multi_path,
-            },
+            firmware_build_digest,
+            capability_digest,
+            maximum_raw_csi_bytes: raw.maximum_raw_csi_bytes,
+            maximum_plaintext_bytes: raw.maximum_plaintext_bytes,
         };
         if output.insert(id.clone(), sensor).is_some() {
             return Err(ConfigError::Duplicate { kind: "sensor", id: id.to_string() });
         }
     }
     Ok(output)
-}
-
-fn parse_firmware_dialect(value: &str) -> Result<FirmwareDialect, ConfigError> {
-    match value {
-        "esp-idf" => Ok(FirmwareDialect::EspIdf),
-        "esp-idf-he" => Ok(FirmwareDialect::EspIdfHe),
-        other => Err(invalid(
-            "sensors[].adr018.firmware_dialect",
-            format!("unsupported value {other:?}"),
-        )),
-    }
-}
-
-fn parse_acquisition_mode(value: &str) -> Result<AcquisitionMode, ConfigError> {
-    match value {
-        "wifi-csi" => Ok(AcquisitionMode::WifiCsi),
-        other => {
-            Err(invalid("sensors[].adr018.csi_acquire", format!("unsupported value {other:?}")))
-        }
-    }
-}
-
-fn parse_ltf_selection(value: &str) -> Result<LtfSelection, ConfigError> {
-    match value {
-        "legacy" => Ok(LtfSelection::Legacy),
-        "ht" => Ok(LtfSelection::Ht),
-        "he" => Ok(LtfSelection::He),
-        other => {
-            Err(invalid("sensors[].adr018.ltf_selection", format!("unsupported value {other:?}")))
-        }
-    }
-}
-
-fn parse_ltf_merge(value: &str) -> Result<LtfMerge, ConfigError> {
-    match value {
-        "none" => Ok(LtfMerge::None),
-        "firmware-defined" => Ok(LtfMerge::FirmwareDefined),
-        other => Err(invalid("sensors[].adr018.ltf_merge", format!("unsupported value {other:?}"))),
-    }
-}
-
-fn parse_validity_dialect(value: &str) -> Result<ValidityDialect, ConfigError> {
-    match value {
-        "explicit-flag" => Ok(ValidityDialect::ExplicitFlag),
-        "first-word-invalid" => Ok(ValidityDialect::FirstWordInvalid),
-        "missing-frame-validity" => Ok(ValidityDialect::MissingFrameValidity),
-        other => Err(invalid(
-            "sensors[].adr018.validity_dialect",
-            format!("unsupported value {other:?}"),
-        )),
-    }
 }
 
 fn build_links(
@@ -1590,62 +1495,40 @@ fn build_links(
             kind: "sensor",
             id: receiver.to_string(),
         })?;
-        let channel_policy = build_channel_policy(raw.channel_policy, sensor.hardware_kind)?;
+        let expected_transmitter_mac =
+            parse_mac("links[].expected_transmitter_mac", &raw.expected_transmitter_mac)?;
+        let channel_policy = build_channel_policy(raw.channel_policy)?;
         let link = LinkConfig {
             id: id.clone(),
             space,
             transmitter,
             receiver,
-            source_contract: SourceContract {
-                provisioned: raw.source_contract.provisioned,
-                fixed_source_mac_filter: raw.source_contract.fixed_source_mac_filter,
-            },
+            expected_transmitter_mac,
             channel_policy,
         };
         if output.insert(id.clone(), link).is_some() {
             return Err(ConfigError::Duplicate { kind: "link", id: id.to_string() });
         }
+        let _ = sensor;
     }
     Ok(output)
 }
 
-fn build_channel_policy(
-    raw: RawChannelPolicy,
-    hardware_kind: HardwareKind,
-) -> Result<ChannelPolicy, ConfigError> {
-    let RawChannelPolicy { allowed, expected } = raw;
-    if allowed.is_empty() || allowed.contains(&0) {
+fn build_channel_policy(raw: RawChannelPolicy) -> Result<ChannelPolicy, ConfigError> {
+    if raw.allowed.is_empty() || raw.allowed.contains(&0) || raw.allowed.iter().any(|v| *v > 14) {
         return Err(invalid(
-            "links[].channel_policy",
-            "allowed channels must be non-empty and positive",
+            "links[].channel_policy.allowed",
+            "must contain unique ESP32 Wi-Fi channels in 1..=14",
         ));
     }
-    if matches!(hardware_kind, HardwareKind::Esp32S3 | HardwareKind::Esp32C6) {
-        if allowed.iter().any(|channel| !is_esp32_wifi_channel(*channel)) {
-            return Err(invalid(
-                "links[].channel_policy.allowed",
-                "must contain only ESP32 Wi-Fi channels in 1..=14",
-            ));
-        }
-        if expected.is_some_and(|channel| !is_esp32_wifi_channel(channel)) {
-            return Err(invalid(
-                "links[].channel_policy.expected",
-                "must be an ESP32 Wi-Fi channel in 1..=14",
-            ));
-        }
+    let set: BTreeSet<u8> = raw.allowed.iter().copied().collect();
+    if set.len() != raw.allowed.len() {
+        return Err(invalid("links[].channel_policy.allowed", "must be unique"));
     }
-    let set: BTreeSet<u16> = allowed.iter().copied().collect();
-    if set.len() != allowed.len() {
-        return Err(invalid("links[].channel_policy", "allowed channels must be unique"));
-    }
-    if expected.is_some_and(|channel| !set.contains(&channel)) {
+    if raw.expected.is_some_and(|channel| !set.contains(&channel)) {
         return Err(invalid("links[].channel_policy.expected", "must be one of allowed channels"));
     }
-    Ok(ChannelPolicy { allowed: allowed.into_boxed_slice(), expected })
-}
-
-fn is_esp32_wifi_channel(channel: u16) -> bool {
-    (ESP32_WIFI_CHANNEL_MIN..=ESP32_WIFI_CHANNEL_MAX).contains(&channel)
+    Ok(ChannelPolicy { allowed: raw.allowed.into_boxed_slice(), expected: raw.expected })
 }
 
 fn build_routes(
@@ -1657,13 +1540,27 @@ fn build_routes(
     let mut output = Vec::with_capacity(values.len());
     let mut identities = BTreeSet::new();
     for raw in values {
-        if raw.peak_packets_per_second == 0
-            || raw.maximum_valid_datagram_bytes == 0
-            || raw.maximum_valid_datagram_bytes > max_datagram_bytes
+        let peer = raw
+            .peer
+            .parse::<IpAddr>()
+            .map_err(|error| invalid("routes[].peer", error.to_string()))?;
+        let device_id = DeviceId::new(raw.device_id);
+        let key_epoch = KeyEpoch::try_new(raw.key_epoch)
+            .map_err(|error| ConfigError::id("routes[].key_epoch", error))?;
+        if !identities.insert((peer, device_id, key_epoch)) {
+            return Err(ConfigError::AmbiguousRoute {
+                peer: peer.to_string(),
+                device_id: device_id.get(),
+                key_epoch: key_epoch.get(),
+            });
+        }
+        if raw.maximum_valid_datagram_bytes == 0
+            || u32::from(raw.maximum_valid_datagram_bytes) > max_datagram_bytes
+            || raw.maximum_valid_datagram_bytes < NATIVE_FRAME_OVERHEAD_BYTES
         {
             return Err(invalid(
-                "routes[]",
-                "rate/maximum_valid_datagram_bytes exceed capture limits",
+                "routes[].maximum_valid_datagram_bytes",
+                "must fit the capture limit and fixed native-frame overhead",
             ));
         }
         let link =
@@ -1671,63 +1568,72 @@ fn build_routes(
         let link_config = links
             .get(&link)
             .ok_or_else(|| ConfigError::UnknownReference { kind: "link", id: link.to_string() })?;
-        let peer = raw
-            .peer
-            .as_deref()
-            .map(|value| {
-                value.parse::<IpAddr>().map_err(|error| invalid("routes[].peer", error.to_string()))
-            })
-            .transpose()?;
-        if !identities.insert((raw.node_id, peer)) {
-            return Err(ConfigError::AmbiguousRoute {
-                node_id: raw.node_id,
-                peer: peer.map_or_else(|| "*".to_owned(), |value| value.to_string()),
-            });
-        }
-        if let Some(channel) = raw.channel
-            && (!link_config.channel_policy.allowed.contains(&channel)
-                || link_config.channel_policy.expected.is_some_and(|expected| expected != channel))
-        {
-            return Err(ConfigError::ChannelPolicyConflict { node_id: raw.node_id });
-        }
-        let receiver = sensors.get(&link_config.receiver).ok_or_else(|| {
+        let sensor = sensors.get(&link_config.receiver).ok_or_else(|| {
             ConfigError::UnknownReference { kind: "sensor", id: link_config.receiver.to_string() }
         })?;
-        if peer.is_some_and(|value| value != receiver.expected_peer_ip) {
-            return Err(invalid("routes[].peer", "does not match receiver expected_peer_ip"));
+        let minimum_datagram_bytes = NATIVE_FRAME_OVERHEAD_BYTES + sensor.maximum_plaintext_bytes;
+        if raw.maximum_valid_datagram_bytes < minimum_datagram_bytes {
+            return Err(invalid(
+                "routes[].maximum_valid_datagram_bytes",
+                "must cover native-frame overhead plus the receiver plaintext limit",
+            ));
         }
-        if receiver.node_id != raw.node_id {
-            return Err(invalid("routes[].node_id", "does not match receiver node_id"));
+        if sensor.expected_peer_ip != peer {
+            return Err(invalid("routes[].peer", "must match the receiver expected_peer_ip"));
         }
-        output.push(RouteConfig {
-            peer,
-            node_id: raw.node_id,
-            link,
-            peak_packets_per_second: raw.peak_packets_per_second,
-            maximum_valid_datagram_bytes: raw.maximum_valid_datagram_bytes,
-            channel: raw.channel,
-        });
-    }
-    let mut wildcard_nodes = BTreeSet::new();
-    let mut exact_nodes = BTreeSet::new();
-    for route in &output {
-        if let Some(peer) = route.peer {
-            exact_nodes.insert((route.node_id, peer));
-        } else if !wildcard_nodes.insert(route.node_id) {
-            return Err(ConfigError::AmbiguousRoute {
-                node_id: route.node_id,
-                peer: "*".to_owned(),
-            });
+        if sensor.device_id != device_id || sensor.key_epoch != key_epoch {
+            return Err(invalid(
+                "routes[].device_id/key_epoch",
+                "must match the referenced receiver identity",
+            ));
         }
-    }
-    for route in &output {
-        if route.peer.is_none() && exact_nodes.iter().any(|(node_id, _)| *node_id == route.node_id)
-        {
-            return Err(ConfigError::AmbiguousRoute {
-                node_id: route.node_id,
-                peer: "*".to_owned(),
-            });
-        }
+        let admission_limits = AdmissionLimits::try_new(
+            raw.maximum_valid_datagram_bytes,
+            raw.peak_packets_per_second,
+            raw.maximum_authenticated_bytes_per_second,
+            raw.replay_window_packets,
+        )
+        .map_err(|error| invalid("routes[]", error.to_string()))?;
+        output.push(RouteConfig { peer, device_id, key_epoch, link, admission_limits });
     }
     Ok(output)
+}
+
+fn parse_digest(field: &'static str, value: &str) -> Result<[u8; 32], ConfigError> {
+    let value = value.trim();
+    if value.len() != 64 {
+        return Err(ConfigError::InvalidDigest { field });
+    }
+    let mut digest = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        digest[index] = (hex_value(chunk[0]).ok_or(ConfigError::InvalidDigest { field })? << 4)
+            | hex_value(chunk[1]).ok_or(ConfigError::InvalidDigest { field })?;
+    }
+    Ok(digest)
+}
+
+fn parse_mac(field: &'static str, value: &str) -> Result<[u8; 6], ConfigError> {
+    let parts: Vec<&str> = value.trim().split(':').collect();
+    if parts.len() != 6 || parts.iter().any(|part| part.len() != 2) {
+        return Err(ConfigError::InvalidMac { field });
+    }
+    let mut mac = [0_u8; 6];
+    for (index, part) in parts.iter().enumerate() {
+        let bytes = part.as_bytes();
+        mac[index] = (hex_value(bytes[0]).ok_or(ConfigError::InvalidMac { field })? << 4)
+            | hex_value(bytes[1]).ok_or(ConfigError::InvalidMac { field })?;
+    }
+    if mac == [0; 6] {
+        return Err(ConfigError::InvalidMac { field });
+    }
+    Ok(mac)
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }

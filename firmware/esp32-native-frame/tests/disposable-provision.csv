@@ -1,0 +1,16 @@
+key,type,encoding,value
+provision,namespace,,
+schema,data,u16,1
+device_id,data,u64,0
+key_epoch,data,u16,7
+aes_key,data,hex2bin,000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+ssid,data,string,native-frame-test
+wifi_pass,data,string,test-only-password
+bssid,data,hex2bin,02000000000a
+channel,data,u8,6
+probe_port,data,u16,9000
+collector_ip,data,string,192.0.2.10
+collect_port,data,u16,9001
+cap_digest,data,hex2bin,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
+runtime,namespace,,
+boot_generation,data,u32,0

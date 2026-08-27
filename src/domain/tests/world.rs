@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use crate::domain::csi::{CaptureProfileId, CsiPath, CsiSampleCoordinate};
 use crate::domain::identity::{
-    AlgorithmVersion, BaselineContractId, BaselineRevision, BaselineStateSequence,
-    ConditioningVersion, DecoderVersion, DeploymentId, LinkProfileKey, RadioLinkId, SensorId,
-    SessionId, SnapshotId, SpaceId, StreamId, StreamKey, WindowId,
+    AlgorithmVersion, BaselineContractId, BaselineRevision, BaselineStateSequence, BootGeneration,
+    ConditioningVersion, DecoderVersion, DeploymentId, DeviceEpoch, DeviceId, LinkProfileKey,
+    RadioLinkId, SensorId, SessionId, SnapshotId, SpaceId, StreamInstanceId, StreamKey, WindowId,
 };
-use crate::domain::time::{HostEpoch, SessionTime, TimeInterval, TimeQuality};
+use crate::domain::time::{SessionTime, TimeInterval, TimeQuality};
 use crate::domain::world::{
     BaselineCoordinate, BaselineDecision, BaselineSnapshot, BaselineStatus, CoordinateEvidence,
     DerivationReceipt, EvidenceReceipt, Knowledge, LinkBelief, LinkContribution, LinkDiagnostics,
@@ -129,6 +129,17 @@ fn stable_value_constructors_reject_non_finite_or_out_of_range_values() {
             CsiPath::RawPathOrdinal(0),
             CsiSampleCoordinate::OpaqueSampleOrdinal(0),
             1,
+            0.0,
+            0.0,
+            1,
+        ),
+        Err(WorldValueError::EmptyBaselineCoordinate { .. })
+    ));
+    assert!(matches!(
+        BaselineCoordinate::try_new(
+            CsiPath::RawPathOrdinal(0),
+            CsiSampleCoordinate::OpaqueSampleOrdinal(0),
+            1,
             f64::NAN,
             0.0,
             1,
@@ -231,9 +242,11 @@ fn link_step_evidence_rejects_identity_coordinates_and_sequence_mismatches() {
     let other_link = RadioLinkId::new("other-link").expect("other link");
     let profile_id = profile(1);
     let link_profile = LinkProfileKey::new(link.clone(), profile_id);
-    let stream = StreamId::new(
+    let device_epoch =
+        DeviceEpoch::new(DeviceId::new(1), BootGeneration::try_new(1).expect("boot generation"));
+    let stream = StreamInstanceId::new(
         StreamKey::new(SensorId::new("sensor").expect("sensor"), link.clone(), profile_id),
-        HostEpoch::new(0),
+        device_epoch,
     );
     let base = |stream, link_profile, coordinates, scored, resulting| {
         LinkStepEvidence::try_new(
@@ -250,9 +263,9 @@ fn link_step_evidence_rejects_identity_coordinates_and_sequence_mismatches() {
         )
     };
 
-    let mismatched_stream = StreamId::new(
+    let mismatched_stream = StreamInstanceId::new(
         StreamKey::new(SensorId::new("sensor").expect("sensor"), other_link, profile_id),
-        HostEpoch::new(0),
+        device_epoch,
     );
     assert!(matches!(
         base(mismatched_stream, link_profile.clone(), Vec::new(), None, None),

@@ -4,17 +4,19 @@ use std::net::SocketAddr;
 
 use crate::domain::identity::SessionId;
 
-/// The transport family that supplied a captured datagram.
+/// The only transport family understood by the first native-frame decoder.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum WireFormat {
-    /// An ESP32 UDP datagram whose protocol magic is decoded by `esp32`.
-    Esp32Udp,
+    /// The authenticated native-frame UDP envelope.
+    NativeFrameUdp,
 }
 
-/// An immutable in-memory view of one authoritative received datagram.
+/// An immutable view of one datagram accepted by the capture boundary.
 ///
-/// Construction records all receive context supplied by the capture boundary. It
-/// deliberately does not open sockets, read clocks, perform I/O, or decode bytes.
+/// This type records receive context and exact encrypted bytes. It does not
+/// open sockets, read clocks, look up secrets, or decode the payload.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CapturedPacket {
     session_id: SessionId,
@@ -26,6 +28,7 @@ pub(crate) struct CapturedPacket {
     bytes: Box<[u8]>,
 }
 
+#[allow(dead_code)]
 impl CapturedPacket {
     /// Creates a packet from already captured receive context and owned bytes.
     #[must_use]
@@ -73,7 +76,7 @@ impl CapturedPacket {
         self.receive_utc_ns
     }
 
-    /// Returns the source peer address; route resolution intentionally ignores its port.
+    /// Returns the source peer address; route resolution ignores its port.
     #[must_use]
     pub(crate) const fn peer(&self) -> SocketAddr {
         self.peer
@@ -105,7 +108,7 @@ mod tests {
             123_456,
             -7,
             "192.0.2.10:5005".parse().expect("peer"),
-            WireFormat::Esp32Udp,
+            WireFormat::NativeFrameUdp,
             vec![1_u8, 2, 3].into_boxed_slice(),
         );
 
@@ -114,7 +117,7 @@ mod tests {
         assert_eq!(packet.receive_monotonic_ns(), 123_456);
         assert_eq!(packet.receive_utc_ns(), -7);
         assert_eq!(packet.peer(), "192.0.2.10:5005".parse().expect("peer"));
-        assert_eq!(packet.wire_format(), WireFormat::Esp32Udp);
+        assert_eq!(packet.wire_format(), WireFormat::NativeFrameUdp);
         assert_eq!(packet.bytes(), &[1, 2, 3]);
 
         let cloned = packet.clone();

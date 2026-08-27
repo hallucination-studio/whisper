@@ -10,6 +10,7 @@ license = "MIT"
 [workspace]
 
 [dependencies]
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 ciborium = "0.2.2"
 mimalloc = "0.1.48"
 serde = { version = "1.0.228", features = ["derive"] }

@@ -4,10 +4,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use ciborium::ser::into_writer;
+use ciborium::value::{CanonicalValue, Value};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::identity::{DecoderVersion, HardwareKind, RadioLinkId, SensorId, SessionId};
+use super::identity::{
+    DecoderVersion, DeviceEpoch, HardwareKind, RadioLinkId, SensorId, SessionId,
+};
 use super::time::{FrameTiming, TimeQuality};
 
 /// An error found while constructing a native CSI layout.
@@ -402,6 +405,10 @@ pub struct ProfileDescriptor {
     pub bandwidth_hz: Option<u64>,
     /// PPDU/PHY metadata, if known.
     pub ppdu: Option<PpduKind>,
+    /// Native secondary-channel placement: 0 none, 1 above, or 2 below.
+    pub secondary_channel: Option<u8>,
+    /// Native STBC fact, when the protocol supplies it.
+    pub stbc: Option<bool>,
     /// Native path/sample layout.
     pub layout: CsiLayout,
     /// Integer encoding and scale convention.
@@ -494,6 +501,18 @@ pub enum ProfileError {
     /// Scale numerator or denominator was zero.
     #[error("sample scale numerator and denominator must be positive")]
     InvalidScale,
+    /// A known channel was zero.
+    #[error("known profile channel must be non-zero")]
+    ZeroChannel,
+    /// A known centre frequency was zero.
+    #[error("known profile centre frequency must be non-zero")]
+    ZeroCentreFrequency,
+    /// A known bandwidth was zero.
+    #[error("known profile bandwidth must be non-zero")]
+    ZeroBandwidth,
+    /// A known secondary-channel placement was outside the native values.
+    #[error("known profile secondary channel {0} is outside 0..=2")]
+    InvalidSecondaryChannel(u8),
     /// A corrected timestamp profile omitted its clock domain.
     #[error("clock-corrected profile requires a clock domain")]
     MissingClockDomain,
@@ -832,7 +851,10 @@ pub(crate) struct CsiObservation {
     sensor: SensorId,
     hardware: HardwareKind,
     link: RadioLinkId,
-    device_sequence: u32,
+    device_epoch: DeviceEpoch,
+    capture_sequence: u64,
+    /// Callback delivery tick in the device boot clock, in microseconds.
+    callback_tick_us: u64,
     timing: FrameTiming,
     radio: RadioMetadata,
     profile: CaptureProfileId,
@@ -844,20 +866,34 @@ impl CsiObservation {
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
-        reason = "The envelope constructor mirrors its nine architecture-defined fields"
+        reason = "The envelope constructor mirrors its architecture-defined fields"
     )]
     pub(crate) fn new(
         input: InputReceipt,
         sensor: SensorId,
         hardware: HardwareKind,
         link: RadioLinkId,
-        device_sequence: u32,
+        device_epoch: DeviceEpoch,
+        capture_sequence: u64,
+        callback_tick_us: u64,
         timing: FrameTiming,
         radio: RadioMetadata,
         profile: CaptureProfileId,
         csi: CsiCapture,
     ) -> Self {
-        Self { input, sensor, hardware, link, device_sequence, timing, radio, profile, csi }
+        Self {
+            input,
+            sensor,
+            hardware,
+            link,
+            device_epoch,
+            capture_sequence,
+            callback_tick_us,
+            timing,
+            radio,
+            profile,
+            csi,
+        }
     }
 
     /// Returns the input receipt.
@@ -884,10 +920,22 @@ impl CsiObservation {
         &self.link
     }
 
-    /// Returns the device sequence number.
+    /// Returns the authenticated device epoch.
     #[must_use]
-    pub(crate) const fn device_sequence(&self) -> u32 {
-        self.device_sequence
+    pub(crate) const fn device_epoch(&self) -> DeviceEpoch {
+        self.device_epoch
+    }
+
+    /// Returns the source capture sequence number.
+    #[must_use]
+    pub(crate) const fn capture_sequence(&self) -> u64 {
+        self.capture_sequence
+    }
+
+    /// Returns the callback delivery tick in the device boot clock.
+    #[must_use]
+    pub(crate) const fn callback_tick_us(&self) -> u64 {
+        self.callback_tick_us
     }
 
     /// Returns the frame timing and provenance.
@@ -925,6 +973,20 @@ fn validate_profile_descriptor(descriptor: &ProfileDescriptor) -> Result<(), Pro
     if descriptor.capability_id.trim().is_empty() {
         return Err(ProfileError::EmptyField("capability_id"));
     }
+    if matches!(descriptor.channel, Some(0)) {
+        return Err(ProfileError::ZeroChannel);
+    }
+    if matches!(descriptor.centre_frequency_hz, Some(0)) {
+        return Err(ProfileError::ZeroCentreFrequency);
+    }
+    if matches!(descriptor.bandwidth_hz, Some(0)) {
+        return Err(ProfileError::ZeroBandwidth);
+    }
+    if let Some(channel) = descriptor.secondary_channel
+        && channel > 2
+    {
+        return Err(ProfileError::InvalidSecondaryChannel(channel));
+    }
     let _ = descriptor.layout.sample_count()?;
     match descriptor.time_quality {
         TimeQuality::ClockCorrected => match descriptor.clock_domain.as_deref() {
@@ -958,6 +1020,8 @@ struct CanonicalProfile<'a> {
     centre_frequency_hz: &'a Option<u64>,
     bandwidth_hz: &'a Option<u64>,
     ppdu: &'a Option<PpduKind>,
+    secondary_channel: &'a Option<u8>,
+    stbc: &'a Option<bool>,
     layout: &'a CsiLayout,
     encoding: &'a SampleEncoding,
     phase_state: &'a PhaseState,
@@ -977,21 +1041,86 @@ fn canonical_profile_bytes(descriptor: &ProfileDescriptor) -> Result<Vec<u8>, Pr
         centre_frequency_hz: &descriptor.centre_frequency_hz,
         bandwidth_hz: &descriptor.bandwidth_hz,
         ppdu: &descriptor.ppdu,
+        secondary_channel: &descriptor.secondary_channel,
+        stbc: &descriptor.stbc,
         layout: &descriptor.layout,
         encoding: &descriptor.encoding,
         phase_state: &descriptor.phase_state,
         time_quality: &descriptor.time_quality,
         clock_domain: &descriptor.clock_domain,
     };
+    let mut value = Value::serialized(&value)
+        .map_err(|error| ProfileError::CanonicalEncoding(error.to_string()))?;
+    canonicalize_value(&mut value);
     let mut bytes = Vec::new();
     into_writer(&value, &mut bytes)
         .map_err(|error| ProfileError::CanonicalEncoding(error.to_string()))?;
     Ok(bytes)
 }
 
+fn canonicalize_value(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(canonicalize_value),
+        Value::Map(entries) => {
+            entries.iter_mut().for_each(|(key, value)| {
+                canonicalize_value(key);
+                canonicalize_value(value);
+            });
+            entries.sort_by(|(left, _), (right, _)| {
+                CanonicalValue::from(left.clone()).cmp(&CanonicalValue::from(right.clone()))
+            });
+        }
+        Value::Tag(_, value) => canonicalize_value(value),
+        Value::Integer(_)
+        | Value::Bytes(_)
+        | Value::Float(_)
+        | Value::Text(_)
+        | Value::Bool(_)
+        | Value::Null => {}
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonicalize_value_sorts_nested_maps_by_rfc_key_order() {
+        let mut value = Value::Map(vec![
+            (
+                Value::Text("zz".into()),
+                Value::Map(vec![
+                    (Value::Text("bbb".into()), Value::Integer(3.into())),
+                    (Value::Text("a".into()), Value::Integer(1.into())),
+                ]),
+            ),
+            (Value::Text("a".into()), Value::Null),
+        ]);
+
+        canonicalize_value(&mut value);
+
+        let mut encoded = Vec::new();
+        into_writer(&value, &mut encoded).expect("canonical test value encodes");
+        assert_eq!(
+            encoded,
+            [
+                0xa2, 0x61, b'a', 0xf6, 0x62, b'z', b'z', 0xa2, 0x61, b'a', 0x01, 0x63, b'b', b'b',
+                b'b', 0x03,
+            ]
+        );
+
+        let Value::Map(entries) = value else {
+            panic!("expected map");
+        };
+        assert_eq!(entries[0].0.as_text(), Some("a"));
+        assert_eq!(entries[1].0.as_text(), Some("zz"));
+        let Value::Map(nested) = &entries[1].1 else {
+            panic!("expected nested map");
+        };
+        assert_eq!(nested[0].0.as_text(), Some("a"));
+        assert_eq!(nested[1].0.as_text(), Some("bbb"));
+    }
 
     fn test_profile() -> CaptureProfile {
         let layout = CsiLayout::try_new(
@@ -1015,6 +1144,8 @@ mod tests {
             centre_frequency_hz: None,
             bandwidth_hz: None,
             ppdu: None,
+            secondary_channel: None,
+            stbc: None,
             layout,
             encoding: SampleEncoding::try_new(8, 1, 1, ComplexOrder::RealImaginary)
                 .expect("valid encoding"),
