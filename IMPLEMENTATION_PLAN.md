@@ -1,6 +1,6 @@
 # 第一版本实现计划
 
-- 状态：用户已批准实现；工作包 1.1、1.2 PASS，工作包 1.3 进行中
+- 状态：用户已批准实现；工作包 1.1—1.3 PASS，工作包 2.1 进行中
 - 范围：事实内核、持久化与 replay、最小 RF World Model、查询与动态可视化
 - 执行者：每个工作包委托一个 `gpt-5.6-sol`、low reasoning 的写 Executor
 - 验收者：本线程；只审阅、运行检查、决定通过或退回，不直接修改实现
@@ -198,7 +198,7 @@ tests/fixtures/native-frame/**
 
 ### 工作包 1.3：自有 ESP-IDF firmware image
 
-前置：工作包 1.2 PASS。固定 profile 为 `esp32s3`、ESP32-S3-DevKitC-1-compatible、display-less 8 MB QSPI flash、无 PSRAM dependency，且唯一 build toolchain 是 `espressif/idf@sha256:f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb`（ESP-IDF v5.4）；host flasher 固定 `esptool==5.3.1`。在任何 `write_flash` 前，`python -m esptool --chip esp32s3 --port <port> chip-id` 和 `flash-id` 必须记录 ESP32-S3/8 MB；当前 CP2102N port 还未通过该 probe，故真实 build/flash/board gate 仍阻塞。首版不接受第二个 target、4 MB fallback、display profile 或 target abstraction。
+前置：工作包 1.2 PASS。固定 profile 为 `esp32s3`、ESP32-S3-DevKitC-1-compatible、display-less 8 MB QSPI flash、无 PSRAM dependency，且唯一 build toolchain 是 `espressif/idf@sha256:f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb`（ESP-IDF v5.4）；host flasher 固定 `esptool==5.3.1`。在任何 `write_flash` 前，`python -m esptool --chip esp32s3 --port <port> chip-id` 和 `flash-id` 必须记录 ESP32-S3/8 MB；当前 CP2102N port 已完成该 gate，后续每次提交态重刷仍须重新 probe。首版不接受第二个 target、4 MB fallback、display profile 或 target abstraction。
 
 所有权：
 
