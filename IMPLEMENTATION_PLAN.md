@@ -1,6 +1,7 @@
-# 第一版本实现计划
+# Whisper 第一版本实现计划
 
 - 状态：用户已批准实现；工作包 1.1—1.3 PASS，工作包 2.1 进行中
+- 项目身份：Rust package、library crate 与 binary 均为 `whisper`；checkout 目录保留 `world`
 - 范围：事实内核、持久化与 replay、最小 RF World Model、查询与动态可视化
 - 执行者：每个工作包委托一个 `gpt-5.6-sol`、low reasoning 的写 Executor
 - 验收者：本线程；只审阅、运行检查、决定通过或退回，不直接修改实现
@@ -14,7 +15,7 @@
 `ARCHITECTURE.md` 是本轮实现的受保护合同，当前 SHA-256 为：
 
 ```text
-093fc92ef506fa0c9248d403d7c7e668c89d6a85e06bf6dc1860bf8f962c7bd1
+89e4caa0a013b8c715615a116d553cbe9d930fad1fad15d3ae0fcf70ff721b9f
 ```
 
 每个执行工作包开始和结束时都必须运行：
@@ -63,7 +64,7 @@ UDP/session bytes
 
 ### 1.3 最小实现原则
 
-- 一个 Rust package，library + binary；不建 workspace。
+- 一个名为 `whisper` 的 Rust package，library + binary；不建 workspace，不保留 `world` package/crate/binary alias。
 - 默认使用具体类型和 `pub(crate)`；没有真实外部消费者时不稳定公共 SDK。
 - 一个 ingest owner 顺序拥有 `Timeline`、`BaselineEstimator` 和当前 `WorldSnapshot`。
 - 原始 datagram 是唯一事实源；不写第二份 decoded CSI 日志。
@@ -244,7 +245,7 @@ cargo doc --workspace --all-features --no-deps
 
 目标：先持久化 raw packet，再解码；session 可严格读取、检测损坏、恢复 crash tail，并从相同 bytes 重放。
 
-### 工作包 2.1：session container
+### 工作包 2.1：Whisper/config 边界与 session container
 
 前置：阶段一 PASS。
 
@@ -252,17 +253,29 @@ cargo doc --workspace --all-features --no-deps
 
 ```text
 src/session.rs
-src/lib.rs                 仅增加模块声明
-Cargo.toml                 只增加当前 session container 所需 CRC-32C/编码依赖
-Cargo.lock                 只接受上述依赖的机械更新
+src/config.rs              Config 根、ReplayConfig/RuntimeConfig 与唯一 replay-config codec
+src/wire.rs                只做 Config/ReplayConfig 签名和 decoder version 原子迁移
+src/main.rs                只做 whisper crate/binary 与 Config 原子迁移
+src/lib.rs                 模块声明、whisper crate docs 与 Config re-export
+Cargo.toml                 package 改名为 whisper；只增加 session 所需 CRC-32C/编码依赖
+Cargo.lock                 只接受 package 改名和上述依赖的机械更新
+firmware/esp32-native-frame/provision.py  只改临时目录的项目名前缀
+tests/config_validation.rs
+tests/fixtures/config/**   只把 effective-config canonical fixture 替换为 replay-config fixture
 tests/session_*.rs
 tests/fixtures/session/**
 ```
 
 实现：
 
+- 原子把 Rust package、library crate、binary、CLI 文案、项目名前缀临时文件和 decoder version 从 `world` 改为 `whisper`；checkout 目录、`WorldSnapshot`、RF World Model、`/api/world` 与 `domain/world.rs` 等领域名称不改；不保留 package/type/version compatibility alias；
+- 将 `EffectiveConfig` 原子改名为 `Config`，不保留旧 type alias；`parse_config` 仍是唯一 TOML 入口，一次构造只读 `Config { replay: ReplayConfig, runtime: RuntimeConfig }` 并完成跨 section 校验；raw TOML DTO 只留在 `config.rs`，低层模块只接收所需的具体子配置，不把整个 `Config` 当 service locator；
+- `ReplayConfig` 复用现有 `Deployment`、`WindowConfig`、`ConditioningConfig`、`QualityConfig`、`BaselineConfig` 和 `Registry`；`RuntimeConfig` 复用现有 capture/session/view/server/performance 配置，不复制字段体系；
+- 将现有 canonical bytes/digest 所有权从完整配置移到 `ReplayConfig`；`Config`/`RuntimeConfig` 不提供 digest，runtime-only 变化不得改变 `config_digest`；
+- `config.rs` 独占 `ReplayConfig` 的严格 named-field canonical CBOR encode/decode 与 SHA-256；decoder 使用与 TOML 路径相同的强类型构造和不变量校验，不给 invariant-bearing types 增加可绕过构造器的直接 `Deserialize`；
+- wire 不接收整个 `Config`：live datagram limit 由 app 从 `CaptureConfig` 显式传入，route/decode 只接收 `ReplayConfig` 中的 `Registry`；该签名迁移不改变已冻结 native-frame bytes 或拒绝分类；
 - file header、named-field CBOR manifest 和 length+CRC-32C record；
-- manifest 落盘创建 session 时已由现有 `parse_config` 验证通过的 `effective_config_toml` source；reader 必须复用同一个 `parse_config`，核对解析所得 canonical digest 与 `config_digest` 后才产生内存中的 `EffectiveConfig`；replay 不读取当前磁盘配置，TOML 不得包含 AES key；
+- manifest 直接嵌入创建 session 时同一个 `Config` 中的强类型 `ReplayConfig`；reader 只调用 `config.rs` 的严格 decoder，重新验证并核对 canonical digest 与 `config_digest` 后才产生 manifest；不落盘 TOML source/`RuntimeConfig`，replay 不读取当前磁盘配置，AES key 不进入 config/session；
 - `SessionRecord` 的 packet、baseline command、timeline advance、closed；
 - 严格 `record_seq`、monotonic `at`、schema、长度上限和 trailing data 校验；
 - writer append/flush/sync 与 `durable_through_record_seq`；
@@ -271,17 +284,19 @@ tests/fixtures/session/**
 - 最小 retention 只删除最旧的 closed/recovery-sealed session，永不删除 active session，不建数据库/refcount/artifact GC；
 - 使用标准库 advisory file lock；不建 sentinel、refcount database 或通用 object store；
 - manifest 不含 candidate/shadow/artifact 字段；第一版本不实现 artifact 导入、选择或 GC。
-- 不新增第二套 config parser 或通用 canonical-CBOR decoder，不修改 `src/config.rs`。
+- 不新增第二个配置根、模块私有 config parser、通用 canonical-CBOR/value decoder、全局配置 singleton 或 DI container。
 
 必测：
 
 - header/manifest/record 固定 bytes fixture；
-- config pin 的有效 TOML roundtrip、非法 TOML 拒绝、source/digest 不一致拒绝；build/decoder/conditioning/algorithm pin roundtrip；
+- `parse_config` 只构造 `Config`；semantic 配置变化改变 `ReplayConfig` digest，runtime-only 配置变化不改变它；canonical `ReplayConfig` roundtrip 保持强类型和值，unknown/malformed field 与不变量失败被拒绝；
+- session 的强类型 `ReplayConfig` roundtrip、config/digest 不一致拒绝，并证明 fixture 不含 TOML source、`RuntimeConfig`、secret root 或 AES key；build/decoder/conditioning/algorithm pin roundtrip；
 - 长度超限在分配前失败；
 - CRC-32C 中段损坏带 offset 失败；
 - 任意尾部截断只恢复完整前缀并标记 read-only；
 - record sequence 重复、跳号、倒退时间和 Closed 后 append 被拒绝；
 - sync/append 故障不产生可发布状态。
+- 全仓库不存在 `EffectiveConfig` 或 `world` package/crate/binary/decoder-version 残留；领域 `world` 名称不计入该扫描。
 
 ### 工作包 2.2：capture/replay 应用壳
 

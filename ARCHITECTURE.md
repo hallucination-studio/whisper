@@ -1,4 +1,4 @@
-# 持续学习时序 RF World Model 架构
+# Whisper：持续学习时序 RF World Model 架构
 
 - 状态：开发基线（Development Baseline）
 - 适用范围：本仓库
@@ -6,6 +6,8 @@
 - 已知后续采集端：Intel 5300 CSI
 
 本文档定义一套架构，不按 `v1`、`v2` 复制目录或分叉领域类型。“首个开发切片”只限制现在实现哪些能力，不建立一套将来需要推倒的临时架构。
+
+项目、Rust package、library crate 与 binary 的唯一名称分别为 `Whisper`/`whisper`；checkout 目录继续保留为 `world`，但它不是产品或兼容身份。`WorldSnapshot`、RF World Model、`/api/world` 和 `domain/world.rs` 中的 `world` 表示领域语义，不是旧项目名。代码、CLI、测试和 version string 不保留 `world` package/binary/brand alias。
 
 当前只延后以下 release/性能事项，不缩减本文定义的功能范围与验收：
 
@@ -167,7 +169,7 @@ src/
 │   ├── csi.rs             CsiLayout、CsiSampleAxis、CsiCapture
 │   └── world.rs           Knowledge、belief、snapshot、receipt
 ├── capture.rs             CapturedPacket；不打开 socket
-├── config.rs              TOML、EffectiveConfig、Registry、全量校验
+├── config.rs              TOML、Config、ReplayConfig/RuntimeConfig、Registry、全量校验
 ├── wire.rs                唯一 native-frame dispatcher、校验与 resolver
 ├── session.rs             append/read/recovery/container
 ├── timeline.rs            sequence、profile、epoch、watermark、window
@@ -193,14 +195,14 @@ domain         pure value/hash/serialization support only; no runtime or I/O
 capture        domain
 config         domain
 wire           capture + config + domain
-session        capture + domain
-timeline       domain
-conditioning   domain + timeline
-estimator      domain + conditioning
+session        capture + config + domain
+timeline       config + domain
+conditioning   config + domain + timeline
+estimator      config + domain + conditioning
 candidate      domain; frozen encoder 到来后才加 conditioning
 engine         domain + timeline + conditioning + estimator
-view           domain
-server         domain + view
+view           config + domain
+server         config + domain + view
 app            all modules above; composition only
 main           app
 ```
@@ -208,6 +210,8 @@ main           app
 强制规则：
 
 - `domain` 不依赖 Tokio、HTTP、文件、ESP32、神经模型 backend 或 UI。
+- `config` 是唯一配置 schema、解析、持久化 codec 与全量校验 owner；其它模块不解析 TOML、不定义平行 raw config，也不从全局变量读取配置。
+- `app` 只调用一次 `parse_config`，再把具体模块所需的 `ReplayConfig`/`RuntimeConfig` 子配置显式传入；低层模块不接收整个 `Config` 作为 service locator。
 - `wire` 不拥有 socket、文件、密钥持久化或世界状态；同一 wire schema 只有一个 decoder。`app` 在 session append 前拥有固定 header、peer allowlist、AEAD 和 replay admission。
 - `timeline`、`conditioning`、`estimator` 不读取系统时钟、网络、配置文件或全局变量。
 - `estimator` 不依赖 `server`、`view`、`session` 或 ESP32 wire 类型。
@@ -220,7 +224,7 @@ main           app
 
 Intel 5300 真正接入后先增加具体 decoder 和一个小 enum dispatcher。只有两个真实实现暴露出相同变化轴时，才从重复代码中抽 trait。
 
-## 5. 身份、拓扑与有效配置
+## 5. 身份、拓扑与配置
 
 ### 5.1 稳定 ID
 
@@ -271,34 +275,43 @@ struct RadioLink {
 - inference-eligible route 必须同时匹配 provisioned `device_id`、expected peer、认证 key epoch 和 link 的 `expected_transmitter_mac`。固件 Wi-Fi filter 只是减少无关 capture；host 必须再次检查 payload 中的 driver-reported MAC。没有该证据的 frame 为 `UnresolvedSource`，不能伪造稳定 link。
 - packet/profile 的实测 channel、bandwidth、PHY/LTF facts 必须满足 link 的 `channel_policy` 和 route capability，否则 `RouteRadioMismatch`；channel hopping 仍可形成多个 profile，而不是改变物理 link 身份。
 
-### 5.4 配置是 session 的输入
+### 5.4 `Config` 是唯一配置根
 
-TOML 至少定义：
+`config.rs::parse_config` 是 TOML 的唯一解析入口，一次完成字段校验、强类型构造和跨 section 校验，返回不可变的 `Config`。TOML DTO 只在 `config.rs` 内部存在；其它模块复用下面的强类型，不得各自定义配置结构或 parser：
 
-```text
-deployment id
-capture bind, max_datagram_bytes, socket_buffer_bytes,
-        max_ingress_packets_per_second, max_authenticated_bytes_per_second
-control capability_announce_period, health_report_period
-session directory, retention, flush policy
-secret_root path (not key bytes)
-window width, step, allowed_lateness, inactive_after
-sequence reorder_horizon, replay_window_packets
-conditioning recipe and amplitude scale
-quality minimum_frames, coverage, gap, jitter, time_quality
-baseline learning minimum_windows/minimum_valid_exposure, EW time_constant
-baseline update gate, stale_after, stable/change thresholds
-performance capture max_rss, snapshot_deadline, thread limits
-spaces[]
-transmitters[]
-sensors[]: id, hardware_kind, device_id, expected_peer_ip, firmware build digest,
-           key epoch, native-frame capability digest, maximum frame/plaintext bytes
-links[]: id, space, transmitter, receiver, expected_transmitter_mac, channel policy
-routes[]: exact peer/device/link resolution, peak_packets_per_second,
-          maximum_valid_datagram_bytes, authenticated byte/rate budgets
+```rust
+struct Config {
+    replay: ReplayConfig,
+    runtime: RuntimeConfig,
+}
+
+struct ReplayConfig {
+    deployment: Deployment,
+    window: WindowConfig,
+    conditioning: ConditioningConfig,
+    quality: QualityConfig,
+    baseline: BaselineConfig,
+    registry: Registry,
+}
+
+struct RuntimeConfig {
+    capture: CaptureConfig,
+    session: SessionConfig,
+    view: ViewConfig,
+    server: ServerConfig,
+    performance: PerformanceConfig,
+}
 ```
 
-每条 route 的 peak、最大 plaintext/datagram bytes 和 admission byte/rate budget 必须来自固件配置或实机观测再留明确余量，`maximum_valid_datagram_bytes <= max_datagram_bytes`，且 capability 的最大 CSI body 必须装入一个 UDP datagram。所有非显然数值都使用带单位的名称，并记录来源与改动影响。运行中不热更新影响推理的配置、key epoch 或 route；修改后开启新 session。`EffectiveConfig` 的完整快照和 digest 写入 manifest，明文 key 永不写入 config 或 session。
+`ReplayConfig` 只包含能够改变 typed decode、link identity、timeline、conditioning、quality 或 baseline/aggregation 结果的配置；它是 live 与 replay 共享的语义合同。`RuntimeConfig` 只包含 socket/buffer、secret root path、session 目录/retention/flush、HTTP/WS/view 和资源预算；它决定进程如何运行，但不改变相同 session records 的语义结果。`parse_config` 仍负责两部分之间的约束，例如 route datagram 上限不得超过 capture 上限；分组不能削弱全量校验。
+
+完整 `Config` 不持久化，也不拥有 canonical bytes/digest；`config_digest` 专指 `ReplayConfig` 的内容身份，因此只改 bind、目录、retention、UI 或资源预算不会改变 replay identity。
+
+模块只借用实际需要的 section，例如 wire 使用 `Registry`，live datagram 上限由 app 从 `CaptureConfig` 作为显式数值传入，timeline 使用 `WindowConfig`，estimator 使用 `QualityConfig`/`BaselineConfig`，server 使用 `ServerConfig`/`ViewConfig`。不建立全局 singleton、DI container 或第二个配置根。运行中不热更新 `ReplayConfig`、key epoch 或 route；修改后开启新 session。
+
+`config.rs` 独占 `ReplayConfig` 的严格 named-field canonical CBOR codec；解码必须通过同一组强类型构造与不变量校验，不能给 invariant-bearing type 直接派生可绕过构造器的反序列化，也不建立通用 config/value decoder。session manifest 直接嵌入 `ReplayConfig` 和其 canonical SHA-256；不保存 TOML source 或 `RuntimeConfig`，replay 不读取当前磁盘配置。明文 AES key 永不进入 TOML、`Config` 或 session。
+
+每条 route 的 peak、最大 plaintext/datagram bytes 和 admission byte/rate budget 必须来自固件配置或实机观测再留明确余量，`maximum_valid_datagram_bytes <= max_datagram_bytes`，且 capability 的最大 CSI body 必须装入一个 UDP datagram。所有非显然数值都使用带单位的名称，并记录来源与改动影响。
 
 ## 6. 字节事实源与 session 契约
 
@@ -340,8 +353,8 @@ record*
 struct SessionManifest {
     session_id: SessionId,
     started_utc_ns: i64,
-    effective_config_toml: Box<str>,
-    config_digest: [u8; 32],
+    replay_config: ReplayConfig,
+    config_digest: [u8; 32],             // ReplayConfig canonical digest
     application_version: String,
     build_fingerprint: [u8; 32],
     decoder_version: String,
@@ -386,11 +399,11 @@ struct TargetedBaselineCommand {
 }
 ```
 
-`effective_config_toml` 是创建 session 时已由现有 `parse_config` 验证通过的 TOML source。reader 必须重新调用同一个 `parse_config`，并在产生内存中的 `EffectiveConfig` 前核对其 canonical digest 与 `config_digest` 一致。replay 不读取磁盘上的当前配置；该 TOML 只保存非秘密配置，不得包含 AES key。
+`replay_config` 是创建 session 时从同一个 `Config` 取得的强类型值，不是 session 自己定义的 DTO。reader 必须调用 `config.rs` 的唯一严格 decoder，重新验证并核对 canonical digest 与 `config_digest` 后才产生 manifest；非法字段、不变量失败或 digest 不一致均拒绝。session 模块不解析 TOML，也不持久化 `RuntimeConfig`。
 
 `CapturedPacket` 是 decoder 使用的完整内存 view，由 record envelope + `Packet` body 组合，不在磁盘中重复序列化 total order/time。reader 必须验证 `record_seq` 从 0 开始严格递增且唯一，`at` 不倒退。
 
-CBOR 使用 named fields 和严格 schema；不能依赖 Rust enum 的偶然内存布局。`config_digest`/`build_fingerprint` 对各自 canonical bytes 取 SHA-256，并随 fixed fixtures 测试；digest 用于内容身份，不替代 CRC-32C 的磁盘损坏检测或 AEAD 的网络认证。session CRC 固定为 CRC-32C/Castagnoli（reflected polynomial `0x82F63B78`，init/xorout `0xffff_ffff`，`"123456789" -> 0xe3069283`），little-endian 写入，覆盖对应 manifest/body bytes。`wire_admission` pin 是 replay 所需的非秘密设备/build/capability 事实，明文 key 只在独立 secret store 中按 device/key epoch 保留。首个切片只读写当前 container version；第二个真实 container 版本出现后才写迁移器，不为 candidate 或 artifact 预留字段。
+CBOR 使用 named fields 和严格 schema；不能依赖 Rust enum 的偶然内存布局。`config_digest` 是 `ReplayConfig` canonical bytes 的 SHA-256，`build_fingerprint` 对 executable canonical bytes 取 SHA-256，两者随 fixed fixtures 测试；digest 用于内容身份，不替代 CRC-32C 的磁盘损坏检测或 AEAD 的网络认证。session CRC 固定为 CRC-32C/Castagnoli（reflected polynomial `0x82F63B78`，init/xorout `0xffff_ffff`，`"123456789" -> 0xe3069283`），little-endian 写入，覆盖对应 manifest/body bytes。`wire_admission` pin 是 replay 所需的非秘密设备/build/capability 事实，明文 key 只在独立 secret store 中按 device/key epoch 保留。首个切片只读写当前 container version；第二个真实 container 版本出现后才写迁移器，不为 candidate 或 artifact 预留字段。
 
 ### 6.3 写入、恢复与保留
 
@@ -424,7 +437,7 @@ session 同时配置 `max_session_duration` 和 `max_session_bytes`。达到任�
 
 ### 6.4 faithful replay
 
-首个切片只实现 `faithful replay`。manifest 的 build fingerprint、wire admission pin、decoder、conditioning 和 algorithm 必须与当前 executable 完全匹配，且 secret store 中必须仍可取得对应 device/key epoch 的 replay key；任一项不匹配就拒绝，并提示使用原 build/key retention policy，不能靠字符串 registry 假装旧实现仍存在。
+首个切片只实现 `faithful replay`。manifest 的 `ReplayConfig` digest、build fingerprint、wire admission pin、decoder、conditioning 和 algorithm 必须与当前 executable 完全匹配，且 secret store 中必须仍可取得对应 device/key epoch 的 replay key；任一项不匹配就拒绝，并提示使用原 build/key retention policy，不能靠字符串 registry 假装旧实现仍存在。
 
 未来若确有 parser 修复或研究需要，可增加显式 `reinterpret`，用新的输出 namespace 重新解释旧 bytes；它不得声称是原 session 的相同结论，也不属于首个 CLI。
 
@@ -1384,10 +1397,10 @@ live EngineOutput -> bounded shadow queue -> candidate diagnostics
 这是一条从事实日志向 candidate 的单向旁路；candidate 不回调、不持锁、不阻塞 Engine。
 
 ```text
-world learn-ar1 <closed sessions...>
-world evaluate-candidate <candidate> <holdout sessions...>
-world select-shadow <candidate> <evaluation-report>
-world rollback-shadow <previous-candidate> <its-evaluation-report>
+whisper learn-ar1 <closed sessions...>
+whisper evaluate-candidate <candidate> <holdout sessions...>
+whisper select-shadow <candidate> <evaluation-report>
+whisper rollback-shadow <previous-candidate> <its-evaluation-report>
 ```
 
 - `learn-ar1` 只读取正常关闭或 recovery-sealed 的 immutable session，并复用 replay 的 decoder、timeline、conditioning 和 pinned baseline decision；不能订阅 live mutable window。
