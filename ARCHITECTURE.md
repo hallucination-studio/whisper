@@ -26,7 +26,7 @@
 
 - 至少两个 authenticated ESP32 route 的真实 captured datagram fixtures/corpus 能同窗进入，并证明设备、链路和 baseline 隔离；当前可用真实开发板完成 live smoke，多物理板长期同步运行只属于后续 soak/release gate；
 - 同一时刻存在不同 CSI 布局时原样保存、独立建模和并列显示；
-- 字节级 session 记录、确定性 replay 和损坏检测；
+- SQLite 中字节级 session 记录、确定性 replay 和严格 schema 校验；
 - 原生坐标 CSI、sequence/缺口/时间质量诊断；
 - 每条链路的预测、deviation、RF dynamics 和受门控 baseline；
 - 多链路到房间级 `Stable | Changing | Unknown(reason)` 的保守聚合；
@@ -41,7 +41,7 @@
 - 相干相位融合、ToF、AoA 或三维重建；
 - Intel 5300 的真实采集实现；
 - foundation model、采集进程内训练神经网络主干、在线改写生产权重或自动模型晋升；
-- 数据库、微服务、插件、数字孪生或 Three.js 场景。
+- 外部数据库服务、第二事实库、ORM、微服务、插件、数字孪生或 Three.js 场景。
 
 最小内核的“持续学习”特指：在明确生命周期和污染门控下，持续更新部署现场的统计 baseline。后续神经路径仍使用同一事实与评估合同：GPU 只离线训练 RF 预训练模型并产出不可变 artifact；部署 CPU 只运行已通过效果、资源和回放门禁的部署模型。预训练模型、部署模型和生产 baseline 共享动态坐标的 forecast/evidence 语义，不要求共享 latent shape、runtime 或权重，也不在 live session 内改写当前生产状态或权重。
 
@@ -75,7 +75,7 @@ CapturedPacket                         authoritative
                  └── WorldSnapshot    algorithm-versioned
 ```
 
-不再永久保存一份重复的 decoded-frame 日志。若需要查询速度，可以建可删除的 cache；cache 不是事实源。
+同一 SQLite 数据库可保存由 raw records 确定性重建的 typed query projections；它们不是第二事实源。禁止第二个 authoritative decoded-frame log、数据库或文件。
 
 ### 2.2 没有 canonical RF tensor
 
@@ -90,7 +90,7 @@ CSI 描述 transmitter 到 receiver 的传播链路。进入统计估计或神�
 ### 2.4 未知不是错误，错误也不是未知
 
 - 数据不足、baseline 未就绪、时间质量不足或覆盖不足产生 `Unknown(reason)`。
-- 认证/重放/入站预算失败、malformed packet、配置冲突、CRC-32C 损坏和存储失败产生分类错误与健康指标。
+- 认证/重放/入站预算失败、malformed packet、配置冲突、SQLite schema/事务失败产生分类错误与健康指标。
 - 禁止把解析失败包装成一个“UNKNOWN observation”送入统计估计或神经推理路径。
 
 ### 2.5 时间、坐标、质量和来源不能隐式丢失
@@ -103,22 +103,21 @@ CSI 描述 transmitter 到 receiver 的传播链路。进入统计估计或神�
 
 ### 2.7 一个顺序写入者拥有世界状态
 
-`Timeline`、`BaselineEstimator` 和当前 `WorldSnapshot` 只由 ingest task 顺序拥有，不放进全局共享写锁。HTTP、WebSocket 和 UI 只能读取 immutable view 或提交有序 command。
+`Timeline`、`BaselineEstimator` 和当前 `WorldSnapshot` 只由 ingest task 顺序拥有，不放进全局共享写锁。HTTP、WebSocket 和 UI 只能读取 committed immutable SQLite projection rows/DTOs 或提交有序 command。
 
 ## 3. 端到端数据流
 
 ```text
-UDP socket / session reader
+UDP socket / SQLite session reader
           │
           ▼
-size + peer + route + AEAD + replay admission
+size + peer + route + exact key + AEAD + rate/byte admission
           │
           ├── reject -> bounded IngressHealth only
           ▼
-CapturedPacket + total record order
+SQLite transaction: replay admission + exact SessionRecord
           │
-          ├── append session ─────────────────────────────┐
-          │       append 成功才继续                        │
+          ├── commit 成功后构造 CapturedPacket ───────────┐
           ▼                                                │ replay
 single native-frame dispatcher                              │
           │                                                │
@@ -143,10 +142,10 @@ link beliefs -> conservative space aggregation             │
           ▼                                                │
 immutable WorldSnapshot                                    │
           │                                                │
-          ├── bounded recent read store -> HTTP queries    │
+          ├── same-DB typed projections -> indexed queries │
           └── latest/delta notification -> WebSocket       │
                                                            │
-session reader ───────── same decoder and Engine path ─────┘
+SQLite ordered rows ───── same decoder and Engine path ────┘
 ```
 
 协议、时序、conditioning、统计估计和世界聚合是同步的普通函数/具体类型。首个切片不在每层之间放 actor 或消息总线。
@@ -171,7 +170,8 @@ src/
 ├── capture.rs             CapturedPacket；不打开 socket
 ├── config.rs              TOML、Config、ReplayConfig/RuntimeConfig、Registry、全量校验
 ├── wire.rs                唯一 native-frame dispatcher、校验与 resolver
-├── session.rs             append/read/recovery/container
+├── session.rs             SessionManifest/SessionRecord strong types、replay contracts
+├── database.rs            concrete SQLite schema/transactions/queries/retention
 ├── timeline.rs            sequence、profile、epoch、watermark、window
 ├── conditioning.rs        可审计的原生坐标特征
 ├── estimator.rs           baseline predictor、gate、space aggregation
@@ -196,13 +196,14 @@ capture        domain
 config         domain
 wire           capture + config + domain
 session        capture + config + domain
+database       capture + config + domain + session
 timeline       config + domain
 conditioning   config + domain + timeline
 estimator      config + domain + conditioning
 candidate      domain; frozen encoder 到来后才加 conditioning
 engine         domain + timeline + conditioning + estimator
-view           config + domain
-server         config + domain + view
+view           config + database + domain
+server         config + database + domain + view
 app            all modules above; composition only
 main           app
 ```
@@ -212,15 +213,16 @@ main           app
 - `domain` 不依赖 Tokio、HTTP、文件、ESP32、神经模型 backend 或 UI。
 - `config` 是唯一配置 schema、解析、持久化 codec 与全量校验 owner；其它模块不解析 TOML、不定义平行 raw config，也不从全局变量读取配置。
 - `app` 只调用一次 `parse_config`，再把具体模块所需的 `ReplayConfig`/`RuntimeConfig` 子配置显式传入；低层模块不接收整个 `Config` 作为 service locator。
-- `wire` 不拥有 socket、文件、密钥持久化或世界状态；同一 wire schema 只有一个 decoder。`app` 在 session append 前拥有固定 header、peer allowlist、AEAD 和 replay admission。
+- `wire` 不拥有 socket、数据库、密钥持久化或世界状态；同一 wire schema 只有一个 decoder。`app` 在 SQLite 事务前拥有 size/header、peer allowlist、exact key lookup、AEAD 和 rate/byte admission；`database` 在同一事务内拥有 durable anti-replay admission 与 raw record insert。
 - `timeline`、`conditioning`、`estimator` 不读取系统时钟、网络、配置文件或全局变量。
 - `estimator` 不依赖 `server`、`view`、`session` 或 ESP32 wire 类型。
 - future candidate 代码不读取 socket 或生产 Engine；经过独立批准后，它只从 sealed-session faithful replay 的 `LinkStepEvidence` 私有派生输入，app 不得重算。未来 frozen encoder 也不能改变 V1 EngineOutput 或让 app 自行重算。
-- `server` 不持有 `&mut Engine`，只能查询 read store 或发送 command。
+- `server` 不持有 `&mut Engine`，只能执行 bounded indexed SQLite projection queries 或发送 command。
 - `app` 只组合和治理生命周期，不复制领域计算。
+- `database` 直接使用 `rusqlite`，不定义 storage/repository/provider trait、ORM 或通用 migration/checkpoint framework。
 - 模块间使用具体类型；首个切片没有 `FrameDecoder`、`WorldModel`、`StorageBackend`、`ViewProjector`、`Clock` trait、registry factory 或 DI container。
 
-箭头含义为“左侧依赖右侧”。`AlignedWindow` 只能先经过 `condition`，`BaselineEstimator` 不接收 raw window。若 view 需要近期数据，由 app 把 read-store snapshot 作为参数传入；`view` 不反向读取 session 或 Engine。
+箭头含义为“左侧依赖右侧”。`AlignedWindow` 只能先经过 `condition`，`BaselineEstimator` 不接收 raw window。view 只从 `database` 的 concrete bounded query functions 取得 committed projections；它不读取 Engine working state，也不重新解释 raw records。
 
 Intel 5300 真正接入后先增加具体 decoder 和一个小 enum dispatcher。只有两个真实实现暴露出相同变化轴时，才从重复代码中抽 trait。
 
@@ -303,9 +305,9 @@ struct RuntimeConfig {
 }
 ```
 
-`ReplayConfig` 只包含能够改变 typed decode、link identity、timeline、conditioning、quality 或 baseline/aggregation 结果的配置；它是 live 与 replay 共享的语义合同。`RuntimeConfig` 只包含 socket/buffer、secret root path、session 目录/retention/flush、HTTP/WS/view 和资源预算；它决定进程如何运行，但不改变相同 session records 的语义结果。`parse_config` 仍负责两部分之间的约束，例如 route datagram 上限不得超过 capture 上限；分组不能削弱全量校验。
+`ReplayConfig` 只包含能够改变 typed decode、link identity、timeline、conditioning、quality 或 baseline/aggregation 结果的配置；它是 live 与 replay 共享的语义合同。`RuntimeConfig` 只包含 socket/buffer、secret root path、`SessionConfig.database_path`、retention、HTTP/WS/view 和资源预算；数据库路径是一个明确的 SQLite 文件路径，不是目录且没有旧字段 alias。它决定进程如何运行，但不改变相同 session records 的语义结果。`parse_config` 仍负责两部分之间的约束，例如 route datagram 上限不得超过 capture 上限；分组不能削弱全量校验。
 
-完整 `Config` 不持久化，也不拥有 canonical bytes/digest；`config_digest` 专指 `ReplayConfig` 的内容身份，因此只改 bind、目录、retention、UI 或资源预算不会改变 replay identity。
+完整 `Config` 不持久化，也不拥有 canonical bytes/digest；`config_digest` 专指 `ReplayConfig` 的内容身份，因此只改 bind、数据库路径、retention、UI 或资源预算不会改变 replay identity。
 
 模块只借用实际需要的 section，例如 wire 使用 `Registry`，live datagram 上限由 app 从 `CaptureConfig` 作为显式数值传入，timeline 使用 `WindowConfig`，estimator 使用 `QualityConfig`/`BaselineConfig`，server 使用 `ServerConfig`/`ViewConfig`。不建立全局 singleton、DI container 或第二个配置根。运行中不热更新 `ReplayConfig`、key epoch 或 route；修改后开启新 session。
 
@@ -331,23 +333,47 @@ struct CapturedPacket {
 
 `CapturedPacket` 只能由通过 peer/route/AEAD/replay admission 的输入构造；decrypted body 只在内存中交给 decoder，不再写第二份。`record_seq` 是 packet 和 control command 共用的 session 总序。monotonic time 负责排序与窗口，UTC 不能参与核心顺序。
 
-### 6.2 容器格式
+### 6.2 SQLite schema v1
 
-首个切片固定一个简单容器，不引入数据库或通用对象仓库：
+Embedded SQLite is the sole authoritative host persistence system. `database.rs` uses `rusqlite` directly; `session.rs` owns the strong manifest/record/replay contracts. There is no ORM, repository/provider trait, generic migration framework, second fact store, or external database service. The existing single ingest owner owns the one synchronous writer connection. Stage four HTTP queries may open bounded read-only connections against the same WAL database; there is no pool/actor abstraction, and synchronous DB work runs off async runtime/ingest execution. Every connection verifies `foreign_keys=ON` and schema version `1`; the writer also enables/verifies WAL and `synchronous=FULL`.
+
+The minimal schema has exactly these responsibilities:
 
 ```text
-file header
-├── magic: "RFWSESS\0"
-├── container_version: u16 little-endian
-├── manifest_len: u32 little-endian
-├── manifest_crc32c: u32 little-endian
-└── manifest: named-field CBOR
+admission_epochs
+  PRIMARY KEY (device_id, key_epoch)
+  replay_window_identity, replay_window_size
+  highest_boot_generation NULL, maximum_message_sequence NULL, seen_bitmap
 
-record*
-├── body_len: u32 little-endian
-├── body_crc32c: u32 little-endian
-└── body: named-field CBOR SessionRecord
+sessions
+  PRIMARY KEY (session_id)
+  started_utc_ns, manifest_cbor, lifecycle, sealed_utc_ns NULL
+
+session_records
+  PRIMARY KEY (session_id, record_seq)
+  session_time, kind, body_cbor
+  FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+
+csi_observations
+  PRIMARY KEY (session_id, record_seq)
+  session_time, sensor_id, link_id, profile_id, observation_cbor, version receipts
+
+world_snapshots
+  PRIMARY KEY (session_id, snapshot_id)
+  interval, snapshot_cbor, source record range, version receipts
+
+snapshot_link_evidence
+  PRIMARY KEY (session_id, snapshot_id, link_id, profile_id)
+  evidence_cbor, source record range, version receipts
+
+baseline_projections
+  PRIMARY KEY (deployment_id, link_id, profile_id)
+  lifecycle/snapshot_cbor, source session/record, version receipts
 ```
+
+`device_id`、`record_seq`、session time、boot generation 和 message sequence 的完整 unsigned domain 必须保留；超出 SQLite signed `INTEGER` 的值使用固定宽度 canonical big-endian bytes 和 schema constraints，不得窄化、reinterpret cast 或按有符号值排序。`seen_bitmap` 长度由已配置且有界的 replay-window size 决定。
+
+Raw `session_records` are the sole authority. Projection tables contain strict typed CBOR rather than one row per CSI coordinate; each row carries source session/record receipts and decoder/conditioning/algorithm/config versions. They are deletable and deterministically rebuildable by faithful replay. They are not viewport tiles, multiresolution caches, WebSocket state, metrics, or a generic event/value store. Indexes cover the specified bounded API access paths: session/record/time/sensor/link/profile and snapshot/baseline identity.
 
 ```rust
 struct SessionManifest {
@@ -403,41 +429,28 @@ struct TargetedBaselineCommand {
 
 `CapturedPacket` 是 decoder 使用的完整内存 view，由 record envelope + `Packet` body 组合，不在磁盘中重复序列化 total order/time。reader 必须验证 `record_seq` 从 0 开始严格递增且唯一，`at` 不倒退。
 
-CBOR 使用 named fields 和严格 schema；不能依赖 Rust enum 的偶然内存布局。`config_digest` 是 `ReplayConfig` canonical bytes 的 SHA-256，`build_fingerprint` 对 executable canonical bytes 取 SHA-256，两者随 fixed fixtures 测试；digest 用于内容身份，不替代 CRC-32C 的磁盘损坏检测或 AEAD 的网络认证。session CRC 固定为 CRC-32C/Castagnoli（reflected polynomial `0x82F63B78`，init/xorout `0xffff_ffff`，`"123456789" -> 0xe3069283`），little-endian 写入，覆盖对应 manifest/body bytes。`wire_admission` pin 是 replay 所需的非秘密设备/build/capability 事实，明文 key 只在独立 secret store 中按 device/key epoch 保留。首个切片只读写当前 container version；第二个真实 container 版本出现后才写迁移器，不为 candidate 或 artifact 预留字段。
+manifest 和 record body 使用 named-field canonical CBOR 与严格 schema；不能依赖 Rust enum 的偶然内存布局。`config_digest` 是 `ReplayConfig` canonical bytes 的 SHA-256，`build_fingerprint` 对 executable canonical bytes 取 SHA-256，两者以行为测试验证。`wire_admission` pin 是 replay 所需的非秘密设备/build/capability 事实，明文 key 只在独立 secret store 中按 device/key epoch 保留。首个切片只接受 schema version 1，不实现迁移器，也不为 candidate 或 artifact 预留字段。
 
-### 6.3 写入、恢复与保留
+### 6.3 事务、恢复、provisioning 与保留
 
-```text
-data_root/
-├── sessions/
-├── state/admission.cbor
-├── state/current-baseline.cbor
-└── locks/runtime.lock
-```
+`capture`/`replay` 只打开已存在且正确初始化的数据库；文件缺失、SQLite 损坏、schema/version/pragma 不符或任一 configured epoch row 缺失都 fail closed。capture 不自动 create、reset 或 repair。进程仍持有现有 OS advisory exclusive runtime lock；获取失败明确拒绝。
 
-`capture` 从读取 current baseline 到创建 session manifest 始终持有同一个 OS advisory exclusive lock；写入 baseline snapshot、rotation 和 retention 也由同一进程顺序执行。获取失败就明确拒绝，不使用会遗留 stale 状态的 create/delete sentinel。出现真实的并发读写需求后，才设计 shared lock 或 session lease。
+- size、fixed header、peer、`HeaderRoute`、exact key lookup、AEAD 和 per-route rate/byte budget 在数据库 mutation 前完成。通过 AEAD 后，一个 `BEGIN IMMEDIATE` transaction 读取并验证匹配的 `admission_epochs` row，在有界窗口中拒绝 replay 或推进 boot/message window，插入包含 exact encrypted bytes、peer、record/time 的 `SessionRecord`，然后 commit。只有 commit 成功后才 decode cleartext 或推进 Engine。事务失败既不改变 durable admission，也不改变 Engine。
+- raw transaction commit 后才 decode/advance Engine。随后 transaction B 原子写入该 output 的 `CsiObservation`、`WorldSnapshot`、per-link evidence 和 baseline projection 变化及 source/version receipts；API 只暴露 committed projection rows。projection transaction 失败时在任何发布/WS notification 前停止 capture。crash 后从 active session 的 ordered raw rows 确定性重建 Engine working state 和 projections，不依赖只存在内存的 cursor，也不增加通用 checkpoint framework。
+- unknown peer/version/key、bad tag、replay 或 budget reject 不写 raw。authenticated unknown kind、malformed/unsupported body 或 source/radio mismatch 在事务中先 durable raw，再作为 decode reject，绝不进入 timeline/estimator。
+- `BeginLearning`、`Commit`、`Freeze`、`Resume`、`ActivateSnapshot` 和 `TimelineAdvance` 都先在各自事务中插入 ordered record 并 commit，再执行。`ActivateSnapshot` 完整嵌入不可变 baseline snapshot。
+- `whisper init-admission <config> <device-id> <key-epoch>` 是唯一 host 初始化入口：数据库不存在时创建 schema v1；随后插入与配置 replay-window identity/size 精确匹配、boot/sequence 为空且 bitmap 为空的新 epoch row。完全相同且仍为空的 retry 可幂等成功；任何已推进或冲突 row 都拒绝 reset。现有 firmware `provision.py` 在 durable key 写入且 board provisioning 验证成功后调用此命令。
+- SQLite transaction rollback replaces torn-tail/CRC recovery。启动把任何 non-sealed prior session 都视为 incomplete，包括 raw tail 已是 `Closed` 的 session：按 ordered raw rows faithful replay，重建缺失 projections/Engine working state，在 durable tail 确定性 finish，然后在一个 transaction 中写入 final projections/baseline handoff 并标记 recovery-sealed；完成后才创建 next session。它不扫描 packet bytes 重建 admission，也不增加 checkpoint framework。
+- graceful shutdown/rotation 的 transaction A 只插入 `Closed`，不改变 lifecycle；`Closed` 使 raw record stream 立即 non-appendable。随后 `Engine::finish`；final transaction B 原子写 final observation/snapshot/evidence/baseline projections 并将 lifecycle 改为 sealed。rotation 还在同一 transaction B 中用该 baseline handoff 创建 next session manifest。seal 永不领先 final projections/handoff。
+- retention 在单个事务中只删除最旧 sealed session 及其 FK-owned records，永不删除 active session；`admission_epochs` 永不参与 retention。SQLite 可复用 free pages；热路径不运行 `VACUUM`，不建立 GC framework。
 
-- 只有通过 fixed-header、peer、`HeaderRoute`、AEAD、anti-replay、payload-size 和 per-peer/per-device rate admission 的 packet 才可创建 `CapturedPacket`；其 exact encrypted bytes 必须 append 成功、由 writer 接管后才能 decode 和改变世界状态。未通过 admission 的 traffic 只更新内存中有界、按原因聚合的 health counters。
-- `state/admission.cbor` 是非秘密、有界 replay checkpoint：每个已登记 `(device_id, key_epoch)` 只保存已认证的最高 `boot_generation`、该 generation 的最大 `message_seq` 和配置窗口内的 seen bitmap。它不是第二事实源：启动时先加载 checkpoint，再扫描 active session 已落盘 `Packet` header 重建窗口，完成前不绑定 socket；session rotation 或正常 shutdown 在 `Closed` 已 sync 后以 temp + sync + atomic rename 更新 checkpoint。provisioning 同时创建一个已 sync 的空 checkpoint；任何缺失/损坏都 fail closed，清除它必须以 fresh key epoch 重新 provision，不能把 replay protection 静默归零。
-- `BeginLearning`、`Commit`、`Freeze`、`Resume`、`ActivateSnapshot` 全部先写 session 再执行。`ActivateSnapshot` 的不可变 baseline snapshot 完整嵌入 command record，不能只引用 session 外部 revision。
-- 没有 packet 但需要关闭窗口或判定 stream inactive 时，先写 `TimelineAdvance` 再调用 `Engine::advance_to`；replay 按同一记录推进，不能重新依赖墙钟。
-- manifest 包含所有影响结果的配置和初始 baseline，replay 不依赖“当前磁盘配置”。
-- 末尾 body 不完整表示 crash tail：恢复之前所有完整记录并明确报告 `RecoveredTruncatedTail`。
-- 完整 body 的 CRC-32C 不匹配表示中间损坏：带 byte offset 失败，不静默跳过。
-- reader 在分配前检查配置硬上限 `max_manifest_bytes` 和 `max_record_bytes`；声明长度超限直接失败，不能由损坏的 `u32` 触发巨额分配。
-- graceful shutdown 写 `Closed`、flush 并 sync；没有 footer 仍可扫描恢复。
-- state/current baseline 是完整 snapshot；更新以 temp + sync + atomic rename 完成，每个 session manifest 仍嵌入它开始时的 snapshot。
-- retention 只删除最旧且已关闭的 session，绝不删除 active session。
+session 同时配置 `max_session_duration` 和 `max_session_bytes`。达到任一上限时暂停新输入，按 `transaction A: Closed -> Engine::finish -> transaction B: final projections + seal + next manifest` 完成 rotation。每个 admitted packet 一事务是首个切片的简单 correctness baseline；只有测量证明需要时才讨论 batching 或 writer task 拆分。
 
-session 同时配置 `max_session_duration` 和 `max_session_bytes`。达到任一上限时暂停新输入，并在 record boundary 执行：`append Closed -> Engine::finish -> sync old session -> atomic sync replay checkpoint -> 写/sync 清除 session-local stale timer 且 adaptation_armed=false 的 BaselineSnapshot -> 新 manifest 嵌入该 snapshot -> 恢复输入`。crash-recovered 文件恢复完整前缀后标记 recovery-sealed/read-only，绝不继续 append；从该前缀通过同一 finish/snapshot handoff 开启新 session。retention 可删除已 Closed 或 recovery-sealed、且不是当前 active 的文件。
-
-`append` 只保证 bytes 已进入 writer，不等于已经抗断电。writer 维护 `durable_through_record_seq`；首个切片在发布每个 closed-window snapshot 前对其全部证据执行 `sync_data`，baseline command 也在应用前 sync。失败即停止 capture。这样已经对外发布的 semantic state 总能从持久前缀重放；若实测每窗口 sync 造成丢包，再依据 durability 指标批量化，不能暗中降低保证。
-
-不永久保存 `CsiObservation`、window 或 snapshot 的第二份权威日志。派生 cache 随时可以删除并从 session 重建。
+同一 SQLite DB 持久化 `CsiObservation`、`WorldSnapshot`、per-link evidence 和 baseline lifecycle/snapshot 的 rebuildable typed projections，但它们不是第二份权威日志；删除后可从 ordered raw `session_records` faithful replay 重建。window working state 只在内存中存在并同样可重建。
 
 ### 6.4 faithful replay
 
-首个切片只实现 `faithful replay`。manifest 的 `ReplayConfig` digest、build fingerprint、wire admission pin、decoder、conditioning 和 algorithm 必须与当前 executable 完全匹配，且 secret store 中必须仍可取得对应 device/key epoch 的 replay key；任一项不匹配就拒绝，并提示使用原 build/key retention policy，不能靠字符串 registry 假装旧实现仍存在。
+首个切片只实现 `faithful replay`。replay 只接受 sealed/recovery-sealed session；raw tail 仅有 `Closed` 但 lifecycle non-sealed 时必须先完成第 6.3 节 recovery。随后按 `(session_id, record_seq)` 读取 rows，并验证 monotonic session time、strict record kind/body、manifest 的 `ReplayConfig` digest、build fingerprint、wire admission pin、decoder、conditioning 和 algorithm。secret store 中必须仍可取得对应 device/key epoch 的 replay key；任一项不匹配就拒绝。exact bytes、peer、record/time 和 control total order 原样进入同一 decoder/Engine path。
 
 未来若确有 parser 修复或研究需要，可增加显式 `reinterpret`，用新的输出 namespace 重新解释旧 bytes；它不得声称是原 session 的相同结论，也不属于首个 CLI。
 
@@ -454,7 +467,7 @@ session 同时配置 `max_session_duration` 和 `max_session_bytes`。达到任�
 - ADR-018 的 `0xC511...` magic、20-byte header、sibling magic registry、`128-pair` 经验值和兼容 parser；
 - RuView 的 `RfFrameV2` 任意 rank、`Vec<Complex64>`、浮点 metadata、逐帧 geometry/evidence，及其 OTA/密钥模型；
 - `56 x 8` canonical tensor，或按 raw length 推断 tone、带宽、PPDU、Tx/Rx、LTF 或相干时间；
-- CRC 当作身份、完整性或 replay 防护；CRC-32C 只保留给已落盘 session record 的随机损坏检测；
+- CRC 当作身份、完整性或 replay 防护；native-frame v1 不引入 wire/session CRC；
 - 生产端口上的 unauthenticated/trusted-LAN fallback、IP fragmentation、application fragmentation、静默截断、静默补零和未限定 TLV extension。
 
 每台设备有 provisioned、部署内唯一的 `device_id:u64` 和每个非零 `key_epoch` 对应的一把随机 32-byte AES key。生产固件只从受 flash encryption 保护的 NVS `provision` namespace 取得 key；不定义含混的 eFuse-derived key API。v1 host secret store 是 deployment 配置只指向的受控本地目录，app 用标准文件 I/O 从 `secret_root/<device_id>/<key_epoch>.key` 读取恰好 32 bytes，其中两个目录名是其 canonical unsigned decimal encoding；目录由部署者保护，key bytes 从不进入 TOML、session 或 log。测试只使用独立 temporary secret root 和 fixture key。这里不定义 provider trait、环境变量 fallback 或旧 key format parser。`device_id` 不是 MAC，也不是可由 node number 推导的值。peer allowlist 是 DoS 收敛措施，不是身份认证。所有 production wire message 都有认证和 replay admission；test decoder 不能监听 production endpoint。
@@ -676,7 +689,7 @@ impl ProfileCatalog {
 }
 ```
 
-`intern` 先验证 descriptor，再 canonical encode/hash，并检查同 ID descriptor 完全相等。live 与 replay 按相同 record 顺序调用它；read store 接收 immutable catalog snapshot，供 API 将 opaque ID 展开为原生坐标/metadata。它不是 adapter registry，也没有 trait。
+`intern` 先验证 descriptor，再 canonical encode/hash，并检查同 ID descriptor 完全相等。live 与 replay 按相同 record 顺序调用它；transaction B 将 API 展开 opaque ID 所需的 typed observation/profile facts 写入 SQLite projection。它不是 adapter registry，也没有 trait。
 
 `StreamKey = (SensorId, RadioLinkId, CaptureProfileId)`；`StreamInstanceId = (StreamKey, DeviceEpoch)`。profile 任一兼容字段改变就切新流、新窗口和新 baseline；经认证的 `boot_generation` 变化切新 stream instance 并禁止窗口跨越启动边界。旧 profile 不丢弃，也不升级、padding 或合并成“最密网格”。API 使用 session 内稳定的 opaque `StreamInstanceId`，而不是让客户端传完整 profile 结构。
 
@@ -999,9 +1012,9 @@ struct EvidenceReceipt {
 }
 ```
 
-snapshot 内保存紧凑 receipt 和计数；精确坐标证据由 snapshot-pinned 查询从 bounded read store 返回 `CsiPath × CsiSampleAxis`、observed、predicted、signed residual、exact included mask、excluded reason 和 baseline revision，超出保留范围则由 faithful replay 重算。这样既能回答具体哪些坐标参与，又不把每个 snapshot 膨胀成完整信号副本。
+snapshot 内保存紧凑 receipt 和计数；精确坐标证据由 snapshot-pinned indexed SQLite projection 查询返回 `CsiPath × CsiSampleAxis`、observed、predicted、signed residual、exact included mask、excluded reason 和 baseline revision，超出 retained projection 范围则由 faithful replay 重建。这样既能回答具体哪些坐标参与，又不把每个 snapshot 膨胀成完整信号副本。
 
-`BaselineEstimator::step` 在同一次评分中使用 pre-update state 产生 transient `CoordinateEvidence` 和 `LinkStepEvidence`。Engine 只聚合 snapshot 并返回这些 evidence；app 可把它们放进 bounded snapshot-pinned read store，不能重算 eligibility，也不另写一份 derived session log。未来若经过独立批准才引入 candidate，它只能从 sealed-session faithful replay 的 `LinkStepEvidence` 私有派生输入；V1 的 Engine/API/session 不公开或保存 candidate input。
+`BaselineEstimator::step` 在同一次评分中使用 pre-update state 产生 transient `CoordinateEvidence` 和 `LinkStepEvidence`。Engine 只聚合 snapshot 并返回这些 evidence；app 在 transaction B 把 typed snapshot/evidence projection 写入同一 SQLite DB，不能重算 eligibility，也不能创建第二 authoritative log。未来若经过独立批准才引入 candidate，它只能从 sealed-session faithful replay 的 `LinkStepEvidence` 私有派生输入；V1 的 Engine/API/session 不公开或保存 candidate input。
 
 ```rust
 struct CoordinateEvidence {
@@ -1053,7 +1066,7 @@ POST /api/baselines/commands
 WS   /api/live
 ```
 
-非法 query 返回 4xx；不存在或证据不足返回 typed empty/unknown，不返回伪造数据。首个 HTTP server 只查询配置容量/时长内的 recent read store；超出范围返回 typed `RangeUnavailable { available_from, available_to }`。完整历史只由离线 replay CLI 处理，server 不临时启动 Engine。
+非法 query 返回 4xx；不存在或证据不足返回 typed empty/unknown，不返回伪造数据。HTTP/SignalView 以现有 query budget 对同一 SQLite DB 的 typed observation/snapshot/evidence/baseline projections 执行 bounded indexed reads；超出 retained/queryable 范围返回 typed `RangeUnavailable { available_from, available_to }`。完整历史重算仍由 replay CLI 处理，server 不临时启动 Engine。
 
 ### 13.2 SignalView
 
@@ -1086,7 +1099,7 @@ struct SignalTile {
 
 I、Q 和 amplitude 缩小时以 viewport 的 `max_time_buckets` 现算 min/max/mean/RMS/count；放大后返回原生点。wrapped phase 在首个切片只允许 raw，不做线性 min/mean/RMS；超过 point budget 返回 422 并要求缩小范围。明确 circular aggregation 及其 receipt 后才能下采样 phase。
 
-首个切片不建多分辨率缓存，测到查询成本后再加。不同设备默认分面显示，不能只读 `nodes[0]`，也不能取模复制短数组。Deviation 只从 snapshot-pinned evidence endpoint 查询，避免 baseline 更新后同一普通 signal query 得到另一种解释。
+首个切片不持久化 viewport tile 或多分辨率 cache。不同设备默认分面显示，不能只读 `nodes[0]`，也不能取模复制短数组。Deviation 只从 snapshot-pinned SQLite evidence projection 查询，避免 baseline 更新后同一普通 signal query 得到另一种解释。
 
 ### 13.3 首个页面
 
@@ -1123,26 +1136,26 @@ WebSocket 不持续发送整个历史或 giant world payload。慢客户端丢 d
 
 ```text
 recv/select packet or baseline command
-  -> size + fixed-header parse + HeaderRoute(peer/device/key epoch) + exact key lookup + AEAD + replay admission
+  -> size + fixed-header parse + HeaderRoute(peer/device/key epoch) + exact key lookup + AEAD + rate/byte admission
   -> assign record_seq and session time
-  -> SessionWriter::append().await
+  -> transaction A: durable replay admission + SessionRecord
   -> decode admitted cleartext + DecodedRoute(source MAC/radio facts) / resolve
   -> Engine::push() / command() / advance_to()
-  -> update bounded read store
+  -> transaction B: typed SQLite projections + receipts
   -> try_send small live notification
 ```
 
 - `Engine`、`Timeline`、`BaselineEstimator` 没有共享锁。
 - HTTP baseline command 进入有界 command queue；满时返回 503，不静默丢弃。
-- read store 保存近期 observation、immutable snapshot 及其 snapshot-pinned coordinate evidence；超出 recent 范围的历史只由离线 replay CLI 查询。
+- SQLite 是 HTTP/replay/SignalView 使用的 typed observation、signal、snapshot、evidence 和 baseline query source。ingest 独占 writer connection；HTTP 在 stage four 使用有界 read-only connections，sync queries 不阻塞 async runtime 或 ingest。内存只保留可由 ordered raw records 重建的 Timeline/Estimator/Engine working state 与有界 socket/WS notification buffers；不存在 authoritative in-memory read store。
 - WebSocket 使用有界队列；慢客户端跳到最新状态或断开，不能反压感知。
 - UDP 本身不可反压。顺序写盘过慢造成的 gap 由 sequence/ingest health 展示；先测量，确认瓶颈后才拆 writer task。
 - socket receive buffer 为完整 UDP datagram 分配 `UDP_MAX_DATAGRAM_BYTES = 65_535`，收到完整长度后再按配置 `max_datagram_bytes` 记录并拒绝超限包；不能用业务上限大小的 buffer 静默截断 datagram。
-- parse reject、unknown route、socket gap、writer latency、view drop 都有独立指标。
+- parse reject、unknown route、socket gap 和 projection failure 都有独立 health 分类；deferred metrics/p99 不在首个切片恢复。
 
 ### 14.2 shutdown
 
-shutdown 顺序固定：停止接受新 command 和 socket receive；处理已经接收的输入；append `Closed(record_seq, at)`；以该记录调用 `Engine::finish(at)` 关闭剩余 window；flush + `sync_data` session；把 replay checkpoint 写入 temp 并 sync；atomic rename + fsync 所在目录；把 baseline snapshot 写入 temp 并 sync；atomic rename current pointer 并 fsync 所在目录；最后关闭 HTTP/WS。baseline snapshot 必须记录 source session、last durable record seq 和内容 digest，任何 current pointer 都不能领先 durable session。
+shutdown 顺序固定：停止接受新 command 和 socket receive；处理已经接收的输入；transaction A 只插入 `Closed(record_seq, at)`，使 raw stream non-appendable 但保持 lifecycle non-sealed；以该 durable record 调用 `Engine::finish(at)`；final transaction B 原子提交最终 observation/snapshot/evidence/baseline projections、source receipts 和 sealed lifecycle；最后关闭 HTTP/WS 和 SQLite connection。
 
 ### 14.3 错误策略
 
@@ -1153,9 +1166,10 @@ shutdown 顺序固定：停止接受新 command 和 socket receive；处理已�
 | 已认证但 source MAC/channel/PHY 不满足 route | raw 已记录；拒绝进入 timeline/estimator |
 | route/ID/config 冲突 | 启动失败 |
 | late/duplicate | 分类并排除；不重写历史状态 |
-| session append/flush 失败 | 立即停止 capture |
-| replay 中间 CRC/不支持版本 | 带 offset/version 失败 |
-| crash tail | 恢复完整前缀并明确告警 |
+| raw/admission transaction 失败 | rollback；Engine 不变并立即停止 capture |
+| projection/final-seal transaction 失败 | lifecycle 保持 non-sealed；发布前停止 capture，startup 从 raw rows finish/rebuild |
+| SQLite 损坏/schema/version 不支持 | fail closed |
+| crash 留下任意 non-sealed session，包括 Closed tail | 从 ordered raw rows rebuild/finish；原子写 handoff、recovery-seal，再开启新 session |
 | baseline 不兼容 | `Stale` 或启动失败；不静默重建 |
 | 证据不足 | `Unknown(reason)`，不是应用错误 |
 | HTTP 参数非法 | 4xx |
@@ -1403,10 +1417,10 @@ whisper select-shadow <candidate> <evaluation-report>
 whisper rollback-shadow <previous-candidate> <its-evaluation-report>
 ```
 
-- `learn-ar1` 只读取正常关闭或 recovery-sealed 的 immutable session，并复用 replay 的 decoder、timeline、conditioning 和 pinned baseline decision；不能订阅 live mutable window。
+- `learn-ar1` 只读取正常关闭或 recovery-sealed 的 immutable SQLite session rows，并复用 replay 的 decoder、timeline、conditioning 和 pinned baseline decision；不能订阅 live mutable window。
 - 这是 nearline continual learning：新鲜度下限受 session rotation 周期和 catch-up time 限制，不承诺每窗立即改权重。`learning_lag` 必须可见；不能为了降低它频繁 rotation，导致第 11.3 节的 `adaptation_armed=false` 反复跳过更新。
 - 首实现与 `capture` 排他运行，不提供并发开关、pause IPC 或后台 worker。真有并发新鲜度需求后，先设计 session lease 和协作暂停，再通过联合负载测试；不能只靠 OS priority 偷跑。
-- CPU 演化 scope 开始时才创建新的 container version、content store 和显式 `ShadowSelectionPin`；v1 session、config 和 state directory 保持不变。`learn-ar1/evaluate-candidate` 把 immutable candidate/report 写到调用者指定路径；重复训练写新文件，不覆盖旧文件。只有 `select-shadow/rollback-shadow` 验证二者后才导入该 scope 的 content store，并原子更新 selected sidecar。GC 只保护 retained v2 manifest 和当前 selected sidecar 引用的 digest；其他输入文件由调用者管理。不建 new/previous 指针或 registry。
+- CPU 演化 scope 若获批，再设计 candidate artifact ownership 与显式 `ShadowSelectionPin`；不得修改 raw schema authority 或引入第二事实库。当前不预留 content store、sidecar、GC 或 schema extension。
 - shadow artifact 只在该 v2 session 开始前确定，durable 存入其 content-addressed attachment 并由 manifest pin 住。缺失或摘要不符时拒绝启用；同一 live session 内不换 artifact。导出 session 时必须连同 pinned artifact 一起导出。
 - `select-shadow/rollback-shadow` 首实现只在取得 runtime lock 后成功，验证 report 指向 candidate，并原子更新下一 v2 session 的 `ShadowSelectionPin`；不为它增加进程间控制面。若正在 capture，明确拒绝并要求先完成 shutdown。
 - 训练 checkpoint 不是 production artifact；optimizer state 不进入 capture。
@@ -1495,10 +1509,10 @@ durable raw ingest > statistical baseline/world > selected production inference
 Normal -> DisableShadow -> ReduceViews -> StatisticalOnly
 ```
 
-- raw session append 和统计 baseline 没有可丢的内部队列；跟不上就按第 14 节停止 capture，而不是悄悄跳包。
+- raw transaction 和统计 baseline 没有可丢的内部队列；跟不上就按第 14 节停止 capture，而不是悄悄跳包。
 - shadow 队列有界；满或 deadline miss 时只跳过 shadow，记录非语义 runtime health `ShadowSkipped(reason)`，不写入 WorldSnapshot、不能要求 faithful replay 复现墙钟 deadline，也不反压 ingest。跳过后 predecessor mismatch 必须清该 stream cursor。
 - 离线 learner 只拥有 mutable scratch；失败/中断就丢弃 scratch 并按固定 corpus 顺序重跑，首实现不发明 checkpoint/cursor 协议。它不得持有 production head 或写历史 session。
-- live 状态转换只看 receive-to-append lag、writer/sync latency、kernel UDP drop、sequence gap、watermark lag、RSS 和 read-store/query pressure；每个阈值属于 PerformanceProfile。
+- future performance scope 的 live 状态转换只看 receive-to-raw-commit lag、projection-commit latency、kernel UDP drop、sequence gap、watermark lag、RSS 和 SQLite query pressure；每个阈值属于 PerformanceProfile，首个切片不实现这些 deferred metrics/p99 gates。
 - `ReduceViews` 只降低 viewport point budget、拒绝超预算历史 query 或断开慢 WS；不改变 Engine input、WorldSnapshot 或 retained evidence。
 - 不依赖 OS `nice` 或线程优先级提供正确性。发生越界时按上述状态顺序协作停工；不能先牺牲 raw 事实源或改变 baseline 算法。
 - 将来若 candidate 获准进入生产推理，backend error/deadline 决策必须先成为有序 session 输入，再以 `ModelFallback(reason, candidate_digest)` 写入 receipt 并回到统计 baseline；不能只靠 replay 时的墙钟或静默伪装成 candidate 成功。
@@ -1815,8 +1829,8 @@ ExampleGroup: deployment + space + physical episode/interval
 
 ### 22.4 session、API 与 UI
 
-25. session roundtrip、长度上限、record_seq、CRC-32C 损坏、截断尾部 recovery-seal 和 rotation 均有测试；monotonic time 重置后 session-local timer/armed state 重置，rotation live/replay 等价。
-26. append/flush 失败停止 capture；view queue 满只影响 delivery 并有指标。
+25. temp-DB schema constraints、manifest/record strong roundtrip、完整 unsigned domain、strict record_seq/time、transaction rollback、non-sealed open/Closed-tail recovery-seal 和 rotation 均有测试；crash between Closed transaction A and final transaction B rebuilds identical final projections/handoff before next-session creation；monotonic time 重置后 session-local timer/armed state 重置，rotation live/replay 等价。
+26. raw/admission 或 projection transaction 失败均在 publication 前停止 capture；WS queue 满只影响 delivery。
 27. oversized UDP datagram 被完整接收后明确拒绝，不能伪装成普通 truncated packet；unknown peer/version/key、bad tag、replay 与 admission budget 不写 raw，仅更新有界 health。
 28. SignalView 同时查询不同 sample-coordinate 数，返回各自原生语义。
 29. viewport 聚合保留 min/max/mean/RMS/count 和 missing span；phase 超预算拒绝而非线性聚合。
@@ -1880,7 +1894,7 @@ ExampleGroup: deployment + space + physical episode/interval
 1. `domain`：ID、Registry、CsiLayout/CaptureProfile 构造校验和 Intel 形状内存测试。
 2. `capture + config + wire`：data-plane admission、唯一 decoder、动态 native-frame fixtures 和严格 route/capability 校验。
 3. ESP-IDF firmware：固定工具链 build、disposable provision、probe、flash/verify 和当前可用真实开发板的 authenticated live CSI。
-4. `session + capture/replay app`：CRC-32C container/recovery、durable admission、runtime lock、capture/replay CLI 和 faithful raw replay。
+4. `SQLite session + capture/replay app`：schema v1、durable admission/raw transactions、rebuildable typed projections、runtime lock、provisioning CLI 和 faithful raw replay。
 5. `timeline + conditioning + estimator + engine`：profile/epoch/window、显式 receipt、Welford/EW baseline、world aggregation 和 deterministic faithful replay。
 6. `view + server + web`：动态 SignalView、完整 HTTP/WS 与二维诊断 UI；以至少两个 authenticated ESP32 route 的真实 captured datagram fixtures/corpus 验证同窗 ingestion、隔离和 multi-route/replay runtime smoke，包括 UDP gap、慢 WS、reboot 与 baseline poisoning。多物理板长期 soak、磁盘吞吐与容量性能 gate 延后。
 7. 在声明的参考 CPU 上建立统计 estimator 性能事实；加入具体 `candidate.rs`，实现 native-coordinate AR(1)、closed-session `learn-ar1/evaluate-candidate`、artifact 和 bounded shadow，不添加 ML runtime。
@@ -1902,7 +1916,7 @@ ExampleGroup: deployment + space + physical episode/interval
 - candidate 对 production belief 的融合/替换规则和语义晋升；
 - RF 预训练模型族、CPU 部署模型、可选压缩/蒸馏、RSSM temporal core、artifact-private `EpisodePack` 与 learned multi-link/multimodal fusion；
 - `RepresentationContractId`/encoded token/fusion structs、第二种 concrete modality adapter、MoT 与 offline generator head；
-- viewport 多分辨率 cache、长期索引或数据库；
+- viewport 多分辨率 cache、未由现有 API 驱动的长期索引或第二数据库；
 - late state revision；
 - 多租户权限。
 

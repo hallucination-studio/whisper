@@ -15,7 +15,7 @@
 `ARCHITECTURE.md` 是本轮实现的受保护合同，当前 SHA-256 为：
 
 ```text
-89e4caa0a013b8c715615a116d553cbe9d930fad1fad15d3ae0fcf70ff721b9f
+d6f56c1c10d48b727c232c1c1ea2c89b212438a2afc4eb9b69e9853e5d32232b
 ```
 
 每个执行工作包开始和结束时都必须运行：
@@ -57,7 +57,7 @@ UDP/session bytes
 - RF 预训练/部署神经模型、frozen encoder、GRU、Transformer、RSSM、Perceiver、MoT 或 ML backend；
 - Intel 5300 真实 decoder/transport；只保留 `3 × 3 × 30` 内存兼容测试；
 - 通用 modality/codec/decoder/storage trait、神经模型/adapter/packer/backend registry；
-- 数据库、多 crate workspace、插件、微服务、通用 event bus；
+- 外部数据库服务、第二数据库/事实源、ORM、repository/provider abstraction、多 crate workspace、插件、微服务、通用 event bus；
 - presence、人数、姿态、手势、生命体征、三维重建或 synthetic world；
 - 固定 RF tensor、公共 token schema、统一 padding 网格；
 - 长期历史索引、多分辨率 cache、state revision 或告警系统。
@@ -67,12 +67,12 @@ UDP/session bytes
 - 一个名为 `whisper` 的 Rust package，library + binary；不建 workspace，不保留 `world` package/crate/binary alias。
 - 默认使用具体类型和 `pub(crate)`；没有真实外部消费者时不稳定公共 SDK。
 - 一个 ingest owner 顺序拥有 `Timeline`、`BaselineEstimator` 和当前 `WorldSnapshot`。
-- 原始 datagram 是唯一事实源；不写第二份 decoded CSI 日志。
+- raw `session_records` 是唯一事实源；只允许同一 SQLite DB 中可由 faithful replay 重建的 typed query projections，不写第二份 authoritative decoded CSI 日志。
 - 外部输入失败返回分类 `Result`；只有被检测到的程序不变量可以 panic。
 - 不使用 `unsafe`。
-- 新依赖必须服务当前工作包；不得为以后预装模型、数据库或前端框架。
-- 初始依赖上限为：序列化/TOML、一个 CBOR 实现、SHA-256、AES-256-GCM、CRC-32C、错误派生和受支持目标上的 mimalloc；运行时阶段再加入 Tokio/结构化日志，HTTP 阶段再加入一个 server stack。超出必须先由验收线程批准。
-- CBOR、digest、AEAD 与 CRC-32C 不自行发明通用库；wire fixture 在 1.2 先由 Rust 冻结，1.3 的 firmware 只消费它们并做 parity，不允许反向修改。
+- 新依赖必须服务当前工作包；不得为以后预装模型、外部数据库或前端框架。
+- 初始依赖上限为：序列化/TOML、一个 CBOR 实现、SHA-256、AES-256-GCM、错误派生、`rusqlite`（不带 ORM）和受支持目标上的 mimalloc；运行时阶段再加入 Tokio/结构化日志，HTTP 阶段再加入一个 server stack。超出必须先由验收线程批准。
+- CBOR、digest 与 AEAD 不自行发明通用库；wire fixture 在 1.2 先由 Rust 冻结，1.3 的 firmware 只消费它们并做 parity，不允许反向修改。
 - 前端使用原生 HTML/CSS/JavaScript 与 Canvas/SVG；不引入 Node 构建链和组件框架。
 
 ## 2. Executor/Reviewer 与本线程验收协议
@@ -243,9 +243,9 @@ cargo doc --workspace --all-features --no-deps
 
 ## 4. 阶段二：持久化、capture 与 replay
 
-目标：先持久化 raw packet，再解码；session 可严格读取、检测损坏、恢复 crash tail，并从相同 bytes 重放。
+目标：先在 SQLite 原子持久化 replay admission 与 raw packet，再解码；同一数据库保存可从 raw records 重建的 typed query projections，并从相同 bytes 严格重放。
 
-### 工作包 2.1：Whisper/config 边界与 session container
+### 工作包 2.1：Whisper/config 边界与 SQLite schema/session contract
 
 前置：阶段一 PASS。
 
@@ -253,18 +253,18 @@ cargo doc --workspace --all-features --no-deps
 
 ```text
 src/session.rs
+src/database.rs            concrete rusqlite schema/transactions/queries/retention；不建 trait/ORM
 src/domain/world.rs        仅删除因 WP 2.1 正式使用 baseline 类型而失效的两处 dead_code expectation
 src/config.rs              Config 根、ReplayConfig/RuntimeConfig 与唯一 replay-config codec
 src/wire.rs                只做 Config/ReplayConfig 签名和 decoder version 原子迁移
 src/main.rs                只做 whisper crate/binary 与 Config 原子迁移
 src/lib.rs                 模块声明、whisper crate docs 与 Config re-export
-Cargo.toml                 package 改名为 whisper；只增加 session 所需 CRC-32C/编码依赖
+Cargo.toml                 package 改名为 whisper；只增加 session 所需 rusqlite/编码依赖
 Cargo.lock                 只接受 package 改名和上述依赖的机械更新
-firmware/esp32-native-frame/provision.py  只改临时目录的项目名前缀
 tests/config_validation.rs
 tests/fixtures/config/**   只把 effective-config canonical fixture 替换为 replay-config fixture
 tests/session_*.rs
-tests/fixtures/session/**
+tests/fixtures/session/**  只保留 typed CBOR/semantic fixtures；不固定 SQLite file bytes
 ```
 
 实现：
@@ -275,28 +275,31 @@ tests/fixtures/session/**
 - 将现有 canonical bytes/digest 所有权从完整配置移到 `ReplayConfig`；`Config`/`RuntimeConfig` 不提供 digest，runtime-only 变化不得改变 `config_digest`；
 - `config.rs` 独占 `ReplayConfig` 的严格 named-field canonical CBOR encode/decode 与 SHA-256；decoder 使用与 TOML 路径相同的强类型构造和不变量校验，不给 invariant-bearing types 增加可绕过构造器的直接 `Deserialize`；
 - wire 不接收整个 `Config`：live datagram limit 由 app 从 `CaptureConfig` 显式传入，route/decode 只接收 `ReplayConfig` 中的 `Registry`；该签名迁移不改变已冻结 native-frame bytes 或拒绝分类；
-- file header、named-field CBOR manifest 和 length+CRC-32C record；
+- `SessionConfig` storage path 从目录原子改为明确 SQLite database file path，不保留 alias；它仍是 runtime-only identity，路径变化不改变 `ReplayConfig` digest；
+- `database.rs` 直接使用 `rusqlite`，一个 schema version 1、一个 database、一个由现有 single ingest owner 持有的 synchronous writer connection；writer open 时启用并验证 WAL、foreign keys 和 FULL durability；不建 ORM、repository/provider trait、connection pool、通用 migration/checkpoint framework；
+- schema v1 包含 `admission_epochs`、`sessions`、`session_records`、typed `csi_observations`、`world_snapshots`、`snapshot_link_evidence`、`baseline_projections` 及 API 所需 indexes；typed projection body 是 strict CBOR，不按 coordinate 拆行；raw `session_records` 是 sole authority，projection 携带 source receipts/version pins 并可由 faithful replay 删除重建；
+- admission row 固化 provisioned `(device_id,key_epoch)`、configured replay-window identity/size、nullable boot/maximum sequence 和 bounded bitmap；sessions 固化 manifest/lifecycle seal；records 固化 `(session_id,record_seq)` total order、monotonic time、strict kind/body 和 exact packet context/bytes；超出 SQLite signed INTEGER 的 unsigned domain 使用 fixed-width canonical bytes，不得窄化；
 - manifest 直接嵌入创建 session 时同一个 `Config` 中的强类型 `ReplayConfig`；reader 只调用 `config.rs` 的严格 decoder，重新验证并核对 canonical digest 与 `config_digest` 后才产生 manifest；不落盘 TOML source/`RuntimeConfig`，replay 不读取当前磁盘配置，AES key 不进入 config/session；
 - `SessionRecord` 的 packet、baseline command、timeline advance、closed；
 - 严格 `record_seq`、monotonic `at`、schema、长度上限和 trailing data 校验；
-- writer append/flush/sync 与 `durable_through_record_seq`；
-- reader roundtrip、中段 CRC-32C 失败、截断尾部 recovery-seal；
-- `Closed`、rotation/recovery 所需的 record-boundary primitive；
-- 最小 retention 只删除最旧的 closed/recovery-sealed session，永不删除 active session，不建数据库/refcount/artifact GC；
-- 使用标准库 advisory file lock；不建 sentinel、refcount database 或通用 object store；
+- transaction A primitive 原子验证/推进 admission window 并插入 exact raw record；rollback 后 admission/raw 均不变。WP 2.1 不实现 decode/Engine projection 写入路径；
+- `Closed` raw record 使 stream non-appendable，但 transaction A 不改变 session lifecycle；seal 与后续 baseline handoff 只由产生对应 projection 的工作包在 final transaction B 完成；
+- startup 把任何 non-sealed prior session（包括 Closed tail）视为 incomplete；具体 projection/working-state rebuild 留给产生该类型的后续工作包，完成后才 recovery-seal/create next session；SQLite rollback 取代 crash-tail scan/CRC；
+- 最小 retention transaction 只删除最旧 sealed session/records/projections，永不删除 active session 或 admission rows；允许 SQLite reuse free pages，不建 hot-path VACUUM/refcount/artifact GC；
+- 使用现有标准库 advisory runtime lock；不建 sentinel 或通用 object store；
 - manifest 不含 candidate/shadow/artifact 字段；第一版本不实现 artifact 导入、选择或 GC。
 - 不新增第二个配置根、模块私有 config parser、通用 canonical-CBOR/value decoder、全局配置 singleton 或 DI container。
 
 必测：
 
-- header/manifest/record 固定 bytes fixture；
+- behavioral temp-DB schema/pragma/version/foreign-key/index constraints 与 transaction rollback；不固定 SQLite file bytes；
 - `parse_config` 只构造 `Config`；semantic 配置变化改变 `ReplayConfig` digest，runtime-only 配置变化不改变它；canonical `ReplayConfig` roundtrip 保持强类型和值，unknown/malformed field 与不变量失败被拒绝；
 - session 的强类型 `ReplayConfig` roundtrip、config/digest 不一致拒绝，并证明 fixture 不含 TOML source、`RuntimeConfig`、secret root 或 AES key；build/decoder/conditioning/algorithm pin roundtrip；
-- 长度超限在分配前失败；
-- CRC-32C 中段损坏带 offset 失败；
-- 任意尾部截断只恢复完整前缀并标记 read-only；
-- record sequence 重复、跳号、倒退时间和 Closed 后 append 被拒绝；
-- sync/append 故障不产生可发布状态。
+- typed CBOR 长度超限在分配前失败；完整 unsigned u64 edge values roundtrip/order 不窄化；
+- missing/corrupt/wrong-schema DB、missing epoch row 和 incompatible pragma fail closed；capture 不 auto-create/reset；
+- Closed 后不能继续插入 raw；non-sealed session 不能被 retention 或当作完整 replay input，只有 recovery 完成后才能 recovery-seal/create next session；
+- record sequence 重复、跳号、倒退时间和 sealed 后 insert 被 schema/transaction 拒绝；
+- transaction A rollback 不推进 admission/raw，也不允许后续 decode/state advance。
 - 全仓库不存在 `EffectiveConfig` 或 `world` package/crate/binary/decoder-version 残留；领域 `world` 名称不计入该扫描。
 
 ### 工作包 2.2：capture/replay 应用壳
@@ -310,6 +313,7 @@ src/app.rs
 src/secrets.rs
 src/main.rs
 src/lib.rs                 仅增加模块声明/最小启动 API
+firmware/esp32-native-frame/provision.py  durable key + verified board provisioning 后调用 host init-admission
 Cargo.toml                 只增加已批准的 Tokio/结构化日志依赖；secret loader 不加依赖
 Cargo.lock                 只接受上述依赖的机械更新
 tests/app_capture_*.rs
@@ -318,15 +322,16 @@ tests/app_replay_*.rs
 
 实现：
 
-- `capture | replay | check-config` CLI；
+- `capture | replay | check-config | init-admission` CLI；`whisper init-admission <config> <device-id> <key-epoch>` 是唯一 host schema/admission provisioning front door；
 - app 独占 socket、文件、任务和 shutdown，领域模块不读取系统状态；
 - 实现具体 app-owned local secret loader：从配置指向的受控 `secret_root/<device_id>/<key_epoch>.key`（canonical unsigned decimal directory names）读取恰好 32 bytes；缺失、非 32 bytes 或 I/O error 分类拒绝。它不是 trait/provider、TOML field、session record、环境变量 fallback 或 legacy-key parser；测试使用独立 temporary secret root；
 - UDP receive buffer 使用 65,535 bytes，完整接收后再按业务上限拒绝；
-- ingest 总序为 size/fixed header parse/`HeaderRoute(peer,device,key epoch)`/key lookup/per-route budget → AEAD → bounded replay admission → assign record/time → session append → cleartext decode/`DecodedRoute(source MAC,channel,PHY,LTF)` resolve；
-- replay checkpoint 只保存有界的非秘密 window state；provisioning 创建已 sync 的空 checkpoint，启动先用 active session 已落盘 header 重建，再绑定 socket；rotation/shutdown 在 `Closed` sync 后原子更新，任何缺失/损坏都 fail closed；
+- ingest 总序为 size/fixed header parse/`HeaderRoute(peer,device,key epoch)`/exact key lookup/AEAD/per-route rate-byte admission → transaction A verify/advance bounded replay window + exact encrypted SessionRecord + commit → cleartext decode/`DecodedRoute(source MAC,channel,PHY,LTF)` resolve → transaction B persist only that decoded `CsiObservation`/profile projection + source/version receipts + commit → typed decode publication；阶段三接入 Engine 后按 WP 3.4 原子扩展 transaction B；
+- `capture`/`replay` 只打开 existing correctly initialized DB，missing/corrupt/wrong schema/pragma 或 missing epoch row fail closed；capture 不 auto-create/reset。init-admission 在 DB absent 时创建 schema v1，并插入 configured empty nullable epoch row；exact already-empty matching retry 可幂等，advanced/conflicting row 拒绝 reset；
+- firmware `provision.py` 仍是 front door，在 durable key 写入和 board provisioning verify 后调用清晰 host CLI；不得把 key bytes 写入 DB/session/log；
 - 只有完整 data-plane admission 成功的 encrypted datagram 才会 durable；认证后的 unknown kind、unsupported capability 或 malformed cleartext 才记录分类 reject 并继续；
 - replay 使用 manifest pin 和同一个 native-frame decoder；第一版本此时输出 typed decode/health 流，阶段三接入相同 Engine 后升级为 semantic replay；
-- graceful shutdown 写 `Closed` 并 sync；不建 HTTP、actor graph 或 writer task 拆分。
+- graceful shutdown/rotation 的 transaction A 只 commit `Closed`；stage-two final transaction B 写完截至该 tail 的 observation/profile projections 后才 atomically seal，rotation 同 transaction 创建 next manifest。startup 对任意 non-sealed session 从 raw rows rebuild stage-two projections、完成 final transaction B、recovery-seal，再创建 next session；不建 HTTP、actor graph、checkpoint framework 或 writer task 拆分。
 
 必测：
 
@@ -334,16 +339,16 @@ tests/app_replay_*.rs
 - unknown peer/version/key、bad tag、replay 和 admission rate/byte budget 不创建 `CapturedPacket`，只更新有界 health；
 - missing/malformed secret file 与不同 `(device_id,key_epoch)` key lookup 均分类拒绝，key bytes 不出现在 config/session/error；
 - message sequence duplicate/old/new boot generation 和 controlled reordering 按固定 replay window 验证；
-- host restart 和 session rotation 后重放同一有效 datagram 被拒绝；checkpoint 缺失/损坏 fail closed，fresh key epoch provisioning 建立已 sync 的空 checkpoint；
-- append 失败后 decoder/状态更新未发生；
+- host restart 和 session rotation 后重放同一有效 datagram 被拒绝；missing epoch row fail closed，fresh key epoch provisioning 建立空 admission row，advanced/conflicting row 不能 reset；
+- transaction A 失败后 decoder/state advance 未发生；observation transaction B 失败后停止 capture，observation/profile projection 与 typed decode notification 均未发布；
 - raw packet live/replay 解码结果相同；
 - authenticated malformed body、unknown kind、capability unavailable 与 source-MAC mismatch 的 raw packet 已记录但不进入推理输入；
 - runtime lock 冲突明确拒绝；
-- 关闭和 crash-recovered session 均能只读 replay。
+- sealed/recovery-sealed session 均能按 ordered rows 只读 replay；crash after Closed A/before observation B 会 rebuild stage-two projection、recovery-seal 后才创建 next session。
 
 ### 阶段二 Gate
 
-必须通过架构测试 5、25—27 中当前可实现部分，以及阶段一全部回归。相同真实 packet corpus 的 session roundtrip 必须保持原始 bytes、peer、record sequence 和时间不变。
+必须通过架构测试 5、25—27 中当前可实现部分，以及阶段一全部回归。相同真实 packet corpus 的 SQLite roundtrip 必须保持原始 bytes、peer、record sequence 和时间不变，并证明 projection 删除后可 faithful replay 重建。
 
 ## 5. 阶段三：最小 RF World Model
 
@@ -416,19 +421,22 @@ tests/estimator_*.rs
 ```text
 src/engine.rs
 src/app.rs                 只接入 Engine/replay/shutdown
-src/session.rs             只接入已定义 baseline command/snapshot
+src/session.rs             只接入已定义 baseline command/snapshot strong records
+src/database.rs            只接入 observation/snapshot/evidence/baseline projection transaction
 src/lib.rs                 仅增加模块声明/最小启动 API
 tests/engine_*.rs
 tests/replay_*.rs
 ```
 
-实现唯一 world 写入路径；live/replay 共享 decoder、registry、timeline、conditioning、estimator 和 engine；Engine 只返回包含 snapshot 与 `LinkStepEvidence` 的具体内部 `EngineOutput`，由 `app.rs` 更新 snapshot-pinned read store，Engine 不依赖 view/read store；第一版本不实现 `CandidateInput`/candidate；baseline command 先记录并 durable 再执行；`finish`、rotation 和 shutdown 完成 snapshot handoff。
+实现唯一 world 写入路径；live/replay 共享 decoder、registry、timeline、conditioning、estimator 和 engine；Engine 只返回包含 snapshot 与 `LinkStepEvidence` 的具体内部 `EngineOutput`，Engine 不依赖 database/view。`app.rs` 将 WP 2.2 的 transaction B 原子扩展为：同一 transaction 写入该 record 的 typed observation/profile projection，以及对应 `EngineOutput` 的 snapshot/per-link evidence/baseline projections和全部 source/version receipts；任一写入失败则整体 rollback 并在 publication 前停止 capture。shutdown/rotation 先以 transaction A 只追加 non-appendable `Closed`，再调用 `Engine::finish`；final transaction B 原子写 final projections/handoff 并 seal，rotation 同时创建 next manifest。startup 对任何 non-sealed session（含 Closed tail）replay ordered raw、重建 missing projections/working state、deterministically finish，并以同一 transaction recovery-seal/create next session。第一版本不实现 `CandidateInput`/candidate；baseline command 先记录并 durable 再执行。内存只保留可从 raw ordered rows 重建的 Engine working state 和 bounded notification buffers。
 
 必测：
 
 - 架构测试 20、22—24；
 - 两 sensors × 两 profiles 同一 window 只产生一个 snapshot；
 - 相同 session/build/config 的 live 与 faithful replay typed semantic projection 相等；
+- final transaction B 的 observation、snapshot、evidence 或 baseline 任一写入故障都整体 rollback，且没有 partial projection/notification；
+- crash after Closed transaction A/before final transaction B 后，startup 重建相同 final projections/baseline handoff，recovery-seal 后才创建 next session；
 - HTTP/delivery/运行耗时不进入 snapshot；
 - `Engine` 保留具体 `EstimatorError`，证据不足返回 `Unknown` 而不是 `Err`。
 
@@ -440,18 +448,19 @@ tests/replay_*.rs
 
 目标：在不改变事实、统计估计与 RF World Model 语义的前提下，查询多个动态 profile，并通过一页二维诊断 UI 看清信号、时间、世界状态和 baseline。
 
-### 工作包 4.1：View 与 bounded read store projection
+### 工作包 4.1：View 与 SQLite read projections
 
 所有权：
 
 ```text
 src/view.rs
-src/app.rs                 仅接入 bounded immutable read store
+src/database.rs            仅增加 API 所需 bounded indexed projection queries
+src/app.rs                 仅接入 concrete database query handle
 src/lib.rs                 仅增加模块声明
 tests/view_*.rs
 ```
 
-实现 `SignalQuery`、per-stream/profile `SignalTile`、native axis、missing span、snapshot evidence 和 viewport 聚合。I/Q/amplitude 支持 min/max/mean/RMS/count；phase 超预算返回明确拒绝。
+实现 `SignalQuery`、per-stream/profile `SignalTile`、native axis、missing span、snapshot evidence 和 viewport 聚合。typed observation/signal、world snapshot、evidence 和 baseline query state 全部来自同一 SQLite DB 的 committed projections；bounded indexed SQL obey existing query budgets/range errors。I/Q/amplitude 支持 min/max/mean/RMS/count；phase 超预算返回明确拒绝。不持久化 viewport tiles 或 multiresolution cache。
 
 必测架构测试 28—30、33 的 view 部分；不同长度同时查询时不得合并、取模复制或补零。
 
@@ -463,7 +472,7 @@ tests/view_*.rs
 
 ```text
 src/server.rs
-src/app.rs                 只接入 server/command queue/shutdown
+src/app.rs                 只接入 server/command queue/database/shutdown
 src/main.rs                只接入最终 CLI
 src/lib.rs                 仅增加模块声明/启动 API
 Cargo.toml                 只增加一个已批准的 HTTP/WebSocket server stack
@@ -471,7 +480,7 @@ Cargo.lock                 只接受上述依赖的机械更新
 tests/server_*.rs
 ```
 
-实现架构列出的 topology/signals/timeline/world/evidence/baseline endpoint、baseline command、有界 WebSocket 通知和 recent-range 错误。server 只读 immutable store 或发送有序 command，不持有 `&mut Engine`。
+实现架构列出的 topology/signals/timeline/world/evidence/baseline endpoint、baseline command、有界 WebSocket 通知和 range 错误。server 只通过 bounded read-only connections 做 indexed SQLite projection queries 或发送有序 command，不持有 `&mut Engine`；不建 connection pool/repository/actor，synchronous queries 不阻塞 async runtime 或 ingest。WS queue 只携带 ID/delivery，不是 semantic state。
 
 必测非法 query 4xx、typed unknown/empty、`RangeUnavailable`、慢客户端不反压 ingest、command queue 满返回 503、delivery sequence 不进入 semantic snapshot。
 
@@ -524,12 +533,12 @@ cargo doc --workspace --all-features --no-deps
 
 必须确认：
 
-- 架构摘要仍为 `bccd432f78b427f2a1e332a5994ccccf98f3b79908534693a7e79f88c1256b67`；
+- 架构摘要仍为 `d6f56c1c10d48b727c232c1c1ea2c89b212438a2afc4eb9b69e9853e5d32232b`；
 - 架构测试 1—34 有逐项对应的 runnable test 或明确端到端验收；
 - 没有 `unsafe`、未授权依赖、future feature flag、空 trait 或第二套 parser；
 - domain/session/API/UI 没有权威固定 RF shape；
-- 没有 `candidate.rs`、ML runtime、数据库或第二事实源；
-- `cargo tree` 中没有未授权的 GPU/ML/frontend/database 依赖。
+- 没有 `candidate.rs`、ML runtime、第二数据库或第二事实源；
+- `cargo tree` 中只有获批的 `rusqlite`，没有 ORM、外部 DB client、未授权 GPU/ML/frontend/database 依赖。
 
 ### 7.2 端到端验收场景
 
