@@ -253,6 +253,7 @@ cargo doc --workspace --all-features --no-deps
 
 ```text
 src/session.rs
+src/domain/world.rs        仅删除因 WP 2.1 正式使用 baseline 类型而失效的两处 dead_code expectation
 src/config.rs              Config 根、ReplayConfig/RuntimeConfig 与唯一 replay-config codec
 src/wire.rs                只做 Config/ReplayConfig 签名和 decoder version 原子迁移
 src/main.rs                只做 whisper crate/binary 与 Config 原子迁移
