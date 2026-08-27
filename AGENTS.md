@@ -50,3 +50,20 @@ cargo doc --workspace --all-features --no-deps
 - Use full-workspace checks for cross-crate, workspace, release, or CI changes. Test feature combinations when manifests or features change; run Miri for affected unsafe code.
 - Do not claim a check was run when it was not. Report skipped or failed checks and why.
 - Format changed Rust and TOML. Fix warnings at their source; keep justified suppressions narrow and use `#[expect(lint, reason = "...")]` when available (M-LINT-OVERRIDE-EXPECT).
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues for `hallucination-studio/whisper`.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The repository uses the five default Matt Pocock triage labels.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+The repository uses a multi-context layout for the Rust host and ESP-IDF
+firmware. See `docs/agents/domain.md`.
