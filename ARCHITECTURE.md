@@ -7,13 +7,22 @@
 
 本文档定义一套架构，不按 `v1`、`v2` 复制目录或分叉领域类型。“首个开发切片”只限制现在实现哪些能力，不建立一套将来需要推倒的临时架构。
 
+当前只延后以下 release/性能事项，不缩减本文定义的功能范围与验收：
+
+- signed shared-image manifest 与 release key；
+- Secure Boot v2、flash encryption、eFuse、signed OTA，以及 production provisioning/release/factory ceremony；
+- callback/encoder latency metrics、runtime histograms 与 p99；
+- soak、capacity report 和其他 release performance gates。
+
+开发固件使用 unsigned image 和 disposable provisioning，不声明 production at-rest security。build/capability digest 与 host admission pin、严格 decoder、动态 CSI、认证、correctness/drop counters、真实开发板和浏览器验收仍是当前要求。
+
 ## 1. 产品边界与架构结论
 
 系统维护的是一个随时间演化、可回放、带知识边界的 RF 世界状态，而不是把 CSI 填进固定张量后调用若干互不相关的分类器。
 
 首个开发切片必须交付：
 
-- 多个 ESP32 同时采集，设备、链路和 baseline 互不污染；
+- 至少两个 authenticated ESP32 route 的真实 captured datagram fixtures/corpus 能同窗进入，并证明设备、链路和 baseline 隔离；当前可用真实开发板完成 live smoke，多物理板长期同步运行只属于后续 soak/release gate；
 - 同一时刻存在不同 CSI 布局时原样保存、独立建模和并列显示；
 - 字节级 session 记录、确定性 replay 和损坏检测；
 - 原生坐标 CSI、sequence/缺口/时间质量诊断；
@@ -516,7 +525,7 @@ ESP-IDF S3 v1 proves one raw receive path, so host always maps it to `RawPathOrd
 
 Capabilities is emitted after boot and periodically at a configured rate. It never dynamically negotiates a parser: host accepts a capability only when its route manifest already pins both `firmware_build_digest` and `capability_digest`. A `CsiDataV1` becomes semantically decodable only after a matching `CapabilitiesV1` has been durably recorded earlier in the same `(device_id, key_epoch, boot_generation)` epoch. An authenticated CSI packet received first remains a bounded raw record with `CapabilityUnavailable`; faithful replay preserves that rejection rather than retroactively reinterpreting it.
 
-`HealthV1` is also authenticated and rate-limited. Its fixed body is `capability_digest:[u8;32] | callback_tick_us:u64 | capture_seen:u64 | queue_drop_no_slot:u64 | queue_drop_full:u64 | oversize_reject:u64 | encode_reject:u64 | send_failure:u64 | pool_high_water_slots:u16 | callback_max_us:u32 | encoder_max_us:u32`. Counts are monotonic within `boot_generation`; a counter gap is observable rather than converted into invented CSI. Control messages can be lost, so a later health report contains total counters, and CSI `capture_seq` exposes capture-side gaps independently of UDP transport loss.
+`HealthV1` is also authenticated and rate-limited. Its fixed body is `capability_digest:[u8;32] | callback_tick_us:u64 | capture_seen:u64 | queue_drop_no_slot:u64 | queue_drop_full:u64 | oversize_reject:u64 | encode_reject:u64 | send_failure:u64 | pool_high_water_slots:u16 | callback_max_us:u32 | encoder_max_us:u32`. 当前 schema 保留的两个 latency 字段发送 `0`，直到 latency metrics 获批；correctness/drop counts 仍在 `boot_generation` 内单调递增。counter gap 可观察，不能转换成虚构 CSI；control message 可丢失，因此后续 health report 携带累计计数，CSI `capture_seq` 独立暴露 capture-side gap。
 
 ### 7.5 Callback, pool and throughput contract
 
@@ -533,7 +542,7 @@ validate pointer, `len <= 612`, provisioned BSSID/destination MAC and fixed radi
 
 `capture_seq` starts at 1, is allocated before slot acquisition and never wraps. An otherwise eligible callback with no free slot or queue capacity consumes one sequence number, so its gap remains observable. Slots have a compile-time `slot_bytes` for the 612-byte S3 maximum plus copied metadata, not a guessed pair count. One lower-priority encoder/sender task owns dequeued slots, all `CapabilitiesV1`/`HealthV1` emission, `message_seq`, sealing and UDP send. Other tasks only post slot indexes or counter/period flags; none can seal or allocate a transport sequence. The task validates the target-specific block layout, constructs at most a 705-byte `CsiDataV1` into a preallocated output buffer, encrypts, sends one datagram, records success/failure counters and releases the slot. It never emits a partial buffer. A bounded FreeRTOS queue carries slot indexes; slot ownership is `Free -> Capturing -> Ready -> Encoding -> Free` and is asserted in test builds.
 
-Every supported board/target/IDF profile must have a checked-in budget record before release: internal RAM/PSRAM availability, `raw_csi_bytes` maximum, slot count and slot bytes, output buffer, lwIP packet pressure, task stacks, watchdog margin, configured packet rate, measured callback p99/max, encoder p99/max and sustained drop counters. V1 fixes one bootstrap profile: `esp32s3`, ESP32-S3-DevKitC-1-compatible, display-less, 8 MB QSPI flash and no PSRAM dependency. It builds only in `espressif/idf@sha256:f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb` (ESP-IDF v5.4); no host ESP-IDF installation is a build input. Host flashing uses `esptool==5.3.1`. Before its first flash, `python -m esptool --chip esp32s3 --port <port> chip-id` and `flash-id` must record an ESP32-S3 and 8 MB flash. The currently detected CP2102N UART is only a candidate port, not that proof. A failed probe is a hard stop, not a fallback to a RuView image, 4 MB layout, display profile or second target. v1 then supports exactly this target/board profile; a second target is unsupported until it has its own record and real-target soak. The configuration is unsupported until its worst legal CSI frame fits both slot and datagram budget. This is the only place capacity numbers belong; no document or host domain type treats a fixture size as physics.
+V1 fixes one bootstrap profile: `esp32s3`, ESP32-S3-DevKitC-1-compatible, display-less, 8 MB QSPI flash and no PSRAM dependency. Its compile-time slot/output sizes must cover the worst legal frame, and correctness/drop counters remain required; latency measurements, histograms, p99, capacity reports and soak are later release gates. It builds only in `espressif/idf@sha256:f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb` (ESP-IDF v5.4); no host ESP-IDF installation is a build input. Host flashing uses `esptool==5.3.1`. Before its first flash, `python -m esptool --chip esp32s3 --port <port> chip-id` and `flash-id` must record an ESP32-S3 and 8 MB flash. The currently detected CP2102N UART is only a candidate port, not that proof. A failed probe is a hard stop, not a fallback to a RuView image, 4 MB layout, display profile or second target. v1 then supports exactly this target/board profile; a second target is unsupported until separately approved. The configuration is unsupported until its worst legal CSI frame fits both slot and datagram budget. This is the only place capacity numbers belong; no document or host domain type treats a fixture size as physics.
 
 ### 7.6 Firmware image, provisioning and OTA
 
@@ -547,11 +556,13 @@ ota_0,    app,  ota_0,0x20000, 0x300000,
 ota_1,    app,  ota_1,0x320000,0x300000,
 ```
 
-The partition-table offset is `0x10000`, leaving bootloader room required by Secure Boot/flash encryption; the unallocated tail is not an application store. Build runs in the pinned Docker image with `idf.py set-target esp32s3 && idf.py build`. Initial development/factory flashing uses `python -m esptool` against the build-generated flash arguments only after the required probe, then uses `verify_flash` on the same ranges; never hand-copy a RuView binary, partition table or addresses. A reproducible signed **shared image manifest** binds `target`, board revision, `firmware_version`, security profile, build image digest, `build_digest`, `wire_schema_version`, one capability descriptor digest, partition-table digest and release key id. It contains neither `device_id` nor a transport key.
+`encrypted` flags 保留 release partition layout；development flash encryption 关闭时这些 flags 不生效，不会提供或暗示 at-rest security。
 
-Each device receives a separate generated `provision.bin` in the encrypted `nvs` partition before first secure boot. It contains `device_id`, active `key_epoch`, AES key, station SSID/password/BSSID/channel, probe port, collector endpoint and the one capability digest. The independent `runtime` NVS namespace contains only persistent `boot_generation`. Startup validates the provisioning record, recomputes the descriptor, persists and rereads the next boot generation, then waits for association and the probe socket before emitting `CapabilitiesV1`; any failure fails closed. Host configuration pins only non-secret identity/build/capability facts in `WireAdmissionPin`; it never stores the AES key or Wi-Fi password in TOML/session data.
+The partition-table offset is `0x10000`, preserving room for the later release security profile; the unallocated tail is not an application store. Build runs in the pinned Docker image with `idf.py set-target esp32s3 && idf.py build`. Development flashing uses `python -m esptool` against the build-generated flash arguments only after the required probe, then uses `verify_flash` on the same ranges; never hand-copy a RuView binary, partition table or addresses. The current unsigned development image still produces deterministic `build_digest`, `wire_schema_version`, capability descriptor digest and partition-table digest for host admission. The signed shared-image manifest and release key are deferred.
 
-There are two security gates, not two runtime protocols. Development builds may use a disposable test provisioning record solely for board/vector work and are never allowed production credentials. A release build enables ESP-IDF Secure Boot v2, flash encryption release mode, encrypted NVS and signed OTA rollback; provisioning and eFuse activation are an explicit irreversible factory ceremony. After release activation, normal field update is the signed ESP-IDF OTA path, not `esptool write_flash`. The CSI UDP envelope never carries an image. Image, capability or key-epoch changes open a new host session; key overlap and firmware compatibility fallbacks are not implicit v1 behavior.
+Each development device receives a separate generated disposable `provision.bin` in the `nvs` partition. It contains non-production `device_id`, active `key_epoch`, AES key, station SSID/password/BSSID/channel, probe port, collector endpoint and the one capability digest. Without flash encryption this makes no production at-rest-security claim and must not contain production credentials. The independent `runtime` NVS namespace contains only persistent `boot_generation`. Startup validates the provisioning record, recomputes the descriptor, persists and rereads the next boot generation, then waits for association and the probe socket before emitting `CapabilitiesV1`; any failure fails closed. Host configuration pins only non-secret identity/build/capability facts in `WireAdmissionPin`; it never stores the AES key or Wi-Fi password in TOML/session data.
+
+Secure Boot v2, flash encryption release mode, encrypted-NVS production provisioning, signed OTA rollback, release keys and eFuse/factory ceremony are deferred release work. The CSI UDP envelope never carries an image. Image, capability or key-epoch changes open a new host session; key overlap and firmware compatibility fallbacks are not implicit v1 behavior.
 
 ### 7.7 唯一 host decoder 与拒绝条件
 
@@ -1851,12 +1862,12 @@ ExampleGroup: deployment + space + physical episode/interval
 
 顺序按风险从事实边界向外推进，不先搭空 UI 或模型框架：
 
-1. `domain + config`：ID、Registry、CsiLayout/CaptureProfile 构造校验和 Intel 形状内存测试。
-2. `capture + session + wire`：data-plane admission、字节记录、唯一 decoder、fixtures、CRC-32C/recovery、capture/replay CLI。
-3. `timeline`：profile partition、sequence/epoch、watermark、window、gap 和 actual delta-t。
-4. `conditioning + estimator + engine`：显式 receipt、EW prediction、gate、baseline command、world aggregation、deterministic replay。
-5. `view + server + web`：先完成动态 SignalView contract，再做一页二维诊断 UI。
-6. 端到端多 ESP32 soak/replay：磁盘吞吐、UDP gap、慢 WS、reboot 和 baseline poisoning。
+1. `domain`：ID、Registry、CsiLayout/CaptureProfile 构造校验和 Intel 形状内存测试。
+2. `capture + config + wire`：data-plane admission、唯一 decoder、动态 native-frame fixtures 和严格 route/capability 校验。
+3. ESP-IDF firmware：固定工具链 build、disposable provision、probe、flash/verify 和当前可用真实开发板的 authenticated live CSI。
+4. `session + capture/replay app`：CRC-32C container/recovery、durable admission、runtime lock、capture/replay CLI 和 faithful raw replay。
+5. `timeline + conditioning + estimator + engine`：profile/epoch/window、显式 receipt、Welford/EW baseline、world aggregation 和 deterministic faithful replay。
+6. `view + server + web`：动态 SignalView、完整 HTTP/WS 与二维诊断 UI；以至少两个 authenticated ESP32 route 的真实 captured datagram fixtures/corpus 验证同窗 ingestion、隔离和 multi-route/replay runtime smoke，包括 UDP gap、慢 WS、reboot 与 baseline poisoning。多物理板长期 soak、磁盘吞吐与容量性能 gate 延后。
 7. 在声明的参考 CPU 上建立统计 estimator 性能事实；加入具体 `candidate.rs`，实现 native-coordinate AR(1)、closed-session `learn-ar1/evaluate-candidate`、artifact 和 bounded shadow，不添加 ML runtime。
 8. 通过 AR candidate 的 time-forward holdout、deterministic replay、shadow 干扰、rotation/learning-lag、runtime-lock 排他和 shadow 选择/回滚准入。
 9. 只有积累足够 sealed ESP32 corpus 后，才在外部 GPU 进程做单 profile RF 预训练模型 spike；它使用一个 concrete continuous adapter、一条 shared causal core 和 native-coordinate forecast head，产出 `PretrainedModelArtifact` 与独立评估，不先实现 `EpisodePack`/MoT/generator，也不给 Rust 增加 GPU feature 或训练框架。
@@ -1871,7 +1882,6 @@ ExampleGroup: deployment + space + physical episode/interval
 ### 24.1 有数据再做
 
 - Intel 5300 真实 decoder 与混合硬件 soak；
-- 固件 stable hardware/boot/TX identity 和 per-frame capture ticks；
 - phase calibration、clock mapping 和 coherent fusion；
 - ground-truth 校准的 presence/motion/OOD；
 - candidate 对 production belief 的融合/替换规则和语义晋升；
@@ -1879,7 +1889,7 @@ ExampleGroup: deployment + space + physical episode/interval
 - `RepresentationContractId`/encoded token/fusion structs、第二种 concrete modality adapter、MoT 与 offline generator head；
 - viewport 多分辨率 cache、长期索引或数据库；
 - late state revision；
-- authenticated RF packet 和多租户权限。
+- 多租户权限。
 
 ### 24.2 明确拒绝进入首个切片
 

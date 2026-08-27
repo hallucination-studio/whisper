@@ -1,11 +1,11 @@
 # 第一版本实现计划
 
-- 状态：用户已批准实现；工作包 1.1 进行中
+- 状态：用户已批准实现；工作包 1.1、1.2 PASS，工作包 1.3 进行中
 - 范围：事实内核、持久化与 replay、最小 RF World Model、查询与动态可视化
-- 执行者：按工作包委托 Luna Max
+- 执行者：每个工作包委托一个 `gpt-5.6-sol`、low reasoning 的写 Executor
 - 验收者：本线程；只审阅、运行检查、决定通过或退回，不直接修改实现
 
-本轮已冻结 S3 firmware、native-frame 和实施门槛；用户已于 2026-08-26 批准实施。每个工作包仍须通过独立 Luna Max 对抗审阅，并由本线程独立裁决后才能进入下一包。
+本轮已冻结 S3 firmware、native-frame 和实施门槛；用户已于 2026-08-26 批准实施。每轮审阅使用一个新的 `gpt-5.6-sol`、low reasoning、只读 clean-room Reviewer，并由本线程独立裁决后才能进入下一包。
 
 ## 1. 不可违反的执行约束
 
@@ -14,7 +14,7 @@
 `ARCHITECTURE.md` 是本轮实现的受保护合同，当前 SHA-256 为：
 
 ```text
-80121707b46d05c004e012613be8aa3f05eee0a8c7dc204b09de7bcc5e5cdae5
+bccd432f78b427f2a1e332a5994ccccf98f3b79908534693a7e79f88c1256b67
 ```
 
 每个执行工作包开始和结束时都必须运行：
@@ -48,6 +48,8 @@ UDP/session bytes
 
 第一版本完成 [架构准入测试 1—34](ARCHITECTURE.md#22-开发准入测试) 的功能合同。它是功能开发基线，不声称已经完成后续 30 分钟吞吐、CPU candidate 或神经模型演化门禁。
 
+当前只延后 signed shared-image manifest/release key、production secure-boot/flash-encryption/eFuse/signed-OTA/provisioning ceremony、callback/encoder latency metrics/runtime histograms/p99，以及 soak/capacity/release performance gates。session persistence/recovery/faithful replay、timeline、完整 Welford/EW baseline、多设备、SignalView、完整 API/WebSocket/UI 和 estimator evidence 合同仍按本计划实施。
+
 明确不实现：
 
 - `candidate.rs`、`CandidateInput`、AR(1)、learn/evaluate/select/rollback shadow；
@@ -72,9 +74,9 @@ UDP/session bytes
 - CBOR、digest、AEAD 与 CRC-32C 不自行发明通用库；wire fixture 在 1.2 先由 Rust 冻结，1.3 的 firmware 只消费它们并做 parity，不允许反向修改。
 - 前端使用原生 HTML/CSS/JavaScript 与 Canvas/SVG；不引入 Node 构建链和组件框架。
 
-## 2. Luna Max 执行与本线程验收协议
+## 2. Executor/Reviewer 与本线程验收协议
 
-每个工作包使用一个新的 Luna Max 执行 agent。共享工作区一次只允许一个写入型工作包处于运行状态；可以并行委托其他 Luna Max 做只读审阅，但不得让两个 agent 同时修改相同或相邻合同文件。
+每个工作包使用恰好一个新的 `gpt-5.6-sol`、low reasoning 写 Executor。每轮 review 使用一个新的同模型、同 reasoning、只读 clean-room Reviewer；共享工作区一次只允许一个 writer。
 
 ### 2.1 下发给执行 agent 的固定指令
 
@@ -97,7 +99,7 @@ UDP/session bytes
 2. 验证本计划摘要与工作包开始值相同，检查 `git status` 和 diff，拒绝越权文件与无关重构；
 3. 检查依赖方向、事实边界、动态坐标、错误语义和确定性；
 4. 运行该工作包检查和当前全部回归测试；
-5. 委托另一名 Luna Max 做只读对抗审阅；
+5. 委托一个新的 `gpt-5.6-sol`、low reasoning、只读 clean-room Reviewer 做对抗审阅；
 6. 判定 `PASS` 或列出 blocker，交回原执行 agent 修复；
 7. 只有当前 gate 通过后才下发下一工作包。
 
@@ -154,6 +156,8 @@ src/capture.rs
 src/config.rs
 src/wire.rs
 src/esp32.rs               删除
+src/domain/csi.rs          原子迁移 observation identity/sequence
+src/domain/tests/csi.rs    对应 domain 回归测试
 src/lib.rs                 删除 esp32 声明、加入 wire 声明
 src/main.rs                替换旧 check-config 接入
 Cargo.toml                 只增加 AES-256-GCM 所需依赖
@@ -168,6 +172,7 @@ tests/fixtures/native-frame/**
 实现：
 
 - `CapturedPacket` 只保存 session/record/time/peer/wire/bytes，不打开 socket；
+- 将 `CsiObservation` 的旧 `device_sequence:u32` 原子替换为经认证的 `device_epoch:DeviceEpoch` 和 `capture_sequence:u64`；不得从旧 ADR 字段、序号回退或超时猜测 epoch；
 - 固件 image 与 runtime datagram 分开验收；host 只信任 manifest 中的 `wire_schema_version`/`build_digest`，不加载或复用 RuView image/parser；
 - 原子移除 `src/esp32.rs` 的 ADR-018/ADR-110 magic dispatcher、`RawAdr018`/`Adr018Capabilities`、旧 `WireFormat::Esp32Udp` routing 和所有 ADR config/fixture/test；不得保留 compatibility config、parser 或 feature；
 - 在同一工作包以 native-frame 的 exact peer/device/key-epoch `HeaderRoute`、source-MAC/channel policy `DecodedRoute` 替换旧 ESP32 配置及 `check-config`；配置只保存 secret root path，永不保存 AES key；
@@ -205,21 +210,21 @@ tests/fixtures/native-frame/**       只消费 1.2 已冻结的 golden vector；
 实现：
 
 - 建立一个新的标准 ESP-IDF `main` component；不引入 RuView source、parser、OTA packet 或 compatibility layer；
-- 建立自有 `sdkconfig.defaults`、固定 `0x10000` partition-table offset 与 8 MB `partitions.csv`：encrypted `nvs`、`otadata`、`phy_init` 和两个 3 MiB OTA app slots；Docker 只用固定 image digest 执行 `idf.py set-target esp32s3 && idf.py build`，不依赖 host ESP-IDF，也不复制 RuView 的 defaults/partition/release binary；
+- 建立自有 `sdkconfig.defaults`、固定 `0x10000` partition-table offset 与 8 MB `partitions.csv`，保留 `nvs`、`otadata`、`phy_init` 的 `encrypted` flags 和两个 3 MiB OTA app slots；development flash encryption 关闭时这些 flags 不生效且不提供 at-rest security。Docker 只用固定 image digest 执行 `idf.py set-target esp32s3 && idf.py build`，不依赖 host ESP-IDF，也不复制 RuView 的 defaults/partition/release binary；
 - 使用 ESP-IDF Wi-Fi CSI callback、`esp_timer`、NVS 和 mbedTLS AES-256-GCM；不添加自定义 crypto、scheduler 或 update transport；
 - station 只关联 provisioned 2.4 GHz BSSID，`WIFI_PS_NONE`、无 promiscuous/channel hop/BLE coexistence；collector 的标准 UDP probe 只触发接收，不产生第二种 payload parser。CSI config 固定为三种 S3 LTF enabled、无 LTF merge/channel filter/manual scale/ACK dump；只接受 provisioned BSSID 到本机 station MAC 的 callback；
 - callback 在 pointer/`len <= 612`/source/config validation 后先分配 `capture_seq`/callback tick，再非阻塞取得预分配 slot、复制完整 metadata/raw bytes、enqueue；无 slot/queue 满时丢整帧并累计 Health counter，使 source gap 可见；
 - 唯一 encoder/sender task 独占 `message_seq`、sealing、UDP send 和按 v1 grammar 生成的 `CapabilitiesV1`、`CsiDataV1`、`HealthV1`；其它任务只投递 slot/counter/period signal。按配置周期重发 capability/health，保持 ESP-IDF `[imaginary, real]` raw bytes，一个 capture 只发送一个完整 authenticated datagram；
-- provisioning 与 shared image manifest 分离：image 没有 device/key，生成的 `provision.bin` 写入 encrypted NVS，包含 device/key、station/BSSID、probe port、collector 和 capability facts；启动时校验唯一 descriptor、持久递增并 reread `boot_generation`，关联并绑定 probe socket 后才可发 capability，失败或超 budget 时 fail closed；
-- development build 只能用 disposable test provision；release build 用 ESP-IDF Secure Boot v2、flash-encryption release mode、encrypted NVS 和 signed OTA rollback，按显式 factory/eFuse ceremony 激活；runtime CSI endpoint 不承担更新职责。
+- 当前使用 unsigned development image 和 disposable test `provision.bin`；其中只含非生产 device/key、station/BSSID、probe port、collector 和 capability facts，不声明 production at-rest security。启动时校验唯一 descriptor、持久递增并 reread `boot_generation`，关联并绑定 probe socket 后才可发 capability，失败或超 budget 时 fail closed；
+- build/capability digest 与 host pin 保留；signed shared-image manifest/release key、Secure Boot v2、flash-encryption、eFuse、signed OTA 和 production provisioning/release/factory ceremony 延后。runtime CSI endpoint 不承担更新职责。
 
 必测：
 
-- `idf.py build` 使用该唯一 target/board/IDF revision 成功，产物 manifest 的 target/build/wire/capability/partition facts 与 build 输出一致；
+- `idf.py build` 使用该唯一 target/board/IDF revision 成功，build/capability digest、wire 与 partition facts 与 build 输出一致；
 - `esptool` 先通过 `chip-id`/`flash-id` 确认 target/flash，再按 build-generated flash arguments `write_flash` 并在相同 ranges `verify_flash`；拒绝未探测 port、非 S3、非 8 MB 或任何 RuView artifact；
 - firmware 对 1.2 冻结的 test key/fixture 生成与 Rust 完全相同的 header、AAD、nonce、ciphertext/tag、descriptor digest 和 CSI body bytes；C/firmware/Rust parity 在此阶段验收；
 - NVS boot-generation commit/re-read、zero/wrap、无 key、oversize profile、callback slot exhaustion、queue saturation 和 send failure 均不产生 partial/reused-nonce datagram，并使相应 Health counter 单调增加；
-- callback 运行时不分配、锁阻塞、crypto 或 socket I/O；验证 S3 `secondary=Above/Below` 编码、first-word/trailing invalid accounting、三 LTF driver order 和 612-byte maximum；真实 bootstrap board 的最大合法 frame 同时满足 slot 与 UDP budget，并完成包含 callback/encoder p99/max 和 drop counter 的 soak record。
+- callback 运行时不分配、锁阻塞、crypto 或 socket I/O；验证 S3 `secondary=Above/Below` 编码、first-word/trailing invalid accounting、三 LTF driver order 和 612-byte maximum；真实 bootstrap board 的最大合法 frame 同时满足 slot 与 UDP budget，correctness/drop counters 可观察。若当前 `HealthV1` schema 保留 callback/encoder latency 字段，开发固件发送 `0`；latency metrics、histogram、p99 与 soak record 延后。
 
 ### 阶段一 Gate
 
@@ -501,7 +506,7 @@ cargo doc --workspace --all-features --no-deps
 
 必须确认：
 
-- 架构摘要仍为 `80121707b46d05c004e012613be8aa3f05eee0a8c7dc204b09de7bcc5e5cdae5`；
+- 架构摘要仍为 `bccd432f78b427f2a1e332a5994ccccf98f3b79908534693a7e79f88c1256b67`；
 - 架构测试 1—34 有逐项对应的 runnable test 或明确端到端验收；
 - 没有 `unsafe`、未授权依赖、future feature flag、空 trait 或第二套 parser；
 - domain/session/API/UI 没有权威固定 RF shape；
@@ -510,7 +515,7 @@ cargo doc --workspace --all-features --no-deps
 
 ### 7.2 端到端验收场景
 
-使用至少两个 ESP32 route 和两个不同 profile/长度的真实 fixture：
+使用至少两个 authenticated ESP32 route 和两个不同 profile/长度的真实 captured datagram fixtures/corpus，在同一 window 内并发输入；另用当前可用真实开发板完成 authenticated live smoke：
 
 1. capture 写入 closed session；
 2. live 产生多个独立 stream/link belief 和单一 world snapshot sequence；
@@ -527,7 +532,7 @@ cargo doc --workspace --all-features --no-deps
 
 完成后可以声明：
 
-- 多 ESP32 route、动态 profile 的单机 RF 事实/世界状态链路已通过真实 datagram corpus 与 runtime smoke；
+- 至少两个 authenticated ESP32 route 的真实 captured datagram corpus 已证明同窗 ingestion、独立 stream/link/baseline 和单一 world snapshot sequence；当前可用真实开发板已通过 authenticated live smoke；
 - raw session 可检查、恢复和 faithful replay；
 - 系统能输出可解释的 `Stable | Changing | Unknown(reason)`；
 - UI 不依赖固定 tensor，能够并列显示不同 native layout。
@@ -540,4 +545,4 @@ cargo doc --workspace --all-features --no-deps
 - 已支持 Intel 5300 实采或相干 mixed-device fusion；
 - 已实现 presence、姿态、动作、生命体征或跨环境语义泛化。
 
-第一版本验收通过后，是否进入多设备 soak/performance 或 CPU AR(1) 由用户另行决定，不自动继续。
+第一版本验收通过后，是否进入多物理板长期 soak/performance 或 CPU AR(1) 由用户另行决定，不自动继续。
