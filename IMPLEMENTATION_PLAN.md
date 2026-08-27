@@ -15,7 +15,7 @@
 `ARCHITECTURE.md` 是本轮实现的受保护合同，当前 SHA-256 为：
 
 ```text
-d6f56c1c10d48b727c232c1c1ea2c89b212438a2afc4eb9b69e9853e5d32232b
+9933f41e959d3a437c9a413386bc8919519a85de5f3dfd5b9142fe4763f6921b
 ```
 
 每个执行工作包开始和结束时都必须运行：
@@ -67,7 +67,7 @@ UDP/session bytes
 - 一个名为 `whisper` 的 Rust package，library + binary；不建 workspace，不保留 `world` package/crate/binary alias。
 - 默认使用具体类型和 `pub(crate)`；没有真实外部消费者时不稳定公共 SDK。
 - 一个 ingest owner 顺序拥有 `Timeline`、`BaselineEstimator` 和当前 `WorldSnapshot`。
-- raw `session_records` 是唯一事实源；只允许同一 SQLite DB 中可由 faithful replay 重建的 typed query projections，不写第二份 authoritative decoded CSI 日志。
+- raw `session_records` 是唯一 event/packet fact log；semantic replay authority 是 current `SessionManifest` complete seed + its ordered records；derived SQLite state/projections rebuild from that pair，不写第二份 authoritative decoded CSI 日志。
 - 外部输入失败返回分类 `Result`；只有被检测到的程序不变量可以 panic。
 - 不使用 `unsafe`。
 - 新依赖必须服务当前工作包；不得为以后预装模型、外部数据库或前端框架。
@@ -254,7 +254,7 @@ cargo doc --workspace --all-features --no-deps
 ```text
 src/session.rs
 src/database.rs            concrete rusqlite schema/transactions/queries/retention；不建 trait/ORM
-src/domain/world.rs        仅删除因 WP 2.1 正式使用 baseline 类型而失效的两处 dead_code expectation
+src/domain/world.rs        canonical complete BaselineState value；并删除相应 dead_code expectations
 src/config.rs              Config 根、ReplayConfig/RuntimeConfig 与唯一 replay-config codec
 src/wire.rs                只做 Config/ReplayConfig 签名和 decoder version 原子迁移
 src/main.rs                只做 whisper crate/binary 与 Config 原子迁移
@@ -277,24 +277,25 @@ tests/fixtures/session/**  只保留 typed CBOR/semantic fixtures；不固定 SQ
 - wire 不接收整个 `Config`：live datagram limit 由 app 从 `CaptureConfig` 显式传入，route/decode 只接收 `ReplayConfig` 中的 `Registry`；该签名迁移不改变已冻结 native-frame bytes 或拒绝分类；
 - `SessionConfig` storage path 从目录原子改为明确 SQLite database file path，不保留 alias；它仍是 runtime-only identity，路径变化不改变 `ReplayConfig` digest；
 - `database.rs` 直接使用 `rusqlite`，一个 schema version 1、一个 database、一个由现有 single ingest owner 持有的 synchronous writer connection；writer open 时启用并验证 WAL、foreign keys 和 FULL durability；不建 ORM、repository/provider trait、connection pool、通用 migration/checkpoint framework；
-- schema v1 包含 `admission_epochs`、`sessions`、`session_records`、typed `csi_observations`、`world_snapshots`、`snapshot_link_evidence`、`baseline_projections` 及 API 所需 indexes；typed projection body 是 strict CBOR，不按 coordinate 拆行；raw `session_records` 是 sole authority，projection 携带 source receipts/version pins 并可由 faithful replay 删除重建；
+- schema v1 冻结 `admission_epochs`、`sessions`、`session_records`、`session_processing_state`、`csi_observations`、`world_snapshots`、`snapshot_link_evidence`、`baseline_states` tables/constraints；fresh processed cursor/timeline state 为 NULL，manifest seed/rebind 的 baseline `source_record` 为 NULL；
+- `domain/world.rs` owns one canonical complete `BaselineState`; `session.rs` manifest codec embeds `initial_baseline_states: Vec<BaselineState>`。It preserves Learning Welford count/mean/M2/exposure, Active current EW mean/variance, lifecycle, revision/state sequence, compatibility and every cross-session continuation field；absence means Missing。database shape stores the same type，不建 session DTO/generic value；WP 2.1 defines no estimator behavior and no TimelineState codec；
 - admission row 固化 provisioned `(device_id,key_epoch)`、configured replay-window identity/size、nullable boot/maximum sequence 和 bounded bitmap；sessions 固化 manifest/lifecycle seal；records 固化 `(session_id,record_seq)` total order、monotonic time、strict kind/body 和 exact packet context/bytes；超出 SQLite signed INTEGER 的 unsigned domain 使用 fixed-width canonical bytes，不得窄化；
 - manifest 直接嵌入创建 session 时同一个 `Config` 中的强类型 `ReplayConfig`；reader 只调用 `config.rs` 的严格 decoder，重新验证并核对 canonical digest 与 `config_digest` 后才产生 manifest；不落盘 TOML source/`RuntimeConfig`，replay 不读取当前磁盘配置，AES key 不进入 config/session；
 - `SessionRecord` 的 packet、baseline command、timeline advance、closed；
 - 严格 `record_seq`、monotonic `at`、schema、长度上限和 trailing data 校验；
-- transaction A primitive 原子验证/推进 admission window 并插入 exact raw record；rollback 后 admission/raw 均不变。WP 2.1 不实现 decode/Engine projection 写入路径；
+- transaction A primitive 原子验证/推进 admission window 并插入 exact raw record；rollback 后 admission/raw 均不变。WP 2.1 implements only the canonical complete `BaselineState` strong codec required by the manifest/database contract；it does not implement `TimelineState` codec、estimator mutation、decode pipeline or Engine behavior；
 - `Closed` raw record 使 stream non-appendable，但 transaction A 不改变 session lifecycle；seal 与后续 baseline handoff 只由产生对应 projection 的工作包在 final transaction B 完成；
 - startup 把任何 non-sealed prior session（包括 Closed tail）视为 incomplete；具体 projection/working-state rebuild 留给产生该类型的后续工作包，完成后才 recovery-seal/create next session；SQLite rollback 取代 crash-tail scan/CRC；
-- 最小 retention transaction 只删除最旧 sealed session/records/projections，永不删除 active session 或 admission rows；允许 SQLite reuse free pages，不建 hot-path VACUUM/refcount/artifact GC；
+- `retention_max_sessions` 为正；retention 只删除最旧 sealed session/records/projections，永不删除 active session、current operational baseline 或 admission rows；WP 2.1 freezes manifest/database value contract，handoff behavior 在 WP 3.4；允许 SQLite reuse free pages，不建 GC；
 - 使用现有标准库 advisory runtime lock；不建 sentinel 或通用 object store；
 - manifest 不含 candidate/shadow/artifact 字段；第一版本不实现 artifact 导入、选择或 GC。
 - 不新增第二个配置根、模块私有 config parser、通用 canonical-CBOR/value decoder、全局配置 singleton 或 DI container。
 
 必测：
 
-- behavioral temp-DB schema/pragma/version/foreign-key/index constraints 与 transaction rollback；不固定 SQLite file bytes；
+- behavioral temp-DB schema/pragma/version/FK/index constraints，fresh NULL cursor/timeline state、nullable manifest-seeded baseline source record、complete `BaselineState` manifest/database strong roundtrip and transaction rollback；不测试 Timeline codec，不固定 SQLite file bytes；
 - `parse_config` 只构造 `Config`；semantic 配置变化改变 `ReplayConfig` digest，runtime-only 配置变化不改变它；canonical `ReplayConfig` roundtrip 保持强类型和值，unknown/malformed field 与不变量失败被拒绝；
-- session 的强类型 `ReplayConfig` roundtrip、config/digest 不一致拒绝，并证明 fixture 不含 TOML source、`RuntimeConfig`、secret root 或 AES key；build/decoder/conditioning/algorithm pin roundtrip；
+- session 的强类型 `ReplayConfig`/complete initial `BaselineState` roundtrip、config/digest 不一致拒绝，并证明 fixture 不含 TOML source、`RuntimeConfig`、secret 或 lossy snapshot-only baseline seed；
 - typed CBOR 长度超限在分配前失败；完整 unsigned u64 edge values roundtrip/order 不窄化；
 - missing/corrupt/wrong-schema DB、missing epoch row 和 incompatible pragma fail closed；capture 不 auto-create/reset；
 - Closed 后不能继续插入 raw；non-sealed session 不能被 retention 或当作完整 replay input，只有 recovery 完成后才能 recovery-seal/create next session；
@@ -311,6 +312,7 @@ tests/fixtures/session/**  只保留 typed CBOR/semantic fixtures；不固定 SQ
 ```text
 src/app.rs
 src/secrets.rs
+src/database.rs            只接入 stage-two observation/cursor transaction、resume/rebuild/final seal
 src/main.rs
 src/lib.rs                 仅增加模块声明/最小启动 API
 firmware/esp32-native-frame/provision.py  durable key + verified board provisioning 后调用 host init-admission
@@ -326,12 +328,12 @@ tests/app_replay_*.rs
 - app 独占 socket、文件、任务和 shutdown，领域模块不读取系统状态；
 - 实现具体 app-owned local secret loader：从配置指向的受控 `secret_root/<device_id>/<key_epoch>.key`（canonical unsigned decimal directory names）读取恰好 32 bytes；缺失、非 32 bytes 或 I/O error 分类拒绝。它不是 trait/provider、TOML field、session record、环境变量 fallback 或 legacy-key parser；测试使用独立 temporary secret root；
 - UDP receive buffer 使用 65,535 bytes，完整接收后再按业务上限拒绝；
-- ingest 总序为 size/fixed header parse/`HeaderRoute(peer,device,key epoch)`/exact key lookup/AEAD/per-route rate-byte admission → transaction A verify/advance bounded replay window + exact encrypted SessionRecord + commit → cleartext decode/`DecodedRoute(source MAC,channel,PHY,LTF)` resolve → transaction B persist only that decoded `CsiObservation`/profile projection + source/version receipts + commit → typed decode publication；阶段三接入 Engine 后按 WP 3.4 原子扩展 transaction B；
+- ingest 总序为 size/fixed header parse/`HeaderRoute(peer,device,key epoch)`/exact key lookup/AEAD/per-route rate-byte admission → transaction A verify/advance bounded replay window + exact encrypted SessionRecord + commit → cleartext decode/`DecodedRoute(source MAC,channel,PHY,LTF)` resolve → transaction B atomically persist decoded `CsiObservation`/profile projection（若有）并把 processed cursor 从 NULL/previous seq 推进到该 record → commit → replace optional memory mirror/publish typed decode。stage two 不写/恢复 TimelineState，`timeline_state_cbor` 保持 NULL；authenticated deterministic decode rejects/control records 也推进 cursor；阶段三按 WP 3.4 扩展同一 transaction B；
 - `capture`/`replay` 只打开 existing correctly initialized DB，missing/corrupt/wrong schema/pragma 或 missing epoch row fail closed；capture 不 auto-create/reset。init-admission 在 DB absent 时创建 schema v1，并插入 configured empty nullable epoch row；exact already-empty matching retry 可幂等，advanced/conflicting row 拒绝 reset；
 - firmware `provision.py` 仍是 front door，在 durable key 写入和 board provisioning verify 后调用清晰 host CLI；不得把 key bytes 写入 DB/session/log；
 - 只有完整 data-plane admission 成功的 encrypted datagram 才会 durable；认证后的 unknown kind、unsupported capability 或 malformed cleartext 才记录分类 reject 并继续；
 - replay 使用 manifest pin 和同一个 native-frame decoder；第一版本此时输出 typed decode/health 流，阶段三接入相同 Engine 后升级为 semantic replay；
-- graceful shutdown/rotation 的 transaction A 只 commit `Closed`；stage-two final transaction B 写完截至该 tail 的 observation/profile projections 后才 atomically seal，rotation 同 transaction 创建 next manifest。startup 对任意 non-sealed session 从 raw rows rebuild stage-two projections、完成 final transaction B、recovery-seal，再创建 next session；不建 HTTP、actor graph、checkpoint framework 或 writer task 拆分。
+- stage-two startup 验证 cursor/receipts 和 indexed observations，只 replay cursor 后 raw；cursor/observation state 缺失、损坏或不兼容时在 serving 前从全部 raw rows rebuild into SQLite。graceful shutdown/rotation 的 transaction A 只 commit `Closed`；final transaction B 把 cursor 推到 tail、写完 observation projections 后才 seal，rotation 同 transaction 创建 NULL-cursor next manifest。任何 non-sealed session 用相同规则 recovery-seal；不声称 Timeline restore，不信任 memory，不建 checkpoint framework 或 writer task 拆分。
 
 必测：
 
@@ -340,11 +342,11 @@ tests/app_replay_*.rs
 - missing/malformed secret file 与不同 `(device_id,key_epoch)` key lookup 均分类拒绝，key bytes 不出现在 config/session/error；
 - message sequence duplicate/old/new boot generation 和 controlled reordering 按固定 replay window 验证；
 - host restart 和 session rotation 后重放同一有效 datagram 被拒绝；missing epoch row fail closed，fresh key epoch provisioning 建立空 admission row，advanced/conflicting row 不能 reset；
-- transaction A 失败后 decoder/state advance 未发生；observation transaction B 失败后停止 capture，observation/profile projection 与 typed decode notification 均未发布；
+- transaction A 失败后 decoder/state advance 未发生；transaction B 失败后 cursor/state/observation projection 保持旧 committed 值，停止 capture且 mirror/notification 未替换/发布；decode reject/control cursor advance 与其 state effect 原子；
 - raw packet live/replay 解码结果相同；
 - authenticated malformed body、unknown kind、capability unavailable 与 source-MAC mismatch 的 raw packet 已记录但不进入推理输入；
 - runtime lock 冲突明确拒绝；
-- sealed/recovery-sealed session 均能按 ordered rows 只读 replay；crash after Closed A/before observation B 会 rebuild stage-two projection、recovery-seal 后才创建 next session。
+- valid stage-two cursor 从其后 resume 与 full raw rebuild observation projection 结果相同；cursor/receipt 缺失、损坏或不兼容自动 full rebuild into SQLite；`timeline_state_cbor` 始终 NULL；sealed/recovery-sealed session 均能只读 replay；crash after Closed A/before final B 会完成 cursor/projection、recovery-seal 后才创建 next session。
 
 ### 阶段二 Gate
 
@@ -360,13 +362,14 @@ tests/app_replay_*.rs
 
 ```text
 src/timeline.rs
+src/database.rs            只接入 `session_processing_state` strict codec/validation
 src/lib.rs                 仅增加模块声明
 tests/timeline_*.rs
 ```
 
-实现以 `DeviceEpoch` 为 source 的 `capture_seq`、profile partition、gap/duplicate/reorder、active watermark、固定非重叠窗口、missing span 和 `TimelineAdvance`。不实现 wrap 或由序号猜测 epoch change；所有时间由参数传入，不读取墙钟。
+`timeline.rs` owns concrete `TimelineState` and its strict codec/restore invariants while implementing per-`DeviceEpoch` `capture_seq`、profile partition、gap/duplicate/reorder、active watermark、固定非重叠窗口、missing span 和 `TimelineAdvance`。`database.rs` persists/loads that concrete type; no parallel session DTO or generic bytes API。current-window observations 复用 indexed `csi_observations`，不在 state 中重复。所有时间由参数传入，不读取墙钟；不实现 wrap、序号猜 epoch 或 generic checkpoint。
 
-必测架构测试 7—12；特别覆盖 A/B/A profile 交错、inactive stream、半开窗口边界和 replay advance。
+必测架构测试 7—12；特别覆盖 A/B/A profile 交错、inactive stream、半开窗口边界、replay advance，以及 state + current-window observation rows restore 与 uninterrupted Timeline 等价。
 
 ### 工作包 3.2：Conditioning
 
@@ -406,6 +409,7 @@ tests/estimator_*.rs
 - 完整 `LinkQuality` eligibility conjunction：frame count、ready-coordinate coverage、gap ratio、receive jitter、finite/ordered values/time、time source 以及 resolved/compatible source/link/profile；每个实测值和拒绝原因进入 receipt；
 - predict → score → gate → optional update；
 - `BaselineRevision` 与 `BaselineStateSequence`；
+- `estimator.rs` operates directly on WP 2.1 canonical `domain::world::BaselineState` and enforces its runtime invariants；不定义 duplicate state/DTO/codec；
 - profile 先归约到 physical link，再归约到 space；
 - `Stable | Changing | Unknown(reason)`、diagnostics、contribution/exclusion；
 - `CoordinateEvidence` 和 `LinkStepEvidence` 作为 estimator 的可审计输出；第一版本不构造 candidate input。
@@ -422,21 +426,24 @@ tests/estimator_*.rs
 src/engine.rs
 src/app.rs                 只接入 Engine/replay/shutdown
 src/session.rs             只接入已定义 baseline command/snapshot strong records
-src/database.rs            只接入 observation/snapshot/evidence/baseline projection transaction
+src/database.rs            只接入 concrete TimelineState/BaselineState 与 observation/snapshot/evidence transaction
 src/lib.rs                 仅增加模块声明/最小启动 API
 tests/engine_*.rs
 tests/replay_*.rs
 ```
 
-实现唯一 world 写入路径；live/replay 共享 decoder、registry、timeline、conditioning、estimator 和 engine；Engine 只返回包含 snapshot 与 `LinkStepEvidence` 的具体内部 `EngineOutput`，Engine 不依赖 database/view。`app.rs` 将 WP 2.2 的 transaction B 原子扩展为：同一 transaction 写入该 record 的 typed observation/profile projection，以及对应 `EngineOutput` 的 snapshot/per-link evidence/baseline projections和全部 source/version receipts；任一写入失败则整体 rollback 并在 publication 前停止 capture。shutdown/rotation 先以 transaction A 只追加 non-appendable `Closed`，再调用 `Engine::finish`；final transaction B 原子写 final projections/handoff 并 seal，rotation 同时创建 next manifest。startup 对任何 non-sealed session（含 Closed tail）replay ordered raw、重建 missing projections/working state、deterministically finish，并以同一 transaction recovery-seal/create next session。第一版本不实现 `CandidateInput`/candidate；baseline command 先记录并 durable 再执行。内存只保留可从 raw ordered rows 重建的 Engine working state 和 bounded notification buffers。
+实现唯一 world 写入路径；Engine returns concrete `EngineTransition { timeline, changed_baselines, outputs }`; app persists exactly it。transaction B atomically writes observation、cursor、TimelineState、canonical complete BaselineStates、snapshots/evidence/receipts。rotation/shutdown deterministically reset only session-local baseline fields, embed exact complete values in next/current manifest, write identical `baseline_states` rows with NULL source_record, rebind/create current session, then make old session retention-eligible in the same final B。startup initializes estimator from current manifest `initial_baseline_states`, loads valid derived state and replays cursor tail；invalid baseline/state rebuilds from current manifest seed + that session records even after predecessor retention。No duplicate state、generic checkpoint/value API；memory only disposable。
 
 必测：
 
 - 架构测试 20、22—24；
 - 两 sensors × 两 profiles 同一 window 只产生一个 snapshot；
 - 相同 session/build/config 的 live 与 faithful replay typed semantic projection 相等；
-- final transaction B 的 observation、snapshot、evidence 或 baseline 任一写入故障都整体 rollback，且没有 partial projection/notification；
-- crash after Closed transaction A/before final transaction B 后，startup 重建相同 final projections/baseline handoff，recovery-seal 后才创建 next session；
+- transaction B 的 cursor/timeline/complete-baseline state、observation、snapshot 或 evidence 任一写入故障都整体 rollback，且没有 partial mirror/projection/notification；
+- EngineTransition state equals persisted state byte-for-byte/strong-type roundtrip；app 不重算 Timeline/Baseline state；
+- rotation/shutdown/startup embed and persist byte/strong-value-equal complete baseline seed before retention；manifest/database seed has NULL source_record；positive retention cannot cascade-delete operational baseline；
+- Learning Welford M2/exposure、Active current EW values、lifecycle/revision/state sequence survive rotation exactly；after predecessor retention, forced rebuild from current manifest + records equals uninterrupted run；
+- crash after Closed transaction A/before final transaction B 后，startup 恢复相同 final processing/timeline/baseline state、projections/handoff，recovery-seal 后才创建 next session；
 - HTTP/delivery/运行耗时不进入 snapshot；
 - `Engine` 保留具体 `EstimatorError`，证据不足返回 `Unknown` 而不是 `Err`。
 
@@ -533,7 +540,7 @@ cargo doc --workspace --all-features --no-deps
 
 必须确认：
 
-- 架构摘要仍为 `d6f56c1c10d48b727c232c1c1ea2c89b212438a2afc4eb9b69e9853e5d32232b`；
+- 架构摘要仍为 `9933f41e959d3a437c9a413386bc8919519a85de5f3dfd5b9142fe4763f6921b`；
 - 架构测试 1—34 有逐项对应的 runnable test 或明确端到端验收；
 - 没有 `unsafe`、未授权依赖、future feature flag、空 trait 或第二套 parser；
 - domain/session/API/UI 没有权威固定 RF shape；

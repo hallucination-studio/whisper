@@ -196,7 +196,7 @@ capture        domain
 config         domain
 wire           capture + config + domain
 session        capture + config + domain
-database       capture + config + domain + session
+database       capture + config + domain + session; stage 3 adds timeline concrete state type
 timeline       config + domain
 conditioning   config + domain + timeline
 estimator      config + domain + conditioning
@@ -220,6 +220,7 @@ main           app
 - `server` 不持有 `&mut Engine`，只能执行 bounded indexed SQLite projection queries 或发送 command。
 - `app` 只组合和治理生命周期，不复制领域计算。
 - `database` 直接使用 `rusqlite`，不定义 storage/repository/provider trait、ORM 或通用 migration/checkpoint framework。
+- `TimelineState`/strict codec belong to `timeline`. `domain::world::BaselineState` is the one canonical complete baseline value; `session` owns its manifest codec, `estimator` operates on it, and `database` persists the same type. There is no parallel session DTO or generic bytes/value API.
 - 模块间使用具体类型；首个切片没有 `FrameDecoder`、`WorldModel`、`StorageBackend`、`ViewProjector`、`Clock` trait、registry factory 或 DI container。
 
 箭头含义为“左侧依赖右侧”。`AlignedWindow` 只能先经过 `condition`，`BaselineEstimator` 不接收 raw window。view 只从 `database` 的 concrete bounded query functions 取得 committed projections；它不读取 Engine working state，也不重新解释 raw records。
@@ -354,6 +355,12 @@ session_records
   session_time, kind, body_cbor
   FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 
+session_processing_state
+  PRIMARY KEY (session_id)
+  processed_through_record_seq NULL, timeline_state_cbor NULL
+  config_digest, decoder/conditioning/algorithm versions
+  FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+
 csi_observations
   PRIMARY KEY (session_id, record_seq)
   session_time, sensor_id, link_id, profile_id, observation_cbor, version receipts
@@ -366,14 +373,14 @@ snapshot_link_evidence
   PRIMARY KEY (session_id, snapshot_id, link_id, profile_id)
   evidence_cbor, source record range, version receipts
 
-baseline_projections
+baseline_states
   PRIMARY KEY (deployment_id, link_id, profile_id)
-  lifecycle/snapshot_cbor, source session/record, version receipts
+  complete estimator_state_cbor, source_session, source_record NULL, compatibility receipts
 ```
 
 `device_id`、`record_seq`、session time、boot generation 和 message sequence 的完整 unsigned domain 必须保留；超出 SQLite signed `INTEGER` 的值使用固定宽度 canonical big-endian bytes 和 schema constraints，不得窄化、reinterpret cast 或按有符号值排序。`seen_bitmap` 长度由已配置且有界的 replay-window size 决定。
 
-Raw `session_records` are the sole authority. Projection tables contain strict typed CBOR rather than one row per CSI coordinate; each row carries source session/record receipts and decoder/conditioning/algorithm/config versions. They are deletable and deterministically rebuildable by faithful replay. They are not viewport tiles, multiresolution caches, WebSocket state, metrics, or a generic event/value store. Indexes cover the specified bounded API access paths: session/record/time/sensor/link/profile and snapshot/baseline identity.
+Raw `session_records` are the sole event/packet fact log; semantic replay authority is `(SessionManifest, ordered session_records)`. A fresh session has NULL processed cursor and NULL timeline state; stage two advances only the cursor and leaves `timeline_state_cbor` NULL. Once stage three owns the concrete type, `session_processing_state` stores strict `timeline::TimelineState`; current-window observations remain in indexed `csi_observations` rows and are not duplicated in state. `baseline_states` and the manifest seed both use the same complete `domain::world::BaselineState`. `source_record` may be NULL only when seeded/rebound from a manifest. All derived rows rebuild from the current manifest seed plus that session's ordered records, including after predecessor retention. There is no generic bytes/value state API.
 
 ```rust
 struct SessionManifest {
@@ -387,7 +394,19 @@ struct SessionManifest {
     wire_admission: Vec<WireAdmissionPin>,
     conditioning_version: String,
     algorithm_version: String,
-    initial_baselines: Vec<BaselineSnapshot>,
+    initial_baseline_states: Vec<BaselineState>,
+}
+
+struct BaselineState {
+    key: LinkProfileKey,
+    lifecycle: BaselineLifecycle,
+    learning: BTreeMap<BaselineCoordinateKey, WelfordState>,
+    active: BTreeMap<BaselineCoordinateKey, EwState>,
+    revision: Option<BaselineRevision>,
+    state_sequence: Option<BaselineStateSequence>,
+    adaptation_armed: bool,
+    session_last_eligible_at: Option<SessionTime>,
+    compatibility: BaselineCompatibilityReceipt,
 }
 
 struct WireAdmissionPin {
@@ -425,7 +444,7 @@ struct TargetedBaselineCommand {
 }
 ```
 
-`replay_config` 是创建 session 时从同一个 `Config` 取得的强类型值，不是 session 自己定义的 DTO。reader 必须调用 `config.rs` 的唯一严格 decoder，重新验证并核对 canonical digest 与 `config_digest` 后才产生 manifest；非法字段、不变量失败或 digest 不一致均拒绝。session 模块不解析 TOML，也不持久化 `RuntimeConfig`。
+`replay_config` 是创建 session 时从同一个 `Config` 取得的强类型值，不是 session 自己定义的 DTO。`initial_baseline_states` is the canonical complete estimator seed: Learning preserves per-coordinate Welford count/mean/M2/exposure; Active preserves current EW mean/variance; lifecycle、revision/state sequence、compatibility and all cross-session continuation state are exact. Missing is represented by absence. reader strictly decodes the same `BaselineState` type used by estimator/database; no parallel DTO exists.
 
 `CapturedPacket` 是 decoder 使用的完整内存 view，由 record envelope + `Packet` body 组合，不在磁盘中重复序列化 total order/time。reader 必须验证 `record_seq` 从 0 开始严格递增且唯一，`at` 不倒退。
 
@@ -436,17 +455,17 @@ manifest 和 record body 使用 named-field canonical CBOR 与严格 schema；�
 `capture`/`replay` 只打开已存在且正确初始化的数据库；文件缺失、SQLite 损坏、schema/version/pragma 不符或任一 configured epoch row 缺失都 fail closed。capture 不自动 create、reset 或 repair。进程仍持有现有 OS advisory exclusive runtime lock；获取失败明确拒绝。
 
 - size、fixed header、peer、`HeaderRoute`、exact key lookup、AEAD 和 per-route rate/byte budget 在数据库 mutation 前完成。通过 AEAD 后，一个 `BEGIN IMMEDIATE` transaction 读取并验证匹配的 `admission_epochs` row，在有界窗口中拒绝 replay 或推进 boot/message window，插入包含 exact encrypted bytes、peer、record/time 的 `SessionRecord`，然后 commit。只有 commit 成功后才 decode cleartext 或推进 Engine。事务失败既不改变 durable admission，也不改变 Engine。
-- raw transaction commit 后才 decode/advance Engine。随后 transaction B 原子写入该 output 的 `CsiObservation`、`WorldSnapshot`、per-link evidence 和 baseline projection 变化及 source/version receipts；API 只暴露 committed projection rows。projection transaction 失败时在任何发布/WS notification 前停止 capture。crash 后从 active session 的 ordered raw rows 确定性重建 Engine working state 和 projections，不依赖只存在内存的 cursor，也不增加通用 checkpoint framework。
+- raw transaction commit 后才 decode/advance Engine。Engine returns a concrete `EngineTransition`; transaction B persists exactly its updated `TimelineState`、changed complete `BaselineState`s and outputs together with this record's `CsiObservation`（若有）、processed cursor and receipts。app never reconstructs state。deterministic decode reject 和 control record 也必须在 concrete state effect 后推进 durable cursor。API/WS 只暴露 commit 后 rows/IDs；memory mirror 也只能在 commit 后替换。transaction B 失败时在任何发布前停止 capture。
 - unknown peer/version/key、bad tag、replay 或 budget reject 不写 raw。authenticated unknown kind、malformed/unsupported body 或 source/radio mismatch 在事务中先 durable raw，再作为 decode reject，绝不进入 timeline/estimator。
 - `BeginLearning`、`Commit`、`Freeze`、`Resume`、`ActivateSnapshot` 和 `TimelineAdvance` 都先在各自事务中插入 ordered record 并 commit，再执行。`ActivateSnapshot` 完整嵌入不可变 baseline snapshot。
 - `whisper init-admission <config> <device-id> <key-epoch>` 是唯一 host 初始化入口：数据库不存在时创建 schema v1；随后插入与配置 replay-window identity/size 精确匹配、boot/sequence 为空且 bitmap 为空的新 epoch row。完全相同且仍为空的 retry 可幂等成功；任何已推进或冲突 row 都拒绝 reset。现有 firmware `provision.py` 在 durable key 写入且 board provisioning 验证成功后调用此命令。
-- SQLite transaction rollback replaces torn-tail/CRC recovery。启动把任何 non-sealed prior session 都视为 incomplete，包括 raw tail 已是 `Closed` 的 session：按 ordered raw rows faithful replay，重建缺失 projections/Engine working state，在 durable tail 确定性 finish，然后在一个 transaction 中写入 final projections/baseline handoff 并标记 recovery-sealed；完成后才创建 next session。它不扫描 packet bytes 重建 admission，也不增加 checkpoint framework。
-- graceful shutdown/rotation 的 transaction A 只插入 `Closed`，不改变 lifecycle；`Closed` 使 raw record stream 立即 non-appendable。随后 `Engine::finish`；final transaction B 原子写 final observation/snapshot/evidence/baseline projections 并将 lifecycle 改为 sealed。rotation 还在同一 transaction B 中用该 baseline handoff 创建 next session manifest。seal 永不领先 final projections/handoff。
-- retention 在单个事务中只删除最旧 sealed session 及其 FK-owned records，永不删除 active session；`admission_epochs` 永不参与 retention。SQLite 可复用 free pages；热路径不运行 `VACUUM`，不建立 GC framework。
+- SQLite transaction rollback replaces torn-tail/CRC recovery。startup initializes estimator from current `SessionManifest.initial_baseline_states`, validates committed processing/timeline/baseline state and current-window observations, then replays only records after the cursor. Missing/corrupt/incompatible derived state triggers deterministic rebuild from that manifest seed plus all of that session's ordered records before serving; predecessor sessions are not required. Any non-sealed prior session is brought to its durable tail and recovery-sealed before next-session creation. Memory is never resume authority; no generic checkpoint is added.
+- graceful shutdown/rotation 的 transaction A 只插入 `Closed`。随后 `Engine::finish`; deterministically reset only session-local baseline fields (`adaptation_armed=false`, last-eligible/timer cleared). final transaction B atomically embeds those complete states as next `SessionManifest.initial_baseline_states`, writes the exact same strong values to `baseline_states` with NULL `source_record`, creates/rebinds next session, persists final projections/state and seals old session. shutdown/startup performs the equivalent current-manifest handoff before retention.
+- `retention_max_sessions` 必须为正。retention 在单个事务中只删除最旧 sealed session 及其 FK-owned records，永不删除 active session；current operational baseline 已先 rebind 到新/current manifest，不能被旧 session cascade 删除。`admission_epochs` 永不参与 retention。SQLite 可复用 free pages；热路径不运行 `VACUUM`，不建立 GC framework。
 
 session 同时配置 `max_session_duration` 和 `max_session_bytes`。达到任一上限时暂停新输入，按 `transaction A: Closed -> Engine::finish -> transaction B: final projections + seal + next manifest` 完成 rotation。每个 admitted packet 一事务是首个切片的简单 correctness baseline；只有测量证明需要时才讨论 batching 或 writer task 拆分。
 
-同一 SQLite DB 持久化 `CsiObservation`、`WorldSnapshot`、per-link evidence 和 baseline lifecycle/snapshot 的 rebuildable typed projections，但它们不是第二份权威日志；删除后可从 ordered raw `session_records` faithful replay 重建。window working state 只在内存中存在并同样可重建。
+同一 SQLite DB 持久化 processing/timeline state、complete baseline state、`CsiObservation`、`WorldSnapshot` 和 per-link evidence。它们不是第二份事实日志；删除或验证失败后从 current manifest complete seed + that session's ordered records rebuild。内存只允许 one-record calculation/decryption temporaries、commit 后的 disposable state mirrors 和 bounded notification buffers。
 
 ### 6.4 faithful replay
 
@@ -1014,7 +1033,7 @@ struct EvidenceReceipt {
 
 snapshot 内保存紧凑 receipt 和计数；精确坐标证据由 snapshot-pinned indexed SQLite projection 查询返回 `CsiPath × CsiSampleAxis`、observed、predicted、signed residual、exact included mask、excluded reason 和 baseline revision，超出 retained projection 范围则由 faithful replay 重建。这样既能回答具体哪些坐标参与，又不把每个 snapshot 膨胀成完整信号副本。
 
-`BaselineEstimator::step` 在同一次评分中使用 pre-update state 产生 transient `CoordinateEvidence` 和 `LinkStepEvidence`。Engine 只聚合 snapshot 并返回这些 evidence；app 在 transaction B 把 typed snapshot/evidence projection 写入同一 SQLite DB，不能重算 eligibility，也不能创建第二 authoritative log。未来若经过独立批准才引入 candidate，它只能从 sealed-session faithful replay 的 `LinkStepEvidence` 私有派生输入；V1 的 Engine/API/session 不公开或保存 candidate input。
+`BaselineEstimator::step` 在同一次评分中使用 pre-update state 产生 transient `CoordinateEvidence` 和 `LinkStepEvidence`。Engine returns the concrete transition state and evidence; app persists exactly that transition in transaction B and never reconstructs Timeline/Baseline state.未来若经过独立批准才引入 candidate，它只能从 sealed-session faithful replay 的 `LinkStepEvidence` 私有派生输入；V1 的 Engine/API/session 不公开或保存 candidate input。
 
 ```rust
 struct CoordinateEvidence {
@@ -1043,6 +1062,12 @@ struct LinkStepEvidence {
 struct EngineOutput {
     snapshot: WorldSnapshot,
     links: Vec<LinkStepEvidence>,
+}
+
+struct EngineTransition {
+    timeline: TimelineState,
+    changed_baselines: Vec<BaselineState>,
+    outputs: Vec<EngineOutput>,
 }
 ```
 
@@ -1141,13 +1166,13 @@ recv/select packet or baseline command
   -> transaction A: durable replay admission + SessionRecord
   -> decode admitted cleartext + DecodedRoute(source MAC/radio facts) / resolve
   -> Engine::push() / command() / advance_to()
-  -> transaction B: typed SQLite projections + receipts
+  -> transaction B: observation + processing/timeline/baseline state + projections/receipts
   -> try_send small live notification
 ```
 
 - `Engine`、`Timeline`、`BaselineEstimator` 没有共享锁。
 - HTTP baseline command 进入有界 command queue；满时返回 503，不静默丢弃。
-- SQLite 是 HTTP/replay/SignalView 使用的 typed observation、signal、snapshot、evidence 和 baseline query source。ingest 独占 writer connection；HTTP 在 stage four 使用有界 read-only connections，sync queries 不阻塞 async runtime 或 ingest。内存只保留可由 ordered raw records 重建的 Timeline/Estimator/Engine working state 与有界 socket/WS notification buffers；不存在 authoritative in-memory read store。
+- SQLite 是 resume、HTTP、replay 和 SignalView 使用的 processing/timeline/baseline state 及 typed observation、signal、snapshot、evidence query source。ingest 独占 writer connection；HTTP 在 stage four 使用有界 read-only connections，sync queries 不阻塞 async runtime 或 ingest。内存只允许 one-record temporaries、commit 后可丢弃的 state mirrors 与有界 socket/WS notification buffers；WS gap 从 SQLite resync。
 - WebSocket 使用有界队列；慢客户端跳到最新状态或断开，不能反压感知。
 - UDP 本身不可反压。顺序写盘过慢造成的 gap 由 sequence/ingest health 展示；先测量，确认瓶颈后才拆 writer task。
 - socket receive buffer 为完整 UDP datagram 分配 `UDP_MAX_DATAGRAM_BYTES = 65_535`，收到完整长度后再按配置 `max_datagram_bytes` 记录并拒绝超限包；不能用业务上限大小的 buffer 静默截断 datagram。
@@ -1155,7 +1180,7 @@ recv/select packet or baseline command
 
 ### 14.2 shutdown
 
-shutdown 顺序固定：停止接受新 command 和 socket receive；处理已经接收的输入；transaction A 只插入 `Closed(record_seq, at)`，使 raw stream non-appendable 但保持 lifecycle non-sealed；以该 durable record 调用 `Engine::finish(at)`；final transaction B 原子提交最终 observation/snapshot/evidence/baseline projections、source receipts 和 sealed lifecycle；最后关闭 HTTP/WS 和 SQLite connection。
+shutdown 顺序固定：停止接受新 command 和 socket receive；处理已经接收的输入；transaction A 只插入 `Closed(record_seq, at)`，使 raw stream non-appendable 但保持 lifecycle non-sealed；以该 durable record 调用 `Engine::finish(at)`；final transaction B 原子提交最终 processing/timeline state、complete baseline state、observation/snapshot/evidence projections、source receipts 和 sealed lifecycle；最后关闭 HTTP/WS 和 SQLite connection。
 
 ### 14.3 错误策略
 
@@ -1167,9 +1192,10 @@ shutdown 顺序固定：停止接受新 command 和 socket receive；处理已�
 | route/ID/config 冲突 | 启动失败 |
 | late/duplicate | 分类并排除；不重写历史状态 |
 | raw/admission transaction 失败 | rollback；Engine 不变并立即停止 capture |
-| projection/final-seal transaction 失败 | lifecycle 保持 non-sealed；发布前停止 capture，startup 从 raw rows finish/rebuild |
+| state/projection/final-seal transaction 失败 | lifecycle/cursor 保持旧 committed 值；发布前停止 capture，startup 从 cursor 后 replay 或 full rebuild |
+| processing/timeline/baseline state 缺失、损坏或 receipts 不兼容 | serving 前从 current manifest complete seed + ordered records deterministic rebuild into SQLite |
 | SQLite 损坏/schema/version 不支持 | fail closed |
-| crash 留下任意 non-sealed session，包括 Closed tail | 从 ordered raw rows rebuild/finish；原子写 handoff、recovery-seal，再开启新 session |
+| crash 留下任意 non-sealed session，包括 Closed tail | 从 cursor 后 replay/finish；必要时从 current manifest seed + records full rebuild；原子写 handoff、recovery-seal，再开启新 session |
 | baseline 不兼容 | `Stale` 或启动失败；不静默重建 |
 | 证据不足 | `Unknown(reason)`，不是应用错误 |
 | HTTP 参数非法 | 4xx |
@@ -1233,13 +1259,13 @@ struct Engine {
 
 impl Engine {
     fn push(&mut self, observation: CsiObservation)
-        -> Result<Vec<EngineOutput>, EngineError>;
+        -> Result<EngineTransition, EngineError>;
     fn advance_to(&mut self, now: SessionTime)
-        -> Result<Vec<EngineOutput>, EngineError>;
+        -> Result<EngineTransition, EngineError>;
     fn command(&mut self, command: TargetedBaselineCommand)
-        -> Result<Vec<EngineOutput>, EngineError>;
+        -> Result<EngineTransition, EngineError>;
     fn finish(&mut self, at: SessionTime)
-        -> Result<Vec<EngineOutput>, EngineError>;
+        -> Result<EngineTransition, EngineError>;
 }
 ```
 
@@ -1829,8 +1855,8 @@ ExampleGroup: deployment + space + physical episode/interval
 
 ### 22.4 session、API 与 UI
 
-25. temp-DB schema constraints、manifest/record strong roundtrip、完整 unsigned domain、strict record_seq/time、transaction rollback、non-sealed open/Closed-tail recovery-seal 和 rotation 均有测试；crash between Closed transaction A and final transaction B rebuilds identical final projections/handoff before next-session creation；monotonic time 重置后 session-local timer/armed state 重置，rotation live/replay 等价。
-26. raw/admission 或 projection transaction 失败均在 publication 前停止 capture；WS queue 满只影响 delivery。
+25. temp-DB schema constraints、manifest complete `BaselineState`/record/state strong roundtrip、完整 unsigned domain、strict record_seq/time、transaction rollback、cursor resume/full rebuild、non-sealed recovery 和 rotation 均有测试；Learning M2/exposure and Active EW state survive manifest handoff；after predecessor retention, deleting/corrupting derived state rebuilds identically from current manifest seed + records；crash between Closed A and final B rebuilds identical state/projections/handoff before next-session creation。
+26. raw/admission 或 state/projection transaction 失败均在 publication/mirror replacement 前停止 capture；deterministic decode reject/control advances cursor atomically；WS queue 满只影响 delivery并从 SQLite resync。
 27. oversized UDP datagram 被完整接收后明确拒绝，不能伪装成普通 truncated packet；unknown peer/version/key、bad tag、replay 与 admission budget 不写 raw，仅更新有界 health。
 28. SignalView 同时查询不同 sample-coordinate 数，返回各自原生语义。
 29. viewport 聚合保留 min/max/mean/RMS/count 和 missing span；phase 超预算拒绝而非线性聚合。
