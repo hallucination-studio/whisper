@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use ciborium::ser::into_writer;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::domain::route::{AdmissionLimits, HeaderRoute};
@@ -94,6 +95,9 @@ pub enum ConfigError {
     /// Canonical CBOR encoding unexpectedly failed.
     #[error("canonical configuration encoding failed: {0}")]
     CanonicalEncoding(String),
+    /// Canonical replay configuration decoding failed.
+    #[error("canonical replay configuration decoding failed: {0}")]
+    CanonicalDecoding(String),
 }
 
 impl ConfigError {
@@ -112,14 +116,14 @@ impl ConfigError {
 }
 
 /// Parses and validates a complete TOML configuration.
-pub fn parse_config(source: &str) -> Result<EffectiveConfig, ConfigError> {
+pub fn parse_config(source: &str) -> Result<Config, ConfigError> {
     let raw: RawConfig = toml::from_str(source).map_err(ConfigError::parse)?;
-    EffectiveConfig::from_raw(raw)
+    Config::from_raw(raw)
 }
 
 /// Reads, parses, and validates a configuration file.
 #[expect(dead_code, reason = "consumed by the application startup work package")]
-pub fn load_config(path: impl AsRef<Path>) -> Result<EffectiveConfig, ConfigError> {
+pub fn load_config(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
     parse_config(&fs::read_to_string(path).map_err(ConfigError::Read)?)
 }
 
@@ -148,13 +152,29 @@ struct RawConfig {
     routes: Vec<RawRoute>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayConfigDto {
+    schema: u16,
+    deployment: RawDeployment,
+    window: RawWindow,
+    conditioning: RawConditioning,
+    quality: RawQuality,
+    baseline: RawBaseline,
+    spaces: Vec<RawIdEntry>,
+    transmitters: Vec<RawIdEntry>,
+    sensors: Vec<RawSensor>,
+    links: Vec<RawLink>,
+    routes: Vec<RawRoute>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawDeployment {
     id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCapture {
     bind: String,
@@ -163,7 +183,7 @@ struct RawCapture {
     secret_root: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSession {
     directory: String,
@@ -182,7 +202,7 @@ enum RawFlushPolicy {
     Window,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawWindow {
     width_ns: u64,
@@ -192,7 +212,7 @@ struct RawWindow {
     reorder_horizon: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawConditioning {
     version: String,
@@ -201,7 +221,7 @@ struct RawConditioning {
     scale_denominator: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawQuality {
     minimum_frames: u32,
@@ -218,7 +238,7 @@ enum RawTimeQuality {
     ClockCorrected,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawBaseline {
     minimum_learning_windows: u32,
@@ -236,7 +256,7 @@ struct RawBaseline {
     stale_after_ns: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawView {
     recent_range_ns: u64,
@@ -244,7 +264,7 @@ struct RawView {
     max_signal_points: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawServer {
     bind: String,
@@ -253,7 +273,7 @@ struct RawServer {
     websocket_queue_capacity: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPerformance {
     max_rss_bytes: u64,
@@ -281,7 +301,7 @@ impl From<RawHardwareKind> for HardwareKind {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawSensor {
     id: String,
@@ -295,13 +315,13 @@ struct RawSensor {
     maximum_plaintext_bytes: u16,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawIdEntry {
     id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawLink {
     id: String,
@@ -312,7 +332,7 @@ struct RawLink {
     channel_policy: RawChannelPolicy,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawChannelPolicy {
     allowed: Vec<u8>,
@@ -320,7 +340,7 @@ struct RawChannelPolicy {
     expected: Option<u8>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawRoute {
     peer: String,
@@ -964,53 +984,48 @@ impl Registry {
     }
 }
 
-/// Complete validated, immutable configuration snapshot.
-#[derive(Clone, Debug, Serialize)]
-pub struct EffectiveConfig {
+/// Complete validated, immutable configuration split by replay semantics.
+#[derive(Clone, Debug)]
+pub struct Config {
+    replay: ReplayConfig,
+    runtime: RuntimeConfig,
+}
+
+/// Configuration whose values determine faithful replay results.
+#[derive(Clone, Debug)]
+pub struct ReplayConfig {
     deployment: Deployment,
-    capture: CaptureConfig,
-    session: SessionConfig,
     window: WindowConfig,
     conditioning: ConditioningConfig,
     quality: QualityConfig,
     baseline: BaselineConfig,
-    view: ViewConfig,
-    server: ServerConfig,
-    performance: PerformanceConfig,
     registry: Registry,
-    #[serde(skip)]
+    dto: ReplayConfigDto,
     digest: [u8; 32],
 }
 
-impl EffectiveConfig {
-    fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
-        let deployment = Deployment {
-            id: DeploymentId::new(raw.deployment.ok_or_else(|| missing("deployment.id"))?.id)
-                .map_err(|error| ConfigError::id("deployment.id", error))?,
-        };
-        let capture = build_capture(raw.capture.ok_or_else(|| missing("capture"))?)?;
-        let session = build_session(raw.session.ok_or_else(|| missing("session"))?)?;
-        let window = build_window(raw.window.ok_or_else(|| missing("window"))?)?;
-        let conditioning =
-            build_conditioning(raw.conditioning.ok_or_else(|| missing("conditioning"))?)?;
-        let quality = build_quality(raw.quality.ok_or_else(|| missing("quality"))?)?;
-        let baseline = build_baseline(raw.baseline.ok_or_else(|| missing("baseline"))?)?;
-        let view = build_view(raw.view.ok_or_else(|| missing("view"))?)?;
-        let server = build_server(raw.server.ok_or_else(|| missing("server"))?)?;
-        let performance = build_performance(
-            raw.performance.ok_or_else(|| missing("performance"))?,
-            window.step_ns,
-        )?;
-        let registry = build_registry(
-            raw.spaces,
-            raw.transmitters,
-            raw.sensors,
-            raw.links,
-            raw.routes,
-            capture.max_datagram_bytes,
-        )?;
+impl Serialize for ReplayConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.dto.serialize(serializer)
+    }
+}
 
-        let mut config = Self {
+/// Process-only configuration that does not affect replay semantics.
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    capture: CaptureConfig,
+    session: SessionConfig,
+    view: ViewConfig,
+    server: ServerConfig,
+    performance: PerformanceConfig,
+}
+
+impl Config {
+    fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
+        let RawConfig {
             deployment,
             capture,
             session,
@@ -1021,88 +1036,178 @@ impl EffectiveConfig {
             view,
             server,
             performance,
-            registry,
-            digest: [0; 32],
+            spaces,
+            transmitters,
+            sensors,
+            links,
+            routes,
+        } = raw;
+        let capture = build_capture(capture.ok_or_else(|| missing("capture"))?)?;
+        let replay = ReplayConfig::from_dto(
+            ReplayConfigDto {
+                schema: 1,
+                deployment: deployment.ok_or_else(|| missing("deployment.id"))?,
+                window: window.ok_or_else(|| missing("window"))?,
+                conditioning: conditioning.ok_or_else(|| missing("conditioning"))?,
+                quality: quality.ok_or_else(|| missing("quality"))?,
+                baseline: baseline.ok_or_else(|| missing("baseline"))?,
+                spaces,
+                transmitters,
+                sensors,
+                links,
+                routes,
+            },
+            capture.max_datagram_bytes,
+        )?;
+        let runtime = RuntimeConfig {
+            session: build_session(session.ok_or_else(|| missing("session"))?)?,
+            view: build_view(view.ok_or_else(|| missing("view"))?)?,
+            server: build_server(server.ok_or_else(|| missing("server"))?)?,
+            performance: build_performance(
+                performance.ok_or_else(|| missing("performance"))?,
+                replay.window.step_ns,
+            )?,
+            capture,
         };
-        config.digest = Sha256::digest(config.canonical_bytes()?).into();
-        Ok(config)
+        Ok(Self { replay, runtime })
+    }
+
+    /// Returns the semantic configuration embedded in sessions.
+    #[must_use]
+    pub const fn replay(&self) -> &ReplayConfig {
+        &self.replay
+    }
+
+    /// Returns process-only configuration excluded from replay identity.
+    #[must_use]
+    pub const fn runtime(&self) -> &RuntimeConfig {
+        &self.runtime
     }
 
     /// Returns deployment settings.
     #[must_use]
     pub const fn deployment(&self) -> &Deployment {
-        &self.deployment
+        self.replay.deployment()
     }
 
     /// Returns capture settings.
     #[must_use]
     pub const fn capture(&self) -> &CaptureConfig {
-        &self.capture
+        self.runtime.capture()
     }
 
     /// Returns session settings.
     #[must_use]
     #[expect(dead_code, reason = "consumed by later session work packages")]
     pub(crate) const fn session(&self) -> &SessionConfig {
-        &self.session
+        self.runtime.session()
     }
 
     /// Returns window settings.
     #[must_use]
     #[expect(dead_code, reason = "consumed by later timeline work package")]
     pub(crate) const fn window(&self) -> &WindowConfig {
-        &self.window
+        self.replay.window()
     }
 
     /// Returns conditioning settings.
     #[must_use]
     #[expect(dead_code, reason = "consumed by later conditioning work package")]
     pub(crate) const fn conditioning(&self) -> &ConditioningConfig {
-        &self.conditioning
+        self.replay.conditioning()
     }
 
     /// Returns quality settings.
     #[must_use]
     #[expect(dead_code, reason = "consumed by later estimator work package")]
     pub(crate) const fn quality(&self) -> &QualityConfig {
-        &self.quality
+        self.replay.quality()
     }
 
     /// Returns baseline settings.
     #[must_use]
     #[expect(dead_code, reason = "consumed by later estimator work package")]
     pub(crate) const fn baseline(&self) -> &BaselineConfig {
-        &self.baseline
+        self.replay.baseline()
     }
 
     /// Returns view settings.
     #[must_use]
     #[expect(dead_code, reason = "consumed by later view work package")]
     pub(crate) const fn view(&self) -> &ViewConfig {
-        &self.view
+        self.runtime.view()
     }
 
     /// Returns server settings.
     #[must_use]
     #[expect(dead_code, reason = "consumed by later server work package")]
     pub(crate) const fn server(&self) -> &ServerConfig {
-        &self.server
+        self.runtime.server()
     }
 
     /// Returns process performance settings.
     #[must_use]
     #[expect(dead_code, reason = "consumed by later application work package")]
     pub(crate) const fn performance(&self) -> &PerformanceConfig {
-        &self.performance
+        self.runtime.performance()
     }
 
     /// Returns the validated topology registry.
     #[must_use]
     pub const fn registry(&self) -> &Registry {
-        &self.registry
+        self.replay.registry()
+    }
+}
+
+impl ReplayConfig {
+    fn from_dto(
+        dto: ReplayConfigDto,
+        maximum_live_datagram_bytes: u32,
+    ) -> Result<Self, ConfigError> {
+        if dto.schema != 1 {
+            return Err(invalid("replay.schema", "must equal 1"));
+        }
+        let deployment = Deployment {
+            id: DeploymentId::new(dto.deployment.id.clone())
+                .map_err(|error| ConfigError::id("deployment.id", error))?,
+        };
+        let window = build_window(dto.window.clone())?;
+        let conditioning = build_conditioning(dto.conditioning.clone())?;
+        let quality = build_quality(dto.quality.clone())?;
+        let baseline = build_baseline(dto.baseline.clone())?;
+        let registry = build_registry(
+            dto.spaces.clone(),
+            dto.transmitters.clone(),
+            dto.sensors.clone(),
+            dto.links.clone(),
+            dto.routes.clone(),
+            maximum_live_datagram_bytes,
+        )?;
+        let mut replay = Self {
+            deployment,
+            window,
+            conditioning,
+            quality,
+            baseline,
+            registry,
+            dto,
+            digest: [0; 32],
+        };
+        replay.digest = Sha256::digest(replay.canonical_bytes()?).into();
+        Ok(replay)
     }
 
-    /// Returns the SHA-256 of canonical effective configuration bytes.
+    pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let mut cursor = Cursor::new(bytes);
+        let dto: ReplayConfigDto = ciborium::de::from_reader(&mut cursor)
+            .map_err(|error| ConfigError::CanonicalDecoding(error.to_string()))?;
+        if cursor.position() != bytes.len() as u64 {
+            return Err(ConfigError::CanonicalDecoding("trailing data".into()));
+        }
+        Self::from_dto(dto, u32::from(u16::MAX))
+    }
+
+    /// Returns the SHA-256 of canonical replay configuration bytes.
     #[must_use]
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
@@ -1111,9 +1216,46 @@ impl EffectiveConfig {
     /// Returns canonical CBOR bytes used by [`Self::digest`].
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ConfigError> {
         let mut bytes = Vec::new();
-        into_writer(self, &mut bytes)
+        into_writer(&self.dto, &mut bytes)
             .map_err(|error| ConfigError::CanonicalEncoding(error.to_string()))?;
         Ok(bytes)
+    }
+
+    pub const fn deployment(&self) -> &Deployment {
+        &self.deployment
+    }
+    pub(crate) const fn window(&self) -> &WindowConfig {
+        &self.window
+    }
+    pub(crate) const fn conditioning(&self) -> &ConditioningConfig {
+        &self.conditioning
+    }
+    pub(crate) const fn quality(&self) -> &QualityConfig {
+        &self.quality
+    }
+    pub(crate) const fn baseline(&self) -> &BaselineConfig {
+        &self.baseline
+    }
+    pub const fn registry(&self) -> &Registry {
+        &self.registry
+    }
+}
+
+impl RuntimeConfig {
+    pub const fn capture(&self) -> &CaptureConfig {
+        &self.capture
+    }
+    pub(crate) const fn session(&self) -> &SessionConfig {
+        &self.session
+    }
+    pub(crate) const fn view(&self) -> &ViewConfig {
+        &self.view
+    }
+    pub(crate) const fn server(&self) -> &ServerConfig {
+        &self.server
+    }
+    pub(crate) const fn performance(&self) -> &PerformanceConfig {
+        &self.performance
     }
 }
 
@@ -1635,5 +1777,58 @@ fn hex_value(value: u8) -> Option<u8> {
         b'a'..=b'f' => Some(value - b'a' + 10),
         b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use ciborium::value::Value;
+
+    fn replay() -> ReplayConfig {
+        parse_config(include_str!("../tests/fixtures/config/valid-two-esp32.toml"))
+            .expect("valid config")
+            .replay
+    }
+
+    #[test]
+    fn canonical_replay_config_roundtrips_through_validating_decoder() {
+        let expected = replay();
+        let bytes = expected.canonical_bytes().expect("canonical bytes");
+        let actual = ReplayConfig::from_canonical_bytes(&bytes).expect("decode");
+        assert_eq!(actual.digest(), expected.digest());
+        assert_eq!(actual.canonical_bytes().expect("bytes"), bytes);
+        assert_eq!(actual.registry().routes().len(), 2);
+    }
+
+    #[test]
+    fn replay_decoder_rejects_unknown_trailing_and_invalid_fields() {
+        let bytes = replay().canonical_bytes().expect("bytes");
+        let mut value: Value = ciborium::de::from_reader(bytes.as_slice()).expect("value");
+        let Value::Map(fields) = &mut value else { panic!("replay config must be a map") };
+        fields.push((Value::Text("unknown".into()), Value::Null));
+        let mut unknown = Vec::new();
+        ciborium::ser::into_writer(&value, &mut unknown).expect("encode");
+        assert!(ReplayConfig::from_canonical_bytes(&unknown).is_err());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0xf6);
+        assert!(ReplayConfig::from_canonical_bytes(&trailing).is_err());
+
+        let mut value: Value = ciborium::de::from_reader(bytes.as_slice()).expect("value");
+        let Value::Map(fields) = &mut value else { panic!("replay config must be a map") };
+        let window = fields
+            .iter_mut()
+            .find(|(key, _)| key == &Value::Text("window".into()))
+            .expect("window");
+        let Value::Map(window) = &mut window.1 else { panic!("window must be a map") };
+        window
+            .iter_mut()
+            .find(|(key, _)| key == &Value::Text("width_ns".into()))
+            .expect("width")
+            .1 = Value::Integer(0.into());
+        let mut invalid = Vec::new();
+        ciborium::ser::into_writer(&value, &mut invalid).expect("encode");
+        assert!(ReplayConfig::from_canonical_bytes(&invalid).is_err());
     }
 }

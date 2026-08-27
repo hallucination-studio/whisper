@@ -1,5 +1,5 @@
 [package]
-name = "world"
+name = "whisper"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
@@ -12,6 +12,7 @@ license = "MIT"
 [dependencies]
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 ciborium = "0.2.2"
+crc32c = "0.6.8"
 mimalloc = "0.1.48"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"

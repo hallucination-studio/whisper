@@ -3,7 +3,7 @@
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
-use world::{ConfigError, parse_config};
+use whisper::{ConfigError, parse_config};
 
 fn valid_source() -> String {
     std::fs::read_to_string(format!(
@@ -18,23 +18,23 @@ fn valid_s3_config_has_stable_digest_and_exact_routes() {
     let source = valid_source();
     let first = parse_config(&source).expect("valid config");
     let second = parse_config(&source).expect("valid config");
-    assert_eq!(first.digest(), second.digest());
-    let bytes = first.canonical_bytes().expect("bytes");
-    assert_eq!(bytes, second.canonical_bytes().expect("bytes"));
+    assert_eq!(first.replay().digest(), second.replay().digest());
+    let bytes = first.replay().canonical_bytes().expect("bytes");
+    assert_eq!(bytes, second.replay().canonical_bytes().expect("bytes"));
     let encoded = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     let fixture_dir = format!("{}/tests/fixtures/config", env!("CARGO_MANIFEST_DIR"));
     let expected_bytes =
-        std::fs::read_to_string(format!("{fixture_dir}/effective-config-canonical.hex"))
-            .expect("effective config byte fixture")
+        std::fs::read_to_string(format!("{fixture_dir}/replay-config-canonical.hex"))
+            .expect("replay config byte fixture")
             .trim()
             .to_owned();
     assert_eq!(encoded, expected_bytes);
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    assert_eq!(first.digest(), digest);
+    assert_eq!(first.replay().digest(), digest);
     let digest_hex = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     let expected_digest =
-        std::fs::read_to_string(format!("{fixture_dir}/effective-config-canonical.sha256"))
-            .expect("effective config digest fixture")
+        std::fs::read_to_string(format!("{fixture_dir}/replay-config-canonical.sha256"))
+            .expect("replay config digest fixture")
             .trim()
             .to_owned();
     assert_eq!(digest_hex, expected_digest);
@@ -43,6 +43,25 @@ fn valid_s3_config_has_stable_digest_and_exact_routes() {
     assert_eq!(first.registry().sensors().len(), 2);
     assert_eq!(first.registry().links().len(), 2);
     assert_eq!(first.registry().routes().len(), 2);
+}
+
+#[test]
+fn runtime_only_changes_do_not_change_replay_digest() {
+    let source = valid_source();
+    let original = parse_config(&source).expect("valid config");
+    let changed = parse_config(
+        &source
+            .replace("bind = \"127.0.0.1:9000\"", "bind = \"127.0.0.1:9001\"")
+            .replace("retention_max_sessions = 8", "retention_max_sessions = 7"),
+    )
+    .expect("runtime-only mutation");
+    assert_eq!(original.replay().digest(), changed.replay().digest());
+
+    let semantic = parse_config(
+        &source.replace("allowed_lateness_ns = 100000000", "allowed_lateness_ns = 100000001"),
+    )
+    .expect("semantic mutation");
+    assert_ne!(original.replay().digest(), semantic.replay().digest());
 }
 
 #[test]
@@ -134,20 +153,20 @@ fn configuration_keeps_existing_numeric_guards() {
 fn cli_check_config_reports_success_and_failure() {
     let fixture =
         format!("{}/tests/fixtures/config/valid-two-esp32.toml", env!("CARGO_MANIFEST_DIR"));
-    let success = Command::new(env!("CARGO_BIN_EXE_world"))
+    let success = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["check-config", &fixture])
         .output()
         .expect("run check-config");
     assert!(success.status.success());
 
     let failure_fixture =
-        std::env::temp_dir().join(format!("world-invalid-config-{}.toml", std::process::id()));
+        std::env::temp_dir().join(format!("whisper-invalid-config-{}.toml", std::process::id()));
     std::fs::write(
         &failure_fixture,
         valid_source().replace("deviation_quantile = 0.95", "deviation_quantile = 0.0"),
     )
     .expect("write invalid fixture");
-    let failure = Command::new(env!("CARGO_BIN_EXE_world"))
+    let failure = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["check-config", failure_fixture.to_str().expect("path")])
         .output()
         .expect("run check-config");

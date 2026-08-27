@@ -9,7 +9,7 @@ use aes_gcm::{
 use sha2::{Digest, Sha256};
 
 use crate::capture::{CapturedPacket, WireFormat};
-use crate::config::{EffectiveConfig, RouteError};
+use crate::config::{Registry, RouteError};
 use crate::domain::csi::{
     AcquisitionCapabilities, AcquisitionMode, CaptureProfile, CsiCapture, CsiLayout,
     CsiObservation, CsiPath, CsiSampleAxis, IqSample, LtfMerge, LtfSelection, PhaseState, PpduKind,
@@ -2435,11 +2435,12 @@ pub(crate) fn admit_datagram(
     peer: SocketAddr,
     wire_format: WireFormat,
     bytes: Box<[u8]>,
-    config: &EffectiveConfig,
+    maximum_live_datagram_bytes: u32,
+    registry: &Registry,
     key: &[u8; 32],
 ) -> Result<AdmittedDatagram, IngestError> {
     let actual = bytes.len();
-    let global_maximum = config.capture().max_datagram_bytes() as usize;
+    let global_maximum = maximum_live_datagram_bytes as usize;
     if actual > global_maximum {
         return Err(IngestError::GlobalDatagramTooLarge { actual, maximum: global_maximum });
     }
@@ -2450,7 +2451,7 @@ pub(crate) fn admit_datagram(
     let header = parse_header(&bytes)?;
     let device_id = DeviceId::new(header.device_id);
     let key_epoch = KeyEpoch::try_new(header.key_epoch).map_err(|_| WireError::ZeroKeyEpoch)?;
-    let header_route = config.registry().resolve_header_route(peer.ip(), device_id, key_epoch)?;
+    let header_route = registry.resolve_header_route(peer.ip(), device_id, key_epoch)?;
     let route_maximum = usize::from(header_route.admission_limits().maximum_datagram_bytes());
     if actual > route_maximum {
         return Err(IngestError::RouteDatagramTooLarge { actual, maximum: route_maximum });
@@ -2468,7 +2469,7 @@ pub(crate) fn admit_datagram(
 #[allow(dead_code)]
 pub(crate) fn decode_recorded(
     recorded: &RecordedDatagram,
-    config: &EffectiveConfig,
+    registry: &Registry,
     profiles: &mut ProfileCatalog,
     accepted_capability: Option<&CapabilityReceipt>,
 ) -> Result<DecodedInput, IngestError> {
@@ -2477,7 +2478,7 @@ pub(crate) fn decode_recorded(
         return Ok(DecodedInput::UnknownKind { kind: header.kind_byte() });
     }
     debug_assert_eq!(recorded.header_route.device().get(), header.device_id);
-    let resolved = config.registry().resolve_authenticated_route(recorded.header_route)?;
+    let resolved = registry.resolve_authenticated_route(recorded.header_route)?;
     let decoded = decode_authenticated(&recorded.authenticated)?;
     match decoded.message {
         Message::Capabilities(capability) => {
@@ -2607,7 +2608,7 @@ fn resolve_csi(
     let profile = CaptureProfile::try_new(ProfileDescriptor {
         hardware: HardwareKind::Esp32S3,
         firmware: digest_hex(sensor.firmware_build_digest()).into_boxed_str(),
-        decoder_version: "world-native-frame-v1".into(),
+        decoder_version: "whisper-native-frame-v1".into(),
         capability_id: digest_hex(capability.capability_digest()).into_boxed_str(),
         acquisition: AcquisitionCapabilities {
             mode: AcquisitionMode::WifiCsi,
@@ -2685,7 +2686,7 @@ fn resolve_csi(
     let input = crate::domain::csi::InputReceipt::new(
         packet.session_id().clone(),
         packet.record_seq(),
-        DecoderVersion::new("world-native-frame-v1")
+        DecoderVersion::new("whisper-native-frame-v1")
             .map_err(|error| IngestError::DecodedRoute(error.to_string()))?,
     );
     Ok(DecodedInput::Csi(CsiObservation::new(
@@ -2809,12 +2810,12 @@ mod tests {
             )
     }
 
-    fn config() -> EffectiveConfig {
+    fn config() -> crate::config::Config {
         parse_config(&config_source()).expect("valid route-test config")
     }
 
     fn recorded(
-        config: &EffectiveConfig,
+        config: &crate::config::Config,
         peer: &str,
         record_seq: u64,
         bytes: Box<[u8]>,
@@ -2823,7 +2824,8 @@ mod tests {
             peer.parse().expect("valid peer"),
             WireFormat::NativeFrameUdp,
             bytes,
-            config,
+            config.capture().max_datagram_bytes(),
+            config.registry(),
             &KEY,
         )
         .expect("admitted test datagram")
@@ -2905,19 +2907,20 @@ mod tests {
     }
 
     fn accepted_capability(
-        config: &EffectiveConfig,
+        config: &crate::config::Config,
         profiles: &mut ProfileCatalog,
     ) -> CapabilityReceipt {
         accepted_capability_for(config, profiles, BOOT_GENERATION)
     }
 
     fn accepted_capability_for(
-        config: &EffectiveConfig,
+        config: &crate::config::Config,
         profiles: &mut ProfileCatalog,
         boot_generation: u32,
     ) -> CapabilityReceipt {
         let packet = recorded(config, PEER, 1, sealed_capability(1, boot_generation));
-        match decode_recorded(&packet, config, profiles, None).expect("capability route") {
+        match decode_recorded(&packet, config.registry(), profiles, None).expect("capability route")
+        {
             DecodedInput::Capabilities(capability) => capability,
             other => panic!("expected capability, got {other:?}"),
         }
@@ -2930,8 +2933,8 @@ mod tests {
         let capability = accepted_capability(&config, &mut profiles);
         let packet =
             recorded(&config, PEER, 2, sealed_csi(2, BOOT_GENERATION, [2, 0, 0, 0, 0, 10], 1));
-        let decoded =
-            decode_recorded(&packet, &config, &mut profiles, Some(&capability)).expect("CSI route");
+        let decoded = decode_recorded(&packet, config.registry(), &mut profiles, Some(&capability))
+            .expect("CSI route");
         let DecodedInput::Csi(observation) = decoded else { panic!("expected CSI observation") };
         assert_eq!(observation.device_epoch().boot_generation().get(), BOOT_GENERATION);
         assert_eq!(observation.capture_sequence(), 2);
@@ -2950,13 +2953,13 @@ mod tests {
         let ht_packet =
             recorded(&config, PEER, 3, sealed_csi_ht(3, BOOT_GENERATION, [2, 0, 0, 0, 0, 10], 1));
         let DecodedInput::Csi(non_ht) =
-            decode_recorded(&non_ht_packet, &config, &mut profiles, Some(&capability))
+            decode_recorded(&non_ht_packet, config.registry(), &mut profiles, Some(&capability))
                 .expect("Non-HT route")
         else {
             panic!("expected Non-HT CSI observation")
         };
         let DecodedInput::Csi(ht) =
-            decode_recorded(&ht_packet, &config, &mut profiles, Some(&capability))
+            decode_recorded(&ht_packet, config.registry(), &mut profiles, Some(&capability))
                 .expect("HT route")
         else {
             panic!("expected HT CSI observation")
@@ -2974,7 +2977,8 @@ mod tests {
             PEER.parse().expect("valid peer"),
             WireFormat::NativeFrameUdp,
             datagram.clone(),
-            &config,
+            config.capture().max_datagram_bytes(),
+            config.registry(),
             &KEY,
         )
         .expect("authenticated unknown kind");
@@ -2988,7 +2992,8 @@ mod tests {
         );
 
         assert_eq!(
-            decode_recorded(&recorded, &config, &mut profiles, None).expect("unknown kind route"),
+            decode_recorded(&recorded, config.registry(), &mut profiles, None)
+                .expect("unknown kind route"),
             DecodedInput::UnknownKind { kind: 0x7f }
         );
 
@@ -2999,7 +3004,8 @@ mod tests {
                 PEER.parse().expect("valid peer"),
                 WireFormat::NativeFrameUdp,
                 tampered.into_boxed_slice(),
-                &config,
+                config.capture().max_datagram_bytes(),
+                config.registry(),
                 &KEY,
             ),
             Err(IngestError::Wire(WireError::AuthenticationFailed))
@@ -3015,7 +3021,8 @@ mod tests {
                 "192.0.2.99:5000".parse().expect("valid peer"),
                 WireFormat::NativeFrameUdp,
                 sealed_csi(2, BOOT_GENERATION, [2, 0, 0, 0, 0, 10], 1),
-                &config,
+                config.capture().max_datagram_bytes(),
+                config.registry(),
                 &KEY,
             ),
             Err(IngestError::Route(RouteError::Unknown { .. }))
@@ -3025,7 +3032,8 @@ mod tests {
                 "192.0.2.11:5000".parse().expect("valid peer"),
                 WireFormat::NativeFrameUdp,
                 sealed_csi(2, BOOT_GENERATION, [2, 0, 0, 0, 0, 10], 1),
-                &config,
+                config.capture().max_datagram_bytes(),
+                config.registry(),
                 &KEY,
             ),
             Err(IngestError::Route(RouteError::Unknown { .. }))
@@ -3034,7 +3042,7 @@ mod tests {
         let no_capability =
             recorded(&config, PEER, 2, sealed_csi(2, BOOT_GENERATION, [2, 0, 0, 0, 0, 10], 1));
         assert!(matches!(
-            decode_recorded(&no_capability, &config, &mut profiles, None),
+            decode_recorded(&no_capability, config.registry(), &mut profiles, None),
             Err(IngestError::CapabilityUnavailable)
         ));
     }
@@ -3050,7 +3058,7 @@ mod tests {
         let mut profiles = ProfileCatalog::default();
         let capability_packet = recorded(&config, PEER, 1, sealed_capability(1, BOOT_GENERATION));
         assert!(matches!(
-            decode_recorded(&capability_packet, &config, &mut profiles, None),
+            decode_recorded(&capability_packet, config.registry(), &mut profiles, None),
             Err(IngestError::UnsupportedCapability)
         ));
     }
@@ -3067,8 +3075,9 @@ mod tests {
         ] {
             let packet =
                 recorded(&config, PEER, 2, sealed_csi(2, BOOT_GENERATION, source_mac, channel));
-            let error = decode_recorded(&packet, &config, &mut profiles, Some(&capability))
-                .expect_err("mismatched route facts accepted");
+            let error =
+                decode_recorded(&packet, config.registry(), &mut profiles, Some(&capability))
+                    .expect_err("mismatched route facts accepted");
             assert_eq!(error, expected);
         }
     }
@@ -3087,7 +3096,12 @@ mod tests {
             sealed_csi(2, BOOT_GENERATION, [2, 0, 0, 0, 0, 10], 1),
         );
         assert!(matches!(
-            decode_recorded(&limited_packet, &limited_config, &mut profiles, Some(&capability)),
+            decode_recorded(
+                &limited_packet,
+                limited_config.registry(),
+                &mut profiles,
+                Some(&capability)
+            ),
             Err(IngestError::CsiBudgetExceeded { raw_actual: 6, raw_max: 4, .. })
         ));
 
@@ -3096,12 +3110,17 @@ mod tests {
             recorded(&config, PEER, 2, sealed_csi(3, BOOT_GENERATION + 1, [2, 0, 0, 0, 0, 10], 1));
         let stale_capability = accepted_capability(&config, &mut profiles);
         assert!(matches!(
-            decode_recorded(&next_packet, &config, &mut profiles, Some(&stale_capability)),
+            decode_recorded(
+                &next_packet,
+                config.registry(),
+                &mut profiles,
+                Some(&stale_capability)
+            ),
             Err(IngestError::CapabilityUnavailable)
         ));
         let capability = accepted_capability_for(&config, &mut profiles, BOOT_GENERATION + 1);
         let DecodedInput::Csi(observation) =
-            decode_recorded(&next_packet, &config, &mut profiles, Some(&capability))
+            decode_recorded(&next_packet, config.registry(), &mut profiles, Some(&capability))
                 .expect("next device epoch route")
         else {
             panic!("expected CSI observation")

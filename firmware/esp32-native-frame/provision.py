@@ -227,7 +227,7 @@ def provision(args, password, run=subprocess.run, random_bytes=secrets.token_byt
                 raise RuntimeError("--nvs-tool or IDF_PATH is required")
             nvs_tool = str(Path(idf_path) / "components/nvs_flash/nvs_partition_tool/nvs_tool.py")
 
-        with tempfile.TemporaryDirectory(prefix="world-provision-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="whisper-provision-") as temporary:
             directory = Path(temporary)
             csv_path = directory / "provision.csv"
             bin_path = directory / "provision.bin"

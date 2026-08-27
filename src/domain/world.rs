@@ -137,7 +137,6 @@ pub enum BaselineStatus {
 }
 
 /// Baseline lifecycle commands persisted in session order.
-#[expect(dead_code, reason = "consumed by work-package 2.1 session records and 3.3 estimator")]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum BaselineCommand {
     /// Start a new learning revision.
@@ -162,7 +161,6 @@ pub struct TargetedBaselineCommand {
     command: BaselineCommand,
 }
 
-#[expect(dead_code, reason = "consumed by work-package 2.1 session records and 3.3 estimator")]
 impl TargetedBaselineCommand {
     /// Creates a targeted command.
     #[must_use]

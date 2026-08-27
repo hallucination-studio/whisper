@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use world::{ConfigError, EffectiveConfig, parse_config};
+use whisper::{Config, ConfigError, parse_config};
 
 #[cfg(not(target_arch = "wasm32"))]
 #[global_allocator]
@@ -16,7 +16,7 @@ fn main() -> ExitCode {
     let _program = args.next();
 
     let Some(command) = args.next() else {
-        eprintln!("usage: world check-config <path>");
+        eprintln!("usage: whisper check-config <path>");
         return ExitCode::from(2);
     };
 
@@ -26,7 +26,7 @@ fn main() -> ExitCode {
     }
 
     let Some(path) = args.next() else {
-        eprintln!("usage: world check-config <path>");
+        eprintln!("usage: whisper check-config <path>");
         return ExitCode::from(2);
     };
 
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn check_config(path: &Path) -> Result<EffectiveConfig, ConfigError> {
+fn check_config(path: &Path) -> Result<Config, ConfigError> {
     let contents = fs::read_to_string(path).map_err(ConfigError::read)?;
     parse_config(&contents)
 }
