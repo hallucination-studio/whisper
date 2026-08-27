@@ -340,7 +340,7 @@ record*
 struct SessionManifest {
     session_id: SessionId,
     started_utc_ns: i64,
-    effective_config: EffectiveConfig,
+    effective_config_toml: Box<str>,
     config_digest: [u8; 32],
     application_version: String,
     build_fingerprint: [u8; 32],
@@ -385,6 +385,8 @@ struct TargetedBaselineCommand {
     command: BaselineCommand,
 }
 ```
+
+`effective_config_toml` 是创建 session 时已由现有 `parse_config` 验证通过的 TOML source。reader 必须重新调用同一个 `parse_config`，并在产生内存中的 `EffectiveConfig` 前核对其 canonical digest 与 `config_digest` 一致。replay 不读取磁盘上的当前配置；该 TOML 只保存非秘密配置，不得包含 AES key。
 
 `CapturedPacket` 是 decoder 使用的完整内存 view，由 record envelope + `Packet` body 组合，不在磁盘中重复序列化 total order/time。reader 必须验证 `record_seq` 从 0 开始严格递增且唯一，`at` 不倒退。
 

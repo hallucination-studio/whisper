@@ -14,7 +14,7 @@
 `ARCHITECTURE.md` 是本轮实现的受保护合同，当前 SHA-256 为：
 
 ```text
-bccd432f78b427f2a1e332a5994ccccf98f3b79908534693a7e79f88c1256b67
+093fc92ef506fa0c9248d403d7c7e668c89d6a85e06bf6dc1860bf8f962c7bd1
 ```
 
 每个执行工作包开始和结束时都必须运行：
@@ -262,6 +262,7 @@ tests/fixtures/session/**
 实现：
 
 - file header、named-field CBOR manifest 和 length+CRC-32C record；
+- manifest 落盘创建 session 时已由现有 `parse_config` 验证通过的 `effective_config_toml` source；reader 必须复用同一个 `parse_config`，核对解析所得 canonical digest 与 `config_digest` 后才产生内存中的 `EffectiveConfig`；replay 不读取当前磁盘配置，TOML 不得包含 AES key；
 - `SessionRecord` 的 packet、baseline command、timeline advance、closed；
 - 严格 `record_seq`、monotonic `at`、schema、长度上限和 trailing data 校验；
 - writer append/flush/sync 与 `durable_through_record_seq`；
@@ -270,11 +271,12 @@ tests/fixtures/session/**
 - 最小 retention 只删除最旧的 closed/recovery-sealed session，永不删除 active session，不建数据库/refcount/artifact GC；
 - 使用标准库 advisory file lock；不建 sentinel、refcount database 或通用 object store；
 - manifest 不含 candidate/shadow/artifact 字段；第一版本不实现 artifact 导入、选择或 GC。
+- 不新增第二套 config parser 或通用 canonical-CBOR decoder，不修改 `src/config.rs`。
 
 必测：
 
 - header/manifest/record 固定 bytes fixture；
-- config/build/decoder/conditioning/algorithm pin roundtrip；
+- config pin 的有效 TOML roundtrip、非法 TOML 拒绝、source/digest 不一致拒绝；build/decoder/conditioning/algorithm pin roundtrip；
 - 长度超限在分配前失败；
 - CRC-32C 中段损坏带 offset 失败；
 - 任意尾部截断只恢复完整前缀并标记 read-only；
