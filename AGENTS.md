@@ -65,5 +65,4 @@ See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
-The repository uses a multi-context layout for the Rust host and ESP-IDF
-firmware. See `docs/agents/domain.md`.
+For documentation claims or domain terms, load the documentation authority router at `docs/README.md`.
