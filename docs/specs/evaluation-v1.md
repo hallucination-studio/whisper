@@ -89,10 +89,14 @@ initial baseline states, executable, target, and semantic identity. Comparison
 MUST cover typed snapshots, link evidence, Timeline state, and complete baseline
 state after removing only non-semantic delivery and processing metadata.
 
-The corpus MUST include at least two authenticated routes, two distinct dynamic
-profiles, explicit baseline commands, a source gap, a device-epoch boundary,
-and a profile change. Each expected isolation and Unknown result MUST be stated
-before execution.
+The Program 1 corpus MUST include its one authenticated route and Profile,
+explicit baseline commands, a source gap, and a device-epoch boundary. Profile
+change and multi-route or multi-Profile isolation MAY be exercised with
+generated scenarios, but are not additional physical-fixture requirements and
+MUST retain their distinct evidence classification. Each expected isolation
+and Unknown result MUST be stated before execution. Fixture cardinality and
+evidence classifications are owned by the
+[development E2E v1 specification](development-e2e-v1.md).
 
 ### Statistical world behavior
 
@@ -116,6 +120,14 @@ tail observations MUST NOT establish the v1 snapshot deadline.
 The result MUST report missed deadlines, input loss, unexplained sequence gaps,
 write failures, and peak RSS. A resource run is invalid if meeting the budget
 changes semantic input, estimator behavior, or retained facts.
+
+Program 1 applies this contract to the current Apple Silicon Mac identified by
+the receipt. In addition to the fields above, the receipt MUST identify the
+exact Mac model, architecture, macOS, Rust, Node, and Chrome versions and report
+thread count, tail observations, and client backpressure. The result MUST state
+the actual one-Sensor route/Link/Profile load and MUST NOT claim production
+performance, release capacity, long-duration soak, or Multi-sensor deployment
+acceptance.
 
 ## Evidence record
 

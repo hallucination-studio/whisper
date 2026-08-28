@@ -33,6 +33,34 @@ listed here. The rationale for this evidence threshold is recorded in
 [ADR 0004](adr/0004-research-promotion-evidence.md). External source identity
 and provenance lives in the [references index](references/README.md).
 
+## Multi-sensor deployment validation
+
+### Direction
+
+After the Single-sensor deployment Program completes and a second-board
+environment is identified, validate one bounded Multi-sensor deployment with at
+least two independently provisioned physical Sensors through capture,
+durability, temporal/world semantics, query delivery, and the diagnostic Web.
+Two Sensors are the minimum evidence point for that later Program, not a product
+maximum or a transport topology.
+
+The accepted [development E2E v1 specification](specs/development-e2e-v1.md)
+keeps configuration, schemas, APIs, collections, selectors, runtime ownership,
+and resource formulas dynamic in Sensor count. This roadmap entry owns only the
+deferred physical Multi-sensor deployment acceptance.
+
+### Promotion gate
+
+- Identify two physical Sensors, their independent provisioning, routes,
+  Links/Profiles, firmware images, and controlled network environment.
+- Prove Sensor, route, Link, and Profile isolation through storage, Engine
+  state, queries, browser selection, and Host restart without first-Sensor bias.
+- Retain a physical-to-browser receipt that binds both hardware sources and the
+  actual resource load while disclaiming multi-board soak and release capacity.
+- Create detailed implementation and evidence issues only after board ownership,
+  serial ports, WLAN, credentials, and the supported acceptance deployment are
+  known.
+
 ## Release security and OTA
 
 ### Direction

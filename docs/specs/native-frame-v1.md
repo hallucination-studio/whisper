@@ -28,9 +28,30 @@ fields explicitly and MUST NOT serialize C or Rust memory layouts.
 ## Identities and route phases
 
 Each sender has a deployment-unique `device_id:u64`. Each active key is selected
-by a nonzero `key_epoch:u16` and contains exactly 32 random bytes for AES-256.
+by a nonzero `key_epoch:u16` and contains exactly 32 bytes for AES-256.
 The device MAC address, peer address, source MAC address, message sequence, and
 capture sequence are not substitutes for `device_id`.
+
+Operational key material MUST be generated from a cryptographically secure
+random source. Program 1 uses one explicit exception for disposable development
+fixtures. Its public seed is the exact 33 ASCII bytes
+`whisper-v1-public-e2e-fixture-key`. For one fixture Sensor identifier and
+nonzero `key_epoch`, the temporary key is SHA-256 over this exact preimage,
+concatenated in order:
+
+1. the ASCII bytes `whisper.development-fixture-key`;
+2. one byte with value `0x00`;
+3. one unsigned byte with value `1` for the derivation version;
+4. the fixture-seed length as unsigned `u32` big-endian;
+5. the exact fixture-seed bytes;
+6. the Sensor identifier length as unsigned `u32` big-endian;
+7. the exact Sensor identifier UTF-8 bytes; and
+8. `key_epoch` as unsigned `u16` big-endian.
+
+Equal fixture inputs MUST derive equal key bytes. Changing the seed, Sensor
+identifier, or key epoch changes the derivation input and expected key identity.
+This exception MUST NOT be used as a production credential or generalized into
+a production key-management design.
 
 Admission has two phases:
 
@@ -288,6 +309,14 @@ nonzero `key_epoch`, a 32-byte AES key, station SSID/password/BSSID/channel,
 probe port, collector IP/port, and one capability digest. The separate runtime
 namespace contains only `boot_generation`. Development provisioning uses
 disposable credentials and makes no production-security claim.
+
+Program 1 provisioning MUST place the derived fixture key in this ordinary
+record field. Firmware authentication MUST NOT add a fixture-only branch.
+Raw key bytes, Wi-Fi credentials, real SSIDs, uncontrolled infrastructure
+identities, and secret-bearing provisioning artifacts MUST NOT be committed,
+logged, displayed, screenshotted, or retained in corpus manifests or evidence
+receipts. Sanitized receipts MAY retain the public seed, derivation version,
+Sensor identifier, key epoch, and a non-secret key identity digest.
 
 Startup MUST validate the record, compute the running application digest and
 the pinned Wi-Fi ABI digest, reconstruct the capability descriptor, match its

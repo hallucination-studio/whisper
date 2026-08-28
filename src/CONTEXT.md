@@ -8,6 +8,18 @@ It exists to keep host domain language consistent.
 **Deployment**:
 A named sensing installation that groups related links.
 
+**Sensor**:
+A configured sensing endpoint within a deployment.
+_Avoid_: mesh node, because no transport topology is implied.
+
+**Single-sensor deployment**:
+A deployment configured with exactly one sensor.
+_Avoid_: single-device mode, because it is not a distinct runtime mode.
+
+**Multi-sensor deployment**:
+A deployment configured with more than one sensor.
+_Avoid_: mesh, because sensor count does not imply a network topology.
+
 **Link**:
 A configured RF observation relationship within a deployment.
 _Avoid_: device, when the relationship rather than the hardware is meant.

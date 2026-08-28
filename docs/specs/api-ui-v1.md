@@ -329,17 +329,21 @@ coordinate evidence through the WebSocket.
 
 ## Diagnostic UI
 
-The v1 browser surface is one two-dimensional diagnostic page. It hydrates from
-the HTTP interface, uses WebSocket messages only to invalidate HTTP resources,
-and provides:
+The v1 browser surface is one read-only two-dimensional diagnostic page. It
+hydrates from the HTTP interface, uses WebSocket messages only to invalidate
+HTTP resources, and provides:
 
-- topology plus link/profile selection;
+- explicit Deployment, Sensor, Link, Profile, and session context plus topology
+  selection;
 - one time-by-native-coordinate signal facet per stream/profile;
 - a sequence, gap, device-epoch, rate, jitter, profile, and baseline-command
   timeline;
 - per-link predicted/observed evidence, deviation, RF dynamics, and quality;
 - space `Stable | Changing | UNKNOWN`, contributions, and exclusions; and
 - baseline lifecycle, maturity, revision, and latest decision.
+
+The page exposes no baseline command or other state-changing control. Baseline
+commands remain part of the HTTP API for authenticated tests and operators.
 
 All visible axes name their coordinate semantics and units. An
 `OpaqueSampleOrdinal` is labelled as an opaque CSI sample ordinal, never as a
@@ -352,11 +356,12 @@ changes only the viewport and aggregation, never the stream/profile identity or
 native coordinate meaning. Missing values and measured zeros are visually
 distinct.
 
-On WebSocket disconnect the page visibly enters `DISCONNECTED`. It may retain
-the last committed HTTP result only when marked stale; it cannot present it as
-live, fabricate replacement samples, select only the first sensor by default,
-or repeat a shorter series to fill a view. On reconnect it performs HTTP
-resynchronization before returning to a live state.
+On WebSocket disconnect the page visibly enters `DISCONNECTED`, then marks any
+retained committed HTTP result `STALE`; it cannot present stale data as live,
+fabricate replacement samples, select only the first Sensor by default, or
+repeat a shorter series to fill a view. On reconnect it visibly enters
+`RESYNCHRONIZING`, performs canonical HTTP reads and validation, and enters
+`LIVE` only after resynchronization succeeds.
 
 ## Acceptance
 
@@ -379,13 +384,22 @@ out-of-range integer.
 The browser MUST validate each HTTP body and WebSocket text message against the
 2020-12 schema plus the mandatory runtime formats before using it, preserve
 full-width decimal strings or convert them directly to `BigInt`, and enter a
-visible protocol-error state on invalid input. Browser acceptance uses at least
-two different dynamic profile lengths simultaneously and verifies axis labels,
-missingness, resize/zoom identity, and disconnected state.
+visible protocol-error state on invalid input. Program 1 browser acceptance uses
+its one physical Sensor and Profile fixture in real Google Chrome, retains the
+exact Chrome version, page interactions, network activity, and screenshots, and
+verifies context selection, axis labels, missingness, resize/zoom identity, and
+the `DISCONNECTED`, `STALE`, `RESYNCHRONIZING`, and `LIVE` states.
+Generated scenarios MAY exercise two different dynamic profile lengths
+simultaneously, but do not become physical evidence. The browser implementation
+and all selectors, collections, and layouts remain dynamic in Sensor and
+Profile count as required by the
+[development E2E v1 specification](development-e2e-v1.md).
 
 End-to-end acceptance additionally proves committed capture-derived
 projections can be queried through HTTP, invalidated through WebSocket, and
 rendered by the browser without a second fact store or synthetic data. Test
 source, browser execution, disconnect/resync execution, and end-to-end
-execution are separate evidence classes; each executed claim requires its own
-retained receipt.
+execution are distinct claim surfaces, not additional Program 1 evidence-mode
+classifications. Each executed claim requires its own retained receipt, and
+each Program 1 E2E input artifact and execution receipt uses exactly one mode
+from [development E2E v1](development-e2e-v1.md#evidence-modes).

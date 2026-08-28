@@ -101,6 +101,21 @@ enter ReplayConfig bytes. V1 has no flush-policy field or compatibility alias;
 durability and publication are defined only by the transactions and SQLite
 settings below.
 
+### Program 1 development secret store
+
+Program 1 fixture tooling MUST materialize the exact temporary key derived by
+[native-frame v1](native-frame-v1.md#identities-and-route-phases) only in a
+protected temporary secret store selected through the ordinary
+`RuntimeConfig.capture.secret_root` boundary. The production Host key loader
+MUST consume that material through its normal interface. Configuration MUST NOT
+gain a raw-key field, and Host authentication MUST NOT gain a fixture-only
+branch.
+
+Missing, malformed, wrong-epoch, unreadable, or non-32-byte key material MUST
+fail explicitly. Raw key bytes, secret-store paths, and SQLite database bytes
+MUST NOT be committed, logged, displayed, screenshotted, or retained in corpus
+manifests or evidence receipts.
+
 ### ReplayConfig CBOR
 
 The canonical ReplayConfig is encoded from the accepted contract value, not
@@ -937,6 +952,19 @@ Both `max_session_duration_ns` and `max_session_bytes` are configured nonzero
 rotation limits. Reaching the duration limit MUST pause new input and complete
 the same close, finish, and final-transaction sequence. Byte-limit behavior is
 defined by [Session fact bytes](#session-fact-bytes).
+
+### Program 1 minimal Host restart
+
+Program 1 minimal restart stops only the Host while the Sensor and Mac remain
+running and retains the managed SQLite database. On restart, `HostLifecycle`
+MUST acquire the managed lock and restore canonical Timeline, baseline, World,
+processing-cursor, and committed query state under the recovery rules above
+before accepting new input. The next datagram MUST be processed exactly once.
+
+Minimal Host restart MUST NOT require rebooting the Sensor or Mac. Acceptance
+MAY use the captured corpus, but that execution MUST NOT be classified as a new
+live physical observation. Browser disconnect and canonical HTTP
+resynchronization remain owned by [API/UI v1](api-ui-v1.md#diagnostic-ui).
 
 ## Retention
 
