@@ -10,7 +10,7 @@ secret_root = "./data/secrets"
 [session]
 database_path = "./data/whisper.sqlite3"
 max_manifest_bytes = 1048576
-max_record_bytes = 1048576
+max_record_bytes = 33554432
 max_session_duration_ns = 1800000000000
 max_session_bytes = 1073741824
 retention_max_sessions = 8

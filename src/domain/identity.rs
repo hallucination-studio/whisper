@@ -329,7 +329,6 @@ impl BaselineStateSequence {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct WindowContractId([u8; 32]);
 
-#[expect(dead_code, reason = "consumed by work-package 3.1 timeline")]
 impl WindowContractId {
     /// Creates an ID from its digest bytes.
     #[must_use]

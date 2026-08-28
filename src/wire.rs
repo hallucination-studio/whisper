@@ -39,8 +39,8 @@ pub const WIRE_SCHEMA_VERSION: u8 = 1;
 
 const CAPABILITIES_BODY_BYTES: usize = 32 + 2 + CAPABILITY_DESCRIPTOR_BYTES;
 const HEALTH_BODY_BYTES: usize = 98;
-const CSI_FIXED_BODY_BYTES: usize = 75;
-const LTF_BLOCK_BYTES: usize = 6;
+pub(crate) const CSI_FIXED_BODY_BYTES: usize = 75;
+pub(crate) const LTF_BLOCK_BYTES: usize = 6;
 
 /// The authenticated message kinds defined by native-frame version one.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

@@ -90,6 +90,26 @@ fn runtime_only_changes_do_not_change_replay_digest() {
 }
 
 #[test]
+fn runtime_timeline_state_ceiling_does_not_change_canonical_replay() {
+    const CONFIGURED_CEILING: &str = "max_record_bytes = 33554432";
+    let source = valid_source();
+    assert!(
+        source.contains(CONFIGURED_CEILING),
+        "valid fixture must configure the 32 MiB timeline state ceiling"
+    );
+    let changed_source = source.replace(CONFIGURED_CEILING, "max_record_bytes = 33554431");
+    assert_ne!(source, changed_source, "runtime ceiling mutation must change the TOML source");
+
+    let original = parse_config(&source).expect("valid config");
+    let changed = parse_config(&changed_source).expect("one-byte-smaller runtime ceiling");
+    assert_eq!(
+        original.replay().canonical_bytes().expect("canonical replay bytes"),
+        changed.replay().canonical_bytes().expect("canonical replay bytes")
+    );
+    assert_eq!(original.replay().digest(), changed.replay().digest());
+}
+
+#[test]
 fn configuration_rejects_unknown_fields_duplicate_ids_and_unknown_references() {
     let source = valid_source();
     assert!(parse_config(&format!("{source}\n[unexpected]\nvalue = true\n")).is_err());

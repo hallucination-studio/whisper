@@ -4,6 +4,10 @@ use std::fmt;
 
 use serde::Serialize;
 
+/// Maximum UTF-8 byte length of Timeline clock-domain and mapping-version text.
+/// Changing this limit requires a new Timeline state schema.
+pub(crate) const MAX_TIMELINE_CLOCK_TEXT_BYTES: usize = 128;
+
 /// Errors produced while constructing time values.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum TimeError {
@@ -35,9 +39,25 @@ pub enum TimeError {
     /// A device timestamp did not identify a clock domain.
     #[error("device clock domain must not be empty")]
     EmptyClockDomain,
+    /// A device clock domain exceeded the Timeline state text bound.
+    #[error("device clock domain is {actual_bytes} UTF-8 bytes; maximum is {max_bytes} bytes")]
+    ClockDomainTooLong {
+        /// Actual clock-domain length in UTF-8 bytes.
+        actual_bytes: usize,
+        /// Maximum accepted clock-domain length in UTF-8 bytes.
+        max_bytes: usize,
+    },
     /// A clock mapping version was empty.
     #[error("clock mapping version must not be empty")]
     EmptyClockMappingVersion,
+    /// A clock mapping version exceeded the Timeline state text bound.
+    #[error("clock mapping version is {actual_bytes} UTF-8 bytes; maximum is {max_bytes} bytes")]
+    ClockMappingVersionTooLong {
+        /// Actual mapping-version length in UTF-8 bytes.
+        actual_bytes: usize,
+        /// Maximum accepted mapping-version length in UTF-8 bytes.
+        max_bytes: usize,
+    },
 }
 
 /// Monotonic session time measured in nanoseconds from the session epoch.
@@ -138,10 +158,23 @@ pub struct DeviceTimestamp {
 
 impl DeviceTimestamp {
     /// Creates a device timestamp.
+    ///
+    /// The clock domain must contain non-whitespace UTF-8 text of at most 128 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimeError::EmptyClockDomain`] for empty or whitespace-only text and
+    /// [`TimeError::ClockDomainTooLong`] when the clock domain exceeds 128 bytes.
     pub fn try_new(ticks: u64, clock_domain: impl Into<Box<str>>) -> Result<Self, TimeError> {
         let clock_domain = clock_domain.into();
         if clock_domain.trim().is_empty() {
             return Err(TimeError::EmptyClockDomain);
+        }
+        if clock_domain.len() > MAX_TIMELINE_CLOCK_TEXT_BYTES {
+            return Err(TimeError::ClockDomainTooLong {
+                actual_bytes: clock_domain.len(),
+                max_bytes: MAX_TIMELINE_CLOCK_TEXT_BYTES,
+            });
         }
         Ok(Self { ticks, clock_domain })
     }
@@ -165,10 +198,23 @@ pub struct ClockMappingVersion(Box<str>);
 
 impl ClockMappingVersion {
     /// Creates a non-empty mapping version.
+    ///
+    /// The mapping version must contain non-whitespace UTF-8 text of at most 128 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimeError::EmptyClockMappingVersion`] for empty or whitespace-only text and
+    /// [`TimeError::ClockMappingVersionTooLong`] when the mapping version exceeds 128 bytes.
     pub fn new(value: impl Into<Box<str>>) -> Result<Self, TimeError> {
         let value = value.into();
         if value.trim().is_empty() {
             return Err(TimeError::EmptyClockMappingVersion);
+        }
+        if value.len() > MAX_TIMELINE_CLOCK_TEXT_BYTES {
+            return Err(TimeError::ClockMappingVersionTooLong {
+                actual_bytes: value.len(),
+                max_bytes: MAX_TIMELINE_CLOCK_TEXT_BYTES,
+            });
         }
         Ok(Self(value))
     }

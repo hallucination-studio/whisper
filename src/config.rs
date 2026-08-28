@@ -442,8 +442,31 @@ pub struct WindowConfig {
     reorder_horizon: u32,
 }
 
-#[expect(dead_code, reason = "consumed by later timeline work package")]
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestWindowConfig {
+    pub(crate) width_ns: u64,
+    pub(crate) step_ns: u64,
+    pub(crate) allowed_lateness_ns: u64,
+    pub(crate) inactive_after_ns: u64,
+    pub(crate) reorder_horizon: u32,
+}
+
 impl WindowConfig {
+    #[cfg(test)]
+    pub(crate) const fn for_test(input: TestWindowConfig) -> Self {
+        assert!(input.width_ns > 0, "test window width must be positive");
+        assert!(input.step_ns >= input.width_ns, "test window step must be at least its width");
+        assert!(input.inactive_after_ns > 0, "test inactivity threshold must be positive");
+        Self {
+            width_ns: input.width_ns,
+            step_ns: input.step_ns,
+            allowed_lateness_ns: input.allowed_lateness_ns,
+            inactive_after_ns: input.inactive_after_ns,
+            reorder_horizon: input.reorder_horizon,
+        }
+    }
+
     pub(crate) const fn width_ns(&self) -> u64 {
         self.width_ns
     }
