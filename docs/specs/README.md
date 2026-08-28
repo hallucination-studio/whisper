@@ -11,3 +11,4 @@ execution.
 | Time, sequence, windows, conditioning, statistical baseline, world aggregation, Engine, or semantic replay | [Temporal world v1](temporal-world-v1.md) |
 | Calibration, data splits, leakage, semantic evaluation, or runtime evaluation | [Temporal world evaluation v1](evaluation-v1.md) |
 | Query projections, HTTP, WebSocket, SignalView, JSON DTOs, or diagnostic UI | [Query, API, WebSocket, and diagnostic UI v1](api-ui-v1.md) and its [JSON Schema 2020-12 artifact](schemas/api-ui-v1.schema.json) |
+| Program 1 fixture cardinality, E2E evidence classification, or composed physical-to-browser acceptance | [Single-sensor development E2E v1](development-e2e-v1.md) |

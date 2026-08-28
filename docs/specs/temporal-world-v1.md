@@ -853,8 +853,8 @@ alter estimator behavior, or drop raw facts to meet a deadline.
 V1 temporal/world acceptance requires behavior tests or retained end-to-end
 receipts that demonstrate all of the following through Timeline and Engine:
 
-- independent sequence domains, duplicate/gap/reorder behavior, A/B/A profile
-  interleaving, horizon-bounded duplicate memory, duplicate non-effects,
+- independent sequence domains, duplicate/gap/reorder behavior,
+  horizon-bounded duplicate memory, duplicate non-effects,
   within-horizon reorder insertion if and only if the target is open,
   irreversible typed Late behavior, and epoch transition without forced global
   publication;
@@ -881,12 +881,16 @@ receipts that demonstrate all of the following through Timeline and Engine:
 - Learning/Commit maturity, unready-coordinate exclusion, pollution gates,
   exposure behavior, restart arming, lifecycle commands, and revision/state
   sequence preservation;
-- link/profile isolation, physical-link coverage counting, conservative space
-  aggregation, typed Unknown reasons, and one snapshot per global window;
+- Link/Profile identity preservation for the Program 1 path, physical-link
+  coverage counting, conservative space aggregation, typed Unknown reasons, and
+  one snapshot per global window;
 - transaction rollback without partial state or publication, exact handoff,
   recovery from the current manifest seed, and retained-state equality; and
-- equal live and faithful-replay semantic results for at least two authenticated
-  routes and two distinct dynamic profiles under one pinned build and target.
+- equal live and faithful-replay semantic results for the Program 1 fixture
+  under one pinned build and target. Generated multi-route and multi-Profile
+  scenarios MAY additionally test isolation without becoming physical evidence;
+  fixture cardinality and evidence classification are owned by the
+  [development E2E v1 specification](development-e2e-v1.md).
 
 Checked-in test source is not proof that these cases executed. The retained
 evidence status and open gates are indexed in
