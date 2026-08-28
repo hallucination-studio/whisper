@@ -24,9 +24,11 @@ do not place the claim in the nearest convenient document.
 
 ## Migration state
 
-The legacy monolith retirement is complete. [`../ARCHITECTURE.md`](../ARCHITECTURE.md)
-and [`../IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) are thin
-compatibility entry points; neither file owns architecture, behavior contracts,
+The legacy monolith retirement is complete. The root architecture monolith was
+deleted after its compact authority index moved into [`AGENTS.md`](../AGENTS.md).
+This document retains the detailed routing, maturity vocabulary, and conflict
+rules. [`../IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) remains a thin
+compatibility entry point; it owns no architecture, behavior contracts,
 implementation facts, plans, status, decisions, blockers, or evidence.
 
 [GitHub Issues](agents/issue-tracker.md) are the single live authority for open

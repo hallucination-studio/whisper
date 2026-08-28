@@ -6,10 +6,10 @@ copying legacy prose. Within a row, each authority kind owns a disjoint meaning;
 an Issue link preserves migration provenance and never replaces the document
 owner.
 
-The retired root files became compatibility entry points. Persistence policy
-formerly routed through Issues #24-#29 and #35 was assigned to the persistence
-specification and ADRs; the Issue links are retained only as historical routing
-provenance.
+The retired root monoliths were deleted or reduced to compatibility entry
+points. Persistence policy formerly routed through Issues #24-#29 and #35 was
+assigned to the persistence specification and ADRs; the Issue links are
+retained only as historical routing provenance.
 
 | Legacy chapter | Disjoint assignment and explicit destination | Migration state |
 | --- | --- | --- |
@@ -37,8 +37,8 @@ provenance.
 | Architecture 22 - Development acceptance tests | **Specifications:** v1 criteria through the [specification index](../specs/README.md). **Roadmap:** deferred criteria in [`ROADMAP.md`](../ROADMAP.md). **Evidence:** retained receipts through the [evidence index](../evidence/README.md). | Criteria and receipt ownership assigned; legacy status prose retired. |
 | Architecture 23 - Implementation order | **Issue route selected during migration:** [GitHub Issues](../agents/issue-tracker.md). | Legacy ordering and status prose retired. |
 | Architecture 24 - Deferrals and upgrade thresholds | **Roadmap:** deferred scope and promotion gates in [`ROADMAP.md`](../ROADMAP.md). | Roadmap destination assigned under Issue #7. |
-| Implementation Plan 1 - Execution constraints | **Process:** [`AGENTS.md`](../../AGENTS.md), [`EXECUTION_WORKFLOW.md`](../../EXECUTION_WORKFLOW.md), and [agent guidance](../agents/domain.md). **Specifications:** v1 scope through the [specification index](../specs/README.md). **Architecture:** enduring invariants through the [architecture index](../architecture/README.md). | Product and process meanings are separated. |
-| Implementation Plan 2 - Executor/reviewer protocol | **Process:** [`EXECUTION_WORKFLOW.md`](../../EXECUTION_WORKFLOW.md). | Recovered as process guidance, not product authority. |
+| Implementation Plan 1 - Execution constraints | **Process:** [`AGENTS.md`](../../AGENTS.md) and applicable agent guidance. **Specifications:** v1 scope through the [specification index](../specs/README.md). **Architecture:** enduring invariants through the [architecture index](../architecture/README.md). | Product and process meanings are separated. |
+| Implementation Plan 2 - Executor/reviewer protocol | **Process:** issue-scoped `/implement`, TDD, and two-axis review use the installed agent skills and the repository rules in [`AGENTS.md`](../../AGENTS.md). | The obsolete repository-specific workflow was retired. |
 | Implementation Plan 3 - Stage one | **Specification:** [native-frame v1](../specs/native-frame-v1.md). **Evidence:** [firmware evidence](../evidence/firmware.md). **Historical Issue provenance:** [#3](https://github.com/hallucination-studio/whisper/issues/3). | Target and evidence destinations assigned. |
 | Implementation Plan 4 - Stage two | **Specification:** [persistence v1](../specs/persistence-v1.md). **Evidence:** [persistence evidence](../evidence/host-persistence.md). **Historical Issue provenance:** [#6](https://github.com/hallucination-studio/whisper/issues/6). | Target and evidence destinations assigned. |
 | Implementation Plan 5 - Stage three | **Specifications:** [temporal world v1](../specs/temporal-world-v1.md) and [evaluation v1](../specs/evaluation-v1.md). **Evidence:** [world/runtime evidence](../evidence/world-runtime.md). **Historical Issue provenance:** [#4](https://github.com/hallucination-studio/whisper/issues/4). | Target and evidence destinations assigned. |

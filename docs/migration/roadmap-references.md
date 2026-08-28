@@ -1,8 +1,9 @@
 # Architecture chapters 19-21 destination map
 
-This map assigns each meaning in protected `ARCHITECTURE.md` chapters 19-21 to
-one recovered owner. A row may split a legacy subsection only where its meanings
-belong to different authority kinds; the destinations remain disjoint.
+This historical map records where meanings from legacy architecture chapters
+19-21 were assigned before the root monolith was deleted. A row may split a
+legacy subsection only where its meanings belong to different authority kinds;
+the destinations remain disjoint.
 
 ## Chapter 19: CPU evolution and performance
 

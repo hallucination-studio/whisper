@@ -53,6 +53,13 @@ cargo doc --workspace --all-features --no-deps
 
 ## Agent skills
 
+### Git worktrees
+
+Create every repository worktree under
+`/Users/murphy/code/github/whisper-worktrees/<ticket-or-purpose>`. Before
+committing, verify that `git config user.name` is `tomatopunk` and that the
+configured email belongs to that GitHub account.
+
 ### Issue tracker
 
 Issues are tracked in GitHub Issues for `hallucination-studio/whisper`.
@@ -63,6 +70,20 @@ See `docs/agents/issue-tracker.md`.
 The repository uses the five default Matt Pocock triage labels.
 See `docs/agents/triage-labels.md`.
 
-### Domain docs
+### Documentation authority index
 
-For documentation claims or domain terms, load the documentation authority router at `docs/README.md`.
+| Claim | Canonical owner |
+| --- | --- |
+| Domain terminology | `CONTEXT-MAP.md`, then the selected `CONTEXT.md` |
+| Responsibilities, seams, dependency direction, or invariants | `docs/architecture/README.md` |
+| Exact bytes, schemas, APIs, or accepted behavior | `docs/specs/README.md` |
+| Consequential design rationale | `docs/adr/README.md` |
+| Current implementation | `src/` and `tests/`, or firmware source and tests |
+| Executed test or operational evidence | `docs/evidence/README.md` |
+| Build, provisioning, flash, or live procedures | `docs/operations/README.md` |
+| Open work, blockers, dependencies, and evidence gaps | GitHub Issues via `docs/agents/issue-tracker.md` |
+| Future intent | `docs/ROADMAP.md` |
+| External provenance | `docs/references/README.md` |
+
+For maturity vocabulary, authority conflicts, and topic-specific routing, load
+`docs/README.md`.
