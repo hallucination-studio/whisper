@@ -186,20 +186,12 @@ struct RawCapture {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSession {
-    directory: String,
+    database_path: String,
     max_manifest_bytes: u64,
     max_record_bytes: u64,
     max_session_duration_ns: u64,
     max_session_bytes: u64,
     retention_max_sessions: u32,
-    flush_policy: RawFlushPolicy,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RawFlushPolicy {
-    EveryRecord,
-    Window,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -405,19 +397,18 @@ impl CaptureConfig {
 /// Validated session persistence limits.
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionConfig {
-    directory: PathBuf,
+    database_path: PathBuf,
     max_manifest_bytes: u64,
     max_record_bytes: u64,
     max_session_duration_ns: u64,
     max_session_bytes: u64,
     retention_max_sessions: u32,
-    flush_policy: FlushPolicy,
 }
 
 #[expect(dead_code, reason = "consumed by later session work packages")]
 impl SessionConfig {
-    pub(crate) fn directory(&self) -> &Path {
-        &self.directory
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database_path
     }
 
     pub(crate) const fn max_manifest_bytes(&self) -> u64 {
@@ -439,19 +430,6 @@ impl SessionConfig {
     pub(crate) const fn retention_max_sessions(&self) -> u32 {
         self.retention_max_sessions
     }
-
-    pub(crate) const fn flush_policy(&self) -> FlushPolicy {
-        self.flush_policy
-    }
-}
-
-/// Session flush policy.
-#[derive(Clone, Copy, Debug, Serialize)]
-pub enum FlushPolicy {
-    /// Flush every record boundary.
-    EveryRecord,
-    /// Flush at the window boundary.
-    Window,
 }
 
 /// Validated fixed-window contract.
@@ -1098,7 +1076,6 @@ impl Config {
 
     /// Returns session settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by later session work packages")]
     pub(crate) const fn session(&self) -> &SessionConfig {
         self.runtime.session()
     }
@@ -1290,14 +1267,14 @@ fn build_capture(raw: RawCapture) -> Result<CaptureConfig, ConfigError> {
 }
 
 fn build_session(raw: RawSession) -> Result<SessionConfig, ConfigError> {
-    if raw.directory.trim().is_empty()
+    if raw.database_path.trim().is_empty()
         || raw.max_manifest_bytes == 0
         || raw.max_record_bytes == 0
         || raw.max_session_bytes == 0
         || raw.max_session_duration_ns == 0
         || raw.retention_max_sessions == 0
     {
-        return Err(invalid("session", "directory and all limits must be valid and positive"));
+        return Err(invalid("session", "database_path and all limits must be valid and positive"));
     }
     if raw.max_record_bytes > raw.max_session_bytes
         || raw.max_manifest_bytes > raw.max_session_bytes
@@ -1305,16 +1282,12 @@ fn build_session(raw: RawSession) -> Result<SessionConfig, ConfigError> {
         return Err(invalid("session", "manifest/record limits exceed max_session_bytes"));
     }
     Ok(SessionConfig {
-        directory: PathBuf::from(raw.directory),
+        database_path: PathBuf::from(raw.database_path),
         max_manifest_bytes: raw.max_manifest_bytes,
         max_record_bytes: raw.max_record_bytes,
         max_session_duration_ns: raw.max_session_duration_ns,
         max_session_bytes: raw.max_session_bytes,
         retention_max_sessions: raw.retention_max_sessions,
-        flush_policy: match raw.flush_policy {
-            RawFlushPolicy::EveryRecord => FlushPolicy::EveryRecord,
-            RawFlushPolicy::Window => FlushPolicy::Window,
-        },
     })
 }
 

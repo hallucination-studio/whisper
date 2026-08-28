@@ -1,9 +1,10 @@
-//! Bounded, checksummed session storage for deterministic replay.
+//! Strong session manifest and record contracts for deterministic replay.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Read, Seek, Write};
+#![cfg_attr(not(test), expect(dead_code, reason = "consumed by work-package 2.2"))]
+
+use std::collections::BTreeMap;
+use std::io::Cursor;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 
 use ciborium::value::{Integer, Value};
 
@@ -11,28 +12,19 @@ use crate::capture::WireFormat;
 use crate::config::ReplayConfig;
 use crate::domain::csi::{CaptureProfileId, CsiPath, CsiSampleCoordinate};
 use crate::domain::identity::{
-    BaselineContractId, BaselineRevision, ConditioningVersion, DeploymentId, DeviceId, KeyEpoch,
-    LinkProfileKey, RadioLinkId, SessionId, SpaceId,
+    BaselineContractId, BaselineRevision, BaselineStateSequence, ConditioningVersion, DeploymentId,
+    DeviceId, KeyEpoch, LinkProfileKey, RadioLinkId, SessionId, SpaceId,
 };
 use crate::domain::time::SessionTime;
 use crate::domain::world::{
-    BaselineCommand, BaselineCoordinate, BaselineSnapshot, TargetedBaselineCommand,
+    BaselineCommand, BaselineCompatibilityReceipt, BaselineCoordinate, BaselineCoordinateKey,
+    BaselineLifecycle, BaselineSnapshot, BaselineStaleReason, BaselineState, EwState,
+    TargetedBaselineCommand, WelfordState,
 };
 
-const MAGIC: &[u8; 8] = b"RFWSESS\0";
-const CONTAINER_VERSION: u16 = 1;
-const RECORD_SCHEMA: u16 = 1;
-const HEADER_LEN: u64 = 18;
 /// Native-frame V1's frozen 32-byte header plus 16-byte authentication tag.
 /// Changing this requires a new wire version and corresponding session pin validation.
 const NATIVE_FRAME_V1_OVERHEAD_BYTES: u16 = 32 + 16;
-
-/// Hard allocation limits supplied by the application configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SessionLimits {
-    pub(crate) max_manifest_bytes: u32,
-    pub(crate) max_record_bytes: u32,
-}
 
 /// Non-secret replay admission facts pinned by a session.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +51,7 @@ pub(crate) struct SessionManifest {
     pub(crate) wire_admission: Vec<WireAdmissionPin>,
     pub(crate) conditioning_version: String,
     pub(crate) algorithm_version: String,
-    pub(crate) initial_baselines: Vec<BaselineSnapshot>,
+    pub(crate) initial_baseline_states: Vec<BaselineState>,
 }
 
 /// One entry in the session total order.
@@ -79,40 +71,79 @@ pub(crate) enum SessionRecordKind {
     Closed,
 }
 
-/// Result of scanning a session file.
-#[derive(Clone, Debug)]
-pub(crate) struct ReadSession {
-    pub(crate) manifest: SessionManifest,
-    pub(crate) records: Vec<SessionRecord>,
-    pub(crate) seal: SessionSeal,
+#[derive(Debug)]
+pub(crate) struct ControlRecordInput {
+    record: SessionRecord,
 }
 
-/// Whether a file ended normally or was recovery-sealed at a crash tail.
+impl ControlRecordInput {
+    pub(crate) fn baseline_command(
+        record_seq: u64,
+        at: SessionTime,
+        command: TargetedBaselineCommand,
+    ) -> Self {
+        Self {
+            record: SessionRecord {
+                record_seq,
+                at,
+                kind: SessionRecordKind::BaselineCommand(command),
+            },
+        }
+    }
+
+    pub(crate) fn timeline_advance(record_seq: u64, at: SessionTime) -> Self {
+        Self { record: SessionRecord { record_seq, at, kind: SessionRecordKind::TimelineAdvance } }
+    }
+
+    pub(crate) fn closed(record_seq: u64, at: SessionTime) -> Self {
+        Self { record: SessionRecord { record_seq, at, kind: SessionRecordKind::Closed } }
+    }
+
+    pub(crate) const fn record(&self) -> &SessionRecord {
+        &self.record
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SessionSeal {
-    Open,
+pub(crate) enum RecordKind {
+    Packet,
+    BaselineCommand,
+    TimelineAdvance,
     Closed,
-    RecoverySealed { truncated_at: u64 },
+}
+
+impl RecordKind {
+    pub(crate) const fn from_record(record: &SessionRecordKind) -> Self {
+        match record {
+            SessionRecordKind::Packet { .. } => Self::Packet,
+            SessionRecordKind::BaselineCommand(_) => Self::BaselineCommand,
+            SessionRecordKind::TimelineAdvance => Self::TimelineAdvance,
+            SessionRecordKind::Closed => Self::Closed,
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, SessionError> {
+        match value {
+            "packet" => Ok(Self::Packet),
+            "baseline_command" => Ok(Self::BaselineCommand),
+            "timeline_advance" => Ok(Self::TimelineAdvance),
+            "closed" => Ok(Self::Closed),
+            _ => Err(schema("record kind")),
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Packet => "packet",
+            Self::BaselineCommand => "baseline_command",
+            Self::TimelineAdvance => "timeline_advance",
+            Self::Closed => "closed",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SessionError {
-    #[error("session I/O failed at byte offset {offset}: {source}")]
-    Io {
-        offset: u64,
-        #[source]
-        source: io::Error,
-    },
-    #[error("invalid session magic")]
-    Magic,
-    #[error("unsupported container version {0}")]
-    ContainerVersion(u16),
-    #[error("manifest length {length} exceeds limit {limit}")]
-    ManifestTooLarge { length: u32, limit: u32 },
-    #[error("record length {length} at byte offset {offset} exceeds limit {limit}")]
-    RecordTooLarge { offset: u64, length: u32, limit: u32 },
-    #[error("CRC-32C mismatch at byte offset {offset}")]
-    Crc { offset: u64 },
     #[error("invalid CBOR at byte offset {offset}: {message}")]
     Cbor { offset: u64, message: String },
     #[error("session schema is invalid: {0}")]
@@ -121,274 +152,14 @@ pub(crate) enum SessionError {
     ReplayConfig(String),
     #[error("manifest config digest does not match its ReplayConfig")]
     ConfigDigest,
-    #[error("record sequence {actual} does not equal expected {expected}")]
-    Sequence { expected: u64, actual: u64 },
-    #[error("record time {actual} precedes previous time {previous}")]
-    TimeReversed { previous: u64, actual: u64 },
-    #[error("cannot append after Closed")]
-    Closed,
-    #[error("session lock is already held")]
-    Locked,
 }
 
-/// Exclusive append owner for one active session.
-#[derive(Debug)]
-pub(crate) struct SessionWriter {
-    file: File,
-    next_seq: u64,
-    last_at: Option<u64>,
-    closed: bool,
-    durable_through_record_seq: Option<u64>,
-}
-
-/// Process-wide advisory ownership for capture, replay mutation, and retention.
-#[derive(Debug)]
-pub(crate) struct RuntimeLock {
-    _file: File,
-}
-
-impl RuntimeLock {
-    pub(crate) fn acquire(path: &Path) -> Result<Self, SessionError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|source| SessionError::Io { offset: 0, source })?;
-        file.try_lock().map_err(|error| match error {
-            fs::TryLockError::WouldBlock => SessionError::Locked,
-            fs::TryLockError::Error(source) => SessionError::Io { offset: 0, source },
-        })?;
-        Ok(Self { _file: file })
-    }
-}
-
-impl SessionWriter {
-    pub(crate) fn create(
-        path: &Path,
-        manifest: &SessionManifest,
-        limits: SessionLimits,
-    ) -> Result<Self, SessionError> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|source| SessionError::Io { offset: 0, source })?;
-        let bytes = encode_manifest(manifest)?;
-        let length = u32::try_from(bytes.len()).map_err(|_| SessionError::ManifestTooLarge {
-            length: u32::MAX,
-            limit: limits.max_manifest_bytes,
-        })?;
-        if length > limits.max_manifest_bytes {
-            return Err(SessionError::ManifestTooLarge {
-                length,
-                limit: limits.max_manifest_bytes,
-            });
-        }
-        file.write_all(MAGIC)
-            .and_then(|()| file.write_all(&CONTAINER_VERSION.to_le_bytes()))
-            .and_then(|()| file.write_all(&length.to_le_bytes()))
-            .and_then(|()| file.write_all(&crc32c::crc32c(&bytes).to_le_bytes()))
-            .and_then(|()| file.write_all(&bytes))
-            .map_err(|source| SessionError::Io { offset: 0, source })?;
-        Ok(Self {
-            file,
-            next_seq: 0,
-            last_at: None,
-            closed: false,
-            durable_through_record_seq: None,
-        })
-    }
-
-    pub(crate) fn append(
-        &mut self,
-        record: &SessionRecord,
-        limits: SessionLimits,
-    ) -> Result<(), SessionError> {
-        self.validate_next(record)?;
-        let bytes = encode_record(record)?;
-        let length = u32::try_from(bytes.len()).map_err(|_| SessionError::RecordTooLarge {
-            offset: self.file.stream_position().unwrap_or(0),
-            length: u32::MAX,
-            limit: limits.max_record_bytes,
-        })?;
-        let offset =
-            self.file.stream_position().map_err(|source| SessionError::Io { offset: 0, source })?;
-        if length > limits.max_record_bytes {
-            return Err(SessionError::RecordTooLarge {
-                offset,
-                length,
-                limit: limits.max_record_bytes,
-            });
-        }
-        let mut framed = Vec::with_capacity(8 + bytes.len());
-        framed.extend_from_slice(&length.to_le_bytes());
-        framed.extend_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
-        framed.extend_from_slice(&bytes);
-        self.file.write_all(&framed).map_err(|source| SessionError::Io { offset, source })?;
-        self.next_seq += 1;
-        self.last_at = Some(record.at.as_nanos());
-        self.closed = matches!(record.kind, SessionRecordKind::Closed);
-        Ok(())
-    }
-
-    fn validate_next(&self, record: &SessionRecord) -> Result<(), SessionError> {
-        if self.closed {
-            return Err(SessionError::Closed);
-        }
-        if record.record_seq != self.next_seq {
-            return Err(SessionError::Sequence {
-                expected: self.next_seq,
-                actual: record.record_seq,
-            });
-        }
-        if let Some(previous) = self.last_at.filter(|previous| record.at.as_nanos() < *previous) {
-            return Err(SessionError::TimeReversed { previous, actual: record.at.as_nanos() });
-        }
-        Ok(())
-    }
-
-    pub(crate) fn flush(&mut self) -> Result<(), SessionError> {
-        let offset = self.file.stream_position().unwrap_or(0);
-        self.file.flush().map_err(|source| SessionError::Io { offset, source })
-    }
-
-    pub(crate) fn sync(&mut self) -> Result<(), SessionError> {
-        self.flush()?;
-        let offset = self.file.stream_position().unwrap_or(0);
-        self.file.sync_data().map_err(|source| SessionError::Io { offset, source })?;
-        self.durable_through_record_seq = self.next_seq.checked_sub(1);
-        Ok(())
-    }
-
-    pub(crate) const fn durable_through_record_seq(&self) -> Option<u64> {
-        self.durable_through_record_seq
-    }
-
-    pub(crate) fn record_boundary(&mut self) -> Result<u64, SessionError> {
-        self.flush()?;
-        self.file.stream_position().map_err(|source| SessionError::Io { offset: 0, source })
-    }
-}
-
-pub(crate) fn read(path: &Path, limits: SessionLimits) -> Result<ReadSession, SessionError> {
-    let mut file = File::open(path).map_err(|source| SessionError::Io { offset: 0, source })?;
-    let file_len = file.metadata().map_err(|source| SessionError::Io { offset: 0, source })?.len();
-    let mut header = [0_u8; HEADER_LEN as usize];
-    file.read_exact(&mut header).map_err(|source| SessionError::Io { offset: 0, source })?;
-    if &header[..8] != MAGIC {
-        return Err(SessionError::Magic);
-    }
-    let version = u16::from_le_bytes(header[8..10].try_into().expect("fixed header"));
-    if version != CONTAINER_VERSION {
-        return Err(SessionError::ContainerVersion(version));
-    }
-    let manifest_len = u32::from_le_bytes(header[10..14].try_into().expect("fixed header"));
-    if manifest_len > limits.max_manifest_bytes {
-        return Err(SessionError::ManifestTooLarge {
-            length: manifest_len,
-            limit: limits.max_manifest_bytes,
-        });
-    }
-    let manifest_crc = u32::from_le_bytes(header[14..18].try_into().expect("fixed header"));
-    let mut manifest_bytes = vec![0; manifest_len as usize];
-    file.read_exact(&mut manifest_bytes)
-        .map_err(|source| SessionError::Io { offset: HEADER_LEN, source })?;
-    if crc32c::crc32c(&manifest_bytes) != manifest_crc {
-        return Err(SessionError::Crc { offset: HEADER_LEN });
-    }
-    let manifest = decode_manifest(&manifest_bytes, HEADER_LEN)?;
-    let mut records = Vec::new();
-    let mut expected = 0;
-    let mut last_at = None;
-    let mut seal = SessionSeal::Open;
-    loop {
-        let offset =
-            file.stream_position().map_err(|source| SessionError::Io { offset: 0, source })?;
-        if offset == file_len {
-            break;
-        }
-        if file_len - offset < 8 {
-            seal = SessionSeal::RecoverySealed { truncated_at: offset };
-            break;
-        }
-        let mut framing = [0_u8; 8];
-        file.read_exact(&mut framing).map_err(|source| SessionError::Io { offset, source })?;
-        let length = u32::from_le_bytes(framing[..4].try_into().expect("record header"));
-        if length > limits.max_record_bytes {
-            return Err(SessionError::RecordTooLarge {
-                offset,
-                length,
-                limit: limits.max_record_bytes,
-            });
-        }
-        if file_len - (offset + 8) < u64::from(length) {
-            seal = SessionSeal::RecoverySealed { truncated_at: offset };
-            break;
-        }
-        let expected_crc = u32::from_le_bytes(framing[4..].try_into().expect("record header"));
-        let mut body = vec![0; length as usize];
-        file.read_exact(&mut body)
-            .map_err(|source| SessionError::Io { offset: offset + 8, source })?;
-        if crc32c::crc32c(&body) != expected_crc {
-            return Err(SessionError::Crc { offset });
-        }
-        let record = decode_record(&body, offset + 8)?;
-        if record.record_seq != expected {
-            return Err(SessionError::Sequence { expected, actual: record.record_seq });
-        }
-        if let Some(previous) = last_at.filter(|previous| record.at.as_nanos() < *previous) {
-            return Err(SessionError::TimeReversed { previous, actual: record.at.as_nanos() });
-        }
-        expected += 1;
-        last_at = Some(record.at.as_nanos());
-        if matches!(record.kind, SessionRecordKind::Closed) {
-            seal = SessionSeal::Closed;
-            if file.stream_position().map_err(|source| SessionError::Io { offset, source })?
-                != file_len
-            {
-                return Err(SessionError::Schema("data follows Closed record".into()));
-            }
-        }
-        records.push(record);
-    }
-    if seal == SessionSeal::Open {
-        seal = SessionSeal::RecoverySealed { truncated_at: file_len };
-    }
-    Ok(ReadSession { manifest, records, seal })
-}
-
-/// Deletes eligible files by session start time toward `keep`, excluding `active` and open files.
-pub(crate) fn retain_oldest_closed(
-    sessions: &mut [(PathBuf, SessionSeal, i64)],
-    active: &Path,
-    keep: usize,
-) -> Result<Vec<PathBuf>, SessionError> {
-    sessions.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
-    let mut remove = sessions.len().saturating_sub(keep);
-    let mut removed = Vec::new();
-    for (path, seal, _) in sessions.iter() {
-        if remove == 0 {
-            break;
-        }
-        if path != active && *seal != SessionSeal::Open {
-            fs::remove_file(path).map_err(|source| SessionError::Io { offset: 0, source })?;
-            removed.push(path.clone());
-            remove -= 1;
-        }
-    }
-    Ok(removed)
-}
-
-fn encode_manifest(manifest: &SessionManifest) -> Result<Vec<u8>, SessionError> {
+pub(crate) fn encode_manifest(manifest: &SessionManifest) -> Result<Vec<u8>, SessionError> {
     if manifest.config_digest != manifest.replay_config.digest() {
         return Err(SessionError::ConfigDigest);
     }
-    for pin in &manifest.wire_admission {
-        validate_pin(pin)?;
-    }
+    validate_manifest_replay_contract(manifest)?;
+    validate_initial_baseline_states(manifest)?;
     encode(&Value::Map(vec![
         field("schema", unsigned(1)),
         field("session_id", text(manifest.session_id.as_str())),
@@ -409,13 +180,13 @@ fn encode_manifest(manifest: &SessionManifest) -> Result<Vec<u8>, SessionError> 
         field("conditioning_version", text(&manifest.conditioning_version)),
         field("algorithm_version", text(&manifest.algorithm_version)),
         field(
-            "initial_baselines",
-            Value::Array(manifest.initial_baselines.iter().map(snapshot_value).collect()),
+            "initial_baseline_states",
+            Value::Array(manifest.initial_baseline_states.iter().map(state_value).collect()),
         ),
     ]))
 }
 
-fn decode_manifest(bytes: &[u8], offset: u64) -> Result<SessionManifest, SessionError> {
+pub(crate) fn decode_manifest(bytes: &[u8], offset: u64) -> Result<SessionManifest, SessionError> {
     let mut map = named_map(decode(bytes, offset)?)?;
     require_schema(&mut map, 1)?;
     let replay_value = take(&mut map, "replay_config")?;
@@ -441,13 +212,301 @@ fn decode_manifest(bytes: &[u8], offset: u64) -> Result<SessionManifest, Session
             .collect::<Result<_, _>>()?,
         conditioning_version: take_text(&mut map, "conditioning_version")?,
         algorithm_version: take_text(&mut map, "algorithm_version")?,
-        initial_baselines: take_array(&mut map, "initial_baselines")?
+        initial_baseline_states: take_array(&mut map, "initial_baseline_states")?
             .into_iter()
-            .map(decode_snapshot)
+            .map(decode_state)
             .collect::<Result<_, _>>()?,
     };
     reject_extra(&map)?;
+    validate_manifest_replay_contract(&manifest)?;
+    validate_initial_baseline_states(&manifest)?;
+    if encode_manifest(&manifest)? != bytes {
+        return Err(schema("canonical manifest"));
+    }
     Ok(manifest)
+}
+
+fn validate_manifest_replay_contract(manifest: &SessionManifest) -> Result<(), SessionError> {
+    if manifest.conditioning_version != manifest.replay_config.conditioning().version().as_str() {
+        return Err(schema("manifest conditioning version"));
+    }
+    let registry = manifest.replay_config.registry();
+    let routes = registry.routes();
+    if manifest.wire_admission.len() != routes.len() {
+        return Err(schema("manifest wire admission routes"));
+    }
+    for (pin, route) in manifest.wire_admission.iter().zip(routes) {
+        validate_pin(pin)?;
+        let link = registry
+            .links()
+            .get(route.link())
+            .ok_or_else(|| schema("manifest wire admission link"))?;
+        let sensor = registry
+            .sensors()
+            .get(link.receiver())
+            .ok_or_else(|| schema("manifest wire admission sensor"))?;
+        if pin.device_id != route.device_id()
+            || pin.key_epoch != route.key_epoch()
+            || pin.firmware_build_digest != sensor.firmware_build_digest()
+            || pin.capability_digest != sensor.capability_digest()
+            || pin.maximum_plaintext_bytes != sensor.maximum_plaintext_bytes()
+            || pin.transport_datagram_budget_bytes
+                != route.admission_limits().maximum_datagram_bytes()
+        {
+            return Err(schema("manifest wire admission pin"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_initial_baseline_states(manifest: &SessionManifest) -> Result<(), SessionError> {
+    if manifest.initial_baseline_states.windows(2).any(|pair| pair[0].key() >= pair[1].key()) {
+        return Err(schema("initial baseline state order"));
+    }
+    for state in &manifest.initial_baseline_states {
+        if state.adaptation_armed() || state.session_last_eligible_at().is_some() {
+            return Err(schema("initial baseline state session-local fields"));
+        }
+        let Some(link) = manifest.replay_config.registry().links().get(state.key().link()) else {
+            return Err(schema("initial baseline state link"));
+        };
+        let compatibility = state.compatibility();
+        if compatibility.deployment() != manifest.replay_config.deployment().id()
+            || compatibility.space() != link.space()
+            || compatibility.conditioning_version()
+                != manifest.replay_config.conditioning().version()
+        {
+            return Err(schema("initial baseline state compatibility"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_baseline_state(state: &BaselineState) -> Result<Vec<u8>, SessionError> {
+    encode(&state_value(state))
+}
+
+pub(crate) fn decode_baseline_state(bytes: &[u8]) -> Result<BaselineState, SessionError> {
+    let state = decode_state(decode(bytes, 0)?)?;
+    if encode_baseline_state(&state)? != bytes {
+        return Err(schema("canonical baseline state"));
+    }
+    Ok(state)
+}
+
+fn state_value(state: &BaselineState) -> Value {
+    Value::Map(vec![
+        field("link", text(state.key().link().as_str())),
+        field("profile", bytes(&state.key().profile().as_bytes())),
+        field("lifecycle", lifecycle_value(state.lifecycle())),
+        field(
+            "learning",
+            Value::Array(
+                state
+                    .learning()
+                    .iter()
+                    .map(|(key, value)| {
+                        Value::Map(vec![
+                            field("path", path_value(key.path())),
+                            field("coordinate", sample_coordinate_value(key.coordinate())),
+                            field("count", unsigned(value.count())),
+                            field("mean", Value::Float(value.mean())),
+                            field("m2", Value::Float(value.m2())),
+                            field("accepted_exposure_ns", unsigned(value.accepted_exposure_ns())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        field(
+            "active",
+            Value::Array(
+                state
+                    .active()
+                    .iter()
+                    .map(|(key, value)| {
+                        Value::Map(vec![
+                            field("path", path_value(key.path())),
+                            field("coordinate", sample_coordinate_value(key.coordinate())),
+                            field("count", unsigned(value.count())),
+                            field("mean", Value::Float(value.mean())),
+                            field("variance", Value::Float(value.variance())),
+                            field("accepted_exposure_ns", unsigned(value.accepted_exposure_ns())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        field("revision", state.revision().map_or(Value::Null, |value| unsigned(value.get()))),
+        field(
+            "state_sequence",
+            state.state_sequence().map_or(Value::Null, |value| unsigned(value.get())),
+        ),
+        field("adaptation_armed", Value::Bool(state.adaptation_armed())),
+        field(
+            "session_last_eligible_at",
+            state
+                .session_last_eligible_at()
+                .map_or(Value::Null, |value| unsigned(value.as_nanos())),
+        ),
+        field("compatibility", compatibility_value(state.compatibility())),
+    ])
+}
+
+fn decode_state(value: Value) -> Result<BaselineState, SessionError> {
+    let mut map = named_map(value)?;
+    let key = LinkProfileKey::new(
+        RadioLinkId::new(take_text(&mut map, "link")?)
+            .map_err(|error| SessionError::Schema(error.to_string()))?,
+        CaptureProfileId::from_bytes(take_digest(&mut map, "profile")?),
+    );
+    let lifecycle = decode_lifecycle(take(&mut map, "lifecycle")?)?;
+    let learning = decode_learning(take_array(&mut map, "learning")?)?;
+    let active = decode_active(take_array(&mut map, "active")?)?;
+    let revision = take_optional_u64(&mut map, "revision")?.map(BaselineRevision::new);
+    let state_sequence =
+        take_optional_u64(&mut map, "state_sequence")?.map(BaselineStateSequence::new);
+    let adaptation_armed = take_bool(&mut map, "adaptation_armed")?;
+    let session_last_eligible_at =
+        take_optional_u64(&mut map, "session_last_eligible_at")?.map(SessionTime::from_nanos);
+    let compatibility = decode_compatibility(take(&mut map, "compatibility")?)?;
+    reject_extra(&map)?;
+    BaselineState::try_new(
+        key,
+        lifecycle,
+        learning,
+        active,
+        revision,
+        state_sequence,
+        adaptation_armed,
+        session_last_eligible_at,
+        compatibility,
+    )
+    .map_err(|error| SessionError::Schema(error.to_string()))
+}
+
+fn lifecycle_value(lifecycle: BaselineLifecycle) -> Value {
+    match lifecycle {
+        BaselineLifecycle::Learning { accepted_windows, accepted_exposure_ns } => Value::Map(vec![
+            field("kind", text("learning")),
+            field("accepted_windows", unsigned(accepted_windows)),
+            field("accepted_exposure_ns", unsigned(accepted_exposure_ns)),
+        ]),
+        BaselineLifecycle::Active => Value::Map(vec![field("kind", text("active"))]),
+        BaselineLifecycle::Frozen => Value::Map(vec![field("kind", text("frozen"))]),
+        BaselineLifecycle::Stale { reason } => Value::Map(vec![
+            field("kind", text("stale")),
+            field(
+                "reason",
+                text(match reason {
+                    BaselineStaleReason::Age => "age",
+                    BaselineStaleReason::Incompatible => "incompatible",
+                }),
+            ),
+        ]),
+    }
+}
+
+fn decode_lifecycle(value: Value) -> Result<BaselineLifecycle, SessionError> {
+    let mut map = named_map(value)?;
+    let lifecycle = match take_text(&mut map, "kind")?.as_str() {
+        "learning" => BaselineLifecycle::Learning {
+            accepted_windows: take_u64(&mut map, "accepted_windows")?,
+            accepted_exposure_ns: take_u64(&mut map, "accepted_exposure_ns")?,
+        },
+        "active" => BaselineLifecycle::Active,
+        "frozen" => BaselineLifecycle::Frozen,
+        "stale" => BaselineLifecycle::Stale {
+            reason: match take_text(&mut map, "reason")?.as_str() {
+                "age" => BaselineStaleReason::Age,
+                "incompatible" => BaselineStaleReason::Incompatible,
+                _ => return Err(schema("baseline stale reason")),
+            },
+        },
+        _ => return Err(schema("baseline lifecycle")),
+    };
+    reject_extra(&map)?;
+    Ok(lifecycle)
+}
+
+fn decode_learning(
+    values: Vec<Value>,
+) -> Result<BTreeMap<BaselineCoordinateKey, WelfordState>, SessionError> {
+    let mut output = BTreeMap::new();
+    let mut previous = None;
+    for value in values {
+        let mut map = named_map(value)?;
+        let key = BaselineCoordinateKey::new(
+            decode_path(take(&mut map, "path")?)?,
+            decode_sample_coordinate(take(&mut map, "coordinate")?)?,
+        );
+        let state = WelfordState::try_new(
+            take_u64(&mut map, "count")?,
+            take_f64(&mut map, "mean")?,
+            take_f64(&mut map, "m2")?,
+            take_u64(&mut map, "accepted_exposure_ns")?,
+        )
+        .map_err(|error| SessionError::Schema(error.to_string()))?;
+        reject_extra(&map)?;
+        if previous.is_some_and(|previous| previous >= key) {
+            return Err(schema("learning coordinate order"));
+        }
+        previous = Some(key);
+        output.insert(key, state);
+    }
+    Ok(output)
+}
+
+fn decode_active(
+    values: Vec<Value>,
+) -> Result<BTreeMap<BaselineCoordinateKey, EwState>, SessionError> {
+    let mut output = BTreeMap::new();
+    let mut previous = None;
+    for value in values {
+        let mut map = named_map(value)?;
+        let key = BaselineCoordinateKey::new(
+            decode_path(take(&mut map, "path")?)?,
+            decode_sample_coordinate(take(&mut map, "coordinate")?)?,
+        );
+        let state = EwState::try_new(
+            take_u64(&mut map, "count")?,
+            take_f64(&mut map, "mean")?,
+            take_f64(&mut map, "variance")?,
+            take_u64(&mut map, "accepted_exposure_ns")?,
+        )
+        .map_err(|error| SessionError::Schema(error.to_string()))?;
+        reject_extra(&map)?;
+        if previous.is_some_and(|previous| previous >= key) {
+            return Err(schema("active coordinate order"));
+        }
+        previous = Some(key);
+        output.insert(key, state);
+    }
+    Ok(output)
+}
+
+fn compatibility_value(receipt: &BaselineCompatibilityReceipt) -> Value {
+    Value::Map(vec![
+        field("deployment", text(receipt.deployment().as_str())),
+        field("space", text(receipt.space().as_str())),
+        field("conditioning_version", text(receipt.conditioning_version().as_str())),
+        field("contract", bytes(&receipt.contract().as_bytes())),
+    ])
+}
+
+fn decode_compatibility(value: Value) -> Result<BaselineCompatibilityReceipt, SessionError> {
+    let mut map = named_map(value)?;
+    let receipt = BaselineCompatibilityReceipt::new(
+        DeploymentId::new(take_text(&mut map, "deployment")?)
+            .map_err(|error| SessionError::Schema(error.to_string()))?,
+        SpaceId::new(take_text(&mut map, "space")?)
+            .map_err(|error| SessionError::Schema(error.to_string()))?,
+        ConditioningVersion::new(take_text(&mut map, "conditioning_version")?)
+            .map_err(|error| SessionError::Schema(error.to_string()))?,
+        BaselineContractId::from_bytes(take_digest(&mut map, "contract")?),
+    );
+    reject_extra(&map)?;
+    Ok(receipt)
 }
 
 fn command_value(command: &TargetedBaselineCommand) -> Value {
@@ -455,17 +514,17 @@ fn command_value(command: &TargetedBaselineCommand) -> Value {
         field("link", text(command.target().link().as_str())),
         field("profile", bytes(&command.target().profile().as_bytes())),
     ];
-    let kind = match command.command() {
-        BaselineCommand::BeginLearning => "begin_learning",
-        BaselineCommand::Commit => "commit",
-        BaselineCommand::Freeze => "freeze",
-        BaselineCommand::Resume => "resume",
-        BaselineCommand::ActivateSnapshot { snapshot } => {
-            fields.push(field("snapshot", snapshot_value(snapshot)));
-            "activate_snapshot"
-        }
+    let (kind, snapshot) = match command.command() {
+        BaselineCommand::BeginLearning => ("begin_learning", None),
+        BaselineCommand::Commit => ("commit", None),
+        BaselineCommand::Freeze => ("freeze", None),
+        BaselineCommand::Resume => ("resume", None),
+        BaselineCommand::ActivateSnapshot { snapshot } => ("activate_snapshot", Some(snapshot)),
     };
     fields.push(field("command", text(kind)));
+    if let Some(snapshot) = snapshot {
+        fields.push(field("snapshot", snapshot_value(snapshot)));
+    }
     Value::Map(fields)
 }
 
@@ -628,42 +687,29 @@ fn reject_extra(map: &[(String, Value)]) -> Result<(), SessionError> {
     }
 }
 
-fn encode_record(record: &SessionRecord) -> Result<Vec<u8>, SessionError> {
-    let (kind, body) = match &record.kind {
-        SessionRecordKind::Packet { receive_utc_ns, peer, wire_format, bytes: packet } => (
-            "packet",
+pub(crate) fn encode_record_body(kind: &SessionRecordKind) -> Result<Vec<u8>, SessionError> {
+    let body = match kind {
+        SessionRecordKind::Packet { receive_utc_ns, peer, wire_format, bytes: packet } => {
             Value::Map(vec![
                 field("receive_utc_ns", signed(*receive_utc_ns)),
                 field("peer", text(&peer.to_string())),
                 field("wire_format", text(wire_format_name(*wire_format))),
                 field("bytes", Value::Bytes(packet.to_vec())),
-            ]),
-        ),
-        SessionRecordKind::BaselineCommand(command) => ("baseline_command", command_value(command)),
-        SessionRecordKind::TimelineAdvance => ("timeline_advance", Value::Null),
-        SessionRecordKind::Closed => ("closed", Value::Null),
+            ])
+        }
+        SessionRecordKind::BaselineCommand(command) => command_value(command),
+        SessionRecordKind::TimelineAdvance | SessionRecordKind::Closed => Value::Null,
     };
-    encode(&Value::Map(vec![
-        field("schema", unsigned(RECORD_SCHEMA.into())),
-        field("record_seq", unsigned(record.record_seq)),
-        field("at", unsigned(record.at.as_nanos())),
-        field("kind", text(kind)),
-        field("body", body),
-    ]))
+    encode(&body)
 }
 
-fn decode_record(bytes: &[u8], offset: u64) -> Result<SessionRecord, SessionError> {
-    let mut map = named_map(decode(bytes, offset)?)?;
-    require_schema(&mut map, u64::from(RECORD_SCHEMA))?;
-    let record_seq = take_u64(&mut map, "record_seq")?;
-    let at = SessionTime::from_nanos(take_u64(&mut map, "at")?);
-    let kind = take_text(&mut map, "kind")?;
-    let body = take(&mut map, "body")?;
-    if !map.is_empty() {
-        return Err(SessionError::Schema(format!("unknown field {}", map[0].0)));
-    }
-    let kind = match kind.as_str() {
-        "packet" => {
+pub(crate) fn decode_record_body(
+    kind: RecordKind,
+    bytes: &[u8],
+) -> Result<SessionRecordKind, SessionError> {
+    let body = decode(bytes, 0)?;
+    let record = match kind {
+        RecordKind::Packet => {
             let mut body = named_map(body)?;
             let receive_utc_ns = take_i64(&mut body, "receive_utc_ns")?;
             let peer = take_text(&mut body, "peer")?
@@ -671,17 +717,18 @@ fn decode_record(bytes: &[u8], offset: u64) -> Result<SessionRecord, SessionErro
                 .map_err(|_| SessionError::Schema("invalid peer".into()))?;
             let wire_format = parse_wire_format(&take_text(&mut body, "wire_format")?)?;
             let bytes = take_bytes(&mut body, "bytes")?.into_boxed_slice();
-            if !body.is_empty() {
-                return Err(SessionError::Schema("unknown packet field".into()));
-            }
+            reject_extra(&body)?;
             SessionRecordKind::Packet { receive_utc_ns, peer, wire_format, bytes }
         }
-        "baseline_command" => SessionRecordKind::BaselineCommand(decode_command(body)?),
-        "timeline_advance" if body == Value::Null => SessionRecordKind::TimelineAdvance,
-        "closed" if body == Value::Null => SessionRecordKind::Closed,
-        _ => return Err(SessionError::Schema(format!("invalid record kind {kind}"))),
+        RecordKind::BaselineCommand => SessionRecordKind::BaselineCommand(decode_command(body)?),
+        RecordKind::TimelineAdvance if body == Value::Null => SessionRecordKind::TimelineAdvance,
+        RecordKind::Closed if body == Value::Null => SessionRecordKind::Closed,
+        _ => return Err(schema("record body")),
     };
-    Ok(SessionRecord { record_seq, at, kind })
+    if encode_record_body(&record)? != bytes {
+        return Err(schema("canonical record body"));
+    }
+    Ok(record)
 }
 
 fn pin_value(pin: &WireAdmissionPin) -> Value {
@@ -810,11 +857,27 @@ fn take_array(map: &mut Vec<(String, Value)>, name: &str) -> Result<Vec<Value>, 
         _ => Err(schema(name)),
     }
 }
+fn take_bool(map: &mut Vec<(String, Value)>, name: &str) -> Result<bool, SessionError> {
+    match take(map, name)? {
+        Value::Bool(value) => Ok(value),
+        _ => Err(schema(name)),
+    }
+}
 fn take_u64(map: &mut Vec<(String, Value)>, name: &str) -> Result<u64, SessionError> {
     let Value::Integer(value) = take(map, name)? else {
         return Err(schema(name));
     };
     u64::try_from(value).map_err(|_| schema(name))
+}
+fn take_optional_u64(
+    map: &mut Vec<(String, Value)>,
+    name: &str,
+) -> Result<Option<u64>, SessionError> {
+    match take(map, name)? {
+        Value::Null => Ok(None),
+        Value::Integer(value) => u64::try_from(value).map(Some).map_err(|_| schema(name)),
+        _ => Err(schema(name)),
+    }
 }
 fn take_i64(map: &mut Vec<(String, Value)>, name: &str) -> Result<i64, SessionError> {
     let Value::Integer(value) = take(map, name)? else {
@@ -861,19 +924,120 @@ fn parse_wire_format(value: &str) -> Result<WireFormat, SessionError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
-    const LIMITS: SessionLimits =
-        SessionLimits { max_manifest_bytes: 16 * 1024, max_record_bytes: 16 * 1024 };
+    #[derive(Debug)]
+    enum FixtureValue {
+        Manifest(Box<SessionManifest>),
+        BaselineState(BaselineState),
+        RecordBody(SessionRecordKind),
+        CommandBody(TargetedBaselineCommand),
+    }
 
-    fn path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "whisper-session-{}-{}-{name}",
-            std::process::id(),
-            NEXT_PATH.fetch_add(1, Ordering::Relaxed)
-        ))
+    #[derive(Debug)]
+    struct FixtureCase {
+        file_name: &'static str,
+        value: FixtureValue,
+    }
+
+    fn fixture_cases() -> Vec<FixtureCase> {
+        vec![
+            FixtureCase {
+                file_name: "manifest.cbor",
+                value: FixtureValue::Manifest(Box::new(manifest())),
+            },
+            FixtureCase {
+                file_name: "baseline-learning.cbor",
+                value: FixtureValue::BaselineState(learning_state("link-a", 0x55)),
+            },
+            FixtureCase {
+                file_name: "baseline-active.cbor",
+                value: FixtureValue::BaselineState(committed_state(BaselineLifecycle::Active)),
+            },
+            FixtureCase {
+                file_name: "baseline-frozen.cbor",
+                value: FixtureValue::BaselineState(committed_state(BaselineLifecycle::Frozen)),
+            },
+            FixtureCase {
+                file_name: "baseline-stale-age.cbor",
+                value: FixtureValue::BaselineState(committed_state(BaselineLifecycle::Stale {
+                    reason: BaselineStaleReason::Age,
+                })),
+            },
+            FixtureCase {
+                file_name: "baseline-stale-incompatible.cbor",
+                value: FixtureValue::BaselineState(committed_state(BaselineLifecycle::Stale {
+                    reason: BaselineStaleReason::Incompatible,
+                })),
+            },
+            FixtureCase {
+                file_name: "record-packet.cbor",
+                value: FixtureValue::RecordBody(SessionRecordKind::Packet {
+                    receive_utc_ns: i64::MIN,
+                    peer: "[2001:db8::1]:9000".parse().expect("fixture peer"),
+                    wire_format: WireFormat::NativeFrameUdp,
+                    bytes: vec![0, 1, 2, 0xfe, 0xff].into_boxed_slice(),
+                }),
+            },
+            FixtureCase {
+                file_name: "record-timeline-advance.cbor",
+                value: FixtureValue::RecordBody(SessionRecordKind::TimelineAdvance),
+            },
+            FixtureCase {
+                file_name: "record-closed.cbor",
+                value: FixtureValue::RecordBody(SessionRecordKind::Closed),
+            },
+            FixtureCase {
+                file_name: "command-begin-learning.cbor",
+                value: FixtureValue::CommandBody(fixture_command(BaselineCommand::BeginLearning)),
+            },
+            FixtureCase {
+                file_name: "command-commit.cbor",
+                value: FixtureValue::CommandBody(fixture_command(BaselineCommand::Commit)),
+            },
+            FixtureCase {
+                file_name: "command-freeze.cbor",
+                value: FixtureValue::CommandBody(fixture_command(BaselineCommand::Freeze)),
+            },
+            FixtureCase {
+                file_name: "command-resume.cbor",
+                value: FixtureValue::CommandBody(fixture_command(BaselineCommand::Resume)),
+            },
+            FixtureCase {
+                file_name: "command-activate-snapshot.cbor",
+                value: FixtureValue::CommandBody(fixture_command(
+                    BaselineCommand::ActivateSnapshot { snapshot: baseline() },
+                )),
+            },
+        ]
+    }
+
+    fn fixture_directory() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/session/v1")
+    }
+
+    fn fixture_bytes(case: &FixtureCase) -> Vec<u8> {
+        let path = fixture_directory().join(case.file_name);
+        fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read canonical session fixture {}: {error}; regenerate with `cargo test --locked --lib session::tests::regenerate_canonical_session_fixtures -- --ignored --exact`",
+                path.display()
+            )
+        })
+    }
+
+    fn encode_fixture(case: &FixtureCase) -> Result<Vec<u8>, SessionError> {
+        match &case.value {
+            FixtureValue::Manifest(value) => encode_manifest(value),
+            FixtureValue::BaselineState(value) => encode_baseline_state(value),
+            FixtureValue::RecordBody(value) => encode_record_body(value),
+            FixtureValue::CommandBody(value) => {
+                encode_record_body(&SessionRecordKind::BaselineCommand(value.clone()))
+            }
+        }
     }
 
     fn manifest() -> SessionManifest {
@@ -891,19 +1055,193 @@ mod tests {
             application_version: "0.1.0".into(),
             build_fingerprint: [0x22; 32],
             decoder_version: "native-frame-v1".into(),
-            wire_admission: vec![WireAdmissionPin {
-                wire_version: 1,
-                device_id: DeviceId::new(7),
-                key_epoch: KeyEpoch::try_new(3).expect("key epoch"),
-                firmware_build_digest: [0x33; 32],
-                capability_digest: [0x44; 32],
-                maximum_plaintext_bytes: 705,
-                transport_datagram_budget_bytes: 900,
-            }],
-            conditioning_version: "condition-v1".into(),
+            wire_admission: fixture_wire_admission(),
+            conditioning_version: "amplitude-v1".into(),
             algorithm_version: "baseline-v1".into(),
-            initial_baselines: vec![baseline()],
+            initial_baseline_states: vec![
+                learning_seed_state("link-a", 0x55),
+                active_seed_state("link-b", 0x56),
+            ],
         }
+    }
+
+    fn fixture_wire_admission() -> Vec<WireAdmissionPin> {
+        vec![
+            WireAdmissionPin {
+                wire_version: 1,
+                device_id: DeviceId::new(1),
+                key_epoch: KeyEpoch::try_new(1).expect("key epoch"),
+                firmware_build_digest: [0x01; 32],
+                capability_digest: [0x02; 32],
+                maximum_plaintext_bytes: 705,
+                transport_datagram_budget_bytes: 2048,
+            },
+            WireAdmissionPin {
+                wire_version: 1,
+                device_id: DeviceId::new(2),
+                key_epoch: KeyEpoch::try_new(1).expect("key epoch"),
+                firmware_build_digest: [0x03; 32],
+                capability_digest: [0x04; 32],
+                maximum_plaintext_bytes: 705,
+                transport_datagram_budget_bytes: 4096,
+            },
+        ]
+    }
+
+    fn compatibility() -> BaselineCompatibilityReceipt {
+        BaselineCompatibilityReceipt::new(
+            DeploymentId::new("lab").expect("deployment"),
+            SpaceId::new("room").expect("space"),
+            ConditioningVersion::new("amplitude-v1").expect("conditioning"),
+            BaselineContractId::from_bytes([0x66; 32]),
+        )
+    }
+
+    fn state_coordinate() -> BaselineCoordinateKey {
+        BaselineCoordinateKey::new(
+            CsiPath::RawPathOrdinal(u16::MAX),
+            CsiSampleCoordinate::FrequencyHz(u64::MAX),
+        )
+    }
+
+    fn learning_state(link: &str, profile: u8) -> BaselineState {
+        learning_state_with_compatibility(link, profile, compatibility())
+    }
+
+    fn learning_state_with_compatibility(
+        link: &str,
+        profile: u8,
+        compatibility: BaselineCompatibilityReceipt,
+    ) -> BaselineState {
+        BaselineState::try_new(
+            LinkProfileKey::new(
+                RadioLinkId::new(link).expect("link"),
+                CaptureProfileId::from_bytes([profile; 32]),
+            ),
+            BaselineLifecycle::Learning {
+                accepted_windows: u64::MAX,
+                accepted_exposure_ns: u64::MAX,
+            },
+            BTreeMap::from([(
+                state_coordinate(),
+                WelfordState::try_new(u64::MAX, 1.25, 3.5, u64::MAX).expect("welford"),
+            )]),
+            BTreeMap::new(),
+            None,
+            None,
+            false,
+            Some(SessionTime::from_nanos(u64::MAX)),
+            compatibility,
+        )
+        .expect("learning state")
+    }
+
+    fn active_state(link: &str, profile: u8) -> BaselineState {
+        BaselineState::try_new(
+            LinkProfileKey::new(
+                RadioLinkId::new(link).expect("link"),
+                CaptureProfileId::from_bytes([profile; 32]),
+            ),
+            BaselineLifecycle::Active,
+            BTreeMap::new(),
+            BTreeMap::from([(
+                state_coordinate(),
+                EwState::try_new(u64::MAX, 2.5, 0.75, u64::MAX).expect("EW"),
+            )]),
+            Some(BaselineRevision::new(u64::MAX)),
+            Some(BaselineStateSequence::new(u64::MAX)),
+            true,
+            Some(SessionTime::from_nanos(u64::MAX)),
+            compatibility(),
+        )
+        .expect("active state")
+    }
+
+    fn learning_seed_state(link: &str, profile: u8) -> BaselineState {
+        BaselineState::try_new(
+            LinkProfileKey::new(
+                RadioLinkId::new(link).expect("link"),
+                CaptureProfileId::from_bytes([profile; 32]),
+            ),
+            BaselineLifecycle::Learning {
+                accepted_windows: u64::MAX,
+                accepted_exposure_ns: u64::MAX,
+            },
+            BTreeMap::from([(
+                state_coordinate(),
+                WelfordState::try_new(u64::MAX, 1.25, 3.5, u64::MAX).expect("welford"),
+            )]),
+            BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            compatibility(),
+        )
+        .expect("learning seed state")
+    }
+
+    fn active_seed_state(link: &str, profile: u8) -> BaselineState {
+        BaselineState::try_new(
+            LinkProfileKey::new(
+                RadioLinkId::new(link).expect("link"),
+                CaptureProfileId::from_bytes([profile; 32]),
+            ),
+            BaselineLifecycle::Active,
+            BTreeMap::new(),
+            BTreeMap::from([(
+                state_coordinate(),
+                EwState::try_new(u64::MAX, 2.5, 0.75, u64::MAX).expect("EW"),
+            )]),
+            Some(BaselineRevision::new(u64::MAX)),
+            Some(BaselineStateSequence::new(u64::MAX)),
+            false,
+            None,
+            compatibility(),
+        )
+        .expect("active seed state")
+    }
+
+    fn committed_state(lifecycle: BaselineLifecycle) -> BaselineState {
+        let coordinates = BTreeMap::from([
+            (
+                BaselineCoordinateKey::new(
+                    CsiPath::TxRx { tx_stream: u16::MAX, rx_chain: u16::MAX - 1 },
+                    CsiSampleCoordinate::OpaqueSampleOrdinal(u16::MAX),
+                ),
+                EwState::try_new(u64::MAX, 1.5, 0.25, u64::MAX).expect("opaque EW state"),
+            ),
+            (
+                BaselineCoordinateKey::new(
+                    CsiPath::RawPathOrdinal(u16::MAX),
+                    CsiSampleCoordinate::IeeeToneIndex(i16::MIN),
+                ),
+                EwState::try_new(u64::MAX - 1, 2.5, 0.5, u64::MAX - 1).expect("tone EW state"),
+            ),
+            (
+                BaselineCoordinateKey::new(
+                    CsiPath::RawPathOrdinal(0),
+                    CsiSampleCoordinate::FrequencyHz(u64::MAX),
+                ),
+                EwState::try_new(u64::MAX - 2, 3.5, 0.75, u64::MAX - 2)
+                    .expect("frequency EW state"),
+            ),
+        ]);
+        BaselineState::try_new(
+            LinkProfileKey::new(
+                RadioLinkId::new("link-a").expect("link"),
+                CaptureProfileId::from_bytes([0x55; 32]),
+            ),
+            lifecycle,
+            BTreeMap::new(),
+            coordinates,
+            Some(BaselineRevision::new(u64::MAX)),
+            Some(BaselineStateSequence::new(u64::MAX)),
+            matches!(lifecycle, BaselineLifecycle::Active),
+            Some(SessionTime::from_nanos(u64::MAX)),
+            compatibility(),
+        )
+        .expect("committed baseline state")
     }
 
     fn baseline() -> BaselineSnapshot {
@@ -915,16 +1253,16 @@ mod tests {
                 CaptureProfileId::from_bytes([0x55; 32]),
             ),
             ConditioningVersion::new("amplitude-v1").expect("conditioning"),
-            BaselineRevision::new(7),
+            BaselineRevision::new(u64::MAX),
             BaselineContractId::from_bytes([0x66; 32]),
             vec![
                 BaselineCoordinate::try_new(
-                    CsiPath::RawPathOrdinal(0),
-                    CsiSampleCoordinate::OpaqueSampleOrdinal(0),
-                    2,
+                    CsiPath::RawPathOrdinal(u16::MAX),
+                    CsiSampleCoordinate::FrequencyHz(u64::MAX),
+                    u64::MAX,
                     1.0,
                     0.5,
-                    10,
+                    u64::MAX,
                 )
                 .expect("coordinate"),
             ],
@@ -932,7 +1270,7 @@ mod tests {
         .expect("baseline")
     }
 
-    fn command(command: BaselineCommand) -> TargetedBaselineCommand {
+    fn fixture_command(command: BaselineCommand) -> TargetedBaselineCommand {
         TargetedBaselineCommand::new(
             LinkProfileKey::new(
                 RadioLinkId::new("link-a").expect("link"),
@@ -942,470 +1280,563 @@ mod tests {
         )
     }
 
-    fn records() -> Vec<SessionRecord> {
-        vec![
-            SessionRecord {
-                record_seq: 0,
-                at: SessionTime::from_nanos(10),
-                kind: SessionRecordKind::Packet {
-                    receive_utc_ns: 50,
-                    peer: "192.0.2.1:9000".parse().expect("peer"),
-                    wire_format: WireFormat::NativeFrameUdp,
-                    bytes: vec![1, 2, 3, 4].into_boxed_slice(),
-                },
-            },
-            SessionRecord {
-                record_seq: 1,
-                at: SessionTime::from_nanos(10),
-                kind: SessionRecordKind::BaselineCommand(command(BaselineCommand::Freeze)),
-            },
-            SessionRecord {
-                record_seq: 2,
-                at: SessionTime::from_nanos(11),
-                kind: SessionRecordKind::TimelineAdvance,
-            },
-            SessionRecord {
-                record_seq: 3,
-                at: SessionTime::from_nanos(11),
-                kind: SessionRecordKind::Closed,
-            },
-        ]
-    }
-
-    fn write_session(path: &Path, records: &[SessionRecord]) {
-        let mut writer = SessionWriter::create(path, &manifest(), LIMITS).expect("create");
-        for record in records {
-            writer.append(record, LIMITS).expect("append");
-        }
-        writer.sync().expect("sync");
-        assert_eq!(writer.durable_through_record_seq(), records.last().map(|r| r.record_seq));
-    }
-
     #[test]
-    fn fixed_header_manifest_records_and_pins_roundtrip() {
-        assert_eq!(crc32c::crc32c(b"123456789"), 0xe306_9283);
-        let path = path("roundtrip.rfws");
-        let expected_records = records();
-        write_session(&path, &expected_records);
-        let bytes = fs::read(&path).expect("read bytes");
-        let fixture = include_str!("../tests/fixtures/session/session-v1.hex").trim();
-        assert_eq!(hex(&bytes), fixture);
-        assert_eq!(&bytes[..10], b"RFWSESS\0\x01\x00");
-        let actual = read(&path, LIMITS).expect("read session");
-        assert_eq!(actual.manifest.replay_config.digest(), manifest().replay_config.digest());
+    fn canonical_manifest_fixture_roundtrips_complete_replay_semantics() {
+        let case = fixture_cases().into_iter().next().expect("manifest fixture case");
+        let FixtureValue::Manifest(expected) = &case.value else {
+            panic!("first fixture case is not the manifest")
+        };
+        let bytes = fixture_bytes(&case);
+        let actual = decode_manifest(&bytes, 0).expect("decode canonical manifest fixture");
+        let text = String::from_utf8_lossy(&bytes);
+
+        assert_eq!(actual.session_id, expected.session_id);
+        assert_eq!(actual.started_utc_ns, expected.started_utc_ns);
+        assert_eq!(actual.config_digest, expected.config_digest);
+        assert_eq!(actual.replay_config.digest(), expected.replay_config.digest());
+        assert_eq!(actual.application_version, expected.application_version);
+        assert_eq!(actual.build_fingerprint, expected.build_fingerprint);
+        assert_eq!(actual.decoder_version, expected.decoder_version);
+        assert_eq!(actual.wire_admission, expected.wire_admission);
+        assert_eq!(actual.conditioning_version, expected.conditioning_version);
+        assert_eq!(actual.algorithm_version, expected.algorithm_version);
+        assert_eq!(actual.initial_baseline_states, expected.initial_baseline_states);
+        assert!(actual.initial_baseline_states.iter().all(|state| {
+            !state.adaptation_armed() && state.session_last_eligible_at().is_none()
+        }));
         assert_eq!(
-            actual.manifest.replay_config.canonical_bytes().expect("config bytes"),
-            manifest().replay_config.canonical_bytes().expect("config bytes")
+            actual.initial_baseline_states[0].learning()[&state_coordinate()]
+                .accepted_exposure_ns(),
+            u64::MAX
         );
-        assert_eq!(actual.manifest.config_digest, manifest().config_digest);
-        assert_eq!(actual.manifest.session_id, manifest().session_id);
-        assert_eq!(actual.records, expected_records);
-        assert_eq!(actual.seal, SessionSeal::Closed);
-        fs::remove_file(path).expect("cleanup");
+        assert_eq!(
+            actual.initial_baseline_states[1].active()[&state_coordinate()].variance(),
+            0.75
+        );
+        for forbidden in [
+            "./data/whisper.sqlite3",
+            "./data/secrets",
+            "database_path",
+            "secret_root",
+            "[deployment]",
+            "[[routes]]",
+        ] {
+            assert!(!text.contains(forbidden), "manifest fixture leaked {forbidden}");
+        }
+        assert_eq!(encode_manifest(&actual).expect("re-encode manifest fixture"), bytes);
     }
 
     #[test]
-    fn manifest_rejects_config_digest_mismatch_and_excludes_runtime_secrets() {
-        let path = path("manifest-boundary.rfws");
-        let manifest = manifest();
-        let encoded = encode_manifest(&manifest).expect("manifest");
-        let text = String::from_utf8_lossy(&encoded);
-        assert!(!text.contains("./data/secrets"));
-        assert!(!text.contains("runtime"));
-        assert!(!text.contains("secret_root"));
-        assert!(!text.contains("aes_key"));
-        assert!(!text.contains("[capture]"));
-        assert!(!text.contains("[[routes]]"));
-        assert!(!encoded.windows(32).any(|bytes| bytes == [0x77; 32]));
+    fn canonical_baseline_fixtures_cover_every_lifecycle_and_strong_coordinate() {
+        let cases = fixture_cases()
+            .into_iter()
+            .filter(|case| matches!(case.value, FixtureValue::BaselineState(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(cases.len(), 5);
 
-        let mut value = decode(&encoded, 0).expect("manifest value");
-        let Value::Map(fields) = &mut value else { panic!("manifest must be a map") };
-        let digest = fields
-            .iter_mut()
-            .find(|(key, _)| key == &Value::Text("config_digest".into()))
-            .expect("digest");
-        digest.1 = Value::Bytes(vec![0; 32]);
-        let bad = encode(&value).expect("bad manifest");
-        write_manifest_only(&path, &bad);
-        assert!(matches!(read(&path, LIMITS), Err(SessionError::ConfigDigest)));
-        fs::remove_file(path).expect("cleanup");
+        for case in cases {
+            let FixtureValue::BaselineState(expected) = &case.value else {
+                panic!("filtered fixture is not a baseline state")
+            };
+            let bytes = fixture_bytes(&case);
+            let actual =
+                decode_baseline_state(&bytes).expect("decode canonical baseline state fixture");
+            assert_eq!(&actual, expected, "{} semantics", case.file_name);
+            assert_eq!(
+                encode_baseline_state(&actual).expect("re-encode baseline fixture"),
+                bytes,
+                "{} canonical bytes",
+                case.file_name
+            );
+        }
+
+        let active = committed_state(BaselineLifecycle::Active);
+        assert!(active.active().contains_key(&BaselineCoordinateKey::new(
+            CsiPath::TxRx { tx_stream: u16::MAX, rx_chain: u16::MAX - 1 },
+            CsiSampleCoordinate::OpaqueSampleOrdinal(u16::MAX),
+        )));
+        assert!(active.active().contains_key(&BaselineCoordinateKey::new(
+            CsiPath::RawPathOrdinal(u16::MAX),
+            CsiSampleCoordinate::IeeeToneIndex(i16::MIN),
+        )));
+        assert!(active.active().contains_key(&BaselineCoordinateKey::new(
+            CsiPath::RawPathOrdinal(0),
+            CsiSampleCoordinate::FrequencyHz(u64::MAX),
+        )));
     }
 
     #[test]
-    fn decoded_session_rejects_invalid_strong_identity_and_wire_values() {
-        let encoded = encode_manifest(&manifest()).expect("manifest");
-        let mut value = decode(&encoded, 0).expect("manifest value");
-        let Value::Map(fields) = &mut value else { panic!("manifest must be a map") };
-        fields
-            .iter_mut()
-            .find(|(key, _)| key == &Value::Text("session_id".into()))
-            .expect("session id")
-            .1 = Value::Text(" ".into());
+    fn canonical_record_fixtures_cover_packet_and_exact_null_controls() {
+        let cases = fixture_cases()
+            .into_iter()
+            .filter(|case| matches!(case.value, FixtureValue::RecordBody(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(cases.len(), 3);
+
+        for case in cases {
+            let FixtureValue::RecordBody(expected) = &case.value else {
+                panic!("filtered fixture is not a record body")
+            };
+            let bytes = fixture_bytes(&case);
+            let kind = RecordKind::from_record(expected);
+            let actual = decode_record_body(kind, &bytes).expect("decode canonical record fixture");
+            assert_eq!(&actual, expected, "{} semantics", case.file_name);
+            assert_eq!(
+                encode_record_body(&actual).expect("re-encode record fixture"),
+                bytes,
+                "{} canonical bytes",
+                case.file_name
+            );
+            if matches!(expected, SessionRecordKind::TimelineAdvance | SessionRecordKind::Closed) {
+                assert_eq!(bytes, [0xf6], "{} exact CBOR null", case.file_name);
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_command_fixtures_cover_every_baseline_command() {
+        let cases = fixture_cases()
+            .into_iter()
+            .filter(|case| matches!(case.value, FixtureValue::CommandBody(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(cases.len(), 5);
+
+        for case in cases {
+            let FixtureValue::CommandBody(expected) = &case.value else {
+                panic!("filtered fixture is not a command body")
+            };
+            let bytes = fixture_bytes(&case);
+            let actual = decode_record_body(RecordKind::BaselineCommand, &bytes)
+                .expect("decode canonical command fixture");
+            let expected = SessionRecordKind::BaselineCommand(expected.clone());
+            assert_eq!(actual, expected, "{} semantics", case.file_name);
+            assert_eq!(
+                encode_record_body(&actual).expect("re-encode command fixture"),
+                bytes,
+                "{} canonical bytes",
+                case.file_name
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "writes canonical fixture files under tests/fixtures/session/v1"]
+    fn regenerate_canonical_session_fixtures() {
+        let directory = fixture_directory();
+        fs::create_dir_all(&directory).unwrap_or_else(|error| {
+            panic!("failed to create fixture directory {}: {error}", directory.display())
+        });
+        for case in fixture_cases() {
+            let path = directory.join(case.file_name);
+            let bytes = encode_fixture(&case).unwrap_or_else(|error| {
+                panic!("failed to encode canonical fixture {}: {error}", path.display())
+            });
+            fs::write(&path, bytes).unwrap_or_else(|error| {
+                panic!("failed to write canonical fixture {}: {error}", path.display())
+            });
+        }
+    }
+
+    #[test]
+    fn session_manifest_roundtrips_strong_replay_config_without_runtime_or_secrets() {
+        let expected = manifest();
+        let bytes = encode_manifest(&expected).expect("encode manifest");
+        let text = String::from_utf8_lossy(&bytes);
+        for forbidden in ["./data/secrets", "runtime", "secret_root", "aes_key", "[capture]"] {
+            assert!(!text.contains(forbidden));
+        }
+        assert!(!text.contains("initial_baselines"));
+        let actual = decode_manifest(&bytes, 0).expect("decode manifest");
+        assert_eq!(actual.session_id, expected.session_id);
+        assert_eq!(actual.config_digest, expected.config_digest);
+        assert_eq!(actual.replay_config.digest(), expected.replay_config.digest());
+        assert_eq!(actual.wire_admission.len(), 2);
+        assert_eq!(actual.wire_admission[0].device_id.get(), 1);
+        assert_eq!(actual.wire_admission[0].key_epoch.get(), 1);
+        assert_eq!(actual.wire_admission[1].device_id.get(), 2);
+        assert_eq!(actual.wire_admission[1].key_epoch.get(), 1);
+        assert_eq!(actual.decoder_version, "native-frame-v1");
+        assert_eq!(actual.conditioning_version, "amplitude-v1");
+        assert_eq!(actual.algorithm_version, "baseline-v1");
+        assert_eq!(actual.initial_baseline_states, expected.initial_baseline_states);
+        assert_eq!(actual.initial_baseline_states[0].learning()[&state_coordinate()].m2(), 3.5);
+        assert_eq!(
+            actual.initial_baseline_states[0].learning()[&state_coordinate()]
+                .accepted_exposure_ns(),
+            u64::MAX
+        );
+        assert_eq!(
+            actual.initial_baseline_states[1].active()[&state_coordinate()].variance(),
+            0.75
+        );
+        assert_eq!(
+            actual.initial_baseline_states[1].active()[&state_coordinate()].count(),
+            u64::MAX
+        );
+        assert_eq!(
+            actual.initial_baseline_states[1].state_sequence().expect("state sequence").get(),
+            u64::MAX
+        );
+        assert!(actual.initial_baseline_states.iter().all(|state| {
+            !state.adaptation_armed() && state.session_last_eligible_at().is_none()
+        }));
+    }
+
+    #[test]
+    fn manifest_replay_contract_rejects_each_cross_field_mismatch() {
+        let expected = manifest();
+        encode_manifest(&expected).expect("valid manifest replay contract");
+        let mut invalid = Vec::new();
+
+        let mut conditioning = expected.clone();
+        conditioning.conditioning_version = "other".into();
+        invalid.push(("conditioning", conditioning));
+
+        let mut length = expected.clone();
+        length.wire_admission.pop();
+        invalid.push(("pin length", length));
+
+        let mut order = expected.clone();
+        order.wire_admission.swap(0, 1);
+        invalid.push(("pin order", order));
+
+        let mut device = expected.clone();
+        device.wire_admission[0].device_id = DeviceId::new(99);
+        invalid.push(("device", device));
+
+        let mut epoch = expected.clone();
+        epoch.wire_admission[0].key_epoch = KeyEpoch::try_new(2).expect("key epoch");
+        invalid.push(("key epoch", epoch));
+
+        let mut firmware = expected.clone();
+        firmware.wire_admission[0].firmware_build_digest = [0x09; 32];
+        invalid.push(("firmware", firmware));
+
+        let mut capability = expected.clone();
+        capability.wire_admission[0].capability_digest = [0x09; 32];
+        invalid.push(("capability", capability));
+
+        let mut plaintext = expected.clone();
+        plaintext.wire_admission[0].maximum_plaintext_bytes = 704;
+        invalid.push(("maximum plaintext", plaintext));
+
+        let mut datagram = expected;
+        datagram.wire_admission[0].transport_datagram_budget_bytes = 2047;
+        invalid.push(("datagram budget", datagram));
+
+        for (field, invalid) in invalid {
+            assert!(
+                matches!(encode_manifest(&invalid), Err(SessionError::Schema(_))),
+                "accepted mismatched {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_initial_baseline_seeds_reject_armed_or_session_local_state() {
+        let mut invalid = manifest();
+        invalid.initial_baseline_states =
+            vec![learning_state("link-a", 0x55), active_state("link-b", 0x56)];
+        assert!(invalid.initial_baseline_states.iter().any(BaselineState::adaptation_armed));
+        assert!(
+            invalid
+                .initial_baseline_states
+                .iter()
+                .any(|state| state.session_last_eligible_at().is_some())
+        );
+
+        assert!(matches!(encode_manifest(&invalid), Err(SessionError::Schema(_))));
+    }
+
+    #[test]
+    fn session_manifest_rejects_digest_mismatch_unknown_fields_and_trailing_data() {
+        let expected = manifest();
+        let mut mismatched = expected.clone();
+        mismatched.config_digest = [0; 32];
+        assert!(matches!(encode_manifest(&mismatched), Err(SessionError::ConfigDigest)));
+
+        let mut value = decode(&encode_manifest(&expected).expect("encode"), 0).expect("value");
+        let Value::Map(fields) = &mut value else { panic!("manifest map") };
+        fields.push(field("unknown", Value::Null));
         assert!(matches!(
-            decode_manifest(&encode(&value).expect("encode"), 0),
+            decode_manifest(&encode(&value).expect("encode unknown"), 0),
             Err(SessionError::Schema(_))
         ));
 
-        let mut pin = pin_value(&manifest().wire_admission[0]);
-        let Value::Map(fields) = &mut pin else { panic!("pin must be a map") };
-        fields
-            .iter_mut()
-            .find(|(key, _)| key == &Value::Text("wire_version".into()))
-            .expect("wire version")
-            .1 = Value::Integer(0.into());
-        assert!(matches!(decode_pin(pin), Err(SessionError::Schema(_))));
-
-        let mut invalid_manifest = manifest();
-        invalid_manifest.wire_admission[0].maximum_plaintext_bytes = 0;
-        assert!(matches!(encode_manifest(&invalid_manifest), Err(SessionError::Schema(_))));
-        invalid_manifest.wire_admission[0].maximum_plaintext_bytes = 900;
-        invalid_manifest.wire_admission[0].transport_datagram_budget_bytes = 900;
-        assert!(matches!(encode_manifest(&invalid_manifest), Err(SessionError::Schema(_))));
-
-        assert!(matches!(parse_wire_format("unknown"), Err(SessionError::Schema(_))));
+        let mut bytes = encode_manifest(&expected).expect("manifest");
+        bytes.push(0xf6);
+        assert!(matches!(decode_manifest(&bytes, 0), Err(SessionError::Cbor { .. })));
     }
 
     #[test]
-    fn baseline_commands_and_initial_snapshot_roundtrip_strong_values() {
-        let variants = vec![
+    fn session_decoders_reject_missing_duplicate_reordered_and_noncanonical_fields() {
+        let canonical_manifest = encode_manifest(&manifest()).expect("canonical manifest");
+
+        let mut missing = decode(&canonical_manifest, 0).expect("manifest value");
+        let Value::Map(fields) = &mut missing else { panic!("manifest map") };
+        fields.retain(|(key, _)| key != &Value::Text("algorithm_version".into()));
+        assert!(matches!(
+            decode_manifest(&encode(&missing).expect("missing field bytes"), 0),
+            Err(SessionError::Schema(_))
+        ));
+
+        let mut duplicate = decode(&canonical_manifest, 0).expect("manifest value");
+        let Value::Map(fields) = &mut duplicate else { panic!("manifest map") };
+        let session_id = fields
+            .iter()
+            .find(|(key, _)| key == &Value::Text("session_id".into()))
+            .expect("session ID field")
+            .clone();
+        fields.push(session_id);
+        assert!(matches!(
+            decode_manifest(&encode(&duplicate).expect("duplicate field bytes"), 0),
+            Err(SessionError::Schema(_))
+        ));
+
+        let mut noncanonical = canonical_manifest.clone();
+        assert_eq!(noncanonical[8], 1, "canonical schema value location changed");
+        noncanonical.insert(8, 0x18);
+        assert!(decode_manifest(&noncanonical, 0).is_err(), "accepted an overlong CBOR encoding");
+
+        let mut reordered = decode(
+            &encode_baseline_state(&committed_state(BaselineLifecycle::Active))
+                .expect("canonical baseline"),
+            0,
+        )
+        .expect("baseline value");
+        let Value::Map(fields) = &mut reordered else { panic!("baseline map") };
+        fields.reverse();
+        assert!(
+            decode_baseline_state(&encode(&reordered).expect("reordered baseline")).is_err(),
+            "accepted reordered baseline fields"
+        );
+    }
+
+    #[test]
+    fn unit_control_record_bodies_are_exact_cbor_null() {
+        let timeline_advance = SessionRecord {
+            record_seq: 7,
+            at: SessionTime::from_nanos(11),
+            kind: SessionRecordKind::TimelineAdvance,
+        };
+        let closed = SessionRecord {
+            record_seq: 8,
+            at: SessionTime::from_nanos(12),
+            kind: SessionRecordKind::Closed,
+        };
+
+        assert_eq!(
+            encode_record_body(&timeline_advance.kind).expect("timeline advance body"),
+            [0xf6]
+        );
+        assert_eq!(encode_record_body(&closed.kind).expect("closed body"), [0xf6]);
+    }
+
+    #[test]
+    fn record_body_codec_roundtrips_all_variants() {
+        let command = TargetedBaselineCommand::new(
+            LinkProfileKey::new(
+                RadioLinkId::new("link-a").expect("link"),
+                CaptureProfileId::from_bytes([0x55; 32]),
+            ),
+            BaselineCommand::Freeze,
+        );
+        let variants = [
+            SessionRecordKind::Packet {
+                receive_utc_ns: i64::MIN,
+                peer: "[2001:db8::1]:9000".parse().expect("peer"),
+                wire_format: WireFormat::NativeFrameUdp,
+                bytes: vec![0, 1, 2].into_boxed_slice(),
+            },
+            SessionRecordKind::BaselineCommand(command),
+            SessionRecordKind::TimelineAdvance,
+            SessionRecordKind::Closed,
+        ];
+
+        for expected in variants {
+            let tag = RecordKind::from_record(&expected);
+            let body = encode_record_body(&expected).expect("encode body");
+            assert_eq!(decode_record_body(tag, &body).expect("decode body"), expected);
+        }
+    }
+
+    #[test]
+    fn control_inputs_construct_only_their_allowed_record_kinds() {
+        let command = TargetedBaselineCommand::new(
+            LinkProfileKey::new(
+                RadioLinkId::new("link-a").expect("link"),
+                CaptureProfileId::from_bytes([0x55; 32]),
+            ),
+            BaselineCommand::Freeze,
+        );
+        assert!(matches!(
+            ControlRecordInput::baseline_command(1, SessionTime::from_nanos(11), command)
+                .record()
+                .kind,
+            SessionRecordKind::BaselineCommand(_)
+        ));
+        assert!(matches!(
+            ControlRecordInput::timeline_advance(2, SessionTime::from_nanos(12)).record().kind,
+            SessionRecordKind::TimelineAdvance
+        ));
+        assert!(matches!(
+            ControlRecordInput::closed(3, SessionTime::from_nanos(13)).record().kind,
+            SessionRecordKind::Closed
+        ));
+    }
+
+    #[test]
+    fn record_body_decoder_rejects_unknown_tags_noncanonical_and_trailing_input() {
+        for (tag, expected) in [
+            ("packet", RecordKind::Packet),
+            ("baseline_command", RecordKind::BaselineCommand),
+            ("timeline_advance", RecordKind::TimelineAdvance),
+            ("closed", RecordKind::Closed),
+        ] {
+            assert_eq!(RecordKind::parse(tag).expect("accepted record kind"), expected);
+            assert_eq!(expected.as_str(), tag);
+        }
+        assert!(RecordKind::parse("unknown").is_err());
+
+        let packet = SessionRecordKind::Packet {
+            receive_utc_ns: -1,
+            peer: "192.0.2.1:9000".parse().expect("peer"),
+            wire_format: WireFormat::NativeFrameUdp,
+            bytes: vec![1, 2, 3].into_boxed_slice(),
+        };
+        let mut reordered =
+            decode(&encode_record_body(&packet).expect("packet body"), 0).expect("packet value");
+        let Value::Map(fields) = &mut reordered else { panic!("packet map") };
+        fields.reverse();
+        assert!(
+            decode_record_body(RecordKind::Packet, &encode(&reordered).expect("reordered body"))
+                .is_err()
+        );
+
+        let mut repeated_envelope =
+            decode(&encode_record_body(&packet).expect("packet body"), 0).expect("packet value");
+        let Value::Map(fields) = &mut repeated_envelope else { panic!("packet map") };
+        fields.push(field("record_seq", unsigned(7)));
+        assert!(
+            decode_record_body(
+                RecordKind::Packet,
+                &encode(&repeated_envelope).expect("body with envelope field")
+            )
+            .is_err()
+        );
+
+        assert!(decode_record_body(RecordKind::Closed, &[0xf4]).is_err());
+        assert!(decode_record_body(RecordKind::TimelineAdvance, &[0xf6, 0xf6]).is_err());
+    }
+
+    #[test]
+    fn session_baseline_command_bodies_and_snapshot_roundtrip_strong_values() {
+        let target = LinkProfileKey::new(
+            RadioLinkId::new("link-a").expect("link"),
+            CaptureProfileId::from_bytes([0x55; 32]),
+        );
+        let variants = [
             BaselineCommand::BeginLearning,
             BaselineCommand::Commit,
             BaselineCommand::Freeze,
             BaselineCommand::Resume,
             BaselineCommand::ActivateSnapshot { snapshot: baseline() },
         ];
-        for (record_seq, variant) in variants.into_iter().enumerate() {
-            let expected = SessionRecord {
-                record_seq: record_seq as u64,
-                at: SessionTime::from_nanos(20),
-                kind: SessionRecordKind::BaselineCommand(command(variant)),
-            };
+        for command in variants {
+            let expected = SessionRecordKind::BaselineCommand(TargetedBaselineCommand::new(
+                target.clone(),
+                command,
+            ));
             assert_eq!(
-                decode_record(&encode_record(&expected).expect("encode"), 0).expect("decode"),
+                decode_record_body(
+                    RecordKind::BaselineCommand,
+                    &encode_record_body(&expected).expect("encode body")
+                )
+                .expect("decode body"),
                 expected
             );
         }
 
         let expected = manifest();
-        let actual =
-            decode_manifest(&encode_manifest(&expected).expect("encode"), 0).expect("decode");
-        assert_eq!(actual.initial_baselines, expected.initial_baselines);
-        let snapshot = &actual.initial_baselines[0];
-        assert_eq!(snapshot.coordinates(), baseline().coordinates());
-        assert_eq!(snapshot.contract(), baseline().contract());
+        let actual = decode_manifest(&encode_manifest(&expected).expect("encode"), 0)
+            .expect("decode complete state");
+        assert_eq!(actual.initial_baseline_states, expected.initial_baseline_states);
     }
 
     #[test]
-    fn baseline_decoder_rejects_invalid_and_extra_payload_fields() {
-        let mut value = command_value(&command(BaselineCommand::Freeze));
-        let Value::Map(fields) = &mut value else { panic!("command must be a map") };
-        fields.iter_mut().find(|(key, _)| key == &Value::Text("link".into())).expect("link").1 =
-            Value::Text(" ".into());
-        assert!(decode_command(value).is_err());
-
-        let mut value = command_value(&command(BaselineCommand::Freeze));
-        let Value::Map(fields) = &mut value else { panic!("command must be a map") };
+    fn session_decoder_rejects_invalid_strong_identity_and_wire_pin() {
+        let mut value = decode(&encode_manifest(&manifest()).expect("encode"), 0).expect("value");
+        let Value::Map(fields) = &mut value else { panic!("manifest map") };
         fields
             .iter_mut()
-            .find(|(key, _)| key == &Value::Text("profile".into()))
-            .expect("profile")
-            .1 = Value::Bytes(vec![0; 31]);
-        assert!(decode_command(value).is_err());
-
-        let mut value = snapshot_value(&baseline());
-        let Value::Map(fields) = &mut value else { panic!("snapshot must be a map") };
-        let coordinates = fields
-            .iter_mut()
-            .find(|(key, _)| key == &Value::Text("coordinates".into()))
-            .expect("coordinates");
-        let Value::Array(coordinates) = &mut coordinates.1 else { panic!("coordinates array") };
-        coordinates.push(coordinates[0].clone());
-        assert!(decode_snapshot(value).is_err());
-
-        let mut value = snapshot_value(&baseline());
-        let Value::Map(fields) = &mut value else { panic!("snapshot must be a map") };
-        fields.push(field("extra", Value::Null));
-        assert!(decode_snapshot(value).is_err());
-    }
-
-    #[test]
-    fn runtime_lock_conflicts_releases_and_session_files_do_not_claim_it() {
-        let lock_path = path("runtime.lock");
-        let first = RuntimeLock::acquire(&lock_path).expect("first lock");
-        assert!(matches!(RuntimeLock::acquire(&lock_path), Err(SessionError::Locked)));
-        drop(first);
-        let second = RuntimeLock::acquire(&lock_path).expect("released lock");
-        drop(second);
-        fs::remove_file(lock_path).expect("cleanup lock");
-
-        let session_path = path("unlocked-session.rfws");
-        let writer = SessionWriter::create(&session_path, &manifest(), LIMITS).expect("session");
-        let probe = OpenOptions::new().read(true).write(true).open(&session_path).expect("probe");
-        probe.try_lock().expect("session file must not own runtime lock");
-        drop(probe);
-        drop(writer);
-        fs::remove_file(session_path).expect("cleanup session");
-    }
-
-    #[test]
-    fn writer_rejects_sequence_time_and_closed_without_changing_boundary() {
-        let path = path("writer-validation.rfws");
-        let mut writer = SessionWriter::create(&path, &manifest(), LIMITS).expect("create");
-        let initial = writer.record_boundary().expect("boundary");
-        let mut record = records().remove(0);
-        record.record_seq = 1;
-        assert!(matches!(writer.append(&record, LIMITS), Err(SessionError::Sequence { .. })));
-        assert_eq!(writer.record_boundary().expect("boundary"), initial);
-        record.record_seq = 0;
-        writer.append(&record, LIMITS).expect("first");
-        assert!(matches!(writer.append(&record, LIMITS), Err(SessionError::Sequence { .. })));
-        let mut reversed = SessionRecord {
-            record_seq: 1,
-            at: SessionTime::from_nanos(9),
-            kind: SessionRecordKind::TimelineAdvance,
-        };
-        assert!(matches!(writer.append(&reversed, LIMITS), Err(SessionError::TimeReversed { .. })));
-        reversed.at = SessionTime::from_nanos(10);
-        reversed.kind = SessionRecordKind::Closed;
-        writer.append(&reversed, LIMITS).expect("close");
+            .find(|(key, _)| key == &Value::Text("session_id".into()))
+            .expect("session id")
+            .1 = Value::Text(" ".into());
         assert!(matches!(
-            writer.append(
-                &SessionRecord {
-                    record_seq: 2,
-                    at: SessionTime::from_nanos(10),
-                    kind: SessionRecordKind::TimelineAdvance
-                },
-                LIMITS
-            ),
-            Err(SessionError::Closed)
+            decode_manifest(&encode(&value).expect("encode invalid"), 0),
+            Err(SessionError::Schema(_))
         ));
-        fs::remove_file(path).expect("cleanup");
+
+        let mut invalid = manifest();
+        invalid.wire_admission[0].maximum_plaintext_bytes = 900;
+        invalid.wire_admission[0].transport_datagram_budget_bytes = 900;
+        assert!(matches!(encode_manifest(&invalid), Err(SessionError::Schema(_))));
     }
 
     #[test]
-    fn every_crash_tail_recovers_only_the_complete_prefix() {
-        let complete = path("complete.rfws");
-        let expected = records();
-        write_session(&complete, &expected);
-        let bytes = fs::read(&complete).expect("bytes");
-        let manifest_len = u32::from_le_bytes(bytes[10..14].try_into().expect("length")) as usize;
-        let first_record = HEADER_LEN as usize + manifest_len;
-        for cut in first_record..bytes.len() {
-            let truncated = path("truncated.rfws");
-            fs::write(&truncated, &bytes[..cut]).expect("write truncation");
-            let recovered = read(&truncated, LIMITS).expect("recover tail");
-            assert!(matches!(
-                recovered.seal,
-                SessionSeal::RecoverySealed { .. } | SessionSeal::Open
-            ));
-            assert!(expected.starts_with(&recovered.records));
-            fs::remove_file(truncated).expect("cleanup");
-        }
-        fs::remove_file(complete).expect("cleanup");
-    }
-
-    #[test]
-    fn mid_file_crc_failure_reports_record_offset() {
-        let path = path("crc.rfws");
-        write_session(&path, &records());
-        let mut bytes = fs::read(&path).expect("bytes");
-        let manifest_len = u32::from_le_bytes(bytes[10..14].try_into().expect("length")) as usize;
-        let first_offset = HEADER_LEN as usize + manifest_len;
-        bytes[first_offset + 8] ^= 1;
-        fs::write(&path, bytes).expect("corrupt");
-        assert!(
-            matches!(read(&path, LIMITS), Err(SessionError::Crc { offset }) if offset == first_offset as u64)
+    fn session_baseline_state_codec_rejects_invalid_unordered_and_incompatible_values() {
+        let expected = active_state("link-a", 0x55);
+        assert_eq!(
+            decode_baseline_state(&encode_baseline_state(&expected).expect("encode"))
+                .expect("decode"),
+            expected
         );
-        fs::remove_file(path).expect("cleanup");
-    }
 
-    #[test]
-    fn declared_lengths_are_rejected_before_body_allocation() {
-        let manifest_path = path("manifest-limit.rfws");
-        let mut header = Vec::from(MAGIC.as_slice());
-        header.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
-        header.extend_from_slice(&(LIMITS.max_manifest_bytes + 1).to_le_bytes());
-        header.extend_from_slice(&0_u32.to_le_bytes());
-        fs::write(&manifest_path, header).expect("header");
-        assert!(matches!(read(&manifest_path, LIMITS), Err(SessionError::ManifestTooLarge { .. })));
-        fs::remove_file(manifest_path).expect("cleanup");
+        let mut value = state_value(&expected);
+        let Value::Map(fields) = &mut value else { panic!("state map") };
+        let active = fields
+            .iter_mut()
+            .find(|(key, _)| key == &Value::Text("active".into()))
+            .expect("active");
+        let Value::Array(coordinates) = &mut active.1 else { panic!("coordinate array") };
+        coordinates.push(coordinates[0].clone());
+        assert!(decode_state(value).is_err());
 
-        let record_path = path("record-limit.rfws");
-        let manifest_bytes = encode_manifest(&manifest()).expect("manifest");
-        let mut bytes = Vec::from(MAGIC.as_slice());
-        bytes.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&(manifest_bytes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&crc32c::crc32c(&manifest_bytes).to_le_bytes());
-        bytes.extend_from_slice(&manifest_bytes);
-        bytes.extend_from_slice(&(LIMITS.max_record_bytes + 1).to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        fs::write(&record_path, bytes).expect("record header");
-        assert!(matches!(read(&record_path, LIMITS), Err(SessionError::RecordTooLarge { .. })));
-        fs::remove_file(record_path).expect("cleanup");
-    }
+        let mut value = state_value(&expected);
+        let Value::Map(fields) = &mut value else { panic!("state map") };
+        fields.push(field("extra", Value::Null));
+        assert!(decode_state(value).is_err());
 
-    #[test]
-    fn retention_removes_only_oldest_sealed_non_active_files() {
-        let closed = path("z-older-closed");
-        let recovered = path("a-newer-recovered");
-        let open = path("003-open");
-        let active = path("004-active");
-        for path in [&closed, &recovered, &open, &active] {
-            fs::write(path, []).expect("file");
-        }
-        let mut sessions = vec![
-            (active.clone(), SessionSeal::Closed, 40),
-            (open.clone(), SessionSeal::Open, 10),
-            (recovered.clone(), SessionSeal::RecoverySealed { truncated_at: 9 }, 30),
-            (closed.clone(), SessionSeal::Closed, 20),
-        ];
-        let removed = retain_oldest_closed(&mut sessions, &active, 3).expect("retain");
-        assert_eq!(removed.as_slice(), std::slice::from_ref(&closed));
-        assert!(removed.iter().all(|path| !path.exists()));
-        assert!(recovered.exists() && open.exists() && active.exists());
-        for path in [closed, recovered, open, active] {
-            let _ = fs::remove_file(path);
-        }
-    }
+        let mut unordered = manifest();
+        unordered.initial_baseline_states.reverse();
+        assert!(matches!(encode_manifest(&unordered), Err(SessionError::Schema(_))));
 
-    #[test]
-    fn reader_rejects_sequence_time_schema_and_cbor_trailing_data() {
-        let first = records().remove(0);
-        let cases = [
-            (
-                "duplicate",
-                vec![
-                    first.clone(),
-                    SessionRecord {
-                        record_seq: 0,
-                        at: SessionTime::from_nanos(10),
-                        kind: SessionRecordKind::TimelineAdvance,
-                    },
-                ],
-                "sequence",
-            ),
-            (
-                "time",
-                vec![
-                    first,
-                    SessionRecord {
-                        record_seq: 1,
-                        at: SessionTime::from_nanos(9),
-                        kind: SessionRecordKind::TimelineAdvance,
-                    },
-                ],
-                "time",
-            ),
-            (
-                "skip",
-                vec![
-                    records().remove(0),
-                    SessionRecord {
-                        record_seq: 2,
-                        at: SessionTime::from_nanos(10),
-                        kind: SessionRecordKind::TimelineAdvance,
-                    },
-                ],
-                "sequence",
-            ),
-        ];
-        for (name, records, expected) in cases {
-            let path = path(name);
-            write_raw(&path, &records);
-            let error = read(&path, LIMITS).expect_err("invalid order");
-            assert!(matches!(
-                (&error, expected),
-                (SessionError::Sequence { .. }, "sequence")
-                    | (SessionError::TimeReversed { .. }, "time")
-            ));
-            fs::remove_file(path).expect("cleanup");
-        }
-
-        let mut record = encode_record(&records()[0]).expect("record");
-        record.push(0xf6);
-        let trailing = path("trailing");
-        write_raw_bodies(&trailing, &[record]);
-        assert!(matches!(read(&trailing, LIMITS), Err(SessionError::Cbor { .. })));
-        fs::remove_file(trailing).expect("cleanup");
-
-        let after_closed = path("after-closed");
-        let mut records = records();
-        records.push(SessionRecord {
-            record_seq: 4,
-            at: SessionTime::from_nanos(11),
-            kind: SessionRecordKind::TimelineAdvance,
-        });
-        write_raw(&after_closed, &records);
-        assert!(matches!(read(&after_closed, LIMITS), Err(SessionError::Schema(_))));
-        fs::remove_file(after_closed).expect("cleanup");
-
-        let wrong_schema = Value::Map(vec![field("schema", unsigned(2))]);
-        let schema = path("schema");
-        write_raw_bodies(&schema, &[encode(&wrong_schema).expect("encode")]);
-        assert!(matches!(read(&schema, LIMITS), Err(SessionError::Schema(_))));
-        fs::remove_file(schema).expect("cleanup");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn append_and_sync_failures_never_advance_publishable_sequence() {
-        let read_only_path = path("read-only");
-        fs::write(&read_only_path, []).expect("file");
-        let file = File::open(&read_only_path).expect("read only");
-        let mut writer = SessionWriter {
-            file,
-            next_seq: 0,
-            last_at: None,
-            closed: false,
-            durable_through_record_seq: None,
+        let receipt = |deployment, space, conditioning| {
+            BaselineCompatibilityReceipt::new(
+                DeploymentId::new(deployment).expect("deployment"),
+                SpaceId::new(space).expect("space"),
+                ConditioningVersion::new(conditioning).expect("conditioning"),
+                BaselineContractId::from_bytes([0x66; 32]),
+            )
         };
-        assert!(matches!(writer.append(&records()[0], LIMITS), Err(SessionError::Io { .. })));
-        assert_eq!(writer.next_seq, 0);
-        assert_eq!(writer.durable_through_record_seq(), None);
-        fs::remove_file(read_only_path).expect("cleanup");
-
-        let file = OpenOptions::new().write(true).open("/dev/null").expect("dev null");
-        let mut writer = SessionWriter {
-            file,
-            next_seq: 1,
-            last_at: Some(10),
-            closed: false,
-            durable_through_record_seq: None,
-        };
-        assert!(writer.sync().is_err());
-        assert_eq!(writer.durable_through_record_seq(), None);
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    fn write_raw(path: &Path, records: &[SessionRecord]) {
-        let bodies =
-            records.iter().map(encode_record).collect::<Result<Vec<_>, _>>().expect("encode");
-        write_raw_bodies(path, &bodies);
-    }
-
-    fn write_raw_bodies(path: &Path, bodies: &[Vec<u8>]) {
-        let manifest = encode_manifest(&manifest()).expect("manifest");
-        write_manifest_and_bodies(path, &manifest, bodies);
-    }
-
-    fn write_manifest_only(path: &Path, manifest: &[u8]) {
-        write_manifest_and_bodies(path, manifest, &[]);
-    }
-
-    fn write_manifest_and_bodies(path: &Path, manifest: &[u8], bodies: &[Vec<u8>]) {
-        let mut bytes = Vec::from(MAGIC.as_slice());
-        bytes.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&crc32c::crc32c(manifest).to_le_bytes());
-        bytes.extend_from_slice(manifest);
-        for body in bodies {
-            bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&crc32c::crc32c(body).to_le_bytes());
-            bytes.extend_from_slice(body);
+        let incompatible = [
+            learning_state("missing-link", 0x55),
+            learning_state_with_compatibility(
+                "link-a",
+                0x55,
+                receipt("other", "room", "amplitude-v1"),
+            ),
+            learning_state_with_compatibility(
+                "link-a",
+                0x55,
+                receipt("lab", "other", "amplitude-v1"),
+            ),
+            learning_state_with_compatibility("link-a", 0x55, receipt("lab", "room", "other")),
+        ];
+        for state in incompatible {
+            let mut invalid = manifest();
+            invalid.initial_baseline_states = vec![state];
+            assert!(matches!(encode_manifest(&invalid), Err(SessionError::Schema(_))));
         }
-        fs::write(path, bytes).expect("raw session");
     }
 }

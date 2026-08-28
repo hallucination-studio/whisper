@@ -46,12 +46,37 @@ fn valid_s3_config_has_stable_digest_and_exact_routes() {
 }
 
 #[test]
+fn configuration_omits_flush_policy_and_rejects_legacy_values() {
+    let source = valid_source();
+    parse_config(&source).expect("config without flush_policy must be valid");
+
+    for legacy in ["every_record", "window"] {
+        let legacy_source = source.replace(
+            "retention_max_sessions = 8",
+            &format!("retention_max_sessions = 8\nflush_policy = \"{legacy}\""),
+        );
+        match parse_config(&legacy_source) {
+            Err(ConfigError::Parse(message)) => assert!(
+                message.contains("unknown field `flush_policy`"),
+                "legacy value {legacy} produced the wrong parse error: {message}"
+            ),
+            Err(error) => panic!("legacy value {legacy} produced the wrong error: {error}"),
+            Ok(_) => panic!("legacy value {legacy} was accepted"),
+        }
+    }
+}
+
+#[test]
 fn runtime_only_changes_do_not_change_replay_digest() {
     let source = valid_source();
     let original = parse_config(&source).expect("valid config");
     let changed = parse_config(
         &source
             .replace("bind = \"127.0.0.1:9000\"", "bind = \"127.0.0.1:9001\"")
+            .replace(
+                "database_path = \"./data/whisper.sqlite3\"",
+                "database_path = \"./other.sqlite3\"",
+            )
             .replace("retention_max_sessions = 8", "retention_max_sessions = 7"),
     )
     .expect("runtime-only mutation");
@@ -88,6 +113,7 @@ fn configuration_rejects_unknown_fields_duplicate_ids_and_unknown_references() {
 #[test]
 fn configuration_rejects_legacy_or_ambiguous_route_fields() {
     let source = valid_source();
+    assert!(parse_config(&source.replace("database_path =", "directory =")).is_err());
     assert!(parse_config(&source.replacen("device_id = 1", "node_id = 1", 1)).is_err());
     assert!(parse_config(&source.replacen("peer = \"192.0.2.10\"", "peer = \"*\"", 1)).is_err());
     assert!(

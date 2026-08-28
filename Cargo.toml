@@ -12,8 +12,8 @@ license = "MIT"
 [dependencies]
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 ciborium = "0.2.2"
-crc32c = "0.6.8"
 mimalloc = "0.1.48"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
 thiserror = "2.0.17"

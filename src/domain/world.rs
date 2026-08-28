@@ -10,7 +10,7 @@ use super::identity::{
     BuildFingerprint, ConditioningVersion, DecoderVersion, DeploymentId, LinkProfileKey,
     RadioLinkId, SensorId, SessionId, SnapshotId, SpaceId, StreamInstanceId, WindowId,
 };
-use super::time::{TimeInterval, TimeQuality};
+use super::time::{SessionTime, TimeInterval, TimeQuality};
 
 /// A value that explicitly records the boundary of current knowledge.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -134,6 +134,336 @@ pub enum BaselineStatus {
         /// Why the revision became stale.
         reason: BaselineStaleReason,
     },
+}
+
+/// One stable native coordinate key in complete baseline state.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct BaselineCoordinateKey {
+    path: CsiPath,
+    coordinate: CsiSampleCoordinate,
+}
+
+impl BaselineCoordinateKey {
+    /// Creates a native coordinate key.
+    #[must_use]
+    pub const fn new(path: CsiPath, coordinate: CsiSampleCoordinate) -> Self {
+        Self { path, coordinate }
+    }
+
+    /// Returns the CSI path.
+    #[must_use]
+    pub const fn path(self) -> CsiPath {
+        self.path
+    }
+
+    /// Returns the native sample coordinate.
+    #[must_use]
+    pub const fn coordinate(self) -> CsiSampleCoordinate {
+        self.coordinate
+    }
+}
+
+/// Complete Welford accumulator for one learning coordinate.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct WelfordState {
+    count: u64,
+    mean: f64,
+    m2: f64,
+    accepted_exposure_ns: u64,
+}
+
+impl WelfordState {
+    /// Validates a non-empty learning accumulator.
+    pub fn try_new(
+        count: u64,
+        mean: f64,
+        m2: f64,
+        accepted_exposure_ns: u64,
+    ) -> Result<Self, WorldValueError> {
+        if !mean.is_finite() || !m2.is_finite() {
+            return Err(WorldValueError::NonFiniteBaselineState);
+        }
+        if count == 0 || accepted_exposure_ns == 0 || m2 < 0.0 {
+            return Err(WorldValueError::InvalidWelfordState);
+        }
+        Ok(Self { count, mean, m2, accepted_exposure_ns })
+    }
+
+    /// Returns the accepted sample count.
+    #[must_use]
+    pub const fn count(self) -> u64 {
+        self.count
+    }
+
+    /// Returns the Welford mean.
+    #[must_use]
+    pub const fn mean(self) -> f64 {
+        self.mean
+    }
+
+    /// Returns the Welford M2 accumulator.
+    #[must_use]
+    pub const fn m2(self) -> f64 {
+        self.m2
+    }
+
+    /// Returns accepted coordinate exposure in nanoseconds.
+    #[must_use]
+    pub const fn accepted_exposure_ns(self) -> u64 {
+        self.accepted_exposure_ns
+    }
+}
+
+/// Current exponentially weighted state for one active coordinate.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct EwState {
+    count: u64,
+    mean: f64,
+    variance: f64,
+    accepted_exposure_ns: u64,
+}
+
+impl EwState {
+    /// Validates a finite active coordinate state.
+    pub fn try_new(
+        count: u64,
+        mean: f64,
+        variance: f64,
+        accepted_exposure_ns: u64,
+    ) -> Result<Self, WorldValueError> {
+        if !mean.is_finite() || !variance.is_finite() {
+            return Err(WorldValueError::NonFiniteBaselineState);
+        }
+        if count < 2 || variance < 0.0 || accepted_exposure_ns == 0 {
+            return Err(WorldValueError::InvalidEwState);
+        }
+        Ok(Self { count, mean, variance, accepted_exposure_ns })
+    }
+
+    /// Returns the accepted sample count needed for immutable snapshots.
+    #[must_use]
+    pub const fn count(self) -> u64 {
+        self.count
+    }
+
+    /// Returns the current EW mean.
+    #[must_use]
+    pub const fn mean(self) -> f64 {
+        self.mean
+    }
+
+    /// Returns the current EW variance.
+    #[must_use]
+    pub const fn variance(self) -> f64 {
+        self.variance
+    }
+
+    /// Returns accepted coordinate exposure needed for immutable snapshots.
+    #[must_use]
+    pub const fn accepted_exposure_ns(self) -> u64 {
+        self.accepted_exposure_ns
+    }
+}
+
+/// Lifecycle of a present complete baseline state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum BaselineLifecycle {
+    /// A revision is accumulating Welford statistics.
+    Learning {
+        /// Number of accepted windows.
+        accepted_windows: u64,
+        /// Total accepted learning exposure in nanoseconds.
+        accepted_exposure_ns: u64,
+    },
+    /// A committed revision may score and adapt.
+    Active,
+    /// Adaptation is explicitly disabled.
+    Frozen,
+    /// The revision requires an explicit lifecycle command.
+    Stale {
+        /// Reason the revision became stale.
+        reason: BaselineStaleReason,
+    },
+}
+
+/// Compatibility identity required to continue one baseline across sessions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BaselineCompatibilityReceipt {
+    deployment: DeploymentId,
+    space: SpaceId,
+    conditioning_version: ConditioningVersion,
+    contract: BaselineContractId,
+}
+
+impl BaselineCompatibilityReceipt {
+    /// Creates an exact baseline compatibility receipt.
+    #[must_use]
+    pub const fn new(
+        deployment: DeploymentId,
+        space: SpaceId,
+        conditioning_version: ConditioningVersion,
+        contract: BaselineContractId,
+    ) -> Self {
+        Self { deployment, space, conditioning_version, contract }
+    }
+
+    /// Returns the deployment identity.
+    #[must_use]
+    pub const fn deployment(&self) -> &DeploymentId {
+        &self.deployment
+    }
+
+    /// Returns the space identity.
+    #[must_use]
+    pub const fn space(&self) -> &SpaceId {
+        &self.space
+    }
+
+    /// Returns the conditioning version.
+    #[must_use]
+    pub const fn conditioning_version(&self) -> &ConditioningVersion {
+        &self.conditioning_version
+    }
+
+    /// Returns the baseline contract identity.
+    #[must_use]
+    pub const fn contract(&self) -> BaselineContractId {
+        self.contract
+    }
+}
+
+/// Canonical complete persisted estimator state for one link and profile.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BaselineState {
+    key: LinkProfileKey,
+    lifecycle: BaselineLifecycle,
+    learning: BTreeMap<BaselineCoordinateKey, WelfordState>,
+    active: BTreeMap<BaselineCoordinateKey, EwState>,
+    revision: Option<BaselineRevision>,
+    state_sequence: Option<BaselineStateSequence>,
+    adaptation_armed: bool,
+    session_last_eligible_at: Option<SessionTime>,
+    compatibility: BaselineCompatibilityReceipt,
+}
+
+impl BaselineState {
+    /// Validates and creates one complete baseline state.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the constructor validates one complete persisted state contract"
+    )]
+    pub fn try_new(
+        key: LinkProfileKey,
+        lifecycle: BaselineLifecycle,
+        learning: BTreeMap<BaselineCoordinateKey, WelfordState>,
+        active: BTreeMap<BaselineCoordinateKey, EwState>,
+        revision: Option<BaselineRevision>,
+        state_sequence: Option<BaselineStateSequence>,
+        adaptation_armed: bool,
+        session_last_eligible_at: Option<SessionTime>,
+        compatibility: BaselineCompatibilityReceipt,
+    ) -> Result<Self, WorldValueError> {
+        match lifecycle {
+            BaselineLifecycle::Learning { accepted_windows, accepted_exposure_ns } => {
+                if !active.is_empty()
+                    || revision.is_some()
+                    || state_sequence.is_some()
+                    || adaptation_armed
+                    || (accepted_windows == 0) != learning.is_empty()
+                    || (accepted_exposure_ns == 0) != learning.is_empty()
+                    || learning
+                        .values()
+                        .any(|state| state.accepted_exposure_ns() > accepted_exposure_ns)
+                {
+                    return Err(WorldValueError::InvalidBaselineLifecycle);
+                }
+            }
+            BaselineLifecycle::Active => {
+                if !learning.is_empty()
+                    || active.is_empty()
+                    || revision.is_none_or(|value| value.get() == 0)
+                    || state_sequence.is_none_or(|value| value.get() == 0)
+                {
+                    return Err(WorldValueError::InvalidBaselineLifecycle);
+                }
+            }
+            BaselineLifecycle::Frozen | BaselineLifecycle::Stale { .. } => {
+                if !learning.is_empty()
+                    || active.is_empty()
+                    || revision.is_none_or(|value| value.get() == 0)
+                    || state_sequence.is_none_or(|value| value.get() == 0)
+                    || adaptation_armed
+                {
+                    return Err(WorldValueError::InvalidBaselineLifecycle);
+                }
+            }
+        }
+        Ok(Self {
+            key,
+            lifecycle,
+            learning,
+            active,
+            revision,
+            state_sequence,
+            adaptation_armed,
+            session_last_eligible_at,
+            compatibility,
+        })
+    }
+
+    /// Returns the link/profile identity.
+    #[must_use]
+    pub const fn key(&self) -> &LinkProfileKey {
+        &self.key
+    }
+
+    /// Returns the lifecycle.
+    #[must_use]
+    pub const fn lifecycle(&self) -> BaselineLifecycle {
+        self.lifecycle
+    }
+
+    /// Returns learning coordinate accumulators in stable order.
+    #[must_use]
+    pub const fn learning(&self) -> &BTreeMap<BaselineCoordinateKey, WelfordState> {
+        &self.learning
+    }
+
+    /// Returns active coordinate state in stable order.
+    #[must_use]
+    pub const fn active(&self) -> &BTreeMap<BaselineCoordinateKey, EwState> {
+        &self.active
+    }
+
+    /// Returns the committed revision, when present.
+    #[must_use]
+    pub const fn revision(&self) -> Option<BaselineRevision> {
+        self.revision
+    }
+
+    /// Returns the mutable state sequence, when present.
+    #[must_use]
+    pub const fn state_sequence(&self) -> Option<BaselineStateSequence> {
+        self.state_sequence
+    }
+
+    /// Returns whether post-session-boundary adaptation is armed.
+    #[must_use]
+    pub const fn adaptation_armed(&self) -> bool {
+        self.adaptation_armed
+    }
+
+    /// Returns the last eligible time in the current session.
+    #[must_use]
+    pub const fn session_last_eligible_at(&self) -> Option<SessionTime> {
+        self.session_last_eligible_at
+    }
+
+    /// Returns the exact compatibility receipt.
+    #[must_use]
+    pub const fn compatibility(&self) -> &BaselineCompatibilityReceipt {
+        &self.compatibility
+    }
 }
 
 /// Baseline lifecycle commands persisted in session order.
@@ -260,6 +590,18 @@ impl BaselineCoordinate {
 /// Errors found while constructing immutable baseline values.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum WorldValueError {
+    /// A complete baseline state statistic was NaN or infinite.
+    #[error("complete baseline state statistics must be finite")]
+    NonFiniteBaselineState,
+    /// A Welford accumulator was empty, negative, or had no exposure.
+    #[error("Welford state requires count/exposure and non-negative M2")]
+    InvalidWelfordState,
+    /// An exponentially weighted variance was negative.
+    #[error("EW baseline variance must be non-negative")]
+    InvalidEwState,
+    /// Baseline lifecycle fields did not form one valid complete state.
+    #[error("baseline lifecycle fields are inconsistent")]
+    InvalidBaselineLifecycle,
     /// A statistic was NaN or infinite.
     #[error("baseline statistic for {path:?}/{coordinate:?} is not finite")]
     NonFiniteStatistic {
@@ -1483,6 +1825,108 @@ impl WorldSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state_parts() -> (LinkProfileKey, BaselineCompatibilityReceipt, BaselineCoordinateKey) {
+        (
+            LinkProfileKey::new(
+                RadioLinkId::new("link").expect("link"),
+                CaptureProfileId::from_bytes([1; 32]),
+            ),
+            BaselineCompatibilityReceipt::new(
+                DeploymentId::new("deployment").expect("deployment"),
+                SpaceId::new("space").expect("space"),
+                ConditioningVersion::new("conditioning").expect("conditioning"),
+                BaselineContractId::from_bytes([2; 32]),
+            ),
+            BaselineCoordinateKey::new(
+                CsiPath::RawPathOrdinal(0),
+                CsiSampleCoordinate::OpaqueSampleOrdinal(0),
+            ),
+        )
+    }
+
+    #[test]
+    fn complete_baseline_state_preserves_learning_and_active_statistics() {
+        let (key, compatibility, coordinate) = state_parts();
+        let learning = BaselineState::try_new(
+            key.clone(),
+            BaselineLifecycle::Learning { accepted_windows: 3, accepted_exposure_ns: 30 },
+            BTreeMap::from([(
+                coordinate,
+                WelfordState::try_new(7, 1.5, 2.25, 21).expect("welford"),
+            )]),
+            BTreeMap::new(),
+            None,
+            None,
+            false,
+            Some(SessionTime::from_nanos(40)),
+            compatibility.clone(),
+        )
+        .expect("learning state");
+        assert_eq!(learning.learning()[&coordinate].m2(), 2.25);
+        assert_eq!(learning.learning()[&coordinate].accepted_exposure_ns(), 21);
+
+        let active = BaselineState::try_new(
+            key,
+            BaselineLifecycle::Active,
+            BTreeMap::new(),
+            BTreeMap::from([(coordinate, EwState::try_new(11, 1.75, 0.5, 42).expect("EW"))]),
+            Some(BaselineRevision::new(4)),
+            Some(BaselineStateSequence::new(9)),
+            true,
+            Some(SessionTime::from_nanos(50)),
+            compatibility,
+        )
+        .expect("active state");
+        assert_eq!(active.active()[&coordinate].mean(), 1.75);
+        assert_eq!(active.active()[&coordinate].count(), 11);
+        assert_eq!(active.active()[&coordinate].accepted_exposure_ns(), 42);
+        assert_eq!(active.state_sequence().expect("sequence").get(), 9);
+    }
+
+    #[test]
+    fn complete_baseline_state_rejects_invalid_lifecycle_and_statistics() {
+        let (key, compatibility, coordinate) = state_parts();
+        assert!(matches!(
+            WelfordState::try_new(1, 0.0, f64::NAN, 1),
+            Err(WorldValueError::NonFiniteBaselineState)
+        ));
+        assert!(matches!(EwState::try_new(2, 0.0, -1.0, 1), Err(WorldValueError::InvalidEwState)));
+        assert!(matches!(
+            BaselineState::try_new(
+                key.clone(),
+                BaselineLifecycle::Learning { accepted_windows: 1, accepted_exposure_ns: 1 },
+                BTreeMap::from([(
+                    coordinate,
+                    WelfordState::try_new(1, 0.0, 0.0, 2).expect("welford")
+                )]),
+                BTreeMap::new(),
+                None,
+                None,
+                false,
+                None,
+                compatibility.clone(),
+            ),
+            Err(WorldValueError::InvalidBaselineLifecycle)
+        ));
+        assert!(matches!(
+            BaselineState::try_new(
+                key,
+                BaselineLifecycle::Active,
+                BTreeMap::from([(
+                    coordinate,
+                    WelfordState::try_new(1, 0.0, 0.0, 1).expect("welford")
+                )]),
+                BTreeMap::new(),
+                None,
+                None,
+                false,
+                None,
+                compatibility,
+            ),
+            Err(WorldValueError::InvalidBaselineLifecycle)
+        ));
+    }
 
     #[test]
     fn baseline_snapshot_rejects_single_sample_coordinate() {
