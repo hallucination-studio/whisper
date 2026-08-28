@@ -1,5 +1,9 @@
 # Cargo build artifacts
 /target/
 
+# Python tooling and test bytecode
+__pycache__/
+*.py[cod]
+
 # macOS metadata
 .DS_Store
