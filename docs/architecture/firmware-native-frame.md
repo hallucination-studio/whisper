@@ -39,7 +39,10 @@ shared image
 The provisioning seam separates common executable identity from per-device
 secrets and deployment bindings. Changing a device record does not create a
 different application image; changing the running image or Wi-Fi ABI changes
-the capability identity that the host must admit.
+the capability identity that the host must admit. The provisioning record owns
+station credentials and the collector endpoint, while firmware resolves the
+associated AP BSSID and channel at startup and freezes them for that boot's
+callback validation.
 
 The callback snapshot seam isolates the Wi-Fi task from encoding, crypto, and
 network latency. Snapshot ownership transfers through a bounded queue and has
@@ -66,6 +69,9 @@ becoming session data.
 - Identity is refined across trust seams. Peer address bounds work, AEAD
   authenticates device/key/epoch/message facts, and authenticated source/radio
   facts resolve the physical link.
+- Wi-Fi association discovery does not weaken capture admission. One boot uses
+  only the resolved associated AP BSSID and channel, and disconnect fails the
+  runtime instead of silently changing the physical link.
 - Raw encrypted bytes and receive context are immutable after durable admission.
   Typed CSI and profiles remain reproducible derivatives.
 - Firmware preserves target facts and dynamic sample cardinality. It does not

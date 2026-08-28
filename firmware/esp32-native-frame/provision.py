@@ -20,6 +20,7 @@ NVS_OFFSET = 0x11000
 NVS_SIZE = 0x7000
 DEFAULT_BAUD = 115200
 ESPTOOL_VERSION = "5.3.1"
+PROVISIONING_SCHEMA = 2
 
 # Extracted from espressif/idf@sha256:f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb.
 GENERATOR_SOURCE_SHA256 = "5adcd0e787ea41b8c3a1d42bdeb3dcc333e2d63949ee0778ba10c6ba901ad80e"
@@ -41,19 +42,9 @@ def bounded_int(name, value, low, high):
     return number
 
 
-def parse_bssid(value):
-    if re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", value) is None:
-        raise ValueError("BSSID must use AA:BB:CC:DD:EE:FF format")
-    raw = bytes.fromhex(value.replace(":", ""))
-    if raw == bytes(6) or raw[0] & 1:
-        raise ValueError("BSSID must be a nonzero unicast address")
-    return raw
-
-
 def validate(args, password):
     device_id = bounded_int("device ID", args.device_id, 0, (1 << 64) - 1)
     key_epoch = bounded_int("key epoch", args.key_epoch, 1, 65535)
-    channel = bounded_int("channel", args.channel, 1, 14)
     probe_port = bounded_int("probe port", args.probe_port, 1, 65535)
     collector_port = bounded_int("collector port", args.collector_port, 1, 65535)
     baud = bounded_int("baud", args.baud, 1, 4_000_000)
@@ -62,7 +53,6 @@ def validate(args, password):
     password_bytes = password.encode("utf-8")
     if "\0" in password or (password_bytes and not 8 <= len(password_bytes) <= 63):
         raise ValueError("Wi-Fi password must be empty or contain 8..63 UTF-8 bytes without NUL")
-    bssid = parse_bssid(args.bssid)
     collector = ipaddress.ip_address(args.collector_ip)
     if collector.is_unspecified or collector.is_loopback or collector.is_multicast:
         raise ValueError("collector IP must be unicast and non-loopback")
@@ -81,8 +71,7 @@ def validate(args, password):
             raise ValueError(f"output directory does not exist: {output.parent}")
     return {
         "device_id": device_id, "key_epoch": key_epoch, "ssid": args.ssid,
-        "password": password, "bssid": bssid, "channel": channel,
-        "probe_port": probe_port, "collector_ip": str(collector),
+        "password": password, "probe_port": probe_port, "collector_ip": str(collector),
         "collector_port": collector_port,
         "capability_digest": bytes.fromhex(args.capability_digest), "baud": baud,
         "key_output": key_output, "receipt_output": receipt_output,
@@ -93,14 +82,12 @@ def write_csv(path, config, key):
     rows = [
         ("key", "type", "encoding", "value"),
         ("provision", "namespace", "", ""),
-        ("schema", "data", "u16", "1"),
+        ("schema", "data", "u16", str(PROVISIONING_SCHEMA)),
         ("device_id", "data", "u64", str(config["device_id"])),
         ("key_epoch", "data", "u16", str(config["key_epoch"])),
         ("aes_key", "data", "hex2bin", key.hex()),
         ("ssid", "data", "string", config["ssid"]),
         ("wifi_pass", "data", "string", config["password"]),
-        ("bssid", "data", "hex2bin", config["bssid"].hex()),
-        ("channel", "data", "u8", str(config["channel"])),
         ("probe_port", "data", "u16", str(config["probe_port"])),
         ("collector_ip", "data", "string", config["collector_ip"]),
         ("collect_port", "data", "u16", str(config["collector_port"])),
@@ -259,12 +246,11 @@ def provision(args, password, run=subprocess.run, random_bytes=secrets.token_byt
                 raise RuntimeError("connected ESP32-S3 does not report 8 MB flash")
 
             receipt = {
-                "schema": 1, "target": "ESP32-S3", "port": args.port,
+                "schema": PROVISIONING_SCHEMA, "target": "ESP32-S3", "port": args.port,
                 "baud": config["baud"], "device_id": config["device_id"],
                 "key_epoch": config["key_epoch"], "key_file": str(config["key_output"]),
                 "key_format": "raw-aes-256", "key_sha256": hashlib.sha256(key).hexdigest(),
-                "ssid": config["ssid"], "bssid": config["bssid"].hex(":"),
-                "channel": config["channel"], "probe_port": config["probe_port"],
+                "ssid": config["ssid"], "probe_port": config["probe_port"],
                 "collector_ip": config["collector_ip"],
                 "collector_port": config["collector_port"],
                 "capability_digest": config["capability_digest"].hex(),
@@ -296,8 +282,6 @@ def parser():
     result.add_argument("--device-id", required=True, help="u64; decimal or 0x-prefixed")
     result.add_argument("--key-epoch", required=True, help="nonzero u16")
     result.add_argument("--ssid", required=True)
-    result.add_argument("--bssid", required=True, help="pinned AP BSSID, AA:BB:CC:DD:EE:FF")
-    result.add_argument("--channel", required=True)
     result.add_argument("--probe-port", required=True)
     result.add_argument("--collector-ip", required=True)
     result.add_argument("--collector-port", required=True)

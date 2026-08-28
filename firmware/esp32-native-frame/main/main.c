@@ -28,6 +28,7 @@ static const char *TAG = "native_frame";
 #define ASSOCIATION_TIMEOUT_MS UINT32_C(30000)
 #define CAPABILITIES_PERIOD_US UINT64_C(30000000)
 #define HEALTH_PERIOD_US UINT64_C(10000000)
+#define WIFI_DYNAMIC_CHANNEL UINT8_C(0)
 #define WIFI_READY_BIT BIT0
 #define WIFI_FAILED_BIT BIT1
 #define SENDER_READY_BIT BIT2
@@ -152,9 +153,9 @@ static esp_err_t start_station(const provisioning_v1_t *provisioning)
         strnlen(provisioning->station_ssid, sizeof(config.sta.ssid)));
     memcpy(config.sta.password, provisioning->station_password,
         strnlen(provisioning->station_password, sizeof(config.sta.password)));
-    memcpy(config.sta.bssid, provisioning->station_bssid, sizeof(config.sta.bssid));
-    config.sta.bssid_set = true;
-    config.sta.channel = provisioning->station_channel;
+    config.sta.bssid_set = false;
+    /* ESP-IDF channel zero scans all supported channels for the configured SSID. */
+    config.sta.channel = WIFI_DYNAMIC_CHANNEL;
     if (result == ESP_OK) result = esp_wifi_set_config(WIFI_IF_STA, &config);
     mbedtls_platform_zeroize(&config, sizeof(config));
     if (result == ESP_OK) result = esp_wifi_start();
@@ -165,6 +166,29 @@ static esp_err_t start_station(const provisioning_v1_t *provisioning)
     EventBits_t bits = xEventGroupWaitBits(runtime.events, WIFI_READY_BIT | WIFI_FAILED_BIT,
         pdFALSE, pdFALSE, pdMS_TO_TICKS(ASSOCIATION_TIMEOUT_MS));
     return (bits & WIFI_READY_BIT) != 0 ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t resolve_capture_binding(csi_capture_v1_config_t *capture_config)
+{
+    if (capture_config == NULL) return ESP_ERR_INVALID_ARG;
+    wifi_ap_record_t access_point = {0};
+    esp_err_t result = esp_wifi_sta_get_ap_info(&access_point);
+    bool bssid_nonzero = false;
+    for (size_t index = 0; index < sizeof(access_point.bssid); ++index) {
+        bssid_nonzero |= access_point.bssid[index] != 0;
+    }
+    if (result == ESP_OK && (!bssid_nonzero || (access_point.bssid[0] & 1) != 0
+        || access_point.primary < 1 || access_point.primary > 14)) {
+        result = ESP_ERR_INVALID_RESPONSE;
+    }
+    if (result == ESP_OK) {
+        memcpy(capture_config->station_bssid, access_point.bssid,
+            sizeof(capture_config->station_bssid));
+        capture_config->channel = access_point.primary;
+        result = esp_wifi_get_mac(WIFI_IF_STA, capture_config->station_mac);
+    }
+    mbedtls_platform_zeroize(&access_point, sizeof(access_point));
+    return result;
 }
 
 static esp_err_t open_probe_socket(const provisioning_v1_t *provisioning)
@@ -281,16 +305,9 @@ void app_main(void)
         fail_runtime(&runtime);
     }
 
-    uint8_t station_mac[6];
-    if (result == ESP_OK) result = esp_wifi_get_mac(WIFI_IF_STA, station_mac);
     csi_capture_v1_config_t capture_config = {0};
-    if (result == ESP_OK) {
-        memcpy(capture_config.station_bssid, provisioning.station_bssid,
-            sizeof(capture_config.station_bssid));
-        memcpy(capture_config.station_mac, station_mac, sizeof(capture_config.station_mac));
-        capture_config.channel = provisioning.station_channel;
-        if (!csi_capture_v1_init(&runtime.capture, &capture_config)) result = ESP_FAIL;
-    }
+    if (result == ESP_OK) result = resolve_capture_binding(&capture_config);
+    if (result == ESP_OK && !csi_capture_v1_init(&runtime.capture, &capture_config)) result = ESP_FAIL;
     if (result == ESP_OK) {
         runtime.envelope = (nf_v1_envelope_t) {.device_id = provisioning.device_id,
             .key_epoch = provisioning.key_epoch, .boot_generation = boot_generation,

@@ -61,9 +61,9 @@ class ProvisionTest(unittest.TestCase):
         self.digest_patch.start()
         self.args = provision.parser().parse_args([
             "--port", "/dev/test", "--device-id", "0x12", "--key-epoch", "7",
-            "--ssid", "世界", "--bssid", "02:00:00:00:00:0a", "--channel", "6",
+            "--ssid", "世界",
             "--probe-port", "9000", "--collector-ip", "192.0.2.10",
-            "--collector-port", "9001", "--capability-digest", "5a" * 32,
+            "--collector-port", "9000", "--capability-digest", "5a" * 32,
             "--key-output", str(root / "key.bin"),
             "--receipt-output", str(root / "receipt.json"),
             "--generator-source", str(self.generator),
@@ -88,6 +88,9 @@ class ProvisionTest(unittest.TestCase):
         flat = "\n".join(" ".join(command) for command in commands)
         self.assertNotIn("secret-pass", flat)
         self.assertNotIn("password", json.dumps(receipt))
+        self.assertNotIn("bssid", receipt)
+        self.assertNotIn("channel", receipt)
+        self.assertEqual(receipt["schema"], 2)
         self.assertEqual(receipt["device_id"], 0x12)
         self.assertEqual(receipt["nvs_offset"], 0x11000)
         self.assertEqual(receipt["nvs_size"], 0x7000)
@@ -114,6 +117,9 @@ class ProvisionTest(unittest.TestCase):
         self.assertEqual(rows["ssid"][3], "世界")
         self.assertEqual(rows["collector_ip"][3], "192.0.2.10")
         self.assertEqual(rows["aes_key"][3], bytes(range(32)).hex())
+        self.assertEqual(rows["schema"][3], "2")
+        self.assertNotIn("bssid", rows)
+        self.assertNotIn("channel", rows)
         patched = Path(self.temporary.name) / "patched.py"
         provision.patched_generator(self.generator, patched)
         source = patched.read_text(encoding="utf-8")
@@ -163,7 +169,7 @@ class ProvisionTest(unittest.TestCase):
         self.assertFalse(json.loads(Path(self.args.receipt_output).read_text())["verified"])
 
     def test_validation_precedes_commands(self):
-        self.args.channel = "15"
+        self.args.collector_ip = "127.0.0.1"
         fake = FakeRun()
         with self.assertRaises(ValueError):
             provision.provision(self.args, "secret-pass", run=fake)

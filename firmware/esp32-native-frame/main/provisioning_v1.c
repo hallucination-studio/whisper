@@ -53,9 +53,6 @@ esp_err_t provisioning_v1_load(provisioning_v1_t *provisioning)
         sizeof(provisioning->station_ssid), false));
     GET(get_bounded_string(handle, "wifi_pass", provisioning->station_password,
         sizeof(provisioning->station_password), true));
-    GET(get_exact_blob(handle, "bssid", provisioning->station_bssid,
-        sizeof(provisioning->station_bssid)));
-    GET(nvs_get_u8(handle, "channel", &provisioning->station_channel));
     GET(nvs_get_u16(handle, "probe_port", &provisioning->probe_port));
     GET(get_bounded_string(handle, "collector_ip", provisioning->collector_endpoint,
         sizeof(provisioning->collector_endpoint), false));
@@ -66,15 +63,9 @@ esp_err_t provisioning_v1_load(provisioning_v1_t *provisioning)
 
     struct in6_addr address;
     size_t password_bytes = strlen(provisioning->station_password);
-    bool bssid_nonzero = false;
-    for (size_t index = 0; index < sizeof(provisioning->station_bssid); ++index) {
-        bssid_nonzero |= provisioning->station_bssid[index] != 0;
-    }
     if (schema != PROVISIONING_V1_SCHEMA || provisioning->key_epoch == 0
-        || (!bssid_nonzero || (provisioning->station_bssid[0] & 1) != 0)
         || (password_bytes != 0 && (password_bytes < 8 || password_bytes > 63))
-        || provisioning->station_channel < 1
-        || provisioning->station_channel > 14 || provisioning->probe_port == 0
+        || provisioning->probe_port == 0
         || provisioning->collector_port == 0
         || (inet_pton(AF_INET, provisioning->collector_endpoint, &address) != 1
             && inet_pton(AF_INET6, provisioning->collector_endpoint, &address) != 1)) {

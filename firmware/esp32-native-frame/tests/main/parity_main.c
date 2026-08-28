@@ -165,7 +165,6 @@ static bool check_all(void)
 
 static bool seed_test_nvs(bool include_key, bool include_runtime, uint32_t generation)
 {
-    static const uint8_t BSSID[6] = {2, 0, 0, 0, 0, 10};
     static const uint8_t DIGEST[32] = {[0 ... 31] = 0x5a};
     nvs_flash_deinit();
     if (nvs_flash_erase() != ESP_OK || nvs_flash_init() != ESP_OK) {
@@ -181,11 +180,9 @@ static bool seed_test_nvs(bool include_key, bool include_runtime, uint32_t gener
         && (!include_key || nvs_set_blob(handle, "aes_key", KEY, sizeof(KEY)) == ESP_OK)
         && nvs_set_str(handle, "ssid", "native-frame-test") == ESP_OK
         && nvs_set_str(handle, "wifi_pass", "test-only-password") == ESP_OK
-        && nvs_set_blob(handle, "bssid", BSSID, sizeof(BSSID)) == ESP_OK
-        && nvs_set_u8(handle, "channel", 6) == ESP_OK
         && nvs_set_u16(handle, "probe_port", 9000) == ESP_OK
         && nvs_set_str(handle, "collector_ip", "192.0.2.10") == ESP_OK
-        && nvs_set_u16(handle, "collect_port", 9001) == ESP_OK
+        && nvs_set_u16(handle, "collect_port", 9000) == ESP_OK
         && nvs_set_blob(handle, "cap_digest", DIGEST, sizeof(DIGEST)) == ESP_OK
         && nvs_commit(handle) == ESP_OK;
     nvs_close(handle);
@@ -198,6 +195,18 @@ static bool seed_test_nvs(bool include_key, bool include_runtime, uint32_t gener
     return ok;
 }
 
+static bool overwrite_provisioning_schema(uint16_t schema)
+{
+    nvs_handle_t handle;
+    if (nvs_open("provision", NVS_READWRITE, &handle) != ESP_OK) {
+        return false;
+    }
+    bool ok = nvs_set_u16(handle, "schema", schema) == ESP_OK
+        && nvs_commit(handle) == ESP_OK;
+    nvs_close(handle);
+    return ok;
+}
+
 static bool check_provisioning(void)
 {
     provisioning_v1_t provisioning;
@@ -205,6 +214,7 @@ static bool check_provisioning(void)
     if (!seed_test_nvs(true, true, 4)
         || provisioning_v1_load(&provisioning) != ESP_OK
         || provisioning.device_id != 0
+        || strcmp(provisioning.station_ssid, "native-frame-test") != 0
         || boot_generation_v1_advance(&generation) != ESP_OK || generation != 5
         || !seed_test_nvs(true, true, 0)
         || boot_generation_v1_advance(&generation) != ESP_OK || generation != 1
@@ -213,7 +223,9 @@ static bool check_provisioning(void)
         || !seed_test_nvs(true, false, 0)
         || boot_generation_v1_advance(&generation) == ESP_OK
         || !seed_test_nvs(true, true, UINT32_MAX)
-        || boot_generation_v1_advance(&generation) == ESP_OK) {
+        || boot_generation_v1_advance(&generation) == ESP_OK
+        || !overwrite_provisioning_schema(1)
+        || provisioning_v1_load(&provisioning) == ESP_OK) {
         return false;
     }
     nvs_handle_t handle;

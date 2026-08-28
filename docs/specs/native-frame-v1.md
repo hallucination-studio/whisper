@@ -269,9 +269,9 @@ Counter gaps are observable loss; they MUST NOT create synthetic CSI.
 
 ## Capture and sender behavior
 
-The firmware callback MUST validate the pointer, configured channel, complete
-radio combination, provisioned BSSID, destination station MAC, and the
-612-byte ceiling. It MUST assign `capture_sequence` before attempting a
+The firmware callback MUST validate the pointer, boot-resolved channel,
+complete radio combination, boot-resolved associated AP BSSID, destination
+station MAC, and the 612-byte ceiling. It MUST assign `capture_sequence` before attempting a
 nonblocking slot allocation, copy the complete accepted driver buffer into a
 preallocated slot, and enqueue only a slot index. It MUST NOT allocate, block,
 log, seal, perform socket I/O, or perform inference.
@@ -304,9 +304,10 @@ table at offset `0x10000`:
 The encrypted partition flags preserve the release layout. They do not provide
 at-rest security while development flash encryption is disabled.
 
-The development provisioning record schema is `1` and contains `device_id`,
-nonzero `key_epoch`, a 32-byte AES key, station SSID/password/BSSID/channel,
-probe port, collector IP/port, and one capability digest. The separate runtime
+The development provisioning record schema is `2` and contains `device_id`,
+nonzero `key_epoch`, a 32-byte AES key, station SSID/password, probe port,
+collector IP/port, and one capability digest. BSSID and channel are runtime
+association facts and MUST NOT be provisioned. The separate runtime
 namespace contains only `boot_generation`. Development provisioning uses
 disposable credentials and makes no production-security claim.
 
@@ -320,13 +321,17 @@ Sensor identifier, key epoch, and a non-secret key identity digest.
 
 Startup MUST validate the record, compute the running application digest and
 the pinned Wi-Fi ABI digest, reconstruct the capability descriptor, match its
-digest to provisioning, advance and reread boot generation, associate to the
-provisioned 2.4 GHz BSSID, bind the probe socket, start the sender, and only then
-enable CSI. Any failure MUST fail closed.
+digest to provisioning, advance and reread boot generation, scan for and
+associate to the provisioned SSID, obtain a nonzero unicast BSSID and channel
+in `1..=14` from the associated AP, freeze those values for callback
+validation, bind the probe socket, start the sender, and only then enable CSI.
+Any failure MUST fail closed.
 
-The station uses no power save, promiscuous mode, channel hopping, or BLE
-coexistence. It accepts callbacks only from the provisioned BSSID to its own
-station MAC. Probe traffic is an ordinary rate-limited UDP receive trigger; its
+After association, the station uses no power save, promiscuous mode, channel
+hopping, roaming, or BLE coexistence. It accepts callbacks only from the
+boot-resolved associated AP BSSID on the boot-resolved channel to its own
+station MAC. A disconnect fails the runtime; a later boot performs discovery
+again. Probe traffic is an ordinary rate-limited UDP receive trigger; its
 payload is discarded and is not a second protocol grammar.
 
 ## Replay interaction and reject behavior

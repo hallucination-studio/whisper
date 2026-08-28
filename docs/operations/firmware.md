@@ -115,8 +115,6 @@ python firmware/esp32-native-frame/provision.py \
   --device-id "$DEVICE_ID" \
   --key-epoch "$KEY_EPOCH" \
   --ssid "$SSID" \
-  --bssid "$BSSID" \
-  --channel "$CHANNEL" \
   --probe-port "$PROBE_PORT" \
   --collector-ip "$COLLECTOR_IP" \
   --collector-port "$COLLECTOR_PORT" \
@@ -130,10 +128,17 @@ range, retains the raw 32-byte host key with restrictive permissions, and
 finalizes a JSON receipt. If application and provisioning flashes are separate
 operations, retain both receipts and their ordering.
 
+For the single-board development path, set both the firmware collector target
+and the Host capture listener to UDP port `9000`. The firmware target is the
+Mac IPv4 address on the interface attached to the board's Wi-Fi LAN; the Host
+listener binds `0.0.0.0:9000` or that exact address. Loopback is not reachable
+from the board.
+
 ## Network and live smoke
 
 1. Reserve the station MAC at the exact peer IP admitted by the host
-   configuration. Associate the board to the provisioned 2.4 GHz BSSID.
+   configuration. Confirm that the board dynamically associated to the
+   provisioned SSID on a 2.4 GHz channel.
 2. Send bounded ordinary UDP traffic from the collector to the provisioned
    probe port. Do not interpret the probe payload as a native frame.
 3. Retain the serial startup log showing application/build/capability identity,
