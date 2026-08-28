@@ -1,0 +1,1316 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hallucination.studio/whisper/schemas/api-ui-v1.schema.json",
+  "title": "Whisper API and UI wire schema v1",
+  "description": "Closed JSON DTOs for every v1 HTTP body and WebSocket text message.",
+  "oneOf": [
+    { "$ref": "#/$defs/BaselineCommandRequest" },
+    { "$ref": "#/$defs/TopologyOk" },
+    { "$ref": "#/$defs/SignalsOk" },
+    { "$ref": "#/$defs/TimelineOk" },
+    { "$ref": "#/$defs/WorldListOk" },
+    { "$ref": "#/$defs/WorldLatestOk" },
+    { "$ref": "#/$defs/EvidenceOk" },
+    { "$ref": "#/$defs/BaselinesOk" },
+    { "$ref": "#/$defs/EmptyEnvelope" },
+    { "$ref": "#/$defs/AcceptedEnvelope" },
+    { "$ref": "#/$defs/ErrorEnvelope" },
+    { "$ref": "#/$defs/LiveEnvelope" }
+  ],
+  "$defs": {
+    "U16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "NonZeroU16": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "U32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "NonZeroU32": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "I16": {
+      "type": "integer",
+      "minimum": -32768,
+      "maximum": 32767
+    },
+    "U64": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$",
+      "format": "whisper-u64-v1",
+      "$comment": "Runtime validation rejects values above 18446744073709551615."
+    },
+    "NonZeroU64": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,19}$",
+      "format": "whisper-nonzero-u64-v1",
+      "$comment": "Runtime validation rejects values above 18446744073709551615."
+    },
+    "FiniteF64": {
+      "type": "number",
+      "format": "whisper-finite-f64-no-negative-zero-v1",
+      "$comment": "Runtime input rejects non-finite values and semantic negative zero; output normalizes negative zero to JSON 0."
+    },
+    "TextId": {
+      "type": "string",
+      "minLength": 1,
+      "format": "whisper-identifier-v1",
+      "$comment": "Runtime validation applies the exact UTF-8 identifier grammar and u32::MAX-byte limit from persistence v1."
+    },
+    "Hex64": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "SnapshotId": {
+      "type": "string",
+      "pattern": "^s1\\.[A-Za-z0-9_-]+\\.(0|[1-9][0-9]{0,19})$",
+      "format": "whisper-snapshot-id-v1",
+      "$comment": "Runtime validation decodes canonical unpadded base64url UTF-8 session bytes, validates the session ID, validates the u64 window, and requires byte-identical re-encoding."
+    },
+    "TimeQuality": {
+      "enum": ["unknown", "receive_only", "clock_corrected"]
+    },
+    "Metric": {
+      "enum": ["i", "q", "amplitude", "phase"]
+    },
+    "StableOrChanging": {
+      "enum": ["stable", "changing"]
+    },
+    "UnknownReason": {
+      "enum": [
+        "baseline_missing",
+        "baseline_learning",
+        "insufficient_coverage",
+        "low_quality",
+        "ambiguous_evidence",
+        "time_uncertain",
+        "missing_data",
+        "profile_mismatch",
+        "stale",
+        "frozen",
+        "inactive",
+        "non_finite"
+      ]
+    },
+    "ExclusionReason": {
+      "enum": [
+        "invalid_sample",
+        "missing",
+        "low_coverage",
+        "unsupported_phase",
+        "late",
+        "profile_mismatch",
+        "time_uncertain",
+        "non_finite",
+        "gap",
+        "unresolved_source",
+        "quality"
+      ]
+    },
+    "BaselineStaleReason": {
+      "enum": ["age", "incompatible"]
+    },
+    "BaselineRejectionReason": {
+      "enum": [
+        "low_quality",
+        "missing_data",
+        "time_uncertain",
+        "profile_mismatch",
+        "stale",
+        "frozen",
+        "deviation_above_gate",
+        "baseline_learning"
+      ]
+    },
+    "CsiPath": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "tx_stream", "rx_chain"],
+          "properties": {
+            "kind": { "const": "tx_rx" },
+            "tx_stream": { "$ref": "#/$defs/U16" },
+            "rx_chain": { "$ref": "#/$defs/U16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "ordinal"],
+          "properties": {
+            "kind": { "const": "raw_path_ordinal" },
+            "ordinal": { "$ref": "#/$defs/U16" }
+          }
+        }
+      ]
+    },
+    "CsiSampleCoordinate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "opaque_sample_ordinal" },
+            "value": { "$ref": "#/$defs/U16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "ieee_tone_index" },
+            "value": { "$ref": "#/$defs/I16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "frequency_hz" },
+            "value": { "$ref": "#/$defs/U64" }
+          }
+        }
+      ]
+    },
+    "CsiSampleAxis": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "count"],
+          "properties": {
+            "kind": { "const": "opaque_sample_ordinal" },
+            "count": { "$ref": "#/$defs/NonZeroU16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "values"],
+          "properties": {
+            "kind": { "const": "ieee_tone_index" },
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/I16" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "values"],
+          "properties": {
+            "kind": { "const": "frequency_hz" },
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/U64" }
+            }
+          }
+        }
+      ]
+    },
+    "TimeInterval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "$ref": "#/$defs/U64" },
+        "end": { "$ref": "#/$defs/U64" }
+      }
+    },
+    "LinkProfileKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["link", "profile"],
+      "properties": {
+        "link": { "$ref": "#/$defs/TextId" },
+        "profile": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "DeviceEpoch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id", "boot_generation"],
+      "properties": {
+        "device_id": { "$ref": "#/$defs/U64" },
+        "boot_generation": { "$ref": "#/$defs/NonZeroU32" }
+      }
+    },
+    "StreamKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sensor", "link", "profile"],
+      "properties": {
+        "sensor": { "$ref": "#/$defs/TextId" },
+        "link": { "$ref": "#/$defs/TextId" },
+        "profile": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "StreamInstanceId": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "device_epoch"],
+      "properties": {
+        "key": { "$ref": "#/$defs/StreamKey" },
+        "device_epoch": { "$ref": "#/$defs/DeviceEpoch" }
+      }
+    },
+    "ViewReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "first_record_seq",
+        "last_record_seq",
+        "decoder_version",
+        "conditioning_version",
+        "algorithm_version"
+      ],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/TextId" },
+        "first_record_seq": { "$ref": "#/$defs/U64" },
+        "last_record_seq": { "$ref": "#/$defs/U64" },
+        "decoder_version": { "$ref": "#/$defs/TextId" },
+        "conditioning_version": { "$ref": "#/$defs/TextId" },
+        "algorithm_version": { "$ref": "#/$defs/TextId" }
+      }
+    },
+    "Knowledge": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "known" },
+            "value": { "$ref": "#/$defs/StableOrChanging" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reason"],
+          "properties": {
+            "kind": { "const": "unknown" },
+            "reason": { "$ref": "#/$defs/UnknownReason" }
+          }
+        }
+      ]
+    },
+    "BaselineStatus": {
+      "oneOf": [
+        { "const": "missing" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "accepted_windows", "mature"],
+          "properties": {
+            "kind": { "const": "learning" },
+            "accepted_windows": { "$ref": "#/$defs/U64" },
+            "mature": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "revision", "state_sequence"],
+          "properties": {
+            "kind": { "const": "active" },
+            "revision": { "$ref": "#/$defs/NonZeroU64" },
+            "state_sequence": { "$ref": "#/$defs/NonZeroU64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "revision"],
+          "properties": {
+            "kind": { "const": "frozen" },
+            "revision": { "$ref": "#/$defs/NonZeroU64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "revision", "reason"],
+          "properties": {
+            "kind": { "const": "stale" },
+            "revision": { "$ref": "#/$defs/NonZeroU64" },
+            "reason": { "$ref": "#/$defs/BaselineStaleReason" }
+          }
+        }
+      ]
+    },
+    "BaselineLifecycle": {
+      "oneOf": [
+        { "const": "active" },
+        { "const": "frozen" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "accepted_windows", "accepted_exposure_ns"],
+          "properties": {
+            "kind": { "const": "learning" },
+            "accepted_windows": { "$ref": "#/$defs/U64" },
+            "accepted_exposure_ns": { "$ref": "#/$defs/U64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reason"],
+          "properties": {
+            "kind": { "const": "stale" },
+            "reason": { "$ref": "#/$defs/BaselineStaleReason" }
+          }
+        }
+      ]
+    },
+    "BaselineCompatibilityReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deployment", "space", "conditioning_version", "contract"],
+      "properties": {
+        "deployment": { "$ref": "#/$defs/TextId" },
+        "space": { "$ref": "#/$defs/TextId" },
+        "conditioning_version": { "$ref": "#/$defs/TextId" },
+        "contract": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "BaselineDecision": {
+      "oneOf": [
+        { "const": "bootstrap_accepted" },
+        { "const": "adaptation_accepted" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reason"],
+          "properties": {
+            "kind": { "const": "rejected" },
+            "reason": { "$ref": "#/$defs/BaselineRejectionReason" }
+          }
+        }
+      ]
+    },
+    "ResidualSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "mean_absolute", "quantile"],
+      "properties": {
+        "count": { "$ref": "#/$defs/U32" },
+        "mean_absolute": { "$ref": "#/$defs/FiniteF64" },
+        "quantile": { "$ref": "#/$defs/FiniteF64" }
+      }
+    },
+    "LinkQuality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame_count",
+        "ready_coordinate_coverage",
+        "packet_gap_ratio",
+        "receive_jitter_ns",
+        "finite_and_ordered",
+        "time_quality",
+        "resolved_and_compatible",
+        "exclusions"
+      ],
+      "properties": {
+        "frame_count": { "$ref": "#/$defs/U32" },
+        "ready_coordinate_coverage": { "$ref": "#/$defs/FiniteF64" },
+        "packet_gap_ratio": { "$ref": "#/$defs/FiniteF64" },
+        "receive_jitter_ns": { "$ref": "#/$defs/U64" },
+        "finite_and_ordered": { "type": "boolean" },
+        "time_quality": { "$ref": "#/$defs/TimeQuality" },
+        "resolved_and_compatible": { "type": "boolean" },
+        "exclusions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ExclusionReason" }
+        }
+      }
+    },
+    "LinkDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deviation_score",
+        "rf_dynamics_log_amplitude_per_second",
+        "prediction_error_summary"
+      ],
+      "properties": {
+        "deviation_score": { "$ref": "#/$defs/FiniteF64" },
+        "rf_dynamics_log_amplitude_per_second": { "$ref": "#/$defs/FiniteF64" },
+        "prediction_error_summary": { "$ref": "#/$defs/ResidualSummary" }
+      }
+    },
+    "ExcludedCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "invalid_sample": { "$ref": "#/$defs/U32" },
+        "missing": { "$ref": "#/$defs/U32" },
+        "low_coverage": { "$ref": "#/$defs/U32" },
+        "unsupported_phase": { "$ref": "#/$defs/U32" },
+        "late": { "$ref": "#/$defs/U32" },
+        "profile_mismatch": { "$ref": "#/$defs/U32" },
+        "time_uncertain": { "$ref": "#/$defs/U32" },
+        "non_finite": { "$ref": "#/$defs/U32" },
+        "gap": { "$ref": "#/$defs/U32" },
+        "unresolved_source": { "$ref": "#/$defs/U32" },
+        "quality": { "$ref": "#/$defs/U32" }
+      }
+    },
+    "EvidenceReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "first_record_seq",
+        "last_record_seq",
+        "link",
+        "profile",
+        "conditioning_version",
+        "baseline_contract",
+        "included_coordinates",
+        "excluded"
+      ],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/TextId" },
+        "first_record_seq": { "$ref": "#/$defs/U64" },
+        "last_record_seq": { "$ref": "#/$defs/U64" },
+        "link": { "$ref": "#/$defs/TextId" },
+        "profile": { "$ref": "#/$defs/Hex64" },
+        "conditioning_version": { "$ref": "#/$defs/TextId" },
+        "baseline_contract": { "$ref": "#/$defs/Hex64" },
+        "baseline_revision": { "$ref": "#/$defs/NonZeroU64" },
+        "scored_against_baseline_state_sequence": { "$ref": "#/$defs/NonZeroU64" },
+        "resulting_baseline_state_sequence": { "$ref": "#/$defs/NonZeroU64" },
+        "residual_summary": { "$ref": "#/$defs/ResidualSummary" },
+        "included_coordinates": { "$ref": "#/$defs/U32" },
+        "excluded": { "$ref": "#/$defs/ExcludedCounts" }
+      }
+    },
+    "SensorHealth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active", "time_quality", "sequence_gaps"],
+      "properties": {
+        "active": { "type": "boolean" },
+        "time_quality": { "$ref": "#/$defs/TimeQuality" },
+        "sequence_gaps": { "$ref": "#/$defs/U64" }
+      }
+    },
+    "LinkBelief": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "quality", "baseline", "evidence"],
+      "properties": {
+        "status": { "$ref": "#/$defs/Knowledge" },
+        "diagnostics": { "$ref": "#/$defs/LinkDiagnostics" },
+        "quality": { "$ref": "#/$defs/LinkQuality" },
+        "baseline": { "$ref": "#/$defs/BaselineStatus" },
+        "evidence": { "$ref": "#/$defs/EvidenceReceipt" }
+      }
+    },
+    "LinkContribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["link", "profiles", "status", "exclusions"],
+      "properties": {
+        "link": { "$ref": "#/$defs/TextId" },
+        "profiles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/Hex64" }
+        },
+        "status": { "$ref": "#/$defs/Knowledge" },
+        "exclusions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ExclusionReason" }
+        }
+      }
+    },
+    "SpaceBelief": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "contributions"],
+      "properties": {
+        "status": { "$ref": "#/$defs/Knowledge" },
+        "contributions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/LinkContribution" }
+        }
+      }
+    },
+    "DerivationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_session",
+        "first_record_seq",
+        "last_record_seq",
+        "durable_through_record_seq",
+        "config_digest",
+        "build_fingerprint",
+        "decoder_version",
+        "conditioning_version",
+        "algorithm_version"
+      ],
+      "properties": {
+        "source_session": { "$ref": "#/$defs/TextId" },
+        "first_record_seq": { "$ref": "#/$defs/U64" },
+        "last_record_seq": { "$ref": "#/$defs/U64" },
+        "durable_through_record_seq": { "$ref": "#/$defs/U64" },
+        "config_digest": { "$ref": "#/$defs/Hex64" },
+        "build_fingerprint": { "$ref": "#/$defs/Hex64" },
+        "decoder_version": { "$ref": "#/$defs/TextId" },
+        "conditioning_version": { "$ref": "#/$defs/TextId" },
+        "algorithm_version": { "$ref": "#/$defs/TextId" }
+      }
+    },
+    "SensorHealthEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sensor", "health"],
+      "properties": {
+        "sensor": { "$ref": "#/$defs/TextId" },
+        "health": { "$ref": "#/$defs/SensorHealth" }
+      }
+    },
+    "LinkBeliefEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["link", "profile", "belief"],
+      "properties": {
+        "link": { "$ref": "#/$defs/TextId" },
+        "profile": { "$ref": "#/$defs/Hex64" },
+        "belief": { "$ref": "#/$defs/LinkBelief" }
+      }
+    },
+    "SpaceBeliefEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["space", "belief"],
+      "properties": {
+        "space": { "$ref": "#/$defs/TextId" },
+        "belief": { "$ref": "#/$defs/SpaceBelief" }
+      }
+    },
+    "WorldSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "deployment",
+        "window",
+        "valid_interval",
+        "sensors",
+        "links",
+        "spaces",
+        "receipt"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/SnapshotId" },
+        "previous_id": { "$ref": "#/$defs/SnapshotId" },
+        "deployment": { "$ref": "#/$defs/TextId" },
+        "window": { "$ref": "#/$defs/U64" },
+        "valid_interval": { "$ref": "#/$defs/TimeInterval" },
+        "sensors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SensorHealthEntry" }
+        },
+        "links": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/LinkBeliefEntry" }
+        },
+        "spaces": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SpaceBeliefEntry" }
+        },
+        "receipt": { "$ref": "#/$defs/DerivationReceipt" }
+      }
+    },
+    "CoordinateEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "path", "coordinate", "observed"],
+          "properties": {
+            "kind": { "const": "included" },
+            "path": { "$ref": "#/$defs/CsiPath" },
+            "coordinate": { "$ref": "#/$defs/CsiSampleCoordinate" },
+            "observed": { "$ref": "#/$defs/FiniteF64" },
+            "predicted": { "$ref": "#/$defs/FiniteF64" },
+            "signed_residual_log_amplitude": { "$ref": "#/$defs/FiniteF64" },
+            "standardized_residual": { "$ref": "#/$defs/FiniteF64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "path", "coordinate", "exclusion"],
+          "properties": {
+            "kind": { "const": "excluded" },
+            "path": { "$ref": "#/$defs/CsiPath" },
+            "coordinate": { "$ref": "#/$defs/CsiSampleCoordinate" },
+            "observed": { "$ref": "#/$defs/FiniteF64" },
+            "predicted": { "$ref": "#/$defs/FiniteF64" },
+            "signed_residual_log_amplitude": { "$ref": "#/$defs/FiniteF64" },
+            "standardized_residual": { "$ref": "#/$defs/FiniteF64" },
+            "exclusion": { "$ref": "#/$defs/ExclusionReason" }
+          }
+        }
+      ]
+    },
+    "LinkStepEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream",
+        "link_profile",
+        "baseline_contract",
+        "baseline_decision",
+        "link_status",
+        "quality",
+        "coordinates"
+      ],
+      "properties": {
+        "stream": { "$ref": "#/$defs/StreamInstanceId" },
+        "link_profile": { "$ref": "#/$defs/LinkProfileKey" },
+        "baseline_contract": { "$ref": "#/$defs/Hex64" },
+        "baseline_revision": { "$ref": "#/$defs/NonZeroU64" },
+        "scored_against_baseline_state_sequence": { "$ref": "#/$defs/NonZeroU64" },
+        "resulting_baseline_state_sequence": { "$ref": "#/$defs/NonZeroU64" },
+        "baseline_decision": { "$ref": "#/$defs/BaselineDecision" },
+        "link_status": { "$ref": "#/$defs/Knowledge" },
+        "quality": { "$ref": "#/$defs/LinkQuality" },
+        "coordinates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CoordinateEvidence" }
+        }
+      }
+    },
+    "BaselineMaturity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted_windows",
+        "accepted_exposure_ns",
+        "ready_coordinate_coverage",
+        "mature"
+      ],
+      "properties": {
+        "accepted_windows": { "$ref": "#/$defs/U64" },
+        "accepted_exposure_ns": { "$ref": "#/$defs/U64" },
+        "ready_coordinate_coverage": { "$ref": "#/$defs/FiniteF64" },
+        "mature": { "type": "boolean" }
+      }
+    },
+    "BaselineItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["link", "profile", "lifecycle", "compatibility"],
+      "properties": {
+        "link": { "$ref": "#/$defs/TextId" },
+        "profile": { "$ref": "#/$defs/Hex64" },
+        "lifecycle": { "$ref": "#/$defs/BaselineLifecycle" },
+        "revision": { "$ref": "#/$defs/NonZeroU64" },
+        "state_sequence": { "$ref": "#/$defs/NonZeroU64" },
+        "maturity": { "$ref": "#/$defs/BaselineMaturity" },
+        "compatibility": { "$ref": "#/$defs/BaselineCompatibilityReceipt" },
+        "latest_decision": { "$ref": "#/$defs/BaselineDecision" }
+      }
+    },
+    "BaselineCoordinate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "coordinate", "count", "mean", "variance", "accepted_exposure_ns"],
+      "properties": {
+        "path": { "$ref": "#/$defs/CsiPath" },
+        "coordinate": { "$ref": "#/$defs/CsiSampleCoordinate" },
+        "count": { "$ref": "#/$defs/NonZeroU64" },
+        "mean": { "$ref": "#/$defs/FiniteF64" },
+        "variance": { "$ref": "#/$defs/FiniteF64" },
+        "accepted_exposure_ns": { "$ref": "#/$defs/NonZeroU64" }
+      }
+    },
+    "BaselineSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deployment",
+        "space",
+        "link",
+        "profile",
+        "conditioning_version",
+        "revision",
+        "contract",
+        "coordinates"
+      ],
+      "properties": {
+        "deployment": { "$ref": "#/$defs/TextId" },
+        "space": { "$ref": "#/$defs/TextId" },
+        "link": { "$ref": "#/$defs/TextId" },
+        "profile": { "$ref": "#/$defs/Hex64" },
+        "conditioning_version": { "$ref": "#/$defs/TextId" },
+        "revision": { "$ref": "#/$defs/NonZeroU64" },
+        "contract": { "$ref": "#/$defs/Hex64" },
+        "coordinates": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/BaselineCoordinate" }
+        }
+      }
+    },
+    "BaselineCommand": {
+      "oneOf": [
+        { "enum": ["begin_learning", "commit", "freeze", "resume"] },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "snapshot"],
+          "properties": {
+            "kind": { "const": "activate_snapshot" },
+            "snapshot": { "$ref": "#/$defs/BaselineSnapshot" }
+          }
+        }
+      ]
+    },
+    "BaselineCommandRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "target", "command"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "target": { "$ref": "#/$defs/LinkProfileKey" },
+        "command": { "$ref": "#/$defs/BaselineCommand" }
+      }
+    },
+    "TopologySpace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "$ref": "#/$defs/TextId" }
+      }
+    },
+    "TopologySensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "hardware_kind", "device_id"],
+      "properties": {
+        "id": { "$ref": "#/$defs/TextId" },
+        "hardware_kind": { "const": "esp32-s3" },
+        "device_id": { "$ref": "#/$defs/U64" }
+      }
+    },
+    "TopologyLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "space", "transmitter", "receiver", "profiles"],
+      "properties": {
+        "id": { "$ref": "#/$defs/TextId" },
+        "space": { "$ref": "#/$defs/TextId" },
+        "transmitter": { "$ref": "#/$defs/TextId" },
+        "receiver": { "$ref": "#/$defs/TextId" },
+        "profiles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/Hex64" }
+        }
+      }
+    },
+    "TopologyData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deployment", "spaces", "sensors", "links"],
+      "properties": {
+        "deployment": { "$ref": "#/$defs/TextId" },
+        "spaces": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TopologySpace" }
+        },
+        "sensors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TopologySensor" }
+        },
+        "links": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TopologyLink" }
+        }
+      }
+    },
+    "SignalBucket": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "raw" },
+            "value": { "$ref": "#/$defs/FiniteF64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "minimum", "maximum", "mean", "rms", "count"],
+          "properties": {
+            "kind": { "const": "min_max_mean_rms_count" },
+            "minimum": { "$ref": "#/$defs/FiniteF64" },
+            "maximum": { "$ref": "#/$defs/FiniteF64" },
+            "mean": { "$ref": "#/$defs/FiniteF64" },
+            "rms": { "$ref": "#/$defs/FiniteF64" },
+            "count": { "$ref": "#/$defs/NonZeroU32" }
+          }
+        }
+      ]
+    },
+    "SignalTile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream",
+        "profile",
+        "time_axis",
+        "path_axis",
+        "sample_axis",
+        "order",
+        "cells",
+        "aggregation",
+        "missing_spans",
+        "receipt"
+      ],
+      "properties": {
+        "stream": { "$ref": "#/$defs/StreamInstanceId" },
+        "profile": { "$ref": "#/$defs/Hex64" },
+        "time_axis": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/U64" }
+        },
+        "path_axis": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/CsiPath" }
+        },
+        "sample_axis": { "$ref": "#/$defs/CsiSampleAxis" },
+        "order": { "const": "time_path_coordinate" },
+        "cells": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "null" },
+              { "$ref": "#/$defs/SignalBucket" }
+            ]
+          }
+        },
+        "aggregation": { "enum": ["raw", "min_max_mean_rms_count"] },
+        "missing_spans": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TimeInterval" }
+        },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "SignalsData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "tiles"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/Metric" },
+        "tiles": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/SignalTile" }
+        }
+      }
+    },
+    "TimelineEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "missing"],
+          "properties": {
+            "kind": { "const": "sequence_gap" },
+            "missing": { "$ref": "#/$defs/NonZeroU64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "device_id", "boot_generation"],
+          "properties": {
+            "kind": { "const": "device_epoch_boundary" },
+            "device_id": { "$ref": "#/$defs/U64" },
+            "previous_boot_generation": { "$ref": "#/$defs/NonZeroU32" },
+            "boot_generation": { "$ref": "#/$defs/NonZeroU32" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "packets_per_second"],
+          "properties": {
+            "kind": { "const": "rate" },
+            "packets_per_second": { "$ref": "#/$defs/FiniteF64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "receive_jitter_ns"],
+          "properties": {
+            "kind": { "const": "jitter" },
+            "receive_jitter_ns": { "$ref": "#/$defs/U64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "profile"],
+          "properties": {
+            "kind": { "const": "profile_changed" },
+            "previous_profile": { "$ref": "#/$defs/Hex64" },
+            "profile": { "$ref": "#/$defs/Hex64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "target", "command"],
+          "properties": {
+            "kind": { "const": "baseline_command" },
+            "target": { "$ref": "#/$defs/LinkProfileKey" },
+            "command": { "$ref": "#/$defs/BaselineCommand" }
+          }
+        }
+      ]
+    },
+    "TimelineEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_time", "stream", "link", "profile", "event", "receipt"],
+      "properties": {
+        "session_time": { "$ref": "#/$defs/U64" },
+        "stream": { "$ref": "#/$defs/StreamInstanceId" },
+        "link": { "$ref": "#/$defs/TextId" },
+        "profile": { "$ref": "#/$defs/Hex64" },
+        "event": { "$ref": "#/$defs/TimelineEvent" },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "TimelineData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries"],
+      "properties": {
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/TimelineEntry" }
+        }
+      }
+    },
+    "WorldListData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshots"],
+      "properties": {
+        "snapshots": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/WorldSnapshot" }
+        }
+      }
+    },
+    "EvidenceData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_id", "entries"],
+      "properties": {
+        "snapshot_id": { "$ref": "#/$defs/SnapshotId" },
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/LinkStepEvidence" }
+        }
+      }
+    },
+    "BaselinesData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baselines"],
+      "properties": {
+        "baselines": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/BaselineItem" }
+        }
+      }
+    },
+    "TopologyOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "resource", "data", "receipt"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "ok" },
+        "resource": { "const": "topology" },
+        "data": { "$ref": "#/$defs/TopologyData" },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "SignalsOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "resource", "data", "receipt"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "ok" },
+        "resource": { "const": "signals" },
+        "data": { "$ref": "#/$defs/SignalsData" },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "TimelineOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "resource", "data", "receipt"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "ok" },
+        "resource": { "const": "timeline" },
+        "data": { "$ref": "#/$defs/TimelineData" },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "WorldListOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "resource", "data", "receipt"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "ok" },
+        "resource": { "const": "world" },
+        "data": { "$ref": "#/$defs/WorldListData" },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "WorldLatestOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "resource", "data", "receipt"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "ok" },
+        "resource": { "const": "world_latest" },
+        "data": { "$ref": "#/$defs/WorldSnapshot" },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "EvidenceOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "resource", "data", "receipt"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "ok" },
+        "resource": { "const": "evidence" },
+        "data": { "$ref": "#/$defs/EvidenceData" },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "BaselinesOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "resource", "data", "receipt"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "ok" },
+        "resource": { "const": "baselines" },
+        "data": { "$ref": "#/$defs/BaselinesData" },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "EmptyEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "resource", "receipt"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "empty" },
+        "resource": {
+          "enum": ["signals", "timeline", "world", "world_latest", "evidence", "baselines"]
+        },
+        "receipt": { "$ref": "#/$defs/ViewReceipt" }
+      }
+    },
+    "AcceptedEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "resource", "target", "correlation_id"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "accepted" },
+        "resource": { "const": "baseline_command" },
+        "target": { "$ref": "#/$defs/LinkProfileKey" },
+        "correlation_id": { "$ref": "#/$defs/TextId" }
+      }
+    },
+    "InvalidRequestError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "const": "invalid_request" },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "RangeUnavailableError": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message"],
+          "properties": {
+            "code": { "const": "range_unavailable" },
+            "message": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "available_from", "available_to"],
+          "properties": {
+            "code": { "const": "range_unavailable" },
+            "message": { "type": "string", "minLength": 1 },
+            "available_from": { "$ref": "#/$defs/U64" },
+            "available_to": { "$ref": "#/$defs/U64" }
+          }
+        }
+      ]
+    },
+    "PhaseOverBudgetError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "max_signal_points"],
+      "properties": {
+        "code": { "const": "phase_over_budget" },
+        "message": { "type": "string", "minLength": 1 },
+        "max_signal_points": { "$ref": "#/$defs/NonZeroU64" }
+      }
+    },
+    "SnapshotNotFoundError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "snapshot_id"],
+      "properties": {
+        "code": { "const": "snapshot_not_found" },
+        "message": { "type": "string", "minLength": 1 },
+        "snapshot_id": { "$ref": "#/$defs/SnapshotId" }
+      }
+    },
+    "CommandQueueFullError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "const": "command_queue_full" },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ProjectionFailedError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "const": "projection_failed" },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ErrorEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "kind", "error"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "kind": { "const": "error" },
+        "error": {
+          "oneOf": [
+            { "$ref": "#/$defs/InvalidRequestError" },
+            { "$ref": "#/$defs/RangeUnavailableError" },
+            { "$ref": "#/$defs/PhaseOverBudgetError" },
+            { "$ref": "#/$defs/SnapshotNotFoundError" },
+            { "$ref": "#/$defs/CommandQueueFullError" },
+            { "$ref": "#/$defs/ProjectionFailedError" }
+          ]
+        }
+      }
+    },
+    "LivePayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "sensor"],
+          "properties": {
+            "kind": { "const": "sensor_health_changed" },
+            "sensor": { "$ref": "#/$defs/TextId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "snapshot_id"],
+          "properties": {
+            "kind": { "const": "world_snapshot_added" },
+            "snapshot_id": { "$ref": "#/$defs/SnapshotId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "link", "profile", "revision"],
+          "properties": {
+            "kind": { "const": "baseline_changed" },
+            "link": { "$ref": "#/$defs/TextId" },
+            "profile": { "$ref": "#/$defs/Hex64" },
+            "revision": { "$ref": "#/$defs/NonZeroU64" }
+          }
+        }
+      ]
+    },
+    "LiveEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_schema_version", "delivery_sequence", "payload"],
+      "properties": {
+        "http_schema_version": { "const": 1 },
+        "delivery_sequence": { "$ref": "#/$defs/U64" },
+        "payload": { "$ref": "#/$defs/LivePayload" }
+      }
+    }
+  }
+}

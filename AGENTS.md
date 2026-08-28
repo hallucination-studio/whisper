@@ -1,6 +1,6 @@
 # Rust Agent Guidelines
 
-This file governs the repository. It adapts the checked-in [`all.txt`](all.txt) snapshot of Microsoft's [Pragmatic Rust Guidelines](https://microsoft.github.io/rust-guidelines/agents/all.txt) into a small always-loaded core plus task-specific guidance under `.agents/guidelines/`.
+This file governs the repository. It adapts Microsoft's [Pragmatic Rust Guidelines](https://microsoft.github.io/rust-guidelines/agents/all.txt) into a small always-loaded core plus task-specific guidance under `.agents/guidelines/`.
 
 ## Core rules
 

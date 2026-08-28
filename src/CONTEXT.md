@@ -38,3 +38,18 @@ _Avoid_: packet, because not every session event represents captured data.
 **Baseline state**:
 The estimator's domain state for a link and profile.
 _Avoid_: snapshot, when referring to the state concept rather than a view of it.
+
+**Managed database**:
+The SQLite file selected for `HostLifecycle` operations.
+
+**Session fact bytes**:
+The logical size of one session's authoritative manifest and ordered records.
+It is independent of storage-engine space usage.
+
+**Baseline handoff**:
+The complete estimator state passed from a finished session to its successor
+without changing its identity or meaning.
+
+**Recovered tail**:
+A previously interrupted session whose durable fact tail has been replayed and
+whose derived state has been finalized for faithful replay.

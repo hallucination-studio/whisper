@@ -1,0 +1,20 @@
+START_UTC=2026-08-27T15:29:13Z
+Checking "python3" ...
+Python 3.12.3
+"python3" has been detected
+Activating ESP-IDF 5.4
+* Checking python version ... 3.12.3
+* Checking python dependencies ... OK
+* Deactivating the current ESP-IDF environment (if any) ... OK
+* Establishing a new ESP-IDF environment ... OK
+* Identifying shell ... bash
+* Detecting outdated tools in system ... OK - no outdated tools found
+* Shell completion ... Autocompletion code generated
+
+Done! You can now compile ESP-IDF projects.
+Go to the project directory and run:
+
+  idf.py build
+PRODUCTION_CAPABILITY_BINDING_QEMU_PASS
+FINISH_UTC=2026-08-27T15:29:45Z
+QEMU_EXIT=0

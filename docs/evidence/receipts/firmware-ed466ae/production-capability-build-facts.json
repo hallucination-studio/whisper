@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "domain": "esp-idf-wifi-csi-abi-v1",
+  "length_encoding": "u64-le",
+  "files": [
+    {
+      "path": "esp_wifi_types_generic.h",
+      "bytes": 71864,
+      "sha256": "2099790a3a8f40a2a2eb66f0ab3b376c8443095307e0782ab254dfd35af68a2b"
+    },
+    {
+      "path": "esp_wifi_types_native.h",
+      "bytes": 7873,
+      "sha256": "654e4dafaa181be069d9bbd6791621f803d97dcf8e3a2ba5ad28c7e6e4ac36ac"
+    }
+  ],
+  "idf_wifi_abi_digest": "601077a28cec92a5e9c13ea999029e92c2a2a529e3a0c62d977543ca6246d535"
+}

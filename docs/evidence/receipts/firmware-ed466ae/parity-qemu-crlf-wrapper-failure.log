@@ -1,0 +1,86 @@
+START_UTC=2026-08-27T15:30:42Z
+Checking "python3" ...
+Python 3.12.3
+"python3" has been detected
+Activating ESP-IDF 5.4
+* Checking python version ... 3.12.3
+* Checking python dependencies ... OK
+* Deactivating the current ESP-IDF environment (if any) ... OK
+* Establishing a new ESP-IDF environment ... OK
+* Identifying shell ... bash
+* Detecting outdated tools in system ... OK - no outdated tools found
+* Shell completion ... Autocompletion code generated
+
+Done! You can now compile ESP-IDF projects.
+Go to the project directory and run:
+
+  idf.py build
+esptool.py v4.8.1
+SHA digest in image updated
+Wrote 0x800000 bytes to file build/parity-qemu-flash.bin, ready to flash to offset 0x0
+Adding SPI flash device
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x1 (POWERON),boot:0x4 (SPI_FLASH_BOOT)
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce2810,len:0x15a0
+load:0x403c8700,len:0x4
+load:0x403c8704,len:0xd20
+load:0x403cb700,len:0x2ee4
+entry 0x403c8928
+I (26) boot: ESP-IDF v5.4 2nd stage bootloader
+I (27) boot: compile time Aug 27 2026 15:29:26
+I (27) boot: Multicore bootloader
+I (30) boot: chip revision: v0.3
+I (30) boot: efuse block revision: v0.0
+I (30) boot.esp32s3: Boot SPI Speed : 80MHz
+I (31) boot.esp32s3: SPI Mode       : DIO
+I (31) boot.esp32s3: SPI Flash Size : 8MB
+I (32) boot: Enabling RNG early entropy source...
+I (33) boot: Partition Table:
+I (34) boot: ## Label            Usage          Type ST Offset   Length
+I (34) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (34) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (35) boot:  2 factory          factory app      00 00 00010000 00100000
+I (35) boot: End of partition table
+I (36) esp_image: segment 0: paddr=00010020 vaddr=3c040020 size=117dch ( 71644) map
+I (43) esp_image: segment 1: paddr=00021804 vaddr=3fc92800 size=02a20h ( 10784) load
+I (44) esp_image: segment 2: paddr=0002422c vaddr=40374000 size=0bdech ( 48620) load
+I (49) esp_image: segment 3: paddr=00030020 vaddr=42000020 size=354cch (218316) map
+I (65) esp_image: segment 4: paddr=000654f4 vaddr=4037fdec size=02984h ( 10628) load
+I (67) esp_image: segment 5: paddr=00067e80 vaddr=600fe100 size=0001ch (    28) load
+I (68) boot: Loaded app from partition at offset 0x10000
+I (69) boot: Disabling RNG early entropy source...
+W (157) rtcinit: o_code calibration fail
+
+I (80) cpu_start: Multicore app
+I (91) cpu_start: Pro cpu start user code
+I (91) cpu_start: cpu freq: 160000000 Hz
+I (91) app_init: Application information:
+I (91) app_init: Project name:     native_frame_v1_parity
+I (91) app_init: App version:      ed466ae
+I (91) app_init: Compile time:     Aug 27 2026 15:29:23
+I (92) app_init: ELF file SHA256:  86ba56648...
+I (92) app_init: ESP-IDF:          v5.4
+I (92) efuse_init: Min chip rev:     v0.0
+I (92) efuse_init: Max chip rev:     v0.99 
+I (92) efuse_init: Chip rev:         v0.3
+I (92) heap_init: Initializing. RAM available for dynamic allocation:
+I (92) heap_init: At 3FC983B8 len 00051358 (324 KiB): RAM
+I (93) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (93) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+I (93) heap_init: At 600FE11C len 00001ECC (7 KiB): RTCRAM
+I (96) spi_flash: detected chip: gd
+I (96) spi_flash: flash io: dio
+I (96) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (96) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (98) main_task: Started on CPU0
+I (98) main_task: Calling app_main()
+NATIVE_FRAME_V1_PROVISIONING_PASS
+NATIVE_FRAME_V1_PARITY_PASS
+NATIVE_FRAME_V1_CSI_CAPTURE_PASS
+NATIVE_FRAME_V1_SENDER_PASS
+qemu-system-xtensa: terminating on signal 15 from pid 65 (timeout)
+FINISH_UTC=2026-08-27T15:31:04Z
+PARITY_EXEC_EXIT=1

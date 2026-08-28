@@ -9,42 +9,46 @@ must not redefine material owned there.
 | Question | Canonical authority | Rule |
 | --- | --- | --- |
 | What does a domain term mean? | The context glossary selected by [`../CONTEXT-MAP.md`](../CONTEXT-MAP.md) | `CONTEXT.md` files contain terminology only. |
-| Which module owns a responsibility, where is a seam, or which invariant constrains the design? | Architecture documentation | Architecture records only non-discoverable ownership, seams, and invariants. Code remains the source for implementation facts. |
-| Why was a consequential choice made? | An Architecture Decision Record (ADR) | Use an ADR only when the choice is hard to reverse, surprising without context, and the result of a real trade-off. ADRs preserve the decision and rationale; they never own normative byte layouts or behavior contracts. |
-| What exact bytes, protocol, schema, or behavior are accepted? | A versioned specification | Specifications own normative contracts and accepted targets, including cross-context contracts. |
-| What does the repository implement now? | Code plus behavior tests at an identified revision | An implemented fact requires both implementation and behavior-focused test source. |
-| Was a test or operational gate actually run? | An immutable execution receipt | Test source is not executed evidence. A receipt identifies the revision, environment or artifact, command or procedure, result, and time needed to interpret it. |
+| Which module owns a responsibility, where is a seam, or which invariant constrains the design? | [Architecture index](architecture/README.md) | Architecture records only non-discoverable ownership, seams, and invariants. Code remains the source for implementation facts. |
+| Why was a consequential choice made? | [ADR index](adr/README.md) | Use an ADR only when the choice is hard to reverse, surprising without context, and the result of a real trade-off. ADRs preserve the decision and rationale; they never own normative byte layouts or behavior contracts. |
+| What exact bytes, protocol, schema, or behavior are accepted? | [Versioned specification index](specs/README.md) | Specifications own normative contracts and accepted targets, including cross-context contracts. |
+| What does the repository implement now? | [Host code](../src/) with [integration tests](../tests/), or [firmware code](../firmware/esp32-native-frame/main/) with [firmware tests](../firmware/esp32-native-frame/tests/) | An implemented fact requires both implementation and behavior-focused test source at an identified revision. |
+| Was a test or operational gate actually run? | [Evidence index](evidence/README.md) | Test source is not executed evidence. A receipt identifies the revision, environment or artifact, command or procedure, result, and time needed to interpret it. |
+| How is a build, provisioning, flash, or live check performed? | [Operations index](operations/README.md) | A procedure is not proof that it was executed. |
 | What remains open or blocked? | [GitHub Issues](agents/issue-tracker.md) | Issues own open work, open decisions, and blockers. |
-| What may be pursued later? | Roadmap documentation | Roadmaps own future intent, not accepted contracts or current behavior. |
-| Where did an external fact come from? | Reference documentation | References preserve provenance and do not become normative merely by being cited. |
+| What may be pursued later? | [Roadmap](ROADMAP.md) | The roadmap owns future intent, not accepted contracts or current behavior. |
+| Where did an external fact come from? | [References index](references/README.md) | References preserve provenance and do not become normative merely by being cited. |
 
 If a canonical destination does not yet exist, open or update a GitHub issue;
 do not place the claim in the nearest convenient document.
 
 ## Migration state
 
-Until [Issue #8](https://github.com/hallucination-studio/whisper/issues/8)
-atomically retires them, [`../ARCHITECTURE.md`](../ARCHITECTURE.md) and
-[`../IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) are frozen legacy
-migration sources and transitional authorities for claims not yet migrated. A
-claim switches to a concrete recovered owner only when the relevant recovery
-ticket accepts that owner. The legacy files remain byte-unchanged until Issue #8
-atomically converts them to thin pointers or indexes, so no claim becomes
-ownerless during migration.
+The legacy monolith retirement is complete. [`../ARCHITECTURE.md`](../ARCHITECTURE.md)
+and [`../IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) are thin
+compatibility entry points; neither file owns architecture, behavior contracts,
+implementation facts, plans, status, decisions, blockers, or evidence.
 
 [GitHub Issues](agents/issue-tracker.md) are the single live authority for open
 work, open decisions, blockers, dependencies, and evidence gaps. A historical
 `PASS` or status statement is not executed evidence, and plan status is not live
-state where the corresponding work is now tracked by Issues.
+state.
 
-For an unmigrated claim, follow the recovery issue for its domain:
-[#3 firmware/native-frame](https://github.com/hallucination-studio/whisper/issues/3),
-[#4 timeline/world/runtime](https://github.com/hallucination-studio/whisper/issues/4),
-[#5 query/API/UI](https://github.com/hallucination-studio/whisper/issues/5),
-[#6 persistence](https://github.com/hallucination-studio/whisper/issues/6), or
-[#7 roadmap/references](https://github.com/hallucination-studio/whisper/issues/7).
-Consult the protected source only to locate and classify the claim; do not
-create substitute authority prose.
+The completed chapter-by-chapter routing is preserved in the
+[legacy migration ledger](migration/legacy-ledger.md) as a historical record.
+
+## Topic routes
+
+Use these routes after selecting the authority kind above. Each link goes to a
+concrete owner; Issues provide live gap and decision state rather than serving
+as a substitute document.
+
+| Topic | Concrete owners |
+| --- | --- |
+| Firmware and native-frame | [Specification](specs/native-frame-v1.md), [architecture](architecture/firmware-native-frame.md), [evidence](evidence/firmware.md), [operations](operations/firmware.md), and [provenance](references/native-frame.md) |
+| Host configuration, sessions, and persistence | [Specification](specs/persistence-v1.md), [architecture](architecture/host-persistence.md), [ADR rationale](adr/0003-sqlite-authoritative-session-store.md), and [evidence](evidence/host-persistence.md) |
+| Timeline, world runtime, and evaluation | [Temporal/world specification](specs/temporal-world-v1.md), [evaluation specification](specs/evaluation-v1.md), [architecture](architecture/world-runtime.md), [ADR rationale](adr/0002-engine-single-writer.md), and [evidence](evidence/world-runtime.md) |
+| Query, API, WebSocket, and UI | [Specification](specs/api-ui-v1.md), [architecture](architecture/query-runtime.md), and [evidence](evidence/query-ui.md) |
 
 ## Maturity vocabulary
 
