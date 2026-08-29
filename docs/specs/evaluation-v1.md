@@ -2,6 +2,12 @@
 
 Status: accepted target
 
+Applicability: all calibration, data-split, leakage, semantic replay, World
+evaluation, and runtime qualification behavior in this document belongs to the
+deferred Semantic Program, called Program 1 within the preserved v1 contracts.
+The bounded Demo has no evaluation contract and a `demo-smoke` result cannot
+satisfy or promote this target.
+
 This specification is the sole normative owner of v1 evaluation, calibration,
 and leakage behavior for the statistical temporal/world runtime. It does not
 define Timeline, estimator, or world behavior; those contracts live in the

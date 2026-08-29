@@ -10,6 +10,11 @@ This page records architecture that cannot be recovered merely by listing
 source files. It does not define routes, DTO fields, status codes, UI content,
 implementation status, or acceptance results.
 
+Applicability: this full semantic query, command, and reconnect architecture
+belongs to the deferred Semantic Program. The bounded Demo query subset,
+watermark-only WebSocket, and polling fallback are first-applicable in
+[Demo Slice architecture](demo-slice.md).
+
 ## Ownership
 
 `CaptureRun` owns ingest order and the sole synchronous database writer

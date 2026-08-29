@@ -13,6 +13,12 @@ composition are described in
 current receipts and maturity are recorded in
 [`../evidence/query-ui.md`](../evidence/query-ui.md).
 
+Applicability: the complete route set, semantic query sources, command path,
+disconnect/recovery behavior, and full schema-validation matrix belong to the
+deferred Semantic Program. [Demo Slice v1](demo-slice-v1.md) is first-applicable
+for its bounded topology/signals/live subset and imports the named JSON
+definitions without redefining their wire shapes.
+
 The domain vocabulary comes from [`../../src/CONTEXT.md`](../../src/CONTEXT.md).
 Temporal and world semantics are imported from
 [`temporal-world-v1.md`](temporal-world-v1.md). Committed session, projection,

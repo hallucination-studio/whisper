@@ -2,6 +2,19 @@
 
 Status: accepted target
 
+Applicability: the configuration grammar and `ReplayConfig`/`RuntimeConfig`
+split, development secret-store epoch-key loader, Managed store root,
+cooperative `HostLifecycle` lease, staged initialization and atomic no-replace
+publication, and common non-creating open are shared by the bounded Demo and
+deferred Semantic Program. This specification also owns the deferred Semantic
+Session Store and its two-stage processing, recovery, rotation, retention, and
+faithful replay contract. For the Demo Store schema, per-serve Capture Session,
+and one-transaction ingest path,
+[Demo Slice v1](demo-slice-v1.md) is first-applicable. The two Stores share the
+named key-loading and lifecycle subsets, ReplayConfig, topology, replay-window,
+Store-ID, and watermark definitions but do not share a SQLite schema or session
+lifecycle.
+
 This specification is the sole normative owner of Whisper v1 host
 configuration identity, session encoding, SQLite persistence, recovery,
 retention, and faithful replay input behavior. Delivery and execution maturity

@@ -2,10 +2,18 @@
 
 Status: accepted target
 
-This specification is the sole normative owner of Whisper v1 Timeline,
-conditioning, statistical baseline estimation, world aggregation, Engine,
-runtime publication, and semantic replay behavior. Current implementation and
-execution maturity are recorded separately in the
+Applicability: Timeline, conditioning, baselines, Engine, World, semantic
+recovery, and semantic replay belong to the deferred Semantic Program. The
+bounded Demo imports only the Capture Profile identity, native-coordinate
+`CsiObservation` value, and standalone CBOR root, as routed by
+[Demo Slice v1](demo-slice-v1.md); deriving or committing those values does not
+claim that any other contract in this document ran.
+
+This specification is the sole normative owner of Whisper v1 Capture Profile
+identity, native-coordinate `CsiObservation`, Timeline, conditioning,
+statistical baseline estimation, world aggregation, Engine, runtime
+publication, and semantic replay behavior. Current implementation and execution
+maturity are recorded separately in the
 [world/runtime evidence index](../evidence/world-runtime.md).
 
 The key words MUST, MUST NOT, SHOULD, and MAY are normative.
@@ -18,11 +26,12 @@ state path is the statistical baseline estimator defined here. It preserves
 native coordinates, explicit time quality, profile isolation, typed knowledge
 limits, and source receipts.
 
-This specification begins after an input has become a typed, authenticated
+Semantic processing begins after an input has become a typed, authenticated
 `CsiObservation`. The applicable wire specification owns datagram bytes,
-authentication, and route admission. The persistence specification owns
-session schemas, replay eligibility, and ordered record decoding. This
-specification owns the semantic result obtained from those ordered inputs.
+authentication, and route admission. The persistence specification owns session
+schemas, replay eligibility, and ordered record decoding. This specification
+owns Profile identity, the observation value, and the semantic result obtained
+from those ordered inputs.
 
 HTTP resources, WebSocket delivery, signal tiles, and UI behavior are outside
 this specification. Delivery metadata MUST NOT affect a semantic result.
@@ -42,6 +51,57 @@ The core MUST receive time explicitly. It MUST NOT read a wall clock, sleep,
 use randomness, depend on hash-map iteration order, or derive semantic state
 from delivery timing. Stable map order or an explicit stable sort MUST define
 all stream, coordinate, link, and space reductions.
+
+## Capture Profile identity
+
+A `CaptureProfileId` is SHA-256 of one Capture Profile v1 descriptor encoded as
+deterministic CBOR. The descriptor contains exactly one definite-length map,
+uses shortest-width integers and definite-length text, arrays, and nested maps,
+and contains no float, tag, indefinite item, unknown key, duplicate key, or
+trailing byte. Map keys are ordered by their deterministic CBOR encoding:
+shorter encoded keys first, then bytewise lexical order for equal lengths.
+Decoders MUST reject bytes that are not identical to canonical re-encoding.
+
+The root map has exactly these keys in encoded order:
+
+| Order | Key | Value |
+| ---: | --- | --- |
+| 1 | `ppdu` | `Legacy`, `Ht`, `He`, or `null` |
+| 2 | `stbc` | boolean or `null` |
+| 3 | `layout` | profile-layout map |
+| 4 | `channel` | nonzero `u16` or `null` |
+| 5 | `encoding` | profile-encoding map |
+| 6 | `firmware` | non-whitespace version text |
+| 7 | `hardware` | `Esp32S3`, `Esp32C6`, or `Intel5300` |
+| 8 | `acquisition` | acquisition map |
+| 9 | `phase_state` | `Unavailable`, `Raw`, or `Calibrated` |
+| 10 | `bandwidth_hz` | nonzero `u64` or `null` |
+| 11 | `clock_domain` | non-whitespace text of at most `MAX_TIMELINE_CLOCK_TEXT_BYTES` bytes or `null` |
+| 12 | `time_quality` | `Unknown`, `ReceiveOnly`, or `ClockCorrected` |
+| 13 | `capability_id` | non-whitespace version text |
+| 14 | `schema_version` | unsigned integer `1` |
+| 15 | `decoder_version` | validated version text |
+| 16 | `secondary_channel` | `u8` in `0..=2` or `null` |
+| 17 | `centre_frequency_hz` | nonzero `u64` or `null` |
+
+The nested maps and enum representations are exact:
+
+| Type | Exact encoded keys and values |
+| --- | --- |
+| profile-layout | `order`: exact text `PathThenSample`; `paths`: nonempty unique array of profile-path values in native order; `samples`: one profile-sample-axis value |
+| profile-path `TxRx` | one-key map `TxRx`: map containing `rx_chain: u16`, then `tx_stream: u16` |
+| profile-path `RawPathOrdinal` | one-key map `RawPathOrdinal`: `u16` |
+| profile-sample-axis opaque | one-key map `OpaqueSampleOrdinal`: map containing `count`: nonzero `u16` |
+| profile-sample-axis tone | one-key map `IeeeToneIndex`: nonempty unique array of `i16` in native order |
+| profile-sample-axis frequency | one-key map `FrequencyHz`: nonempty unique array of `u64` in native order |
+| profile-encoding | `signed_bits`: `u8` in `1..=32`; `complex_order`: `RealImaginary` or `ImaginaryReal`; `scale_numerator`: nonzero `u32`; `scale_denominator`: nonzero `u32` |
+| acquisition | `mode`: exact text `WifiCsi`; `ltf_merge`: `None`, `FirmwareDefined`, or `Unknown`; `ltf_selection`: `Legacy`, `Ht`, `He`, or `Unknown`; `validity_dialect`: `ExplicitFlag`, `FirstWordInvalid`, `MissingFrameValidity`, or `Unknown` |
+
+The scale fraction MUST be reduced. `ClockCorrected` requires a non-null clock
+domain; `ReceiveOnly` and `Unknown` require `clock_domain = null`. All layouts
+MUST satisfy the native-coordinate uniqueness and checked cardinality rules.
+Equal descriptor bytes produce the same Profile ID, and any descriptor-byte
+change produces a different digest preimage.
 
 ## Timeline
 

@@ -15,3 +15,5 @@ the linked specification owns operative behavior.
 | Why trust the Program 1 local store namespace instead of building hostile same-credential isolation? | [ADR 0013](0013-trust-program-1-local-store-namespace.md) |
 | Why can only a verified typed claim graph issue an execution classification? | [ADR 0014](0014-derive-execution-classification-from-claim-graph.md) |
 | Why does a compatible Host restart continue the active session instead of rotating it? | [ADR 0015](0015-keep-compatible-host-restart-in-active-session.md) |
+| Why does every Demo `serve` create another non-semantic Capture Session? | [ADR 0016](0016-new-capture-session-per-serve.md) |
+| Why does Demo ingest commit replay, packet, optional CSI, cursor, and watermark together? | [ADR 0017](0017-atomic-demo-ingest.md) |

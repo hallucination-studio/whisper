@@ -7,6 +7,13 @@ behavior lives only in the
 leakage behavior in [evaluation v1](../specs/evaluation-v1.md), and maturity in
 the [world/runtime evidence index](../evidence/world-runtime.md).
 
+Applicability: all Timeline, estimator, Engine, World, handoff, recovery, and
+semantic replay ownership in this document belongs to the deferred Semantic
+Program. The bounded Demo commits only the imported native-coordinate
+observation with its imported Profile identity and has no owner for these
+semantic mutations; see
+[Demo Slice architecture](demo-slice.md).
+
 ## Responsibilities
 
 Timeline owns source-sequence classification, stream-instance lifecycle,
