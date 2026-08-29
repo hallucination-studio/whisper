@@ -123,12 +123,15 @@ receive-monotonic nanoseconds as unsigned `u64` big-endian; receive-UTC
 nanoseconds as signed two's-complement `i64` big-endian; datagram length as
 unsigned `u64` big-endian; and the exact datagram bytes.
 
-Export MUST use one read-only SQLite snapshot. Within that snapshot it MUST
-match Store ID, a sealed lifecycle, processing cursor and Projection commit,
-then match every selected record's session time and canonical packet body to
-the proposed datagram entry and file. It MUST recompute both aggregate digests,
-every individual digest, and all manifest invariants before publication. SQLite
-database, WAL, and SHM bytes are never corpus artifacts.
+Export MUST enter through the lifecycle-owned corpus-export intent using
+validated configuration to select an existing Managed database. It MUST NOT
+open a caller-supplied arbitrary database path. The
+[host persistence v1 specification](persistence-v1.md#initialization-and-runtime-ownership)
+owns the non-creating open, recovery, snapshot, connection, and retained-lease
+lifecycle. Export MUST match every selected record's session time and canonical
+packet body to the proposed datagram entry and file. It MUST recompute both
+aggregate digests, every individual digest, and all manifest invariants before
+publication. SQLite database, WAL, and SHM bytes are never corpus artifacts.
 
 The manifest SHA-256 is over its exact canonical file bytes and is not embedded
 in the manifest. The immutable corpus version is `v1-<manifest_sha256>` and its

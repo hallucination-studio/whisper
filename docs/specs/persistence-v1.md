@@ -1109,22 +1109,80 @@ component, crash, conflict, or validation,
 checkpoint, synchronization, close, publication, or re-open failure MUST fail
 without replacing the final component or reporting success.
 
-Capture and replay MUST acquire the root lease, open the existing database with
-a mechanically non-creating operation through the qualified VFS, allow SQLite
-to complete WAL recovery, query and reject incompatible persistent settings,
-apply and verify connection-local settings, and validate schema and configured
-epochs, in that order. A sealed-session faithful replay uses a verified
-read-only connection. A missing file, corrupt SQLite database, wrong
+Capture, replay, and corpus export MUST use validated current configuration to
+select the existing Managed database and its trusted root. After validating and
+canonicalizing that root and acquiring the retained root lease, every such
+existing-store lifecycle MUST perform this common open sequence in order:
+
+1. mechanically open the database without creation through the qualified
+   bundled VFS;
+2. permit SQLite WAL and storage recovery as applicable;
+3. query the required persistent settings and reject any incompatibility;
+4. apply and verify every connection-local setting required for that
+   connection;
+5. validate the schema; and
+6. validate the Store ID and require the Store's immutable topology manifest
+   and digest to equal the topology identity derived from the selected
+   configuration.
+
+Capture and replay MUST then, in order, validate the configured admission
+epochs applicable to the intent and validate the applicable replay identity.
+A sealed-session faithful replay uses a verified read-only connection. No open
+may proceed past a failed step. A missing file, corrupt SQLite database, wrong
 schema/version, incompatible setting, Store ID failure, topology-manifest
-mismatch, or epoch failure MUST fail closed. Operational open MUST NOT create,
-reset, repair, or replace the database or admission state as a side effect.
+mismatch, epoch failure where applicable, or replay-identity failure where
+applicable MUST fail closed. Operational open MUST NOT create, reset, repair,
+migrate, or replace the database or admission state as a side effect. No
+lifecycle intent accepts a caller-selected database path or exposes a general
+SQLite connection opener.
+
+Corpus export MUST be a distinct `HostLifecycle` intent from capture, faithful
+replay, and ordinary HTTP/query reads. Under one retained cooperative lease,
+its open has exactly two connection phases. Phase one MUST use one short-lived
+recovery/validation connection to perform the complete common sequence above,
+in that order, through Store ID and immutable topology validation. It MUST NOT
+require the current configured admission epochs or replay identity to equal the
+selected historical session's values. After topology validation, phase one MUST
+close its connection before phase two begins. WAL or storage recovery in phase
+one is not semantic table mutation.
+
+Without releasing the lease, phase two MUST perform this sequence in order:
+
+1. mechanically open one read-only connection without creation through the
+   same accepted qualified bundled VFS;
+2. apply and verify the required reader-local settings;
+3. begin exactly one SQLite read transaction, which fixes exactly one read
+   snapshot;
+4. inside that snapshot, revalidate the Store ID and immutable topology
+   identity established by phase one, require the selected session to exist and
+   have the sealed lifecycle, and validate the selected session's processed
+   cursor and the global Projection watermark; and
+5. return `CorpusExport` only after every preceding validation succeeds.
+
+The resulting bounded `CorpusExport` shell MUST own that one read-only
+connection and snapshot. All logical export readers MUST borrow that connection
+and snapshot; they MUST NOT create another connection, transaction, or
+snapshot. Current replay configuration and current admission epochs MUST NOT be
+required to equal the selected historical sealed session manifest. Historical
+route and replay identities for export come exclusively from that sealed
+manifest. The shell MUST NOT mutate facts, projections, lifecycle, replay
+admission, Engine state, or evidence classification. Dropping `CorpusExport`
+MUST first end its read transaction and close its read-only connection, then
+release the retained lease. Canonical `CorpusManifest` construction, corpus
+artifact publication, and structural artifact validation are outside this
+persistence contract.
 
 One sequential ingest owner MUST hold the sole synchronous writer connection.
 Synchronous database work MUST run off asynchronous runtime and ingest
-execution. Bounded read-only query connections MAY read the same WAL database,
-but no connection pool or database actor is introduced. The lifecycle MUST
-hold the Managed store root lease until all managed writer and reader work has
-stopped and every connection has closed.
+execution. Under a lifecycle that has completed the common existing-store open
+and retains its lease, bounded read-only query connections MAY read the same WAL
+database. Each such connection MUST open mechanically without creation through
+the same qualified bundled VFS, apply and verify its required reader-local
+settings, and verify the Store ID inside its bounded read snapshot before
+returning a view. These ordinary HTTP/query readers do not become replay or
+corpus-export readers. No connection pool or database actor is introduced. The
+lifecycle MUST hold the Managed store root lease until all managed writer and
+reader work has stopped and every connection has closed.
 
 ## Durable admission and processing transactions
 
@@ -1405,6 +1463,12 @@ the specified interfaces. At minimum they MUST cover:
   connection-local setting application, missing epochs, topology mismatch,
   active-manifest replay-identity mismatch, and no create/reset, synthetic
   close, rotation, or silent-repair side effect from capture open;
+- non-creating corpus-export recovery/validation open through validated
+  configuration, recovery-connection close before one read-only
+  sealed-session snapshot, snapshot-local identity and cursor revalidation,
+  active- and missing-session rejection, historical-manifest identity
+  independence from current replay configuration and admission epochs, mutation
+  exclusion, and snapshot/connection close before lease release;
 - application-lease exclusion across two cooperative processes; chosen bundled
   VFS current-Mac qualification with the default tested first; WAL plus
   `synchronous=FULL` SIGKILL recovery, SQLite lock reacquisition, and

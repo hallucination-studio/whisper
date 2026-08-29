@@ -81,6 +81,11 @@ The declared origin and derivation chain of immutable corpus content.
 _Avoid_: evidence classification, which is issued only from an executed claim
 graph.
 
+**Corpus export**:
+A bounded read of immutable packet facts from one sealed session for corpus
+construction.
+_Avoid_: replay or query, which have different purposes and lifecycle seams.
+
 **Executed claim graph**:
 A verifier-checked graph whose typed claims and artifact references support one
 execution-result classification.
