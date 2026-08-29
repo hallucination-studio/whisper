@@ -76,6 +76,24 @@
       "format": "whisper-snapshot-id-v1",
       "$comment": "Runtime validation decodes canonical unpadded base64url UTF-8 session bytes, validates the session ID, validates the u64 window, and requires byte-identical re-encoding."
     },
+    "ProjectionWatermark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store_id", "sequence"],
+      "properties": {
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "sequence": { "$ref": "#/$defs/U64" }
+      }
+    },
+    "CommittedProjectionIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store_id", "sequence"],
+      "properties": {
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "sequence": { "$ref": "#/$defs/NonZeroU64" }
+      }
+    },
     "TimeQuality": {
       "enum": ["unknown", "receive_only", "clock_corrected"]
     },
@@ -272,10 +290,20 @@
         "device_epoch": { "$ref": "#/$defs/DeviceEpoch" }
       }
     },
+    "StreamSegmentIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream", "segment_id"],
+      "properties": {
+        "stream": { "$ref": "#/$defs/StreamInstanceId" },
+        "segment_id": { "$ref": "#/$defs/U64" }
+      }
+    },
     "ViewReceipt": {
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "projection_commit",
         "session_id",
         "first_record_seq",
         "last_record_seq",
@@ -284,12 +312,21 @@
         "algorithm_version"
       ],
       "properties": {
+        "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" },
         "session_id": { "$ref": "#/$defs/TextId" },
         "first_record_seq": { "$ref": "#/$defs/U64" },
         "last_record_seq": { "$ref": "#/$defs/U64" },
         "decoder_version": { "$ref": "#/$defs/TextId" },
         "conditioning_version": { "$ref": "#/$defs/TextId" },
         "algorithm_version": { "$ref": "#/$defs/TextId" }
+      }
+    },
+    "StoreViewReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projection_commit"],
+      "properties": {
+        "projection_commit": { "$ref": "#/$defs/ProjectionWatermark" }
       }
     },
     "Knowledge": {
@@ -687,7 +724,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "stream",
+        "stream_segments",
         "link_profile",
         "baseline_contract",
         "baseline_decision",
@@ -696,7 +733,10 @@
         "coordinates"
       ],
       "properties": {
-        "stream": { "$ref": "#/$defs/StreamInstanceId" },
+        "stream_segments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/StreamSegmentIdentity" }
+        },
         "link_profile": { "$ref": "#/$defs/LinkProfileKey" },
         "baseline_contract": { "$ref": "#/$defs/Hex64" },
         "baseline_revision": { "$ref": "#/$defs/NonZeroU64" },
@@ -844,9 +884,15 @@
     "TopologyData": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["deployment", "spaces", "sensors", "links"],
+      "required": ["deployment", "sessions", "spaces", "sensors", "links"],
       "properties": {
         "deployment": { "$ref": "#/$defs/TextId" },
+        "sessions": {
+          "type": "array",
+          "uniqueItems": true,
+          "$comment": "Prose requires strict ordering by SessionId UTF-8 bytes and includes only sessions with a non-NULL transaction-B projection commit sequence.",
+          "items": { "$ref": "#/$defs/TextId" }
+        },
         "spaces": {
           "type": "array",
           "items": { "$ref": "#/$defs/TopologySpace" }
@@ -1053,7 +1099,6 @@
         "snapshot_id": { "$ref": "#/$defs/SnapshotId" },
         "entries": {
           "type": "array",
-          "minItems": 1,
           "items": { "$ref": "#/$defs/LinkStepEvidence" }
         }
       }
@@ -1073,14 +1118,46 @@
     "TopologyOk": {
       "type": "object",
       "additionalProperties": false,
+      "$comment": "Sequence zero names only provisioned topology with no query-visible sessions or committed Profile membership; prose defines first transaction-B visibility.",
       "required": ["http_schema_version", "kind", "resource", "data", "receipt"],
       "properties": {
         "http_schema_version": { "const": 1 },
         "kind": { "const": "ok" },
         "resource": { "const": "topology" },
         "data": { "$ref": "#/$defs/TopologyData" },
-        "receipt": { "$ref": "#/$defs/ViewReceipt" }
-      }
+        "receipt": { "$ref": "#/$defs/StoreViewReceipt" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "receipt": {
+                "properties": {
+                  "projection_commit": {
+                    "properties": { "sequence": { "const": "0" } }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "sessions": { "maxItems": 0 },
+                  "links": {
+                    "items": {
+                      "properties": {
+                        "profiles": { "maxItems": 0 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "SignalsOk": {
       "type": "object",
@@ -1274,6 +1351,22 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "projection_watermark" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "retention_changed" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["kind", "sensor"],
           "properties": {
             "kind": { "const": "sensor_health_changed" },
@@ -1305,12 +1398,41 @@
     "LiveEnvelope": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["http_schema_version", "delivery_sequence", "payload"],
+      "required": ["http_schema_version", "delivery_sequence", "projection_commit", "payload"],
       "properties": {
         "http_schema_version": { "const": 1 },
         "delivery_sequence": { "$ref": "#/$defs/U64" },
+        "projection_commit": { "$ref": "#/$defs/ProjectionWatermark" },
         "payload": { "$ref": "#/$defs/LivePayload" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["payload"],
+            "properties": {
+              "payload": {
+                "required": ["kind"],
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "retention_changed",
+                      "world_snapshot_added",
+                      "baseline_changed"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "projection_commit": {
+                "$ref": "#/$defs/CommittedProjectionIdentity"
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

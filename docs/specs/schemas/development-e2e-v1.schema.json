@@ -1,0 +1,2448 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hallucination.studio/whisper/schemas/development-e2e-v1.schema.json",
+  "title": "Whisper Program 1 artifacts v1",
+  "description": "Closed corpus manifests, retained execution evidence, typed claims, verifier-issued classifications, Diagnostic UI acceptance, and Program 1 completion.",
+  "oneOf": [
+    { "$ref": "#/$defs/CorpusManifest" },
+    { "$ref": "#/$defs/ExecutionClaimGraph" },
+    { "$ref": "#/$defs/VerificationReceipt" },
+    { "$ref": "#/$defs/ProvisioningReceipt" },
+    { "$ref": "#/$defs/ProjectionReceipt" },
+    { "$ref": "#/$defs/BrowserWebSocketTranscript" },
+    { "$ref": "#/$defs/HostRestartReceipt" },
+    { "$ref": "#/$defs/StorageQualificationReport" },
+    { "$ref": "#/$defs/ResourceQualificationReport" },
+    { "$ref": "#/$defs/AdmittedFactExport" },
+    { "$ref": "#/$defs/CaptureReceipt" },
+    { "$ref": "#/$defs/HostCommitTrace" },
+    { "$ref": "#/$defs/ProjectionStoreExport" },
+    { "$ref": "#/$defs/BrowserTrace" },
+    { "$ref": "#/$defs/DiagnosticUiAcceptanceReport" },
+    { "$ref": "#/$defs/ProgramCompletionReceipt" }
+  ],
+  "$defs": {
+    "Text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "Hex64": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "GitRevision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "NonZeroU16": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "U64": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$",
+      "$comment": "Runtime validation rejects values above 18446744073709551615."
+    },
+    "I64": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,18}|-[1-9][0-9]{0,18})$",
+      "$comment": "Runtime validation rejects values outside -9223372036854775808 through 9223372036854775807."
+    },
+    "NonZeroU64": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,19}$",
+      "$comment": "Runtime validation rejects values above 18446744073709551615."
+    },
+    "CorpusVersion": {
+      "type": "string",
+      "pattern": "^v1-[0-9a-f]{64}$"
+    },
+    "CorpusFile": {
+      "type": "string",
+      "pattern": "^datagrams/[0-9]{20}\\.bin$"
+    },
+    "Timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$",
+      "format": "date-time"
+    },
+    "PackageArtifactPath": {
+      "type": "string",
+      "pattern": "^artifacts/[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$",
+      "$comment": "The ASCII package-relative grammar also excludes absolute paths, empty components, dot components, backslashes, and drive prefixes. Prose additionally rejects symlinks, nonregular files, duplicate paths, and package-root escape."
+    },
+    "ArtifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "media_type", "path", "sha256"],
+      "properties": {
+        "role": { "$ref": "#/$defs/Text" },
+        "media_type": { "$ref": "#/$defs/Text" },
+        "path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "ArtifactRefs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "$comment": "Prose requires strict tuple ordering and uniqueness and at most one reference per role.",
+      "items": { "$ref": "#/$defs/ArtifactRef" }
+    },
+    "PhysicalCaptureArtifacts": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "admitted_fact_export" }, "media_type": { "const": "application/json" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "capture_receipt" }, "media_type": { "const": "application/json" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "firmware_image" }, "media_type": { "const": "application/octet-stream" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "host_commit_trace" }, "media_type": { "const": "application/json" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "host_executable" }, "media_type": { "const": "application/octet-stream" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "provisioning_receipt" }, "media_type": { "const": "application/json" } } }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "CorpusInputArtifacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "corpus_manifest" }, "media_type": { "const": "application/json" } } }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "HostProjectionArtifacts": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "host_commit_trace" }, "media_type": { "const": "application/json" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "host_executable" }, "media_type": { "const": "application/octet-stream" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "projection_receipt" }, "media_type": { "const": "application/json" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "projection_store_export" }, "media_type": { "const": "application/json" } } }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "BrowserObservationArtifacts": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "browser_trace" }, "media_type": { "const": "application/json" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "http_body" }, "media_type": { "const": "application/json" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "websocket_transcript" }, "media_type": { "const": "application/json" } } }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "HostRestartArtifacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "restart_receipt" }, "media_type": { "const": "application/json" } } }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "StorageQualificationArtifacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "storage_qualification_report" }, "media_type": { "const": "application/json" } } }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "ResourceQualificationArtifacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ArtifactRef" },
+            { "properties": { "role": { "const": "resource_qualification_report" }, "media_type": { "const": "application/json" } } }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "DatagramReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "order",
+        "path",
+        "sha256",
+        "peer",
+        "receive_monotonic_ns",
+        "receive_utc_ns"
+      ],
+      "properties": {
+        "order": { "$ref": "#/$defs/U64" },
+        "path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "sha256": { "$ref": "#/$defs/Hex64" },
+        "peer": { "$ref": "#/$defs/Text" },
+        "receive_monotonic_ns": { "$ref": "#/$defs/U64" },
+        "receive_utc_ns": { "$ref": "#/$defs/I64" }
+      }
+    },
+    "DatagramReceipts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "$comment": "Prose requires strict numeric order and uniqueness by order.",
+      "items": { "$ref": "#/$defs/DatagramReceipt" }
+    },
+    "CorpusInputDatagramReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "order",
+        "route_identity_sha256",
+        "path",
+        "sha256",
+        "peer",
+        "receive_monotonic_ns",
+        "receive_utc_ns"
+      ],
+      "properties": {
+        "order": { "$ref": "#/$defs/U64" },
+        "route_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "sha256": { "$ref": "#/$defs/Hex64" },
+        "peer": { "$ref": "#/$defs/Text" },
+        "receive_monotonic_ns": { "$ref": "#/$defs/U64" },
+        "receive_utc_ns": { "$ref": "#/$defs/I64" }
+      }
+    },
+    "CorpusInputDatagramReceipts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "$comment": "Prose requires strict numeric order and uniqueness by order.",
+      "items": { "$ref": "#/$defs/CorpusInputDatagramReceipt" }
+    },
+    "ScreenshotLocator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "trace_event_id"],
+      "properties": {
+        "path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "sha256": { "$ref": "#/$defs/Hex64" },
+        "trace_event_id": { "const": "screenshot" }
+      }
+    },
+    "ScreenshotLocators": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "uniqueItems": true,
+      "$comment": "The sole locator binds the sole BrowserTrace screenshot event; prose additionally requires global path uniqueness, exact digest binding, and PNG validation.",
+      "items": { "$ref": "#/$defs/ScreenshotLocator" }
+    },
+    "ClaimParents": {
+      "type": "array",
+      "uniqueItems": true,
+      "$comment": "Prose requires strict raw UTF-8 ordering, graph-local resolution, no self-edge, and acyclicity.",
+      "items": { "$ref": "#/$defs/Text" }
+    },
+    "CommittedProjectionIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store_id", "sequence"],
+      "properties": {
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "sequence": { "$ref": "#/$defs/NonZeroU64" }
+      }
+    },
+    "AdmittedFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_seq",
+        "datagram_sha256",
+        "peer",
+        "receive_monotonic_ns",
+        "receive_utc_ns",
+        "transaction_a_commit_event_id"
+      ],
+      "properties": {
+        "record_seq": { "$ref": "#/$defs/U64" },
+        "datagram_sha256": { "$ref": "#/$defs/Hex64" },
+        "peer": { "$ref": "#/$defs/Text" },
+        "receive_monotonic_ns": { "$ref": "#/$defs/U64" },
+        "receive_utc_ns": { "$ref": "#/$defs/I64" },
+        "transaction_a_commit_event_id": { "$ref": "#/$defs/Text" }
+      }
+    },
+    "AdmittedFactExport": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes, one SQLite read snapshot, strict record order, and exclusion of encrypted bodies, SQLite bytes, and secrets.",
+      "required": [
+        "schema_version",
+        "store_id",
+        "session_id",
+        "first_record_seq",
+        "last_record_seq",
+        "facts"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "session_id": { "$ref": "#/$defs/Text" },
+        "first_record_seq": { "$ref": "#/$defs/U64" },
+        "last_record_seq": { "$ref": "#/$defs/U64" },
+        "facts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/AdmittedFact" }
+        }
+      }
+    },
+    "CaptureReceiptDatagram": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "order",
+        "path",
+        "sha256",
+        "peer",
+        "receive_monotonic_ns",
+        "receive_utc_ns",
+        "record_seq",
+        "transaction_a_commit_event_id",
+        "decode_result",
+        "decoded_sensor_id",
+        "decoded_link_id",
+        "decoded_profile_id",
+        "observation_sha256"
+      ],
+      "properties": {
+        "order": { "$ref": "#/$defs/U64" },
+        "path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "sha256": { "$ref": "#/$defs/Hex64" },
+        "peer": { "$ref": "#/$defs/Text" },
+        "receive_monotonic_ns": { "$ref": "#/$defs/U64" },
+        "receive_utc_ns": { "$ref": "#/$defs/I64" },
+        "record_seq": { "$ref": "#/$defs/U64" },
+        "transaction_a_commit_event_id": { "$ref": "#/$defs/Text" },
+        "decode_result": { "const": "accepted" },
+        "decoded_sensor_id": { "$ref": "#/$defs/Text" },
+        "decoded_link_id": { "$ref": "#/$defs/Text" },
+        "decoded_profile_id": { "$ref": "#/$defs/Hex64" },
+        "observation_sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "CaptureReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes and equality with exact datagrams, the admitted-fact export, and the production Host commit trace.",
+      "required": [
+        "schema_version",
+        "store_id",
+        "session_id",
+        "host_source_revision",
+        "host_executable_sha256",
+        "admitted_fact_export_sha256",
+        "host_commit_trace_sha256",
+        "datagrams",
+        "result"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "session_id": { "$ref": "#/$defs/Text" },
+        "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+        "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+        "admitted_fact_export_sha256": { "$ref": "#/$defs/Hex64" },
+        "host_commit_trace_sha256": { "$ref": "#/$defs/Hex64" },
+        "datagrams": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/CaptureReceiptDatagram" }
+        },
+        "result": { "enum": ["pass", "fail"] }
+      }
+    },
+    "TransactionACommittedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "event_seq",
+        "kind",
+        "monotonic_ns",
+        "utc",
+        "record_seq",
+        "datagram_sha256"
+      ],
+      "properties": {
+        "event_id": { "$ref": "#/$defs/Text" },
+        "event_seq": { "$ref": "#/$defs/U64" },
+        "kind": { "const": "transaction_a_committed" },
+        "monotonic_ns": { "$ref": "#/$defs/U64" },
+        "utc": { "$ref": "#/$defs/Timestamp" },
+        "record_seq": { "$ref": "#/$defs/U64" },
+        "datagram_sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "TransactionBCommittedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "event_seq",
+        "kind",
+        "monotonic_ns",
+        "utc",
+        "record_seq",
+        "projection_commit"
+      ],
+      "properties": {
+        "event_id": { "$ref": "#/$defs/Text" },
+        "event_seq": { "$ref": "#/$defs/U64" },
+        "kind": { "const": "transaction_b_committed" },
+        "monotonic_ns": { "$ref": "#/$defs/U64" },
+        "utc": { "$ref": "#/$defs/Timestamp" },
+        "record_seq": { "$ref": "#/$defs/U64" },
+        "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" }
+      }
+    },
+    "HostCommitTrace": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes, strict event_seq and monotonic order, and records events only after successful commits.",
+      "required": [
+        "schema_version",
+        "host_source_revision",
+        "host_executable_sha256",
+        "store_id",
+        "session_id",
+        "events"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+        "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "session_id": { "$ref": "#/$defs/Text" },
+        "events": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/TransactionACommittedEvent" },
+              { "$ref": "#/$defs/TransactionBCommittedEvent" }
+            ]
+          },
+          "allOf": [
+            { "contains": { "$ref": "#/$defs/TransactionACommittedEvent" }, "minContains": 1 },
+            { "contains": { "$ref": "#/$defs/TransactionBCommittedEvent" }, "minContains": 1 }
+          ]
+        }
+      }
+    },
+    "ProvisioningReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes and exclusion of all secret-bearing provisioning material.",
+      "required": [
+        "schema_version",
+        "fixture_seed",
+        "derivation_version",
+        "sensor_id",
+        "device_id",
+        "key_epoch",
+        "key_identity_sha256",
+        "route_identity_sha256",
+        "firmware_image_sha256",
+        "provisioned_at",
+        "result"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "fixture_seed": { "$ref": "#/$defs/Text" },
+        "derivation_version": { "const": 1 },
+        "sensor_id": { "$ref": "#/$defs/Text" },
+        "device_id": { "$ref": "#/$defs/U64" },
+        "key_epoch": { "$ref": "#/$defs/NonZeroU16" },
+        "key_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "route_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "firmware_image_sha256": { "$ref": "#/$defs/Hex64" },
+        "provisioned_at": { "$ref": "#/$defs/Timestamp" },
+        "result": { "enum": ["pass", "fail"] }
+      }
+    },
+    "ProjectionExportRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_seq", "kind", "body_cbor_sha256"],
+      "properties": {
+        "record_seq": { "$ref": "#/$defs/U64" },
+        "kind": {
+          "enum": ["packet", "baseline_command", "timeline_advance", "closed"]
+        },
+        "body_cbor_sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "ProjectionExportPacketFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_seq",
+        "datagram_sha256",
+        "peer",
+        "receive_monotonic_ns",
+        "receive_utc_ns"
+      ],
+      "properties": {
+        "record_seq": { "$ref": "#/$defs/U64" },
+        "datagram_sha256": { "$ref": "#/$defs/Hex64" },
+        "peer": { "$ref": "#/$defs/Text" },
+        "receive_monotonic_ns": { "$ref": "#/$defs/U64" },
+        "receive_utc_ns": { "$ref": "#/$defs/I64" }
+      }
+    },
+    "ProjectionExportEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["link_id", "profile_id", "evidence_sha256"],
+      "properties": {
+        "link_id": { "$ref": "#/$defs/Text" },
+        "profile_id": { "$ref": "#/$defs/Hex64" },
+        "evidence_sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "ProjectionExportSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_id", "snapshot_sha256", "evidence"],
+      "properties": {
+        "snapshot_id": { "$ref": "#/$defs/Text" },
+        "snapshot_sha256": { "$ref": "#/$defs/Hex64" },
+        "evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ProjectionExportEvidence" }
+        }
+      }
+    },
+    "ProjectionStoreExport": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes exported from one SQLite read snapshot, strict ordering, and exclusion of SQLite pages, raw datagrams, and secrets.",
+      "required": [
+        "schema_version",
+        "store_id",
+        "session_id",
+        "durable_tail_record_seq",
+        "processed_through_record_seq",
+        "timeline_state_digest",
+        "projection_commit",
+        "records",
+        "packet_facts",
+        "snapshots"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "session_id": { "$ref": "#/$defs/Text" },
+        "durable_tail_record_seq": { "$ref": "#/$defs/U64" },
+        "processed_through_record_seq": { "$ref": "#/$defs/U64" },
+        "timeline_state_digest": { "$ref": "#/$defs/Hex64" },
+        "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+        "records": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ProjectionExportRecord" }
+        },
+        "packet_facts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ProjectionExportPacketFact" }
+        },
+        "snapshots": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ProjectionExportSnapshot" }
+        }
+      }
+    },
+    "PacketFactCommit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_seq",
+        "datagram_sha256",
+        "transaction_a_commit_event_id",
+        "transaction_b_commit_event_id",
+        "projection_commit"
+      ],
+      "properties": {
+        "record_seq": { "$ref": "#/$defs/U64" },
+        "datagram_sha256": { "$ref": "#/$defs/Hex64" },
+        "transaction_a_commit_event_id": { "$ref": "#/$defs/Text" },
+        "transaction_b_commit_event_id": { "$ref": "#/$defs/Text" },
+        "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" }
+      }
+    },
+    "PacketFactCommits": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "$comment": "Prose requires strict numeric record_seq order and one-to-one binding to retained parent datagrams, projection-store-export packet facts, and Host commit-trace A/B events.",
+      "items": { "$ref": "#/$defs/PacketFactCommit" }
+    },
+    "ProjectionReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes and validation against the Host commit trace and projection store export generated from live SQLite.",
+      "required": [
+        "schema_version",
+        "projection_commit",
+        "session_id",
+        "first_record_seq",
+        "last_record_seq",
+        "processed_through_record_seq",
+        "packet_fact_commits",
+        "timeline_state_digest",
+        "host_commit_trace_sha256",
+        "projection_store_export_sha256",
+        "projection_committed_at",
+        "result"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+        "session_id": { "$ref": "#/$defs/Text" },
+        "first_record_seq": { "$ref": "#/$defs/U64" },
+        "last_record_seq": { "$ref": "#/$defs/U64" },
+        "processed_through_record_seq": { "$ref": "#/$defs/U64" },
+        "packet_fact_commits": { "$ref": "#/$defs/PacketFactCommits" },
+        "timeline_state_digest": { "$ref": "#/$defs/Hex64" },
+        "host_commit_trace_sha256": { "$ref": "#/$defs/Hex64" },
+        "projection_store_export_sha256": { "$ref": "#/$defs/Hex64" },
+        "projection_committed_at": { "$ref": "#/$defs/Timestamp" },
+        "result": { "enum": ["pass", "fail"] }
+      }
+    },
+    "BrowserWebSocketEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "received_at", "text"],
+      "properties": {
+        "event_id": { "$ref": "#/$defs/Text" },
+        "received_at": { "$ref": "#/$defs/Timestamp" },
+        "text": { "$ref": "#/$defs/Text" }
+      }
+    },
+    "BrowserWebSocketTranscript": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 wrapper bytes and requires every text field to decode as exactly one api-ui-v1 LiveEnvelope with no trailing bytes.",
+      "required": ["schema_version", "connection_id", "events"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "connection_id": { "$ref": "#/$defs/Text" },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/BrowserWebSocketEvent" }
+        }
+      }
+    },
+    "TraceViewReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "The verifier additionally validates exact equality with api-ui-v1 $defs.ViewReceipt.",
+      "required": [
+        "projection_commit",
+        "session_id",
+        "first_record_seq",
+        "last_record_seq",
+        "decoder_version",
+        "conditioning_version",
+        "algorithm_version"
+      ],
+      "properties": {
+        "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+        "session_id": { "$ref": "#/$defs/Text" },
+        "first_record_seq": { "$ref": "#/$defs/U64" },
+        "last_record_seq": { "$ref": "#/$defs/U64" },
+        "decoder_version": { "$ref": "#/$defs/Text" },
+        "conditioning_version": { "$ref": "#/$defs/Text" },
+        "algorithm_version": { "$ref": "#/$defs/Text" }
+      }
+    },
+    "BrowserWatermarkEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "event_seq",
+        "kind",
+        "monotonic_ns",
+        "utc",
+        "transcript_event_id",
+        "projection_commit"
+      ],
+      "properties": {
+        "event_id": { "$ref": "#/$defs/Text" },
+        "event_seq": { "$ref": "#/$defs/U64" },
+        "kind": { "const": "websocket_watermark_received" },
+        "monotonic_ns": { "$ref": "#/$defs/U64" },
+        "utc": { "$ref": "#/$defs/Timestamp" },
+        "transcript_event_id": { "$ref": "#/$defs/Text" },
+        "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" }
+      }
+    },
+    "BrowserHttpEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "event_seq",
+        "kind",
+        "monotonic_ns",
+        "utc",
+        "body_sha256",
+        "view_receipt"
+      ],
+      "properties": {
+        "event_id": { "$ref": "#/$defs/Text" },
+        "event_seq": { "$ref": "#/$defs/U64" },
+        "kind": { "const": "http_body_received" },
+        "monotonic_ns": { "$ref": "#/$defs/U64" },
+        "utc": { "$ref": "#/$defs/Timestamp" },
+        "body_sha256": { "$ref": "#/$defs/Hex64" },
+        "view_receipt": { "$ref": "#/$defs/TraceViewReceipt" }
+      }
+    },
+    "VisibleDomObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag_name", "role", "accessible_name", "visible_text"],
+      "properties": {
+        "tag_name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "role": { "$ref": "#/$defs/Text" },
+        "accessible_name": { "$ref": "#/$defs/Text" },
+        "visible_text": { "$ref": "#/$defs/Text" }
+      }
+    },
+    "BrowserDomEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "event_seq",
+        "kind",
+        "monotonic_ns",
+        "utc",
+        "selector",
+        "visible",
+        "observation",
+        "projection_commit"
+      ],
+      "properties": {
+        "event_id": { "const": "dom" },
+        "event_seq": { "$ref": "#/$defs/U64" },
+        "kind": { "const": "dom_observation_visible" },
+        "monotonic_ns": { "$ref": "#/$defs/U64" },
+        "utc": { "$ref": "#/$defs/Timestamp" },
+        "selector": { "$ref": "#/$defs/Text" },
+        "visible": { "const": true },
+        "observation": { "$ref": "#/$defs/VisibleDomObservation" },
+        "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" }
+      }
+    },
+    "BrowserScreenshotEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "event_seq",
+        "kind",
+        "monotonic_ns",
+        "utc",
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "event_id": { "const": "screenshot" },
+        "event_seq": { "$ref": "#/$defs/U64" },
+        "kind": { "const": "screenshot_captured" },
+        "monotonic_ns": { "$ref": "#/$defs/U64" },
+        "utc": { "$ref": "#/$defs/Timestamp" },
+        "path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "BrowserTrace": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes, strict event sequence and monotonic order, and cross-artifact/API validation.",
+      "required": ["schema_version", "chrome_version", "page_instance_id", "connection_id", "events"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "chrome_version": { "$ref": "#/$defs/Text" },
+        "page_instance_id": { "$ref": "#/$defs/Text" },
+        "connection_id": { "$ref": "#/$defs/Text" },
+        "events": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            { "$ref": "#/$defs/BrowserWatermarkEvent" },
+            { "$ref": "#/$defs/BrowserHttpEvent" },
+            { "$ref": "#/$defs/BrowserDomEvent" },
+            { "$ref": "#/$defs/BrowserScreenshotEvent" }
+          ],
+          "items": false
+        }
+      }
+    },
+    "DiagnosticComputedStyle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["color", "background_color", "opacity", "display", "visibility"],
+      "properties": {
+        "color": { "$ref": "#/$defs/Text" },
+        "background_color": { "$ref": "#/$defs/Text" },
+        "opacity": { "$ref": "#/$defs/Text" },
+        "display": { "$ref": "#/$defs/Text" },
+        "visibility": { "$ref": "#/$defs/Text" }
+      }
+    },
+    "DiagnosticRenderedObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "selector", "visible", "observation", "computed_style"],
+      "properties": {
+        "name": { "$ref": "#/$defs/Text" },
+        "selector": { "$ref": "#/$defs/Text" },
+        "visible": { "const": true },
+        "observation": { "$ref": "#/$defs/VisibleDomObservation" },
+        "computed_style": { "$ref": "#/$defs/DiagnosticComputedStyle" }
+      }
+    },
+    "DiagnosticUiCaseCore": {
+      "type": "object",
+      "required": [
+        "behavior",
+        "classification",
+        "claim_id",
+        "started_at",
+        "finished_at",
+        "browser_trace_path",
+        "browser_trace_sha256",
+        "screenshot",
+        "result"
+      ],
+      "properties": {
+        "behavior": { "$ref": "#/$defs/Text" },
+        "classification": {
+          "enum": [
+            "captured-corpus-e2e",
+            "scenario-e2e",
+            "live-physical-e2e"
+          ]
+        },
+        "claim_id": { "$ref": "#/$defs/Text" },
+        "started_at": { "$ref": "#/$defs/Timestamp" },
+        "finished_at": { "$ref": "#/$defs/Timestamp" },
+        "browser_trace_path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "browser_trace_sha256": { "$ref": "#/$defs/Hex64" },
+        "screenshot": { "$ref": "#/$defs/ScreenshotLocator" },
+        "result": { "const": "pass" }
+      }
+    },
+    "DiagnosticContextObservations": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticRenderedObservation" }, { "properties": { "name": { "const": "deployment_context" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticRenderedObservation" }, { "properties": { "name": { "const": "sensor_context" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticRenderedObservation" }, { "properties": { "name": { "const": "link_context" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticRenderedObservation" }, { "properties": { "name": { "const": "profile_context" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticRenderedObservation" }, { "properties": { "name": { "const": "session_context" } } }] }
+      ],
+      "items": false
+    },
+    "DiagnosticSignalFacet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream_id", "profile_id", "observation"],
+      "properties": {
+        "stream_id": { "$ref": "#/$defs/Text" },
+        "profile_id": { "$ref": "#/$defs/Hex64" },
+        "observation": {
+          "allOf": [
+            { "$ref": "#/$defs/DiagnosticRenderedObservation" },
+            { "properties": { "name": { "const": "signal_facet" } } }
+          ]
+        }
+      }
+    },
+    "DiagnosticContextAndFacetsCase": {
+      "allOf": [
+        { "$ref": "#/$defs/DiagnosticUiCaseCore" },
+        {
+          "type": "object",
+          "required": ["contexts", "facets"],
+          "properties": {
+            "behavior": { "const": "context_and_dynamic_facets" },
+            "contexts": { "$ref": "#/$defs/DiagnosticContextObservations" },
+            "facets": {
+              "type": "array",
+              "minItems": 2,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/DiagnosticSignalFacet" }
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "DiagnosticFacetIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_id",
+        "profile_id",
+        "native_coordinate_kind",
+        "native_coordinate_label"
+      ],
+      "properties": {
+        "stream_id": { "$ref": "#/$defs/Text" },
+        "profile_id": { "$ref": "#/$defs/Hex64" },
+        "native_coordinate_kind": {
+          "enum": ["opaque_sample_ordinal", "ieee_tone_index", "frequency_hz"]
+        },
+        "native_coordinate_label": { "$ref": "#/$defs/Text" }
+      }
+    },
+    "DiagnosticViewportObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "viewport_width_px",
+        "viewport_height_px",
+        "zoom_percent",
+        "observation"
+      ],
+      "properties": {
+        "viewport_width_px": { "$ref": "#/$defs/NonZeroU64" },
+        "viewport_height_px": { "$ref": "#/$defs/NonZeroU64" },
+        "zoom_percent": { "$ref": "#/$defs/NonZeroU64" },
+        "observation": { "$ref": "#/$defs/DiagnosticRenderedObservation" }
+      }
+    },
+    "DiagnosticResizeZoomIdentityCase": {
+      "allOf": [
+        { "$ref": "#/$defs/DiagnosticUiCaseCore" },
+        {
+          "type": "object",
+          "required": ["action", "identity", "before", "after"],
+          "properties": {
+            "behavior": { "const": "resize_zoom_identity" },
+            "action": { "enum": ["resize", "zoom", "resize_and_zoom"] },
+            "identity": { "$ref": "#/$defs/DiagnosticFacetIdentity" },
+            "before": { "$ref": "#/$defs/DiagnosticViewportObservation" },
+            "after": { "$ref": "#/$defs/DiagnosticViewportObservation" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "DiagnosticForbiddenSelectorCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "selector", "match_count"],
+      "properties": {
+        "name": {
+          "enum": [
+            "baseline_command_control",
+            "state_changing_control",
+            "spatial_heatmap",
+            "human_person_semantics",
+            "human_presence_semantics",
+            "human_pose_semantics"
+          ]
+        },
+        "selector": { "$ref": "#/$defs/Text" },
+        "match_count": { "const": "0" }
+      }
+    },
+    "DiagnosticForbiddenSelectorChecks": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticForbiddenSelectorCheck" }, { "properties": { "name": { "const": "baseline_command_control" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticForbiddenSelectorCheck" }, { "properties": { "name": { "const": "state_changing_control" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticForbiddenSelectorCheck" }, { "properties": { "name": { "const": "spatial_heatmap" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticForbiddenSelectorCheck" }, { "properties": { "name": { "const": "human_person_semantics" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticForbiddenSelectorCheck" }, { "properties": { "name": { "const": "human_presence_semantics" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/DiagnosticForbiddenSelectorCheck" }, { "properties": { "name": { "const": "human_pose_semantics" } } }] }
+      ],
+      "items": false
+    },
+    "DiagnosticAxisAndSafetyCase": {
+      "allOf": [
+        { "$ref": "#/$defs/DiagnosticUiCaseCore" },
+        {
+          "type": "object",
+          "required": [
+            "native_coordinate_kind",
+            "axis_label",
+            "geometry_available",
+            "human_labels_available",
+            "forbidden_selectors"
+          ],
+          "properties": {
+            "behavior": { "const": "axis_semantics_and_read_only_safety" },
+            "native_coordinate_kind": {
+              "enum": ["opaque_sample_ordinal", "ieee_tone_index", "frequency_hz"]
+            },
+            "axis_label": {
+              "allOf": [
+                { "$ref": "#/$defs/DiagnosticRenderedObservation" },
+                { "properties": { "name": { "const": "native_coordinate_axis_label" } } }
+              ]
+            },
+            "geometry_available": { "const": false },
+            "human_labels_available": { "const": false },
+            "forbidden_selectors": { "$ref": "#/$defs/DiagnosticForbiddenSelectorChecks" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "DiagnosticMissingVsZeroCase": {
+      "allOf": [
+        { "$ref": "#/$defs/DiagnosticUiCaseCore" },
+        {
+          "type": "object",
+          "required": ["missing_value", "measured_zero"],
+          "properties": {
+            "behavior": { "const": "missing_vs_zero" },
+            "missing_value": {
+              "allOf": [
+                { "$ref": "#/$defs/DiagnosticRenderedObservation" },
+                { "properties": { "name": { "const": "missing_value" } } }
+              ]
+            },
+            "measured_zero": {
+              "allOf": [
+                { "$ref": "#/$defs/DiagnosticRenderedObservation" },
+                { "properties": { "name": { "const": "measured_zero" } } }
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "DiagnosticViewCase": {
+      "allOf": [
+        { "$ref": "#/$defs/DiagnosticUiCaseCore" },
+        {
+          "type": "object",
+          "required": ["observation"],
+          "properties": {
+            "behavior": {
+              "enum": ["timeline_view", "world_view", "evidence_view", "baseline_view"]
+            },
+            "observation": { "$ref": "#/$defs/DiagnosticRenderedObservation" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "DiagnosticProtocolErrorCase": {
+      "allOf": [
+        { "$ref": "#/$defs/DiagnosticUiCaseCore" },
+        {
+          "type": "object",
+          "required": ["invalid_input", "protocol_error"],
+          "properties": {
+            "behavior": { "const": "protocol_error" },
+            "invalid_input": { "$ref": "#/$defs/Text" },
+            "protocol_error": {
+              "allOf": [
+                { "$ref": "#/$defs/DiagnosticRenderedObservation" },
+                { "properties": { "name": { "const": "protocol_error" } } }
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "DiagnosticConnectionStateObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "observed_at", "observation"],
+      "properties": {
+        "state": { "enum": ["DISCONNECTED", "STALE", "RESYNCHRONIZING", "LIVE"] },
+        "observed_at": { "$ref": "#/$defs/Timestamp" },
+        "observation": { "$ref": "#/$defs/DiagnosticRenderedObservation" }
+      }
+    },
+    "DiagnosticConnectionStates": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/DiagnosticConnectionStateObservation" },
+            {
+              "properties": {
+                "state": { "const": "DISCONNECTED" },
+                "observation": { "properties": { "name": { "const": "disconnected" } } }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/DiagnosticConnectionStateObservation" },
+            {
+              "properties": {
+                "state": { "const": "STALE" },
+                "observation": { "properties": { "name": { "const": "stale" } } }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/DiagnosticConnectionStateObservation" },
+            {
+              "properties": {
+                "state": { "const": "RESYNCHRONIZING" },
+                "observation": { "properties": { "name": { "const": "resynchronizing" } } }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/DiagnosticConnectionStateObservation" },
+            {
+              "properties": {
+                "state": { "const": "LIVE" },
+                "observation": { "properties": { "name": { "const": "live" } } }
+              }
+            }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "DiagnosticTransportReconnectCase": {
+      "allOf": [
+        { "$ref": "#/$defs/DiagnosticUiCaseCore" },
+        {
+          "type": "object",
+          "required": [
+            "session_id",
+            "projection",
+            "host_process_instance_id",
+            "page_instance_id",
+            "before_connection_id",
+            "after_connection_id",
+            "before_commit_index_row_count",
+            "after_commit_index_row_count",
+            "ingest_quiescent",
+            "navigation_count",
+            "states"
+          ],
+          "properties": {
+            "behavior": { "const": "transport_reconnect" },
+            "session_id": { "$ref": "#/$defs/Text" },
+            "projection": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+            "host_process_instance_id": { "$ref": "#/$defs/Text" },
+            "page_instance_id": { "$ref": "#/$defs/Text" },
+            "before_connection_id": { "$ref": "#/$defs/Text" },
+            "after_connection_id": { "$ref": "#/$defs/Text" },
+            "before_commit_index_row_count": { "$ref": "#/$defs/U64" },
+            "after_commit_index_row_count": { "$ref": "#/$defs/U64" },
+            "ingest_quiescent": { "const": true },
+            "navigation_count": { "const": "0" },
+            "states": { "$ref": "#/$defs/DiagnosticConnectionStates" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "DiagnosticHostRestartRecoveryCase": {
+      "allOf": [
+        { "$ref": "#/$defs/DiagnosticUiCaseCore" },
+        {
+          "type": "object",
+          "required": [
+            "host_restart_claim_id",
+            "session_id",
+            "before_projection",
+            "after_projection",
+            "before_durable_tail_record_seq",
+            "before_processed_through_record_seq",
+            "recovered_through_record_seq",
+            "continued_record_seq",
+            "continued_datagram_sha256",
+            "page_instance_id",
+            "before_connection_id",
+            "after_connection_id",
+            "states"
+          ],
+          "properties": {
+            "behavior": { "const": "host_restart_recovery" },
+            "host_restart_claim_id": { "$ref": "#/$defs/Text" },
+            "session_id": { "$ref": "#/$defs/Text" },
+            "before_projection": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+            "after_projection": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+            "before_durable_tail_record_seq": { "$ref": "#/$defs/U64" },
+            "before_processed_through_record_seq": { "$ref": "#/$defs/U64" },
+            "recovered_through_record_seq": { "$ref": "#/$defs/U64" },
+            "continued_record_seq": { "$ref": "#/$defs/U64" },
+            "continued_datagram_sha256": { "$ref": "#/$defs/Hex64" },
+            "page_instance_id": { "$ref": "#/$defs/Text" },
+            "before_connection_id": { "$ref": "#/$defs/Text" },
+            "after_connection_id": { "$ref": "#/$defs/Text" },
+            "states": { "$ref": "#/$defs/DiagnosticConnectionStates" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "DiagnosticUiCases": {
+      "type": "array",
+      "minItems": 11,
+      "maxItems": 11,
+      "prefixItems": [
+        { "$ref": "#/$defs/DiagnosticContextAndFacetsCase" },
+        { "$ref": "#/$defs/DiagnosticResizeZoomIdentityCase" },
+        { "$ref": "#/$defs/DiagnosticAxisAndSafetyCase" },
+        { "$ref": "#/$defs/DiagnosticMissingVsZeroCase" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/DiagnosticViewCase" },
+            {
+              "properties": {
+                "behavior": { "const": "timeline_view" },
+                "observation": { "properties": { "name": { "const": "timeline_view" } } }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/DiagnosticViewCase" },
+            {
+              "properties": {
+                "behavior": { "const": "world_view" },
+                "observation": { "properties": { "name": { "const": "world_view" } } }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/DiagnosticViewCase" },
+            {
+              "properties": {
+                "behavior": { "const": "evidence_view" },
+                "observation": { "properties": { "name": { "const": "evidence_view" } } }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/DiagnosticViewCase" },
+            {
+              "properties": {
+                "behavior": { "const": "baseline_view" },
+                "observation": { "properties": { "name": { "const": "baseline_view" } } }
+              }
+            }
+          ]
+        },
+        { "$ref": "#/$defs/DiagnosticProtocolErrorCase" },
+        { "$ref": "#/$defs/DiagnosticTransportReconnectCase" },
+        { "$ref": "#/$defs/DiagnosticHostRestartRecoveryCase" }
+      ],
+      "items": false
+    },
+    "DiagnosticUiAcceptanceReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "The independent verifier records raw queried DOM/accessibility/style observations and binds each behavior case to one passing graph browser claim, its BrowserTrace, and its PNG.",
+      "required": [
+        "schema_version",
+        "source_revision",
+        "verifier_identity",
+        "chrome_version",
+        "started_at",
+        "finished_at",
+        "cases",
+        "result"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "source_revision": { "$ref": "#/$defs/GitRevision" },
+        "verifier_identity": { "$ref": "#/$defs/Text" },
+        "chrome_version": { "$ref": "#/$defs/Text" },
+        "started_at": { "$ref": "#/$defs/Timestamp" },
+        "finished_at": { "$ref": "#/$defs/Timestamp" },
+        "cases": { "$ref": "#/$defs/DiagnosticUiCases" },
+        "result": { "const": "pass" }
+      }
+    },
+    "HostRestartReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes and ordered restart event times.",
+      "required": [
+        "schema_version",
+        "host_source_revision",
+        "host_executable_sha256",
+        "configuration_identity_sha256",
+        "store_id",
+        "session_id",
+        "before_projection",
+        "after_projection",
+        "before_durable_tail_record_seq",
+        "before_processed_through_record_seq",
+        "recovered_through_record_seq",
+        "continued_record_seq",
+        "continued_datagram_sha256",
+        "page_instance_id",
+        "before_connection_id",
+        "after_connection_id",
+        "browser_claim_id",
+        "browser_trace_path",
+        "browser_trace_sha256",
+        "connection_states",
+        "host_stopped_at",
+        "host_started_at",
+        "recovery_completed_at",
+        "continued_record_committed_at",
+        "sensor_restarted",
+        "mac_restarted",
+        "sqlite_store_retained",
+        "result"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+        "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+        "configuration_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "session_id": { "$ref": "#/$defs/Text" },
+        "before_projection": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+        "after_projection": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+        "before_durable_tail_record_seq": { "$ref": "#/$defs/U64" },
+        "before_processed_through_record_seq": { "$ref": "#/$defs/U64" },
+        "recovered_through_record_seq": { "$ref": "#/$defs/U64" },
+        "continued_record_seq": { "$ref": "#/$defs/U64" },
+        "continued_datagram_sha256": { "$ref": "#/$defs/Hex64" },
+        "page_instance_id": { "$ref": "#/$defs/Text" },
+        "before_connection_id": { "$ref": "#/$defs/Text" },
+        "after_connection_id": { "$ref": "#/$defs/Text" },
+        "browser_claim_id": { "$ref": "#/$defs/Text" },
+        "browser_trace_path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "browser_trace_sha256": { "$ref": "#/$defs/Hex64" },
+        "connection_states": { "$ref": "#/$defs/DiagnosticConnectionStates" },
+        "host_stopped_at": { "$ref": "#/$defs/Timestamp" },
+        "host_started_at": { "$ref": "#/$defs/Timestamp" },
+        "recovery_completed_at": { "$ref": "#/$defs/Timestamp" },
+        "continued_record_committed_at": { "$ref": "#/$defs/Timestamp" },
+        "sensor_restarted": { "const": false },
+        "mac_restarted": { "const": false },
+        "sqlite_store_retained": { "const": true },
+        "result": { "enum": ["pass", "fail"] }
+      }
+    },
+    "StorageCheckResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "result"],
+      "properties": {
+        "name": {
+          "enum": [
+            "application_lease_two_process_exclusion",
+            "fail_closed_corruption",
+            "lock_reacquisition",
+            "same_process_readers",
+            "sigkill_lock_release",
+            "staged_no_replace_publication",
+            "wal_recovery"
+          ]
+        },
+        "result": { "enum": ["pass", "fail"] }
+      }
+    },
+    "StorageCheckResults": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/StorageCheckResult" }, { "properties": { "name": { "const": "application_lease_two_process_exclusion" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/StorageCheckResult" }, { "properties": { "name": { "const": "fail_closed_corruption" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/StorageCheckResult" }, { "properties": { "name": { "const": "lock_reacquisition" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/StorageCheckResult" }, { "properties": { "name": { "const": "same_process_readers" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/StorageCheckResult" }, { "properties": { "name": { "const": "sigkill_lock_release" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/StorageCheckResult" }, { "properties": { "name": { "const": "staged_no_replace_publication" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/StorageCheckResult" }, { "properties": { "name": { "const": "wal_recovery" } } }] }
+      ],
+      "items": false
+    },
+    "StorageVfsAttempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "vfs", "checks", "result"],
+      "properties": {
+        "kind": { "enum": ["default", "fallback"] },
+        "vfs": { "$ref": "#/$defs/Text" },
+        "checks": { "$ref": "#/$defs/StorageCheckResults" },
+        "result": { "enum": ["pass", "fail"] }
+      }
+    },
+    "StorageVfsAttempts": {
+      "type": "array",
+      "minItems": 1,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/StorageVfsAttempt" },
+            { "properties": { "kind": { "const": "default" } } }
+          ]
+        }
+      ],
+      "items": {
+        "allOf": [
+          { "$ref": "#/$defs/StorageVfsAttempt" },
+          { "properties": { "kind": { "const": "fallback" } } }
+        ]
+      }
+    },
+    "StorageQualificationReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes and equality with the storage claim and its environment.",
+      "required": [
+        "schema_version",
+        "host_source_revision",
+        "host_executable_sha256",
+        "vfs",
+        "vfs_attempts",
+        "environment",
+        "checks",
+        "result"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+        "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+        "vfs": { "$ref": "#/$defs/Text" },
+        "vfs_attempts": { "$ref": "#/$defs/StorageVfsAttempts" },
+        "environment": { "$ref": "#/$defs/Environment" },
+        "checks": { "$ref": "#/$defs/StorageCheckResults" },
+        "result": { "enum": ["pass", "fail"] }
+      }
+    },
+    "ResourceLoad": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sensor_count",
+        "route_count",
+        "link_count",
+        "profile_count",
+        "peak_packets_per_second",
+        "maximum_native_path_count",
+        "maximum_native_coordinate_count_per_path"
+      ],
+      "properties": {
+        "sensor_count": { "const": "1" },
+        "route_count": { "const": "1" },
+        "link_count": { "const": "1" },
+        "profile_count": { "const": "1" },
+        "peak_packets_per_second": { "$ref": "#/$defs/NonZeroU64" },
+        "maximum_native_path_count": { "$ref": "#/$defs/NonZeroU64" },
+        "maximum_native_coordinate_count_per_path": { "$ref": "#/$defs/NonZeroU64" }
+      }
+    },
+    "ResourceWindowTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width_ns", "step_ns", "snapshot_deadline_ns"],
+      "properties": {
+        "width_ns": { "$ref": "#/$defs/NonZeroU64" },
+        "step_ns": { "$ref": "#/$defs/NonZeroU64" },
+        "snapshot_deadline_ns": { "$ref": "#/$defs/NonZeroU64" }
+      },
+      "$comment": "Runtime validation requires width_ns <= step_ns and snapshot_deadline_ns <= floor(step_ns / 2); this schema does not introduce a fixed deadline."
+    },
+    "ResourceQueryLoad": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_request_count", "websocket_client_count"],
+      "properties": {
+        "http_request_count": { "$ref": "#/$defs/NonZeroU64" },
+        "websocket_client_count": { "$ref": "#/$defs/NonZeroU64" }
+      }
+    },
+    "ResourceTailObservations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_count", "p95_ns", "p99_ns", "maximum_ns"],
+      "properties": {
+        "sample_count": { "$ref": "#/$defs/NonZeroU64" },
+        "p95_ns": { "$ref": "#/$defs/U64" },
+        "p99_ns": { "$ref": "#/$defs/U64" },
+        "maximum_ns": { "$ref": "#/$defs/U64" }
+      },
+      "$comment": "Runtime validation requires p95_ns <= p99_ns <= maximum_ns."
+    },
+    "ClientBackpressureObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "queue_capacity",
+        "peak_queue_depth",
+        "backpressure_events",
+        "client_disconnects"
+      ],
+      "properties": {
+        "queue_capacity": { "$ref": "#/$defs/NonZeroU64" },
+        "peak_queue_depth": { "$ref": "#/$defs/U64" },
+        "backpressure_events": { "$ref": "#/$defs/U64" },
+        "client_disconnects": { "$ref": "#/$defs/U64" }
+      },
+      "$comment": "Runtime validation requires peak_queue_depth <= queue_capacity."
+    },
+    "ResourceQualificationReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes, equality with the resource claim and its environment, and validation against evaluation v1 without inventing a fixed duration threshold.",
+      "required": [
+        "schema_version",
+        "host_source_revision",
+        "host_executable_sha256",
+        "configuration_identity_sha256",
+        "procedure",
+        "started_at",
+        "finished_at",
+        "target_host",
+        "operating_system",
+        "cpu_policy",
+        "thread_policy",
+        "memory_limit_bytes",
+        "maximum_cpu_threads",
+        "executable_profile",
+        "load",
+        "window_timing",
+        "query_load",
+        "corpus_sha256",
+        "missed_deadlines",
+        "input_loss",
+        "unexplained_sequence_gaps",
+        "write_failures",
+        "peak_rss_bytes",
+        "mac_model",
+        "architecture",
+        "macos_version",
+        "rust_version",
+        "node_version",
+        "chrome_version",
+        "thread_count",
+        "tail_observations",
+        "client_backpressure",
+        "semantic_input_unchanged",
+        "estimator_behavior_unchanged",
+        "retained_facts_complete",
+        "result"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+        "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+        "configuration_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "procedure": { "$ref": "#/$defs/Text" },
+        "started_at": { "$ref": "#/$defs/Timestamp" },
+        "finished_at": { "$ref": "#/$defs/Timestamp" },
+        "target_host": { "$ref": "#/$defs/Text" },
+        "operating_system": { "const": "macOS" },
+        "cpu_policy": { "$ref": "#/$defs/Text" },
+        "thread_policy": { "$ref": "#/$defs/Text" },
+        "memory_limit_bytes": { "$ref": "#/$defs/NonZeroU64" },
+        "maximum_cpu_threads": { "$ref": "#/$defs/NonZeroU64" },
+        "executable_profile": { "$ref": "#/$defs/Text" },
+        "load": { "$ref": "#/$defs/ResourceLoad" },
+        "window_timing": { "$ref": "#/$defs/ResourceWindowTiming" },
+        "query_load": { "$ref": "#/$defs/ResourceQueryLoad" },
+        "corpus_sha256": { "$ref": "#/$defs/Hex64" },
+        "missed_deadlines": { "$ref": "#/$defs/U64" },
+        "input_loss": { "$ref": "#/$defs/U64" },
+        "unexplained_sequence_gaps": { "$ref": "#/$defs/U64" },
+        "write_failures": { "$ref": "#/$defs/U64" },
+        "peak_rss_bytes": { "$ref": "#/$defs/NonZeroU64" },
+        "mac_model": { "$ref": "#/$defs/Text" },
+        "architecture": { "$ref": "#/$defs/Text" },
+        "macos_version": { "$ref": "#/$defs/Text" },
+        "rust_version": { "$ref": "#/$defs/Text" },
+        "node_version": { "$ref": "#/$defs/Text" },
+        "chrome_version": { "$ref": "#/$defs/Text" },
+        "thread_count": { "$ref": "#/$defs/NonZeroU64" },
+        "tail_observations": { "$ref": "#/$defs/ResourceTailObservations" },
+        "client_backpressure": { "$ref": "#/$defs/ClientBackpressureObservation" },
+        "semantic_input_unchanged": { "type": "boolean" },
+        "estimator_behavior_unchanged": { "type": "boolean" },
+        "retained_facts_complete": { "type": "boolean" },
+        "result": { "enum": ["pass", "fail"] }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "result": { "const": "pass" } },
+            "required": ["result"]
+          },
+          "then": {
+            "properties": {
+              "missed_deadlines": { "const": "0" },
+              "input_loss": { "const": "0" },
+              "unexplained_sequence_gaps": { "const": "0" },
+              "write_failures": { "const": "0" },
+              "semantic_input_unchanged": { "const": true },
+              "estimator_behavior_unchanged": { "const": true },
+              "retained_facts_complete": { "const": true }
+            }
+          }
+        }
+      ]
+    },
+    "CorpusRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_identity_sha256",
+        "sensor_id",
+        "device_id",
+        "key_epoch",
+        "link_id",
+        "profile_id"
+      ],
+      "properties": {
+        "route_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "sensor_id": { "$ref": "#/$defs/Text" },
+        "device_id": { "$ref": "#/$defs/U64" },
+        "key_epoch": { "$ref": "#/$defs/NonZeroU16" },
+        "link_id": { "$ref": "#/$defs/Text" },
+        "profile_id": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "CorpusRoutes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/CorpusRoute" }
+    },
+    "CorpusSourceSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store_id",
+        "session_id",
+        "lifecycle",
+        "first_record_seq",
+        "last_record_seq",
+        "processed_through_record_seq",
+        "projection_commit",
+        "source_range_sha256"
+      ],
+      "properties": {
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "session_id": { "$ref": "#/$defs/Text" },
+        "lifecycle": { "const": "sealed" },
+        "first_record_seq": { "$ref": "#/$defs/U64" },
+        "last_record_seq": { "$ref": "#/$defs/U64" },
+        "processed_through_record_seq": { "$ref": "#/$defs/U64" },
+        "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+        "source_range_sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "CorpusDatagram": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "order",
+        "record_seq",
+        "route_identity_sha256",
+        "file",
+        "byte_length",
+        "sha256",
+        "peer",
+        "receive_monotonic_ns",
+        "receive_utc_ns"
+      ],
+      "properties": {
+        "order": { "$ref": "#/$defs/U64" },
+        "record_seq": { "$ref": "#/$defs/U64" },
+        "route_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "file": { "$ref": "#/$defs/CorpusFile" },
+        "byte_length": { "$ref": "#/$defs/NonZeroU64" },
+        "sha256": { "$ref": "#/$defs/Hex64" },
+        "peer": { "$ref": "#/$defs/Text" },
+        "receive_monotonic_ns": { "$ref": "#/$defs/U64" },
+        "receive_utc_ns": { "$ref": "#/$defs/I64" }
+      }
+    },
+    "CorpusDatagrams": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/CorpusDatagram" }
+    },
+    "CorpusPhysicalSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_identity_sha256",
+        "board_identity",
+        "firmware_revision",
+        "firmware_image_sha256",
+        "provisioning_receipt_sha256",
+        "capture_tool_identity",
+        "capture_started_at",
+        "capture_finished_at"
+      ],
+      "properties": {
+        "route_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "board_identity": { "$ref": "#/$defs/Text" },
+        "firmware_revision": { "$ref": "#/$defs/GitRevision" },
+        "firmware_image_sha256": { "$ref": "#/$defs/Hex64" },
+        "provisioning_receipt_sha256": { "$ref": "#/$defs/Hex64" },
+        "capture_tool_identity": { "$ref": "#/$defs/Text" },
+        "capture_started_at": { "$ref": "#/$defs/Timestamp" },
+        "capture_finished_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "CorpusPhysicalSources": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/CorpusPhysicalSource" }
+    },
+    "PhysicalCaptureLineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "sources"],
+      "properties": {
+        "kind": { "const": "physical_capture" },
+        "sources": { "$ref": "#/$defs/CorpusPhysicalSources" }
+      }
+    },
+    "GeneratedScenarioLineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "generator_identity",
+        "generator_source_revision",
+        "scenario_id",
+        "scenario_sha256"
+      ],
+      "properties": {
+        "kind": { "const": "generated_scenario" },
+        "generator_identity": { "$ref": "#/$defs/Text" },
+        "generator_source_revision": { "$ref": "#/$defs/GitRevision" },
+        "scenario_id": { "$ref": "#/$defs/Text" },
+        "scenario_sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "CorpusManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "exporter_identity",
+        "source_snapshot",
+        "source_kind",
+        "lineage",
+        "configuration_identity_sha256",
+        "routes",
+        "content_sha256",
+        "datagrams"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "exporter_identity": { "$ref": "#/$defs/Text" },
+        "source_snapshot": { "$ref": "#/$defs/CorpusSourceSnapshot" },
+        "source_kind": { "enum": ["physical_capture", "generated_scenario"] },
+        "lineage": {
+          "oneOf": [
+            { "$ref": "#/$defs/PhysicalCaptureLineage" },
+            { "$ref": "#/$defs/GeneratedScenarioLineage" }
+          ]
+        },
+        "configuration_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "routes": { "$ref": "#/$defs/CorpusRoutes" },
+        "content_sha256": { "$ref": "#/$defs/Hex64" },
+        "datagrams": { "$ref": "#/$defs/CorpusDatagrams" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "source_kind": { "const": "physical_capture" } } },
+          "then": { "properties": { "lineage": { "$ref": "#/$defs/PhysicalCaptureLineage" } } }
+        },
+        {
+          "if": { "properties": { "source_kind": { "const": "generated_scenario" } } },
+          "then": { "properties": { "lineage": { "$ref": "#/$defs/GeneratedScenarioLineage" } } }
+        }
+      ]
+    },
+    "Environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "os_version", "architecture"],
+      "properties": {
+        "platform": { "$ref": "#/$defs/Text" },
+        "os_version": { "$ref": "#/$defs/Text" },
+        "architecture": { "$ref": "#/$defs/Text" }
+      }
+    },
+    "ClaimCore": {
+      "type": "object",
+      "required": [
+        "id",
+        "claim_type",
+        "parents",
+        "started_at",
+        "finished_at",
+        "result",
+        "tool_identity",
+        "environment",
+        "artifacts"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/Text" },
+        "claim_type": { "$ref": "#/$defs/Text" },
+        "parents": { "$ref": "#/$defs/ClaimParents" },
+        "started_at": { "$ref": "#/$defs/Timestamp" },
+        "finished_at": { "$ref": "#/$defs/Timestamp" },
+        "result": { "enum": ["pass", "fail"] },
+        "tool_identity": { "$ref": "#/$defs/Text" },
+        "environment": { "$ref": "#/$defs/Environment" },
+        "artifacts": { "$ref": "#/$defs/ArtifactRefs" }
+      }
+    },
+    "PhysicalCaptureClaim": {
+      "allOf": [
+        { "$ref": "#/$defs/ClaimCore" },
+        {
+          "type": "object",
+          "required": [
+            "board_identity",
+            "sensor_id",
+            "device_id",
+            "key_epoch",
+            "firmware_revision",
+            "firmware_image_sha256",
+            "provisioning_receipt_sha256",
+            "route_identity_sha256",
+            "configuration_identity_sha256",
+            "link_id",
+            "profile_id",
+            "host_source_revision",
+            "host_executable_sha256",
+            "datagrams"
+          ],
+          "properties": {
+            "claim_type": { "const": "physical_capture" },
+            "parents": { "type": "array", "maxItems": 0 },
+            "artifacts": { "$ref": "#/$defs/PhysicalCaptureArtifacts" },
+            "board_identity": { "$ref": "#/$defs/Text" },
+            "sensor_id": { "$ref": "#/$defs/Text" },
+            "device_id": { "$ref": "#/$defs/U64" },
+            "key_epoch": { "$ref": "#/$defs/NonZeroU16" },
+            "firmware_revision": { "$ref": "#/$defs/GitRevision" },
+            "firmware_image_sha256": { "$ref": "#/$defs/Hex64" },
+            "provisioning_receipt_sha256": { "$ref": "#/$defs/Hex64" },
+            "route_identity_sha256": { "$ref": "#/$defs/Hex64" },
+            "configuration_identity_sha256": { "$ref": "#/$defs/Hex64" },
+            "link_id": { "$ref": "#/$defs/Text" },
+            "profile_id": { "$ref": "#/$defs/Hex64" },
+            "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+            "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+            "datagrams": { "$ref": "#/$defs/DatagramReceipts" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CorpusInputClaim": {
+      "allOf": [
+        { "$ref": "#/$defs/ClaimCore" },
+        {
+          "type": "object",
+          "required": [
+            "source_kind",
+            "corpus_version",
+            "manifest_sha256",
+            "content_sha256",
+            "datagrams"
+          ],
+          "properties": {
+            "claim_type": { "const": "corpus_input" },
+            "artifacts": { "$ref": "#/$defs/CorpusInputArtifacts" },
+            "source_kind": { "enum": ["physical_capture", "generated_scenario"] },
+            "corpus_version": { "$ref": "#/$defs/CorpusVersion" },
+            "manifest_sha256": { "$ref": "#/$defs/Hex64" },
+            "content_sha256": { "$ref": "#/$defs/Hex64" },
+            "datagrams": { "$ref": "#/$defs/CorpusInputDatagramReceipts" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "HostProjectionClaim": {
+      "allOf": [
+        { "$ref": "#/$defs/ClaimCore" },
+        {
+          "type": "object",
+          "required": [
+            "host_source_revision",
+            "host_executable_sha256",
+            "configuration_identity_sha256",
+            "store_id",
+            "session_id",
+            "first_record_seq",
+            "last_record_seq",
+            "projection_commit",
+            "projection_committed_at"
+          ],
+          "properties": {
+            "claim_type": { "const": "host_projection" },
+            "parents": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/Text" }
+            },
+            "artifacts": { "$ref": "#/$defs/HostProjectionArtifacts" },
+            "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+            "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+            "configuration_identity_sha256": { "$ref": "#/$defs/Hex64" },
+            "store_id": { "$ref": "#/$defs/Hex64" },
+            "session_id": { "$ref": "#/$defs/Text" },
+            "first_record_seq": { "$ref": "#/$defs/U64" },
+            "last_record_seq": { "$ref": "#/$defs/U64" },
+            "projection_commit": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+            "projection_committed_at": { "$ref": "#/$defs/Timestamp" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "BrowserObservationClaim": {
+      "allOf": [
+        { "$ref": "#/$defs/ClaimCore" },
+        {
+          "type": "object",
+          "required": [
+            "chrome_version",
+            "page_instance_id",
+            "connection_id",
+            "http_projection",
+            "websocket_projection",
+            "browser_trace_sha256",
+            "screenshots",
+            "watermark_received_at",
+            "http_received_at",
+            "screenshot_captured_at"
+          ],
+          "properties": {
+            "claim_type": { "const": "browser_observation" },
+            "parents": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/Text" }
+            },
+            "artifacts": { "$ref": "#/$defs/BrowserObservationArtifacts" },
+            "chrome_version": { "$ref": "#/$defs/Text" },
+            "page_instance_id": { "$ref": "#/$defs/Text" },
+            "connection_id": { "$ref": "#/$defs/Text" },
+            "http_projection": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+            "websocket_projection": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+            "browser_trace_sha256": { "$ref": "#/$defs/Hex64" },
+            "screenshots": { "$ref": "#/$defs/ScreenshotLocators" },
+            "watermark_received_at": { "$ref": "#/$defs/Timestamp" },
+            "http_received_at": { "$ref": "#/$defs/Timestamp" },
+            "screenshot_captured_at": { "$ref": "#/$defs/Timestamp" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "HostRestartClaim": {
+      "allOf": [
+        { "$ref": "#/$defs/ClaimCore" },
+        {
+          "type": "object",
+          "required": [
+            "host_source_revision",
+            "host_executable_sha256",
+            "configuration_identity_sha256",
+            "store_id",
+            "session_id",
+            "before_projection",
+            "after_projection",
+            "before_durable_tail_record_seq",
+            "before_processed_through_record_seq",
+            "recovered_through_record_seq",
+            "continued_record_seq",
+            "continued_datagram_sha256",
+            "page_instance_id",
+            "before_connection_id",
+            "after_connection_id"
+          ],
+          "properties": {
+            "claim_type": { "const": "host_restart" },
+            "parents": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/Text" }
+            },
+            "artifacts": { "$ref": "#/$defs/HostRestartArtifacts" },
+            "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+            "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+            "configuration_identity_sha256": { "$ref": "#/$defs/Hex64" },
+            "store_id": { "$ref": "#/$defs/Hex64" },
+            "session_id": { "$ref": "#/$defs/Text" },
+            "before_projection": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+            "after_projection": { "$ref": "#/$defs/CommittedProjectionIdentity" },
+            "before_durable_tail_record_seq": { "$ref": "#/$defs/U64" },
+            "before_processed_through_record_seq": { "$ref": "#/$defs/U64" },
+            "recovered_through_record_seq": { "$ref": "#/$defs/U64" },
+            "continued_record_seq": { "$ref": "#/$defs/U64" },
+            "continued_datagram_sha256": { "$ref": "#/$defs/Hex64" },
+            "page_instance_id": { "$ref": "#/$defs/Text" },
+            "before_connection_id": { "$ref": "#/$defs/Text" },
+            "after_connection_id": { "$ref": "#/$defs/Text" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "StorageQualificationClaim": {
+      "allOf": [
+        { "$ref": "#/$defs/ClaimCore" },
+        {
+          "type": "object",
+          "required": [
+            "host_source_revision",
+            "host_executable_sha256",
+            "vfs",
+            "vfs_attempts",
+            "checks"
+          ],
+          "properties": {
+            "claim_type": { "const": "storage_qualification" },
+            "parents": { "type": "array", "maxItems": 0 },
+            "artifacts": { "$ref": "#/$defs/StorageQualificationArtifacts" },
+            "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+            "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+            "vfs": { "$ref": "#/$defs/Text" },
+            "vfs_attempts": { "$ref": "#/$defs/StorageVfsAttempts" },
+            "checks": {
+              "type": "array",
+              "minItems": 7,
+              "maxItems": 7,
+              "uniqueItems": true,
+              "$comment": "prefixItems fixes the strict raw UTF-8 token order required by prose.",
+              "prefixItems": [
+                { "const": "application_lease_two_process_exclusion" },
+                { "const": "fail_closed_corruption" },
+                { "const": "lock_reacquisition" },
+                { "const": "same_process_readers" },
+                { "const": "sigkill_lock_release" },
+                { "const": "staged_no_replace_publication" },
+                { "const": "wal_recovery" }
+              ],
+              "items": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ResourceQualificationClaim": {
+      "allOf": [
+        { "$ref": "#/$defs/ClaimCore" },
+        {
+          "type": "object",
+          "required": [
+            "host_source_revision",
+            "host_executable_sha256",
+            "configuration_identity_sha256",
+            "corpus_sha256",
+            "memory_limit_bytes",
+            "maximum_cpu_threads",
+            "snapshot_deadline_ns"
+          ],
+          "properties": {
+            "claim_type": { "const": "resource_qualification" },
+            "parents": { "type": "array", "maxItems": 0 },
+            "artifacts": { "$ref": "#/$defs/ResourceQualificationArtifacts" },
+            "host_source_revision": { "$ref": "#/$defs/GitRevision" },
+            "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+            "configuration_identity_sha256": { "$ref": "#/$defs/Hex64" },
+            "corpus_sha256": { "$ref": "#/$defs/Hex64" },
+            "memory_limit_bytes": { "$ref": "#/$defs/NonZeroU64" },
+            "maximum_cpu_threads": { "$ref": "#/$defs/NonZeroU64" },
+            "snapshot_deadline_ns": { "$ref": "#/$defs/NonZeroU64" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ExecutionClaim": {
+      "oneOf": [
+        { "$ref": "#/$defs/PhysicalCaptureClaim" },
+        { "$ref": "#/$defs/CorpusInputClaim" },
+        { "$ref": "#/$defs/HostProjectionClaim" },
+        { "$ref": "#/$defs/BrowserObservationClaim" },
+        { "$ref": "#/$defs/HostRestartClaim" },
+        { "$ref": "#/$defs/StorageQualificationClaim" },
+        { "$ref": "#/$defs/ResourceQualificationClaim" }
+      ]
+    },
+    "ExecutionClaimGraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes and pre-DTO duplicate-member rejection.",
+      "required": ["schema_version", "claims"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "claims": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "$comment": "Prose requires strict raw UTF-8 ordering and uniqueness by claim id.",
+          "items": { "$ref": "#/$defs/ExecutionClaim" }
+        }
+      }
+    },
+    "VerificationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes, pre-DTO duplicate-member rejection, and hashing the validated original graph bytes.",
+      "required": [
+        "schema_version",
+        "graph_sha256",
+        "verifier_identity",
+        "verified_at",
+        "result",
+        "classification",
+        "root_claim_ids"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "graph_sha256": { "$ref": "#/$defs/Hex64" },
+        "verifier_identity": { "$ref": "#/$defs/Text" },
+        "verified_at": { "$ref": "#/$defs/Timestamp" },
+        "result": { "const": "pass" },
+        "classification": {
+          "enum": [
+            "board-capture-smoke",
+            "captured-corpus-e2e",
+            "scenario-e2e",
+            "live-physical-e2e"
+          ]
+        },
+        "root_claim_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "$comment": "Prose requires strict raw UTF-8 ordering, unique resolution to passing proof tips, and classification from their ancestor closure.",
+          "items": { "$ref": "#/$defs/Text" }
+        }
+      }
+    },
+    "ProgramVerificationReceiptRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification", "path", "sha256"],
+      "properties": {
+        "classification": {
+          "enum": [
+            "board-capture-smoke",
+            "captured-corpus-e2e",
+            "scenario-e2e",
+            "live-physical-e2e"
+          ]
+        },
+        "path": { "$ref": "#/$defs/Text" },
+        "sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "ProgramVerificationReceiptRefs": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ProgramVerificationReceiptRef" },
+            {
+              "properties": {
+                "classification": { "const": "board-capture-smoke" },
+                "path": { "const": "board-capture-smoke-verification-receipt.json" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ProgramVerificationReceiptRef" },
+            {
+              "properties": {
+                "classification": { "const": "captured-corpus-e2e" },
+                "path": { "const": "captured-corpus-e2e-verification-receipt.json" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ProgramVerificationReceiptRef" },
+            {
+              "properties": {
+                "classification": { "const": "scenario-e2e" },
+                "path": { "const": "scenario-e2e-verification-receipt.json" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/ProgramVerificationReceiptRef" },
+            {
+              "properties": {
+                "classification": { "const": "live-physical-e2e" },
+                "path": { "const": "live-physical-e2e-verification-receipt.json" }
+              }
+            }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "ProgramClaimEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim_id", "artifact_path", "artifact_sha256"],
+      "properties": {
+        "claim_id": { "$ref": "#/$defs/Text" },
+        "artifact_path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "artifact_sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "ProgramRestartEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claim_id",
+        "artifact_path",
+        "artifact_sha256",
+        "browser_claim_id",
+        "browser_trace_path",
+        "browser_trace_sha256"
+      ],
+      "properties": {
+        "claim_id": { "$ref": "#/$defs/Text" },
+        "artifact_path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "artifact_sha256": { "$ref": "#/$defs/Hex64" },
+        "browser_claim_id": { "$ref": "#/$defs/Text" },
+        "browser_trace_path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "browser_trace_sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "ProgramBrowserEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "This binding selects one independently verified live visible committed result; it does not assert the complete diagnostic UI acceptance surface.",
+      "required": [
+        "claim_id",
+        "browser_trace_path",
+        "browser_trace_sha256",
+        "screenshots"
+      ],
+      "properties": {
+        "claim_id": { "$ref": "#/$defs/Text" },
+        "browser_trace_path": { "$ref": "#/$defs/PackageArtifactPath" },
+        "browser_trace_sha256": { "$ref": "#/$defs/Hex64" },
+        "screenshots": { "$ref": "#/$defs/ScreenshotLocators" }
+      }
+    },
+    "ProgramDiagnosticUiEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "const": "diagnostic-ui-acceptance-report.json" },
+        "sha256": { "$ref": "#/$defs/Hex64" }
+      }
+    },
+    "ProgramCompletionReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Prose requires exact RFC 8785 file bytes and independent verification of one graph, all four fixed classification receipts, passing restart/storage/resource claims, one final live visible committed browser result, and the bound diagnostic UI acceptance report.",
+      "required": [
+        "schema_version",
+        "program",
+        "graph_path",
+        "graph_sha256",
+        "verifier_identity",
+        "verified_at",
+        "result",
+        "source_revision",
+        "source_tree_status",
+        "firmware_image_sha256",
+        "host_executable_sha256",
+        "configuration_identity_sha256",
+        "store_id",
+        "session_id",
+        "chrome_version",
+        "verification_receipts",
+        "browser",
+        "diagnostic_ui",
+        "host_restart",
+        "storage_qualification",
+        "resource_qualification"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "program": { "const": "single-sensor-development-e2e-v1" },
+        "graph_path": { "const": "execution-claim-graph.json" },
+        "graph_sha256": { "$ref": "#/$defs/Hex64" },
+        "verifier_identity": { "$ref": "#/$defs/Text" },
+        "verified_at": { "$ref": "#/$defs/Timestamp" },
+        "result": { "const": "pass" },
+        "source_revision": { "$ref": "#/$defs/GitRevision" },
+        "source_tree_status": { "const": "clean" },
+        "firmware_image_sha256": { "$ref": "#/$defs/Hex64" },
+        "host_executable_sha256": { "$ref": "#/$defs/Hex64" },
+        "configuration_identity_sha256": { "$ref": "#/$defs/Hex64" },
+        "store_id": { "$ref": "#/$defs/Hex64" },
+        "session_id": { "$ref": "#/$defs/Text" },
+        "chrome_version": { "$ref": "#/$defs/Text" },
+        "verification_receipts": { "$ref": "#/$defs/ProgramVerificationReceiptRefs" },
+        "browser": { "$ref": "#/$defs/ProgramBrowserEvidence" },
+        "diagnostic_ui": { "$ref": "#/$defs/ProgramDiagnosticUiEvidence" },
+        "host_restart": { "$ref": "#/$defs/ProgramRestartEvidence" },
+        "storage_qualification": { "$ref": "#/$defs/ProgramClaimEvidence" },
+        "resource_qualification": { "$ref": "#/$defs/ProgramClaimEvidence" }
+      }
+    }
+  }
+}

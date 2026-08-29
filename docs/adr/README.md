@@ -12,3 +12,6 @@ the linked specification owns operative behavior.
 | Why require evidence before research changes production semantics? | [ADR 0004](0004-research-promotion-evidence.md) |
 | Why rotate by logical session facts instead of physical SQLite size? | [ADR 0005](0005-logical-session-fact-bytes.md) |
 | Why bind replay admission identity to the epoch key? | [ADR 0006](0006-bind-replay-admission-to-epoch-key.md) |
+| Why trust the Program 1 local store namespace instead of building hostile same-credential isolation? | [ADR 0013](0013-trust-program-1-local-store-namespace.md) |
+| Why can only a verified typed claim graph issue an execution classification? | [ADR 0014](0014-derive-execution-classification-from-claim-graph.md) |
+| Why does a compatible Host restart continue the active session instead of rotating it? | [ADR 0015](0015-keep-compatible-host-restart-in-active-session.md) |

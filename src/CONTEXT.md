@@ -54,6 +54,46 @@ _Avoid_: snapshot, when referring to the state concept rather than a view of it.
 **Managed database**:
 The SQLite file selected for `HostLifecycle` operations.
 
+**Managed store root**:
+The dedicated trusted local directory containing one Managed database, its
+SQLite companions, and its cooperative lifecycle lease.
+_Avoid_: security boundary, because Program 1 does not isolate the root from a
+hostile process with the same filesystem credentials.
+
+**Store ID**:
+The stable non-secret identity assigned when a Managed database is provisioned.
+_Avoid_: credential or attestation, because possession of the value proves no
+authority or physical origin.
+
+**Store topology manifest**:
+The immutable provisioned Deployment, Space, Transmitter, Sensor, and Link
+identity set associated with a Managed database.
+_Avoid_: runtime configuration.
+
+**Projection watermark**:
+The Store ID plus a monotonic sequence naming one query-visible Store state.
+
+**Committed projection identity**:
+A Projection watermark whose sequence is nonzero and names a committed change.
+
+**Corpus input lineage**:
+The declared origin and derivation chain of immutable corpus content.
+_Avoid_: evidence classification, which is issued only from an executed claim
+graph.
+
+**Executed claim graph**:
+A verifier-checked graph whose typed claims and artifact references support one
+execution-result classification.
+_Avoid_: corpus manifest or receipt blob, neither of which can classify itself.
+
+**Evidence package**:
+A retained collection of artifacts used to verify Executed claims.
+_Avoid_: digest list, because unresolvable digests retain no inspectable proof.
+
+**Host commit trace**:
+A procedural record of identified committed Host operations.
+_Avoid_: database timestamp or attestation.
+
 **Session fact bytes**:
 The logical size of one session's authoritative manifest and ordered records.
 It is independent of storage-engine space usage.
@@ -62,6 +102,15 @@ It is independent of storage-engine space usage.
 The complete estimator state passed from a finished session to its successor
 without changing its identity or meaning.
 
+**Pending baseline handoff**:
+A completed Baseline handoff held between a sealed session and its successor.
+_Avoid_: Baseline state projection, which is rebuildable query state rather than
+inter-session bootstrap authority.
+
 **Recovered tail**:
-A previously interrupted session whose durable fact tail has been replayed and
-whose derived state has been finalized for faithful replay.
+The ordered durable facts after an active session's committed processing cursor.
+
+**Host restart**:
+Stopping and reopening the Host process while retaining the Managed database
+and replay identity.
+_Avoid_: session rotation.

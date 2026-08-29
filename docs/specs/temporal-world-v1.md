@@ -91,16 +91,18 @@ struct TimelineTransition {
 
 ```text
 Timeline::new(TimelineConfig) -> Result<Timeline, TimelineError>
-Timeline::restore(TimelineConfig, &[u8]) -> Result<Timeline, TimelineError>
 Timeline::apply(&mut self, TimelineInput) -> Result<TimelineTransition, TimelineError>
 ```
+
+Host recovery calls `Timeline::new` and replays the manifest's ordered SQLite
+facts. Timeline state has a deterministic canonical encoder only so its bytes
+can form the cursor-bound SHA-256 determinism tripwire; v1 defines no state
+decoder or restore interface.
 
 `TimelineConfig` is a validated strong value binding the exact semantic
 receipts from `SessionManifest`: `session_id`, `decoder_version`, the
 `ReplayConfig` registry, window contract, and routes, the derived
-`WindowContractId`, runtime `max_record_bytes`, and the deterministic
-pending-observation and encoded-state bounds derived during configuration
-validation.
+`WindowContractId`, and the runtime resources needed by Timeline.
 
 `observation` MUST be `Some` exactly for `Observation` and MUST contain that
 input's sequence classification and disposition. It MUST be `None` for
@@ -111,10 +113,9 @@ ordered `TimelineInput` values. Dependency direction and state ownership are
 defined once in the [world runtime architecture](../architecture/world-runtime.md).
 
 Time regression, record-sequence regression or duplication, window arithmetic
-overflow, input after finish, and malformed, oversized, or wrong-contract
-state are `TimelineError`s. A failed `Timeline::new` or `Timeline::restore`
-returns no Timeline. A failed `Timeline::apply` MUST leave the receiver
-unchanged.
+overflow, input after finish, and invalid internal state are `TimelineError`s.
+A failed `Timeline::new` returns no Timeline. A failed `Timeline::apply` MUST
+leave the receiver unchanged.
 
 ### Time
 
@@ -359,8 +360,9 @@ a transition.
 
 ### Timeline state CBOR
 
-`TimelineState` v1 bytes MUST be produced by Timeline or fully validated by
-`Timeline::restore` before storage.
+`TimelineState` v1 bytes MUST be produced only by Timeline's canonical encoder.
+Persistence stores only their cursor-bound SHA-256 digest, never the bytes as
+recovery or resume state. No decoder accepts these bytes as Timeline input.
 
 The codec MUST use the Whisper v1 deterministic CBOR profile defined by the
 persistence specification. In particular, CBOR tags are forbidden. The v1 root
@@ -400,11 +402,8 @@ in table order.
 The `classification` map has exactly `kind`, then `value`. `kind` is exactly
 `first`, `in_order`, `gap`, `duplicate`, or `reordered`. `value` is a positive
 `u64` missing count only for `gap`, a positive `u64` distance only for
-`reordered`, and `null` otherwise. For state-bound sizing, `gap` MUST reserve
-the maximum canonical encoding of a full-width positive `u64` missing count.
-An admitted `reordered` observation has distance at most `reorder_horizon`, so
-`canonical_max_len` MUST apply that semantic cap and MUST NOT reserve an
-unconstrained `u64` for that distance.
+`reordered`, and `null` otherwise. An admitted `reordered` observation has
+distance at most `reorder_horizon`.
 
 The `disposition` map has exactly `kind`, `window_id`, then `reason`. `kind` is
 exactly `windowed`, `inter_window_gap`, `duplicate`, or `late`. `window_id` is a
@@ -492,77 +491,37 @@ segment, span, classification, disposition, and typed observation invariants
 MUST all be mutually consistent. Finished state has empty `stream_states`,
 `open_windows`, and `missing_spans` and rejects later input.
 
-Every map, array, byte string, and text string MUST have a definite length.
-The deterministic state cardinalities are derived with checked arithmetic. Let
-`L = allowed_lateness_ns`, `I = inactive_after_ns`, and `W = width_ns`:
-
-```text
-D = checked_add(I, checked_mul(3, L), W)
-Q = checked_add(ceil_div(D, 1_000_000_000), 1)
-N = sum over routes checked_mul(peak_packets_per_second, Q)
-R = route count
-O = checked_add(ceil_div(D, step_ns), 2)
-```
-
-Maximum buffered observations is `N`; maximum open windows is `O`; maximum
-retained stream segments, missing spans, and source epochs is `N + R` each.
-For each source, maximum retained seen sequence values is
-`min(reorder_horizon + 1, N + 1)`. Timeline MUST prune to the rules above, and
-`TimelineConfig` construction MUST reject any overflow in these calculations.
-
-`canonical_max_len` is defined recursively as the exact canonical CBOR header
-length plus the sum of exact encoded key lengths and maximum encoded value
-lengths from this schema. Arrays use the cardinalities above; text uses actual
-manifest and configuration UTF-8 lengths, except clock-domain and mapping text
-use exactly `MAX_TIMELINE_CLOCK_TEXT_BYTES`; observation maxima use the pinned
-sensor and route CSI, plaintext, datagram, and layout caps; integers use their
-maximum-width legal canonical encoding subject to the classification caps
-above. Because `TimelineState` stores only an opaque `CaptureProfileId` and no
-profile descriptor, `TimelineConfig` and `canonical_max_len` MUST NOT narrow the
-layout representation to the normal live-decoder layout solely from hardware or
-native-frame identity. For each route, `TimelineConfig` MUST derive the pinned
-maximum logical coordinate/sample count allowed by the applicable sensor CSI
-and plaintext caps and route datagram cap, then budget the maximum canonical
-encoding across every `CsiLayout` path-count/sample-axis-length factorization
-and every path and axis variant allowed by the typed `TimelineState` schema.
-The `epoch_termination` maximum is included for every retained segment. Thus
-`maximum_encoded_timeline_state_bytes` is
-`canonical_max_len(root, derived_cardinalities_and_receipt_caps)`, not an
-implementation choice. `TimelineConfig` construction MUST reject the
-configuration unless that value is at most `max_record_bytes`.
-
-This conservative sizing rule is solely a resource and trust-boundary rule. It
-MUST NOT change the [native-frame S3 live-decoder domain
-view](native-frame-v1.md#ltf-blocks-and-raw-accounting), establish profile
-descriptor equality, or authorize recovery to bypass the [persistence replay
-and byte-equality requirement](persistence-v1.md#replay-admission-window).
-
-The complete blob and every declared nested length MUST still be checked
-against `max_record_bytes` before allocation. After configuration validation,
-state pressure is an invariant failure, never eviction or truncation.
-
-`Timeline::restore` MUST bind `window_contract_id` to the supplied
-`WindowContractId`, reject unknown, missing, duplicate, or reordered keys,
-reject non-canonical integers and lengths, indefinite items, invalid typed
-values, inconsistent or oversized state, CBOR tags, and trailing data, and
-validate every invariant before returning a Timeline. Root session and contract
-values MUST equal `TimelineConfig`. Every buffered observation's session and
-decoder version MUST equal the pinned manifest receipts; its sensor, device,
-hardware, link, and route relationship MUST match the pinned registry and route;
-its `CaptureProfileId` MUST be an opaque 32-byte receipt; and its capture,
-layout, encoding, timing, and radio values MUST satisfy their typed invariants.
-Timeline state cannot independently prove equality with a dynamic profile
-descriptor. That proof is the replay-and-byte-equality requirement of
-[persistence recovery](persistence-v1.md#replay-admission-window). It
-remains required regardless of conservative state-bound acceptance. Restore
-MUST then canonically re-encode the validated value and require byte-for-byte
-equality with the input.
+Every map, array, byte string, and text string emitted by the canonical encoder
+MUST have a definite length and satisfy the ordering, identity, and typed-state
+invariants above. The resulting exact bytes are only the Timeline digest
+preimage. Runtime pruned-state capacities and allocation bounds are
+implementation concerns; v1 defines no normative encoded-state maximum,
+`max_record_bytes` preflight, decoder, or continuation-from-bytes contract.
 
 ## Conditioning
 
-One `AlignedWindow` MUST produce one `ConditionedWindow` containing every
-stream. Each stream retains its dynamic native coordinate set and its own
-receipt. Conditioning MUST NOT emit a fixed tensor.
+For each `AlignedWindow`, Engine computes the window key set as the union of:
+
+1. every distinct `LinkProfileKey` named by a contributor in that window; and
+2. every `LinkProfileKey` for which Engine currently holds baseline state.
+
+Conditioning MUST produce exactly one `ConditionedLinkWindow` for every key in
+that computed set. The complete output array is strictly ordered and unique by
+Link-ID UTF-8 bytes then Profile-ID bytes. The set and output array may be empty.
+A key with neither a contributor nor current baseline state MUST NOT be
+invented. Each conditioned link window retains its dynamic native coordinate
+set and one ordered contributor receipt; conditioning MUST NOT emit a fixed
+tensor.
+
+A contributor is one `StreamSegmentIdentity(stream, segment_id)`, where
+`segment_id` is that segment's first admitted `record_seq`. A segment is a
+window contributor when the `AlignedWindow` contains either one of its
+observations or a clipped missing span for it. Contributors are strictly ordered
+and unique by the Timeline stream-identity tuple and then `segment_id`. The
+array is empty when a key comes only from current baseline state. Every
+contributor's stream link and profile MUST equal the conditioned key. An
+observation or missing span contributes through exactly one matching stream
+segment and MUST NOT be copied between contributors.
 
 For every valid native coordinate in every valid frame, the v1 recipe is:
 
@@ -574,18 +533,21 @@ value     = ln(1 + amplitude)
 `declared_sample_scale` MUST be finite and positive. The configured rational
 scale is part of the conditioning contract.
 
-Each coordinate MUST be aggregated independently. For one conditioned stream
-and native coordinate, let `v_1, ..., v_n` be that coordinate's finite `value`
-results from valid, included frames in the window. The values MUST remain in
-the `AlignedWindow`'s retained `record_seq` order; a value from a
-different stream, physical link, profile, path, or coordinate MUST NOT enter
-the reduction. The per-window observation is:
+Each coordinate MUST be aggregated independently. For one conditioned
+Link/Profile and native coordinate, let `v_1, ..., v_n` be that coordinate's
+finite `value` results from valid, included frames across all contributors in
+the window. Before the numeric fold, Conditioning MUST explicitly sort all
+matching observations by ascending session-global `record_seq`. Record
+sequences are unique within the session, so ties are impossible. Conditioning
+MUST NOT derive fold order from `AlignedWindow` vector iteration order. A value
+from a different physical link, profile, path, or coordinate MUST NOT enter the
+reduction. The per-window observation is:
 
 ```text
 observed = x_t = (v_1 + ... + v_n) / n
 ```
 
-The sum MUST be evaluated in that retained order using the configured numeric
+The sum MUST be evaluated in that explicit order using the configured numeric
 precision. A measured zero is a valid included value. Missing, invalid, late,
 profile-mismatched, or non-finite values MUST NOT enter the sum and MUST remain
 accounted for by their exclusion reasons. A coordinate excluded for low
@@ -598,9 +560,17 @@ MUST NOT enter Learning, Active scoring, or update.
 This `observed` value is the single per-window, per-link/profile
 native-coordinate statistic consumed by the estimator and retained as `x_t` in
 the formulas below. Temporal absolute slope MUST use adjacent valid per-frame
-values and their actual positive receive-monotonic time delta, with units of
-log-amplitude per second. Zero, regressed, non-finite, or otherwise invalid time
-pairs MUST be excluded.
+values within the same stream segment and their actual positive
+receive-monotonic time delta, with units of log-amplitude per second. A slope
+MUST NOT cross a stream-segment boundary. Zero, regressed, non-finite, or
+otherwise invalid time pairs MUST be excluded.
+
+Quality and accepted exposure are computed once for the aggregate
+`ConditionedLinkWindow`, not once per contributor. Each admitted frame is
+counted at most once. Per-coordinate valid exposure is the union of its valid
+coverage within the window, capped by the window width; overlap between
+contributors MUST NOT multiply exposure. Contributor count MUST NOT multiply
+frame coverage, quality, learning-window count, or estimator updates.
 
 Conditioning MUST NOT interpolate across devices or profiles, pad frequencies,
 normalize each segment to `[0, 1]`, infer physical coordinates, or use raw phase
@@ -608,9 +578,11 @@ for v1 estimation. It MUST retain explicit counts by exclusion reason,
 including invalid sample, missing data, low coverage, unsupported phase, late
 input, and profile mismatch.
 
-Each conditioning receipt MUST identify the conditioning version, stream,
-window, inclusive source record range, included coordinate count, and exclusion
-counts. Coordinates and exclusions MUST have stable ordering.
+Each conditioning receipt MUST identify the conditioning version, Link/Profile,
+ordered contributor array, window, inclusive source record range, included
+coordinate count, and exclusion counts. An empty-contributor receipt retains
+the window source range and typed missing-data accounting. Coordinates and
+exclusions MUST have stable ordering.
 
 ## Statistical baseline estimator
 
@@ -620,6 +592,13 @@ Estimator state is isolated by deployment, space, physical link, capture
 profile, and conditioning version. Coordinate statistics are additionally
 keyed by native path and sample coordinate. State from different links or
 profiles MUST NOT mix.
+
+For every published window, the estimator MUST execute exactly one step for
+every key in the window's computed Link/Profile set, in that set's strict order.
+A baseline-state key with no contributors still produces one typed missing-data
+decision and evidence result; it does not disappear and cannot update coordinate
+state or accrue exposure. If the computed set is empty, the estimator executes
+no link step and MUST NOT invent a Profile key.
 
 The lifecycle is:
 
@@ -637,7 +616,8 @@ always `Unknown::BaselineLearning`, even after maturity, until an explicit
 `Commit`.
 
 `BaselineRevision` identifies an immutable persisted snapshot and is created
-only by commit, explicit snapshot activation, rotation, or shutdown handoff.
+only by commit, explicit snapshot activation, explicit session-finish handoff,
+or limit-rotation handoff. Stopping only the Host process is never a handoff.
 `BaselineStateSequence` advances on each accepted Active update. Missing and
 Learning state MUST NOT invent revision or sequence zero.
 
@@ -690,9 +670,12 @@ Accepted exposure is the coordinate's valid coverage in this accepted window,
 capped by the window width. It MUST NOT accumulate across missing or rejected
 windows.
 
-After a new session, rotation, or host restart, `adaptation_armed` is false.
-The first accepted Active window MUST be scored and arm adaptation without
-updating EW state. A later accepted window uses only its own exposure.
+After a new session or rotation, `adaptation_armed` is false. The first accepted
+Active window MUST be scored and arm adaptation without updating EW state. A
+later accepted window uses only its own exposure. A compatible Host restart
+rebuilds the same active session from its manifest and facts and therefore MUST
+recover the exact current arming state; process lifetime cannot reset it or
+create a semantic boundary.
 
 The link deviation score is the configured nearest-rank quantile of finite
 absolute standardized residuals. Values are sorted stably and the 1-based rank
@@ -775,10 +758,12 @@ stable order. The stable threshold MUST be lower than the changing threshold.
 
 ### Evidence
 
-Each link step MUST retain stream and link/profile identity, the baseline
-contract and revision, pre-update and resulting state sequences, decision,
-knowledge state, quality, and native-coordinate evidence. Coordinates MUST be
-strictly increasing and unique.
+Each link step MUST retain its ordered, possibly empty stream-segment
+contributors and link/profile identity, the baseline contract and revision,
+pre-update and resulting state sequences, decision, knowledge state, quality,
+and native-coordinate evidence. Its durable identity is snapshot plus
+Link/Profile; contributors are provenance and do not alter that identity.
+Coordinates MUST be strictly increasing and unique.
 
 Coordinate evidence MUST identify observed and predicted values, signed and
 standardized residuals when available, and exactly one exclusion when not
@@ -786,34 +771,255 @@ included. The observed field MUST be the same conditioned `x_t` consumed by
 that coordinate's estimator step. Standardized residuals MUST be calculated
 from the pre-update state used by the same decision.
 
+## Durable projection CBOR
+
+`observation_cbor`, `snapshot_cbor`, and `evidence_cbor` use the
+[Whisper v1 deterministic CBOR profile](persistence-v1.md#session-cbor-profile).
+Each root and nested map has exactly the keys below in table order; unknown,
+missing, duplicate, or reordered keys, non-canonical values, tags, indefinite
+items, and trailing bytes are invalid. These language-neutral tables, not a
+Rust type layout or serializer default, define the durable bytes.
+
+Shared text identities use their validated UTF-8 values. Profile, contract,
+configuration, and build identities are byte strings of exactly 32 bytes.
+The exact text values for `time_quality` are `unknown`, `receive_only`, and
+`clock_corrected`. Exclusion reasons are exactly, in this order,
+`invalid_sample`, `missing`, `low_coverage`, `unsupported_phase`, `late`,
+`profile_mismatch`, `time_uncertain`, `non_finite`, `gap`,
+`unresolved_source`, and `quality`. Arrays of exclusions are strictly ordered
+and unique in that order. All statistical floats are finite and obey their
+semantic non-negative or fraction bounds.
+
+A `knowledge` map is exactly one of:
+
+| Kind | Exact ordered keys and values |
+| --- | --- |
+| Known | `kind: "known"`; `value: "stable" | "changing"` |
+| Unknown | `kind: "unknown"`; `reason`: one of `baseline_missing`, `baseline_learning`, `insufficient_coverage`, `low_quality`, `ambiguous_evidence`, `time_uncertain`, `missing_data`, `profile_mismatch`, `stale`, `frozen`, `inactive`, or `non_finite` |
+
+### CsiObservation root
+
+The standalone CsiObservation v1 root has exactly these keys:
+
+| Order | Key | Value |
+| ---: | --- | --- |
+| 1 | `schema_version` | unsigned integer `1` |
+| 2 | `config_digest` | 32-byte ReplayConfig digest |
+| 3 | `conditioning_version` | validated version text |
+| 4 | `observation` | the exact `csi_observation` map defined by the [Timeline state schema](#csiobservation-state-schema) |
+
+The observation input session and record sequence, timing receive nanoseconds,
+sensor, link, profile, decoder version, configuration digest, and conditioning
+version MUST equal the session record, manifest, and projection-row envelope
+that carry these bytes. The root contains no raw packet bytes and cannot replace
+the authoritative packet fact.
+
+### LinkStepEvidence root
+
+The standalone LinkStepEvidence v1 root has exactly these keys:
+
+| Order | Key | Value |
+| ---: | --- | --- |
+| 1 | `schema_version` | unsigned integer `1` |
+| 2 | `snapshot_id` | `snapshot_identity` map below |
+| 3 | `source_record_start` | unsigned `u64` |
+| 4 | `source_record_end` | unsigned `u64`, not less than start |
+| 5 | `conditioning_version` | validated version text |
+| 6 | `algorithm_version` | validated version text |
+| 7 | `evidence` | `link_step_evidence` map below |
+
+The `link_step_evidence` map has exactly these keys:
+
+| Order | Key | Value |
+| ---: | --- | --- |
+| 1 | `stream_segments` | ordered array of `stream_segment_identity` maps below; may be empty |
+| 2 | `link_profile` | map with `link` identifier text, then 32-byte `profile` |
+| 3 | `baseline_contract` | 32-byte BaselineContractId |
+| 4 | `baseline_revision` | nonzero unsigned `u64` or `null` |
+| 5 | `scored_against_baseline_state_sequence` | nonzero unsigned `u64` or `null` |
+| 6 | `resulting_baseline_state_sequence` | nonzero unsigned `u64` or `null` |
+| 7 | `baseline_decision` | decision map below |
+| 8 | `link_status` | `knowledge` map |
+| 9 | `quality` | `link_quality` map below |
+| 10 | `coordinates` | strictly ordered array of `coordinate_evidence` maps |
+
+A `stream_segment_identity` map has exact ordered keys `stream` (the exact
+`stream_identity` map defined above) and `segment_id` (the first admitted
+`record_seq` as `u64`). The array is strictly ordered and unique by stream
+identity tuple and then segment ID. Every member's stream link/profile equals
+`link_profile`; the array is empty exactly when no stream segment contributed
+to the aggregate step.
+
+A baseline-decision map is `kind: "bootstrap_accepted"`,
+`kind: "adaptation_accepted"`, or the ordered keys `kind: "rejected"`, then
+`reason`. A rejection reason is exactly `low_quality`, `missing_data`,
+`time_uncertain`, `profile_mismatch`, `stale`, `frozen`,
+`deviation_above_gate`, or `baseline_learning`.
+
+`link_quality` has exact ordered keys `frame_count` (`u32`),
+`ready_coordinate_coverage` (binary64 fraction), `packet_gap_ratio` (binary64
+fraction), `receive_jitter_ns` (`u64`), `finite_and_ordered` (boolean),
+`time_quality` (text above), `resolved_and_compatible` (boolean), and
+`exclusions` (ordered exclusion-reason text array).
+
+A `coordinate_evidence` map has exact ordered keys `path`, `coordinate`,
+`observed`, `predicted`, `signed_residual_log_amplitude`,
+`standardized_residual`, and `exclusion`. Path is the exact `csi_path` map
+defined above. Coordinate is exactly one of these maps:
+
+| Coordinate | Exact ordered keys and values |
+| --- | --- |
+| Opaque ordinal | `kind: "opaque_sample_ordinal"`; `value: u16` |
+| IEEE tone | `kind: "ieee_tone_index"`; `value: i16` |
+| Frequency | `kind: "frequency_hz"`; `value: u64` |
+
+The four numeric evidence fields are finite statistical floats or `null`;
+`exclusion` is one exclusion-reason text or `null`. An included coordinate has
+an observed value and null exclusion; an excluded coordinate has null observed
+and exactly one exclusion. Coordinates are strictly ordered and unique by path
+then coordinate: `tx_rx` precedes `raw_path_ordinal`, and path fields order
+numerically; coordinate kinds order as in the table, then by signed or unsigned
+numeric value.
+
+Every stream-segment contributor MUST resolve in the Timeline for the source
+session, every record attributed to it for this evidence MUST lie within the
+source range, and its stream link/profile MUST equal `link_profile` and the
+persistence row. A segment may have started before that range. Snapshot session,
+link/profile, source range, conditioning version, and algorithm version MUST
+equal the associated WorldSnapshot and row envelope. Baseline sequences require
+a baseline revision; a resulting sequence requires a scored sequence and cannot
+precede it.
+
+### WorldSnapshot root
+
+The standalone WorldSnapshot v1 root has exactly these keys:
+
+| Order | Key | Value |
+| ---: | --- | --- |
+| 1 | `schema_version` | unsigned integer `1` |
+| 2 | `id` | `snapshot_identity` map |
+| 3 | `previous_id` | `snapshot_identity` map or `null` |
+| 4 | `deployment` | validated Deployment identifier text |
+| 5 | `window` | unsigned `u64` WindowId |
+| 6 | `valid_interval` | `time_interval` map |
+| 7 | `sensors` | ordered array of `sensor_entry` maps |
+| 8 | `links` | ordered array of `link_entry` maps |
+| 9 | `spaces` | ordered array of `space_entry` maps |
+| 10 | `receipt` | `derivation_receipt` map |
+
+The shared identity and interval maps are:
+
+| Type | Exact ordered keys and values |
+| --- | --- |
+| `snapshot_identity` | `session`: validated Session identifier text; `window`: `u64` |
+| `time_interval` | `start_ns`: `u64`; `end_ns`: `u64` not less than start |
+
+The collection entries and world maps are:
+
+| Type | Exact ordered keys and values |
+| --- | --- |
+| `sensor_entry` | `sensor`: Sensor identifier text; `health`: `sensor_health` map |
+| `sensor_health` | `active`: boolean; `time_quality`: exact text above; `sequence_gaps`: `u64` |
+| `link_entry` | `link_profile`: link/profile map above; `belief`: `link_belief` map |
+| `link_belief` | `status`: `knowledge`; `diagnostics`: `link_diagnostics` map or `null`; `quality`: `link_quality`; `baseline`: baseline-status map; `evidence`: evidence-receipt map |
+| `space_entry` | `space`: Space identifier text; `belief`: `space_belief` map |
+| `space_belief` | `status`: `knowledge`; `contributions`: ordered array of link-contribution maps |
+| `link_contribution` | `link`: Link identifier text; `profiles`: nonempty ordered unique array of 32-byte Profile IDs; `status`: `knowledge`; `exclusions`: ordered unique exclusion-reason array |
+
+`link_diagnostics` has ordered keys `deviation_score`,
+`rf_dynamics_log_amplitude_per_second`, and `prediction_error_summary`; the
+first two are finite non-negative statistical floats. `residual_summary`, used
+for the final field and below, has ordered keys `count` (`u32`),
+`mean_absolute` (finite non-negative statistical float), and `quantile` (finite
+non-negative statistical float).
+
+A baseline-status map is exactly one of:
+
+| Status | Exact ordered keys and values |
+| --- | --- |
+| Missing | `kind: "missing"` |
+| Learning | `kind: "learning"`; `accepted_windows: u64`; `mature: boolean` |
+| Active | `kind: "active"`; `revision: nonzero u64`; `state_sequence: nonzero u64` |
+| Frozen | `kind: "frozen"`; `revision: nonzero u64` |
+| Stale | `kind: "stale"`; `revision: nonzero u64`; `reason: "age" | "incompatible"` |
+
+An `evidence_receipt` map has exact ordered keys `session_id`,
+`first_record_seq`, `last_record_seq`, `link`, `profile`,
+`conditioning_version`, `baseline_contract`, `baseline_revision`,
+`scored_against_baseline_state_sequence`,
+`resulting_baseline_state_sequence`, `residual_summary`,
+`included_coordinates`, and `excluded`. Profile and contract are 32-byte values;
+record values are `u64`, while every optional baseline revision or state-sequence
+value is nonzero `u64` or `null`;
+`included_coordinates` is `u32`; `residual_summary` is its map or `null`.
+`excluded` is an ordered array of maps with `reason` then positive `u32` `count`,
+with at most one entry per exclusion reason.
+
+The `derivation_receipt` map has exact ordered keys `source_session`,
+`first_record_seq`, `last_record_seq`, `durable_through_record_seq`,
+`config_digest`, `build_fingerprint`, `decoder_version`,
+`conditioning_version`, and `algorithm_version`. Record bounds satisfy
+`first <= last <= durable_through`; both digests are 32-byte values and versions
+are validated text.
+
+Sensors are strictly ordered and unique by Sensor-ID UTF-8 bytes; links by
+Link-ID UTF-8 bytes then Profile-ID bytes; spaces by Space-ID UTF-8 bytes; and
+link contributions by Link-ID UTF-8 bytes. Root `id.session` equals the receipt
+source session, `id.window` equals `window`, and `previous_id`, when present,
+uses the same session and a smaller window. Every link entry, belief receipt,
+space contribution, Sensor, source range, interval, configuration, and version
+MUST be mutually consistent with the same transition. The SQLite row envelope
+MUST equal root session/window, interval, source range, algorithm version, and
+configuration digest.
+
+The snapshot `links` keys and its associated LinkStepEvidence keys MUST both
+equal exactly that window's computed Link/Profile set. Each key occurs exactly
+once and both collections use the same strict Link-ID/Profile-ID order. Both may
+be empty; a baseline-state key without a contributor still has evidence whose
+`stream_segments` array is empty.
+
 ## Engine and runtime behavior
 
 Engine accepts push observation, advance to explicit time, apply ordered
 baseline command, and finish at explicit time operations.
 
 Each operation MUST return one concrete transition containing the resulting
-Timeline state, every changed complete baseline state, and zero or more window
-outputs. The application MUST persist that exact transition and MUST NOT
+Timeline state, every changed complete baseline state, and zero or more
+`WindowProjection` values. A `WindowProjection` is one WorldSnapshot paired
+with its complete strictly ordered LinkStepEvidence set defined above. Engine
+owns construction, validation, grouping, and ordering of that indivisible
+value. The application MUST commit each exact complete projection and persist
+the canonical Timeline digest; it MUST NOT regroup, sort, drop, duplicate, or
 recompute Timeline, estimator state, evidence, or snapshots.
+
+An `EngineTransition` is only the semantic variant of the application-owned
+private processed-record transition. An authenticated decoder reject never
+enters Timeline or Engine and cannot be represented as an `EngineTransition`.
+The persistence specification owns the closed wrapper, its unforgeable
+construction by the `CaptureRun` processing coordinator, and transaction-B
+cursor/commit behavior for both variants.
 
 Engine operations MUST be applied sequentially.
 
-Raw admission MUST become durable before Engine receives a packet or command.
-Semantic state and projection publication MUST be atomic at the durability seam.
-Before that commit succeeds, memory mirrors and notifications MUST retain the
-previous committed state. A raw transaction failure leaves Engine unchanged. A
-semantic transaction failure rolls back the entire transition and stops
-capture before publication.
+Raw admission MUST become durable before decoding starts or Engine receives a
+packet or command. Semantic state, the cursor-bound Timeline digest, query
+projections, and the next monotonic Projection commit identity MUST be atomic at
+the durability seam. Before that commit succeeds, memory mirrors, HTTP views,
+and notifications MUST retain the previous committed state. A raw transaction
+failure leaves the decoder and Engine untouched. A semantic transaction
+failure rolls back the entire transition and stops capture before publication.
 
 Evidence insufficiency returns typed Unknown output. Invalid numbers, broken
 state-machine invariants, incompatible receipts, or configuration/version
 conflicts return classified errors. Engine MUST preserve estimator error
 classification.
 
-Shutdown MUST stop new input, drain accepted input, durably order a Closed
-record, finish Engine at that record's time, and publish the final transition
-before the session becomes sealed. Session-local adaptation arming and age
-cursors reset at handoff; complete estimator values otherwise survive exactly.
+Explicit session finish and limit rotation MUST stop new input, drain accepted
+input, durably order a Closed record, finish Engine at that record's time, and
+publish the final transition before the session becomes sealed. Session-local
+adaptation arming and age cursors reset at handoff; complete estimator values
+otherwise survive exactly. Stopping only the Host process drains accepted work
+and preserves the active session without an Engine finish or handoff.
 
 ## Faithful semantic replay
 
@@ -824,9 +1030,10 @@ estimator, Engine, initial baseline states, commands, and explicit times.
 
 Replay MUST preserve packet and command total order and MUST call the same
 Timeline and Engine interfaces with identical ordered `TimelineInput`,
-including recorded `TimelineAdvance` and `Finish` inputs. Recovery continuation
-MUST do the same after strict `Timeline::restore`. Replay MUST NOT run HTTP,
-WebSocket, notification, or other delivery side effects.
+including recorded `TimelineAdvance` and `Finish` inputs. Recovery MUST do the
+same from a fresh `Timeline::new`; no serialized Timeline state is an input.
+Replay MUST NOT run HTTP, WebSocket, notification, or other delivery side
+effects.
 
 For the same sealed session, executable, target, and pinned semantic identity,
 live and replay MUST produce equal typed semantic snapshots, link evidence,
@@ -867,12 +1074,8 @@ receipts that demonstrate all of the following through Timeline and Engine:
   window, final state handoff, and
   rejection of later input;
 - atomic error rollback, deterministic ordering and pruning, closed-frontier
-  behavior, canonical state round-trip and continuation equality, configured
-  state-size proof, and rejection of malformed, non-canonical, inconsistent,
-  oversized, wrong-contract, or trailing state;
-- state-bound acceptance at exact `max_record_bytes`, rejection when the same
-  bound is one byte smaller, and successful restore/continuation at every
-  derived maximum cardinality;
+  behavior, deterministic canonical digest preimages, and equal digest/state
+  after rebuilding the same ordered prefix from a fresh Timeline;
 - clock-domain and mapping text acceptance at exactly 128 UTF-8 bytes and
   rejection when empty, whitespace-only, or 129 bytes;
 - rejection of missing, inconsistent, or corrupted epoch-termination receipts;

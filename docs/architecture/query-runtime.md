@@ -12,14 +12,20 @@ implementation status, or acceptance results.
 
 ## Ownership
 
-The ingest module is the only owner of mutable Timeline, baseline estimator,
-and current world state. It owns the database writer and publishes committed
-derived projections in the same transactions that advance processing state.
+`CaptureRun` owns ingest order and the sole synchronous database writer
+connection. Engine alone owns the mutable Timeline, estimator, and current
+World state. The persistence module owns committed rows and creates their
+projection commit identities. No one of these owners exposes its mutation
+interface to query or delivery.
 
 The query projection module owns bounded, indexed reads over immutable committed
-projections. Its interface accepts domain selectors and query budgets and
-returns typed views plus provenance. It has no interface to Engine working
-state and no authority to reinterpret raw session records.
+projections. Store topology comes from the immutable provisioned topology
+manifest; visible sessions and facts come only through persistence-owned
+visibility views cut at the committed processing cursor. Its interface accepts
+domain selectors and query budgets and returns typed views plus provenance and
+the Projection watermark observed in the same read snapshot. It has no
+interface to Engine working state, current TOML, base fact tables, or authority
+to reinterpret raw session records.
 
 The HTTP/WebSocket adapter owns transport parsing, serialization, connection
 lifecycle, and per-client delivery buffers. It delegates semantic reads to the
@@ -27,7 +33,9 @@ query projection module and submits state-changing commands through the one
 ordered command seam. It does not own world or baseline state.
 
 The diagnostic UI is a consumer adapter. HTTP is its semantic state source;
-WebSocket delivery only invalidates that state.
+WebSocket delivery only invalidates that state and carries the Projection
+watermark that the next HTTP read must reach. Sequence zero is a valid handshake
+watermark but is not a Committed projection identity.
 
 ## Composition seams
 
@@ -36,10 +44,11 @@ WebSocket delivery only invalidates that state.
 HTTP adapter ------------------------------------+
     |                                             |
     | bounded query                              v
-    v                                     single ingest owner
-query projection module                    Engine + DB writer
+    v                                         CaptureRun
+query projection module                 ingest order + DB writer
     |                                             |
-    | read-only committed snapshot                | committed projection
+    |                                      exclusive Engine
+    | read-only committed snapshot       Timeline + estimator + World
     v                                             v
              one SQLite database in WAL mode
                               |
@@ -65,15 +74,33 @@ loss make HTTP resynchronization a real second interaction mode.
 
 - A read observes one committed SQLite snapshot. It cannot combine working
   Engine memory with committed rows.
-- Only the ingest owner mutates semantic state. HTTP submits commands but does
-  not directly mutate baselines or hold mutable Engine access.
+- Transaction A cannot affect a query: readers cannot access a session before
+  its first transaction B or a record beyond that session's committed processing
+  cursor, and Store topology never comes from mutable runtime configuration.
+  Committed observation and baseline projections supply only dynamic Profile
+  membership, including first-B baseline publication after a decode reject.
+- `CaptureRun` alone orders ingest and owns the writer connection; Engine alone
+  mutates Timeline, estimator, and World. HTTP submits commands but does not
+  directly mutate baselines or hold mutable Engine access.
 - A live invalidation is published only after the corresponding projection
-  commit. Failed or rolled-back projection work emits no notification.
+  commit and binds that commit identity. Failed or rolled-back projection work
+  emits no notification.
+- A new WebSocket connection always receives the current zero-capable
+  Projection watermark. Only transaction B or retention can produce and publish
+  a nonzero Committed projection identity.
+- Persistence advances the global query-visible Store watermark in the same
+  transaction as a retention deletion and hands only the committed identity to
+  delivery. The API/UI specification alone owns the invalidation name and
+  publication behavior. No query-visible mutation reuses a prior identity.
 - Query work, a full command queue, a slow WebSocket client, or browser failure
   cannot apply backpressure to ingest.
 - Every socket, command, read, and per-client notification queue has a finite
   configured bound. Exhaustion is observable at its owning seam.
 - WebSocket delivery state is disposable and non-semantic. Recovery crosses
-  the HTTP read seam and returns to committed SQLite projections.
+  the HTTP read seam and returns to committed SQLite projections at or beyond
+  the reconnect watermark for the same Store ID.
+- Query consistency is scoped to each SQLite read snapshot and receipt. The
+  query runtime exposes no cross-request snapshot or multiversion-history seam;
+  exact client resynchronization belongs to the API/UI specification.
 These invariants constrain implementations while leaving transport behavior to
 the v1 specification and implementation facts to code and behavior tests.
