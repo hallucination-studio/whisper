@@ -5,6 +5,14 @@ seams, and invariants for host configuration, sessions, and persistence. Exact
 schema, bytes, ordering, paths, errors, and runtime behavior live only in the
 [host persistence v1 specification](../specs/persistence-v1.md).
 
+Applicability: the configuration and Managed-store modules, including the
+trusted-root, cooperative-lease, staged-publication, and non-creating-open
+seams, are shared by the bounded Demo and deferred Semantic Program. The
+two-transaction processing, same-session recovery, rotation, retention,
+handoff, and semantic replay seams belong only to the deferred Semantic
+Program. The Demo Store schema and its per-serve, single-transaction path are
+first-applicable in [Demo Slice architecture](demo-slice.md).
+
 ## Module responsibilities
 
 The configuration module owns the sole interface from human-authored TOML to a

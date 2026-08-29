@@ -47,10 +47,11 @@ as a substitute document.
 
 | Topic | Concrete owners |
 | --- | --- |
+| Bounded ESP32-S3-to-Chrome Demo Slice | [Demo Slice v1 specification](specs/demo-slice-v1.md), [architecture](architecture/demo-slice.md), and [ADRs 0016](adr/0016-new-capture-session-per-serve.md) and [0017](adr/0017-atomic-demo-ingest.md). This route is first-applicable for Demo Store, Capture Session, atomic Demo ingest, canonical API subset, polling, and demo-smoke questions. |
 | Firmware and native-frame | [Specification](specs/native-frame-v1.md), [architecture](architecture/firmware-native-frame.md), [evidence](evidence/firmware.md), [operations](operations/firmware.md), and [provenance](references/native-frame.md) |
-| Host configuration, sessions, and persistence | [Specification](specs/persistence-v1.md), [architecture](architecture/host-persistence.md), [ADR rationale](adr/0003-sqlite-authoritative-session-store.md), and [evidence](evidence/host-persistence.md) |
-| Timeline, world runtime, and evaluation | [Temporal/world specification](specs/temporal-world-v1.md), [evaluation specification](specs/evaluation-v1.md), [architecture](architecture/world-runtime.md), [ADR rationale](adr/0002-engine-single-writer.md), and [evidence](evidence/world-runtime.md) |
-| Query, API, WebSocket, and UI | [Specification](specs/api-ui-v1.md), [architecture](architecture/query-runtime.md), and [evidence](evidence/query-ui.md) |
+| Shared host configuration and Managed store lifecycle, plus deferred Semantic Session persistence | [Specification](specs/persistence-v1.md), [architecture](architecture/host-persistence.md), [local-namespace rationale](adr/0013-trust-program-1-local-store-namespace.md), [Semantic Store rationale](adr/0003-sqlite-authoritative-session-store.md), and [evidence](evidence/host-persistence.md) |
+| Shared Capture Profile and native observation contract, plus deferred Timeline, world runtime, and evaluation | [Temporal/world specification](specs/temporal-world-v1.md), [evaluation specification](specs/evaluation-v1.md), [architecture](architecture/world-runtime.md), [ADR rationale](adr/0002-engine-single-writer.md), and [evidence](evidence/world-runtime.md) |
+| Deferred full query, API, WebSocket, and diagnostic UI | [Specification](specs/api-ui-v1.md), [architecture](architecture/query-runtime.md), and [evidence](evidence/query-ui.md) |
 
 ## Maturity vocabulary
 

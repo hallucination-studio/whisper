@@ -20,6 +20,36 @@ _Avoid_: single-device mode, because it is not a distinct runtime mode.
 A deployment configured with more than one sensor.
 _Avoid_: mesh, because sensor count does not imply a network topology.
 
+**Demo Slice**:
+The bounded development product path from an authenticated physical Sensor to
+committed native-coordinate CSI and a read-only browser.
+_Avoid_: Semantic Program or Program 1, which name the broader deferred target.
+
+**Semantic Program**:
+The deferred delivery scope for the full Program 1 Semantic Session,
+temporal/world, query/UI, and formal development-E2E target.
+_Avoid_: Demo Slice, which has a smaller operative scope.
+
+**Program 1**:
+The contract-local name for the full Single-sensor development E2E target now
+assigned to the Semantic Program.
+_Avoid_: Demo Slice, which does not satisfy that target.
+
+**Demo Store**:
+The persistent identity containing one Demo Slice's admission, capture, and
+query history.
+_Avoid_: Semantic Store, because no semantic processing is implied.
+
+**Capture Session**:
+A non-semantic grouping of admitted packet facts from one uninterrupted Host
+capture lifetime.
+_Avoid_: Semantic Session or Host process, which have different boundaries.
+
+**Semantic Session**:
+A continuity boundary whose ordered facts reconstruct temporal and semantic
+state and may span a compatible Host restart.
+_Avoid_: Capture Session, which carries no temporal or semantic continuity.
+
 **Link**:
 A configured RF observation relationship within a deployment.
 _Avoid_: device, when the relationship rather than the hardware is meant.
@@ -44,7 +74,7 @@ context.
 _Avoid_: raw datagram.
 
 **Session record**:
-A domain event associated with a sensing session.
+A domain event associated with a Semantic Session.
 _Avoid_: packet, because not every session event represents captured data.
 
 **Baseline state**:
@@ -116,6 +146,5 @@ inter-session bootstrap authority.
 The ordered durable facts after an active session's committed processing cursor.
 
 **Host restart**:
-Stopping and reopening the Host process while retaining the Managed database
-and replay identity.
+Stopping and reopening the Host process while retaining the selected Store.
 _Avoid_: session rotation.

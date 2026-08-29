@@ -4,6 +4,12 @@ status: accepted
 
 # Trust the Program 1 local store namespace
 
+Scope: this decision governs the shared local namespace and cooperative
+lifecycle used by the bounded Demo Store and deferred Semantic Store. The Demo
+has its own schema, Capture Session, and ingest contract in
+[Demo Slice v1](../specs/demo-slice-v1.md), while storage qualification and its
+classification remain deferred to the Semantic Program.
+
 ## Context
 
 Program 1 needs a fast, production-shaped demonstration on one identified Mac.

@@ -33,6 +33,39 @@ listed here. The rationale for this evidence threshold is recorded in
 [ADR 0004](adr/0004-research-promotion-evidence.md). External source identity
 and provenance lives in the [references index](references/README.md).
 
+## Deferred Semantic Program
+
+### Direction
+
+After the bounded [Demo Slice v1](specs/demo-slice-v1.md) proves physical
+ESP32-S3 capture through committed native-coordinate CSI and an unchanged
+Chrome page, resume the broader Semantic Program as a distinct authority and
+delivery graph. That Program may implement Semantic Sessions, Timeline,
+conditioning, statistical baselines, Engine, World, same-Semantic-Session Host
+restart, retention, handoff, faithful replay, the complete API/UI matrix, and
+formal development-E2E classification.
+
+The accepted specifications call that full Single-sensor development E2E
+target `Program 1`; the Semantic Program is its current deferred delivery scope.
+
+The accepted persistence, temporal/world, API/UI, evaluation, and
+development-E2E v1 documents preserve that future target. Their applicability
+notes and Demo Slice v1 define the exact shared subset operative for the
+bounded Demo. A `demo-smoke` result cannot promote or satisfy the deferred
+Store, session, transaction, semantic, or evidence contracts.
+
+### Promotion gate
+
+- Retain the completed Demo's actual Store, runtime, browser, and queue behavior
+  as input without upgrading its evidence classification.
+- Reconcile the accepted Semantic Session transaction/recovery model with the
+  implementation baseline and measured Demo failure modes.
+- Select one bounded semantic outcome and its required Timeline, estimator,
+  query, and recovery scope rather than activating every deferred surface at
+  once.
+- Publish the resulting dependency graph and execution-evidence gaps in GitHub
+  Issues before marking any semantic leaf ready.
+
 ## Multi-sensor deployment validation
 
 ### Direction

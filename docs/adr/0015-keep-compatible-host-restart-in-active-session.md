@@ -4,6 +4,11 @@ status: accepted
 
 # Keep compatible Host restart inside the active session
 
+Scope: this decision applies only to a deferred Semantic Session. A Demo Host
+restart creates another non-semantic Capture Session under
+[ADR 0016](0016-new-capture-session-per-serve.md); it does not recover or
+continue the prior Capture Session.
+
 ## Context
 
 Timeline watermarks, open fixed windows, stream instances, estimator arming,
