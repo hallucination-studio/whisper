@@ -44,6 +44,14 @@ station credentials and the collector endpoint, while firmware resolves the
 associated AP BSSID and channel at startup and freezes them for that boot's
 callback validation.
 
+The production Host/fixture secret loader is the sole owner of filesystem
+trust for `secret_root`: layout, mode, aliases, replacement, readability,
+device/key-epoch selection, and key-material validation. The validated value
+crosses the fixture-to-firmware provisioning boundary without a second
+filesystem trust policy. The exact handoff and consumption behavior lives in
+the
+[native-frame v1 specification](../specs/native-frame-v1.md#provisioning-and-image-compatibility).
+
 The callback snapshot seam isolates the Wi-Fi task from encoding, crypto, and
 network latency. Snapshot ownership transfers through a bounded queue and has
 one lifecycle; pressure is represented as explicit loss rather than partial

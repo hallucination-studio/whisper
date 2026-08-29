@@ -220,6 +220,28 @@ MUST reject duplicate object members before constructing a map or DTO. All
 schema `Timestamp` strings are UTC instants with at most nanosecond precision,
 so they compare exactly with `receive_utc_ns`.
 
+### Provisioning artifacts
+
+Provisioning tooling MAY emit a private, untracked
+`ProvisioningOperationRecord` for operator diagnosis or local continuation. If
+emitted, it MUST contain only the private operational metadata necessary for
+those purposes and MUST NOT contain raw keys, Wi-Fi credentials or passwords,
+real SSIDs, or other secret material. It MUST NOT be committed, placed in an
+evidence package, referenced by an artifact locator, or consumed by an execution
+claim, verifier, classification, or Program-completion input. Calling such an
+operational JSON object a receipt does not make it a `ProvisioningReceipt`.
+
+`ProvisioningReceipt` is the distinct, retained Program 1 producer artifact
+defined by the closed `$defs.ProvisioningReceipt` schema. It contains exactly
+`schema_version`, `fixture_seed`, `derivation_version`, `sensor_id`, `device_id`,
+`key_epoch`, `key_identity_sha256`, `route_identity_sha256`,
+`firmware_image_sha256`, `provisioned_at`, and `result`. It MUST contain no raw
+key, credential, SSID, secret/output/serial path, collector address, command,
+log or log path, uncontrolled infrastructure identity, or unknown field.
+Neither artifact assigns an evidence classification. The independent verifier
+validates the schema-defined producer receipt as untrusted input; it does not
+create that receipt and MUST NOT consume `ProvisioningOperationRecord`.
+
 Claims are strictly ordered and unique by claim-ID raw UTF-8 bytes, and every
 claim ID is unique. Within each claim, parent IDs are strictly ordered and
 unique by raw UTF-8 bytes. Each claim's `artifacts` array has exactly the
@@ -254,9 +276,10 @@ results, and its aggregate result.
 The fixed-role artifacts have these additional validation and equality rules:
 
 - `provisioning_receipt` validates as `$defs.ProvisioningReceipt`, contains no
-  secret-bearing material, and matches the physical claim's fixture derivation,
-  Sensor, device, key epoch, route, firmware image digest, execution result, and
-  interval.
+  forbidden provisioning material or operational fields listed above, and
+  matches the physical claim's fixture derivation, Sensor, device, key epoch,
+  route, firmware image digest, execution result, and interval. A
+  `ProvisioningOperationRecord` cannot substitute for this artifact.
 - `admitted_fact_export` validates as `$defs.AdmittedFactExport`. It is exported
   from one SQLite read snapshot and contains only Store/session identity,
   record sequence, datagram digest, peer, receive context, and transaction-A
@@ -513,8 +536,9 @@ browser claims; it does not enlarge one BrowserTrace or block an early tracer
 from producing its bounded evidence.
 
 Physical capture lineage is procedural in Program 1. The claim binds the
-identified board, firmware image, provisioning operation, Sensor, route,
-Link/Profile, capture tool, interval, receive context, and datagram digests.
+identified board, firmware image, schema-defined provisioning receipt, Sensor,
+route, Link/Profile, capture tool, interval, receive context, and datagram
+digests.
 The public development fixture key and AES-256-GCM authenticate known fixture
 bytes but do not attest hardware identity or physical origin. Program 1 makes
 no hardware-attestation claim.
