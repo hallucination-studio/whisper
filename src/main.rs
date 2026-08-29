@@ -27,6 +27,14 @@ fn main() -> ExitCode {
         return check_config_command(args.collect());
     }
 
+    if command == "init-admission" {
+        return init_admission_command(args.collect());
+    }
+
+    if command == "serve" {
+        return serve_command(args.collect());
+    }
+
     #[cfg(feature = "development-fixture")]
     if command == "development-fixture" {
         return development_fixture_command(args.collect());
@@ -49,6 +57,54 @@ fn check_config_command(args: Vec<OsString>) -> ExitCode {
         }
         Err(error) => {
             eprintln!("invalid configuration: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn init_admission_command(args: Vec<OsString>) -> ExitCode {
+    let [path] = args.as_slice() else {
+        print_usage();
+        return ExitCode::from(2);
+    };
+    let config = match check_config(Path::new(path)) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("invalid configuration: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match whisper::init_admission(&config) {
+        Ok(()) => {
+            println!("initialized Demo admission Store");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Demo Store initialization failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn serve_command(args: Vec<OsString>) -> ExitCode {
+    let [path] = args.as_slice() else {
+        print_usage();
+        return ExitCode::from(2);
+    };
+    let config = match check_config(Path::new(path)) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("invalid configuration: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match whisper::serve(&config) {
+        Ok(_session) => {
+            println!("opened Demo Store and created Capture Session");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Demo Store startup failed: {error}");
             ExitCode::from(1)
         }
     }
@@ -87,6 +143,8 @@ fn development_fixture_command(args: Vec<OsString>) -> ExitCode {
 
 fn print_usage() {
     eprintln!("usage: whisper check-config <path>");
+    eprintln!("       whisper init-admission <path>");
+    eprintln!("       whisper serve <path>");
     #[cfg(feature = "development-fixture")]
     eprintln!(
         "       whisper development-fixture <config-path> <sensor-id> <program> [arguments...]"

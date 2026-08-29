@@ -5,15 +5,22 @@
     expect(dead_code, reason = "external lifecycle wiring is implemented in a later work package")
 )]
 
+#[cfg(unix)]
+use std::collections::BTreeSet;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::Config;
 use crate::config::RouteConfig;
 use crate::database::{Database, DatabaseError, EpochHandle, ReplayWindowIdentity};
+#[cfg(unix)]
+use crate::demo_store::{self, AdmissionEpochSeed, DemoStoreError};
 use crate::domain::identity::{DeploymentId, DeviceId, KeyEpoch};
 use crate::key_material::{EpochKey, SecretStoreError, load_epoch_key};
+#[cfg(unix)]
+use crate::managed_store::{ManagedRoot, ManagedStoreError};
 use sha2::{Digest, Sha256};
 
 const REPLAY_WINDOW_IDENTITY_DOMAIN: &[u8] = b"whisper.replay-window.identity";
@@ -303,6 +310,125 @@ pub(crate) enum HostError {
     Database(#[from] DatabaseError),
     #[error(transparent)]
     SecretStore(#[from] SecretStoreError),
+    #[cfg(unix)]
+    #[error(transparent)]
+    ManagedStore(#[from] ManagedStoreError),
+    #[cfg(unix)]
+    #[error(transparent)]
+    DemoStore(#[from] DemoStoreError),
+    #[cfg(not(unix))]
+    #[error("this platform cannot enforce the Unix Managed-store contract")]
+    UnsupportedManagedStorePlatform,
+}
+
+#[derive(Debug)]
+pub(crate) struct DemoSession {
+    store_id: [u8; 32],
+    session_id: String,
+    monotonic_origin: Instant,
+    #[cfg(unix)]
+    _managed: ManagedRoot,
+}
+
+impl DemoSession {
+    #[cfg(unix)]
+    fn new(managed: ManagedRoot, capture: demo_store::CaptureSession) -> Self {
+        Self {
+            store_id: capture.store_id,
+            session_id: capture.session_id,
+            monotonic_origin: capture.monotonic_origin,
+            _managed: managed,
+        }
+    }
+
+    pub(crate) const fn store_id(&self) -> [u8; 32] {
+        self.store_id
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.monotonic_origin.elapsed()
+    }
+}
+
+impl HostError {
+    pub(crate) const fn is_lease_conflict(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::ManagedStore(ManagedStoreError::LeaseConflict))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn init_admission(config: &Config) -> Result<(), HostError> {
+    let managed = ManagedRoot::acquire_for_initialization(config.session().database_path())?;
+    let admissions = admission_seeds(config)?;
+
+    let stage = managed.create_stage()?;
+    let stage_identity = stage.identity();
+    let initialized = demo_store::initialize(&stage, config, admissions)?;
+    let final_path = managed.publish(stage)?;
+    if let Err(error) = initialized.validate(&final_path) {
+        managed.remove_published_if_owned(stage_identity)?;
+        return Err(error.into());
+    }
+    if let Err(error) = managed.finish_closed_database() {
+        managed.remove_published_if_owned(stage_identity)?;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn init_admission(_config: &Config) -> Result<(), HostError> {
+    Err(HostError::UnsupportedManagedStorePlatform)
+}
+
+#[cfg(unix)]
+pub(crate) fn serve(config: &Config) -> Result<DemoSession, HostError> {
+    let managed = ManagedRoot::acquire_existing(config.session().database_path())?;
+    let admissions = admission_seeds(config)?;
+    let capture =
+        demo_store::open_and_create_capture_session(managed.database_path(), config, admissions)?;
+    Ok(DemoSession::new(managed, capture))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn serve(_config: &Config) -> Result<DemoSession, HostError> {
+    Err(HostError::UnsupportedManagedStorePlatform)
+}
+
+#[cfg(unix)]
+fn admission_seeds(config: &Config) -> Result<Vec<AdmissionEpochSeed>, HostError> {
+    let mut identities = BTreeSet::new();
+    let mut admissions = Vec::with_capacity(config.registry().routes().len());
+    for route in config.registry().routes() {
+        let device = route.device_id();
+        let key_epoch = route.key_epoch();
+        if !identities.insert((device, key_epoch)) {
+            return Err(HostError::AmbiguousAdmissionRoute { device, key_epoch });
+        }
+        let (_, replay_window_size) = replay_admission_config(config, device, key_epoch)?;
+        let epoch_key = load_epoch_key(config, device, key_epoch)?;
+        let identity =
+            replay_window_identity(config.deployment().id(), device, key_epoch, &epoch_key)?;
+        admissions.push(AdmissionEpochSeed {
+            device,
+            key_epoch,
+            replay_window_identity: identity,
+            replay_window_size,
+        });
+    }
+    admissions.sort_by_key(|admission| (admission.device, admission.key_epoch));
+    Ok(admissions)
 }
 
 pub(crate) fn open_capture_database(config: &Config) -> Result<Database, HostError> {

@@ -33,7 +33,7 @@ impl ReplayWindowIdentity {
         Self(bytes)
     }
 
-    const fn as_bytes(&self) -> &[u8; 32] {
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
