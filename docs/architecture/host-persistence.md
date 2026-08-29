@@ -18,13 +18,17 @@ by live capture and replay. It does not own SQLite lifecycle or semantic
 mutation.
 
 The application module owns the only external lifecycle interface.
-`HostLifecycle` accepts small operator intents for provisioning, capture, and
-replay, then coordinates trusted-root validation, cooperative leasing, secrets,
-open, same-session recovery, lazy session creation, and retention. A successful
-capture open
+`HostLifecycle` accepts small operator intents for provisioning, capture,
+replay, and corpus export, then coordinates trusted-root validation,
+cooperative leasing, secrets, open, same-session recovery, lazy session
+creation, and retention. A successful capture open
 returns `CaptureRun`, which owns the complete managed-store lease, sole
 synchronous writer connection, ingest order, rotation, shutdown, and publication
-sequencing without exposing internal persistence or Engine operations.
+sequencing without exposing internal persistence or Engine operations. A
+successful corpus-export open returns `CorpusExport`, a bounded read-only shell
+that retains the same lifecycle lease through all of its export readers and
+owns the sole connection and sealed-session SQLite read snapshot used by those
+readers.
 
 The managed-store module is a concrete internal module behind that lifecycle
 seam. It owns the dedicated-root lease, staged provisioning and atomic
@@ -52,6 +56,12 @@ supplied values at the commit seam; it does not reconstruct Engine state.
 Query and delivery modules read committed projections. They cannot mutate raw
 facts, Engine state, lifecycle, or baseline handoffs.
 
+Corpus export is a separate application-owned read intent. It reads immutable
+packet facts from one sealed session without entering the ordinary HTTP/query
+projection seam or the replay processing seam, and cannot mutate facts,
+projections, lifecycle, admission state, Engine state, or evidence
+classification.
+
 ## Interfaces and seams
 
 ```text
@@ -75,6 +85,10 @@ active manifest + ordered facts
   -> recovery/replay seam
   -> same-session continuation or explicit incompatibility
 
+validated configuration + sealed session
+  -> corpus-export seam
+  -> retained managed-store lease + one read-only snapshot
+
 finished Engine transition + complete baseline handoff
   -> seal/pending-handoff seam
 
@@ -92,21 +106,27 @@ concrete error representation.
 HostLifecycle::provision(ProvisionIntent) -> StoreId
 HostLifecycle::capture(CaptureIntent) -> CaptureRun
 HostLifecycle::replay(ReplayIntent) -> ReplayResult
+HostLifecycle::corpus_export(CorpusExportIntent) -> CorpusExport
 
 CaptureRun::ingest(ReceivedDatagram) -> CommittedProjectionIdentity
 CaptureRun::control(CaptureControl) -> CommittedProjectionIdentity
 CaptureRun::finish(FinishIntent) -> FinishedCapture
 ```
 
-`ProvisionIntent`, `CaptureIntent`, and `ReplayIntent` contain validated
-operator choices only. `CaptureRun` is the sole live ingest owner. A complete
-encrypted datagram and its receive context enter at `ingest`; no caller can
-enter at decoded observation, Engine transition, persistence-row, or projection
-publication level. `control` accepts only the ordered Timeline and baseline
-control inputs owned by the session contract. `finish` owns stop-input, drain,
-durable `Closed`, Engine finish, final transition commit, seal, and pending
-handoff publication; it does not create a successor, and there is no separate
-caller-visible seal operation.
+`ProvisionIntent`, `CaptureIntent`, `ReplayIntent`, and `CorpusExportIntent`
+contain validated operator choices only. `CorpusExportIntent` selects its
+existing Managed database and immutable Store topology through validated
+current configuration and identifies one sealed session; it does not accept an
+arbitrary database path. Historical route and replay identities come exclusively
+from that sealed session's manifest, not current replay configuration.
+`CaptureRun` is the
+sole live ingest owner. A complete encrypted datagram and its receive
+context enter at `ingest`; no caller can enter at decoded observation, Engine
+transition, persistence-row, or projection publication level. `control`
+accepts only the ordered Timeline and baseline control inputs owned by the
+session contract. `finish` owns stop-input, drain, durable `Closed`, Engine
+finish, final transition commit, seal, and pending handoff publication; it does
+not create a successor, and there is no separate caller-visible seal operation.
 
 Behind `CaptureRun`, transaction A returns a private, unforgeable
 `DurableRecord` capability only after replay admission and the exact encrypted
@@ -131,8 +151,14 @@ invariants local instead of making every caller coordinate them.
 
 The managed-store seam owns one complete lifetime: the root lease is acquired
 before SQLite open and remains held until all writer and reader connections are
-closed. Process termination releases the operating-system lease; a later
-lifecycle performs SQLite WAL recovery before Host fact replay.
+closed. Under that lease, corpus export uses a short-lived non-creating recovery
+and validation connection, closes it, then owns one read-only connection and
+one long-lived sealed-session snapshot borrowed by every export reader. Ending
+that snapshot and closing its connection precede lease release. Exact open,
+recovery, snapshot-validation, and close behavior is owned by the
+[host persistence v1 specification](../specs/persistence-v1.md). Process
+termination releases the operating-system lease; a later lifecycle performs
+SQLite WAL recovery before Host fact replay.
 
 The configuration and session interfaces provide leverage: the same strong
 values and codecs serve live capture, recovery, and replay. Runtime-only values
@@ -175,8 +201,9 @@ generic migration framework.
 
 - One configuration root supplies every module; replay identity and runtime
   operation remain distinct.
-- `HostLifecycle` and `CaptureRun` own external lifecycle sequencing.
-  Persistence exposes no bare seal or caller-selected recovery state.
+- `HostLifecycle`, `CaptureRun`, and `CorpusExport` own external lifecycle
+  sequencing. Persistence exposes no bare seal, caller-selected recovery state,
+  or general database-path opener.
 - One dedicated trusted local root and one lifecycle-owned OS lease coordinate
   cooperative Whisper processes. Hostile root or same-credential namespace
   mutation is outside Program 1's guarantee.
@@ -193,6 +220,9 @@ generic migration framework.
   external database cannot become a second authority.
 - One sequential ingest owner holds the writer and Engine mutation. Query and
   delivery remain readers of committed state.
+- Ordinary HTTP/query, faithful replay, and corpus export are distinct read
+  intents. Corpus export is bounded to one sealed-session snapshot and cannot
+  become a mutation or evidence-classification seam.
 - The record envelope owns order, time, and kind once. The kind-specific body
   does not duplicate that envelope.
 - Raw packet and control records are immutable facts. Processing state,

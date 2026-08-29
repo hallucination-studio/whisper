@@ -25,7 +25,9 @@ visibility views cut at the committed processing cursor. Its interface accepts
 domain selectors and query budgets and returns typed views plus provenance and
 the Projection watermark observed in the same read snapshot. It has no
 interface to Engine working state, current TOML, base fact tables, or authority
-to reinterpret raw session records.
+to reinterpret raw session records. This is the ordinary HTTP/query read seam;
+the lifecycle-owned sealed-session corpus-export snapshot and faithful replay
+iterator are separate persistence seams.
 
 The HTTP/WebSocket adapter owns transport parsing, serialization, connection
 lifecycle, and per-client delivery buffers. It delegates semantic reads to the
