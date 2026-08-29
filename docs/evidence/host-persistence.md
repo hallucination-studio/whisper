@@ -193,9 +193,10 @@ evidence have not been established.
 Issue #24 has closed the pragma-semantics decision; implementation conformance
 and executed evidence remain open under #33. The accepted target includes
 pragma semantics, logical session byte accounting, Engine-produced complete-
-baseline handoff, removal of the predecessor flush policy, and the recovery
-seal. Neither Clean HEAD, the classified WIP snapshot, nor the retained receipts
-establish implementation or executed acceptance evidence for those targets.
+baseline handoff, removal of the predecessor flush policy, and compatible Host
+restart inside the same active session. Neither Clean HEAD, the classified WIP
+snapshot, nor the retained receipts establish implementation or executed
+acceptance evidence for those targets.
 
 The exact accepted behavior is in the
 [host persistence v1 specification](../specs/persistence-v1.md), and

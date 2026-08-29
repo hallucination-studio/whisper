@@ -10,13 +10,15 @@ the [world/runtime evidence index](../evidence/world-runtime.md).
 ## Responsibilities
 
 Timeline owns source-sequence classification, stream-instance lifecycle,
-watermarks, fixed windows, missing spans, and restorable temporal state. It
+watermarks, fixed windows, missing spans, and canonical digest state. It
 does not own signal transformation, baseline state, persistence, or scheduling
 clocks.
 
 Conditioning owns the pure conversion from one aligned dynamic-coordinate
-window to auditable per-coordinate values and receipts. It does not own window
-closure, baseline lifecycle, world aggregation, or I/O.
+window to one aggregate conditioned link window per computed Link/Profile key,
+including empty-contributor output, auditable per-coordinate values, and
+ordered stream-segment provenance. It does not own window closure, baseline
+lifecycle, world aggregation, or I/O.
 
 The statistical estimator owns evolution of the canonical complete baseline
 state, its lifecycle and update decisions, link/profile evidence, physical-link
@@ -27,10 +29,12 @@ Engine owns Timeline, conditioning, estimator mutation, and current world
 state behind one synchronous semantic interface. It is the only module that can
 produce a world transition.
 
-The application owns runtime composition: socket and command scheduling,
-durability calls, transition publication, shutdown, and bounded delivery. It
-persists Engine's concrete transition; it does not reconstruct or duplicate
-temporal, baseline, evidence, or world computations.
+The application owns runtime composition: `CaptureRun` orders socket and command
+input, owns the sole persistence writer connection, coordinates decoding,
+requests Engine semantic transitions, and sequences publication, shutdown, and
+bounded delivery. Engine alone owns its mutable Timeline, estimator, and World
+state. The application persists Engine's concrete transition; it does not
+reconstruct or duplicate temporal, baseline, evidence, or world computations.
 
 Durability owns committed state and projections at the Engine publication
 seam. Read/query modules consume committed immutable projections. They do not
@@ -63,9 +67,9 @@ does not introduce parallel state DTOs or generic value interfaces.
 durably admitted typed observation or ordered command
     -> Timeline input seam
     -> AlignedWindow seam
-    -> ConditionedWindow seam
+    -> ordered ConditionedLinkWindow set seam
     -> estimator evidence/state seam
-    -> EngineTransition seam
+    -> EngineTransition with complete WindowProjection seam
     -> atomic durability/publication seam
     -> immutable read and notification seam
 ```
@@ -78,17 +82,29 @@ The AlignedWindow seam separates temporal closure from signal transformation.
 It retains actual time, profile, gaps, missing spans, and dynamic coordinates;
 conditioning cannot repair or reinterpret temporal facts.
 
-The ConditionedWindow seam is the estimator's only signal input. It prevents
-raw windows, fixed tensors, and ad hoc transformations from becoming alternate
-baseline paths.
+The ConditionedLinkWindow set seam is the estimator's only signal input. Its
+keys equal the strict union of that window's observation or missing-span
+contributor keys and Engine's current baseline-state keys. The set may be empty;
+each present key advances exactly once, and a key is not invented when neither
+source supplies it. This prevents raw windows, per-stream estimator updates,
+fixed tensors, and ad hoc transformations from becoming alternate baseline
+paths.
 
-The EngineTransition seam is the complete mutation result. The application
-persists it exactly, which keeps state calculation on one side and atomic
-publication on the other.
+The EngineTransition seam is the complete mutation result. Engine owns each
+WindowProjection as one snapshot plus the complete ordered aggregate-evidence
+set whose keys equal that snapshot's computed link keys. The application
+commits the exact projection and canonical Timeline digest without regrouping,
+sorting, or recomputing them, which keeps state calculation on one side and
+atomic publication on the other.
 
 The durable publication seam separates working state from observable state.
-Readers and notifications see only committed projection identity. Replay enters
-through the same ordered semantic input seam and stops before delivery effects.
+Readers and notifications see only a committed projection identity created by
+the same transition transaction. Recovery and replay construct a fresh Engine
+and Timeline and use the ordinary semantic interface. Exact recovery cursor,
+row-comparison, digest-tripwire, fail-closed, and no-repair behavior is owned by
+the [host persistence v1 specification](../specs/persistence-v1.md). Isolated
+replay enters through the same ordered semantic input seam and stops before
+durability or delivery effects.
 
 ## Single-writer ownership
 
@@ -113,17 +129,39 @@ The rationale is recorded in
 - Every clock input to Timeline and Engine is explicit and replayable.
 - Source, stream instance, profile, link, and baseline compatibility identities
   remain distinct; profile changes never merge estimator state.
+- Every key in the per-window contributor/baseline union produces exactly one
+  conditioned aggregate and one estimator step. An empty union produces none.
+  Stream-segment contributors are ordered provenance; conditioning explicitly
+  sorts matching observations by unique session-global record sequence before
+  each fold and does not depend on AlignedWindow collection order. Slopes never
+  cross segment boundaries, and contributor count never multiplies quality or
+  exposure.
 - Missing and Unknown remain typed domain outcomes. Invalid input or broken
   invariants remain classified errors rather than fabricated observations.
 - Estimator evidence is calculated from pre-update state and travels with the
-  exact resulting state in one Engine transition.
+  exact resulting state in one Engine transition. Each WindowProjection owns
+  exactly one evidence item per snapshot Link/Profile key.
+- Engine alone owns the semantic completeness of each WindowProjection,
+  including the contributor/baseline union and omitted-key decision.
 - The application publishes no mirror, projection, or notification before the
   complete corresponding transition commits.
 - A failed raw commit does not call Engine. A failed semantic commit exposes no
   partial transition and stops further capture before publication.
+- Live capture and recovery preserve one Engine transition per ordered semantic
+  input. Authenticated decode rejects do not enter Engine; their private
+  record-processing transition and durability behavior is owned by the
+  [host persistence architecture](host-persistence.md). The application cannot
+  aggregate, reorder, drop, split, or recompute Engine transitions before
+  durability.
 - Physical-link and space reductions are stable-order and conservative.
   Multiple profiles of one physical link never inflate coverage.
-- Complete baseline state crosses shutdown, rotation, recovery, and replay;
-  in-memory state is not resume authority.
+- Complete baseline state crosses explicit finish, rotation, recovery, and
+  replay; in-memory state is not resume authority.
+- A compatible Host restart rebuilds the same active semantic state and cannot
+  reset Timeline windows, stream instances, estimator arming, or World identity.
+  Only explicit finish or limit rotation creates a session handoff.
+- SQLite ordered facts, not a serialized Timeline value, are recovery authority.
+  The [host persistence v1 specification](../specs/persistence-v1.md) owns exact
+  recovery behavior.
 - Runtime delivery, query order, processing duration, and host wall time never
   enter semantic snapshot identity.

@@ -37,11 +37,13 @@ The accepted immutable `Config` MUST contain exactly two semantic groups:
 - `RuntimeConfig` contains capture, session, view, server, and performance
   values that control process operation without changing replay results.
 
-The session storage path MUST be `SessionConfig.database_path`, MUST identify
-one SQLite file rather than a directory, and MUST NOT accept the former
-`directory` name as an alias. Configuration changes are applied by opening a
-new session; v1 does not hot-update replay configuration, key epochs, or
-routes.
+The session storage path MUST be `SessionConfig.database_path` and MUST identify
+one SQLite file rather than a directory. Its parent MUST be a dedicated trusted
+local Managed store root for that database, its SQLite companions, the
+cooperative lease, and private provisioning stages. It MUST NOT accept the
+former `directory` name as an alias. Configuration changes are applied by
+opening a new session; v1 does not hot-update replay configuration, key epochs,
+or routes.
 
 `ReplayConfig` MUST own a strict named-field canonical CBOR encoding and a
 SHA-256 digest of those bytes. TOML and CBOR decoding MUST both apply every
@@ -89,7 +91,7 @@ Runtime-only values obey these rules:
 | Group | Normative validation |
 | --- | --- |
 | capture | `bind` is a socket address; `max_datagram_bytes` is `1..=65535`; `socket_buffer_bytes:u32` is at least that maximum; `secret_root` is UTF-8 path text containing a non-`White_Space` scalar. |
-| session | `database_path` is non-whitespace UTF-8 path text naming one SQLite file; `max_manifest_bytes`, `max_record_bytes`, `max_session_duration_ns`, and `max_session_bytes` are nonzero `u64`; each manifest/record limit is at most `max_session_bytes`; `retention_max_sessions` is nonzero `u32`. |
+| session | `database_path` is non-whitespace UTF-8 path text naming one SQLite file whose parent is the dedicated trusted local Managed store root; `max_manifest_bytes`, `max_record_bytes`, `max_session_duration_ns`, and `max_session_bytes` are nonzero `u64`; each manifest/record limit is at most `max_session_bytes`; `retention_max_sessions` is nonzero `u32`. |
 | view | `recent_range_ns:u64`, `max_time_buckets:u32`, and `max_signal_points:u64` are nonzero. |
 | server | `bind` is a socket address; `recent_range_ns:u64`, `command_queue_capacity:u32`, and `websocket_queue_capacity:u32` are nonzero. |
 | performance | `max_rss_bytes:u64`, `max_cpu_threads:u32`, and `snapshot_deadline_ns:u64` are nonzero, and `snapshot_deadline_ns <= floor(window.step_ns / 2)`. |
@@ -249,9 +251,9 @@ Nothing may follow a `Closed` record.
 
 ## Session CBOR profile
 
-Manifest, record-body, complete-baseline, and baseline-snapshot values use the
-Whisper v1 deterministic CBOR profile below. This profile, not a Rust enum or
-serializer's defaults, defines the persisted bytes.
+Manifest, record-body, complete-baseline, baseline-snapshot, and temporal
+projection values use the Whisper v1 deterministic CBOR profile below. This
+profile, not a Rust enum or serializer's defaults, defines the persisted bytes.
 
 - Each document contains exactly one CBOR item and no trailing bytes.
 - Arrays, maps, text strings, and byte strings use definite lengths.
@@ -282,6 +284,39 @@ checked against `max_record_bytes` before allocation. A decoder MUST reject a
 declared text, byte-string, array, or map length greater than the remaining
 enclosing blob bytes before allocating. The exact collection cardinality rules
 below are then applied to the decoded value.
+
+## Store topology manifest
+
+`StoreTopologyManifestV1` is the immutable provisioned map stored in
+`store_state.topology_manifest_cbor`, with these exact keys and values:
+
+| Order | Key | CBOR value |
+| ---: | --- | --- |
+| 1 | `schema` | unsigned integer, exactly `1` |
+| 2 | `deployment` | deployment identifier text |
+| 3 | `spaces` | strictly ordered unique array of space identifier text |
+| 4 | `transmitters` | strictly ordered unique array of transmitter identifier text |
+| 5 | `sensors` | strictly ordered unique array of topology-sensor maps |
+| 6 | `links` | strictly ordered unique array of topology-link maps |
+
+A topology-sensor map has ordered keys `id`, `hardware_kind`, and `device_id`.
+`hardware_kind` is exactly `esp32-s3` in Program 1 and `device_id` is unsigned
+`u64`. A topology-link map has ordered keys `id`, `space`, `transmitter`, and
+`receiver`; its space, transmitter, and receiver references MUST resolve inside
+the corresponding manifest arrays. Space, Transmitter, Sensor, and Link arrays
+are ordered by ID UTF-8 bytes. The manifest is the exact
+query-visible topology subset deterministically derived from ReplayConfig. It
+contains no route peer, key epoch, secret, firmware/capability pin, socket,
+budget, algorithm, baseline, or other runtime/replay-only field.
+
+`store_state.topology_manifest_digest` MUST equal SHA-256 of the exact standalone
+manifest bytes. Provisioning creates both once. Every later managed open derives
+the manifest from the selected configuration and requires byte equality before
+mutation. A topology change requires another Managed database in v1; current
+TOML is never a query source. Link Profile collections are not stored in this
+manifest: topology reads derive them only from committed observation or
+baseline-state projections, so the sequence-zero profile collections are empty
+and a first-B baseline seed is discoverable even after a decode reject.
 
 ## Session manifest
 
@@ -372,6 +407,17 @@ sequence. Frozen and Stale also require `adaptation_armed=false`; Active may
 encode either boolean. For an initial manifest seed, every lifecycle requires
 `adaptation_armed=false` and `session_last_eligible_at=null`, as required by the
 [temporal baseline session-boundary rule](temporal-world-v1.md#active-prediction-and-update).
+
+`pending_session_handoff.handoff_cbor` is the complete baseline handoff encoded
+as one strictly ordered array of the same complete-baseline-state maps. Its
+digest is SHA-256 of those exact bytes. The pending row exists only after a
+successful final transaction B and before the lazy-creation transaction A of a
+later session consumes it. Genesis has no row and therefore supplies an empty
+initial array, meaning Missing. The source identifiers are retained provenance,
+not foreign-key ownership: the handoff bytes remain valid bootstrap authority
+if retention later removes their sealed source. Once copied into a new session
+manifest, that manifest and its ordered facts are the sole recovery authority
+for that session.
 
 A Welford-coordinate map has ordered keys `path`, `coordinate`, `count`,
 `mean`, `m2`, and `accepted_exposure_ns`. `count` and exposure are nonzero
@@ -553,16 +599,31 @@ CREATE TABLE admission_epochs (
     CHECK(length(seen_bitmap) = (replay_window_size + 7) / 8)
 ) WITHOUT ROWID;
 
+CREATE TABLE store_state (
+    singleton INTEGER NOT NULL CHECK(singleton = 1),
+    store_id BLOB NOT NULL CHECK(length(store_id) = 32),
+    topology_manifest_cbor BLOB NOT NULL,
+    topology_manifest_digest BLOB NOT NULL
+        CHECK(length(topology_manifest_digest) = 32),
+    projection_commit_seq BLOB NOT NULL
+        CHECK(length(projection_commit_seq) = 8),
+    PRIMARY KEY (singleton)
+) WITHOUT ROWID;
+
 CREATE TABLE sessions (
     session_id TEXT NOT NULL,
     started_utc_ns INTEGER NOT NULL,
     manifest_cbor BLOB NOT NULL,
     fact_bytes BLOB NOT NULL CHECK(length(fact_bytes) = 8),
     lifecycle TEXT NOT NULL
-        CHECK(lifecycle IN ('active', 'sealed', 'recovery_sealed')),
+        CHECK(lifecycle IN ('active', 'sealed')),
     sealed_utc_ns INTEGER,
+    seal_reason TEXT
+        CHECK(seal_reason IS NULL OR seal_reason IN
+              ('finish', 'duration_limit', 'byte_limit')),
     PRIMARY KEY (session_id),
-    CHECK((lifecycle = 'active') = (sealed_utc_ns IS NULL))
+    CHECK((lifecycle = 'active') = (sealed_utc_ns IS NULL)),
+    CHECK((lifecycle = 'active') = (seal_reason IS NULL))
 ) WITHOUT ROWID;
 
 CREATE UNIQUE INDEX one_active_session
@@ -586,12 +647,44 @@ CREATE TABLE session_records (
 CREATE INDEX session_records_time
     ON session_records(session_id, session_time, record_seq);
 
+CREATE TABLE projection_commits (
+    commit_seq BLOB NOT NULL CHECK(length(commit_seq) = 8),
+    session_id TEXT,
+    record_seq BLOB
+        CHECK(record_seq IS NULL OR length(record_seq) = 8),
+    kind TEXT NOT NULL
+        CHECK(kind IN ('semantic', 'decode_rejected', 'finish', 'retention')),
+    timeline_state_digest BLOB
+        CHECK(timeline_state_digest IS NULL
+              OR length(timeline_state_digest) = 32),
+    PRIMARY KEY (commit_seq),
+    UNIQUE (session_id, record_seq, commit_seq),
+    FOREIGN KEY (session_id, record_seq)
+        REFERENCES session_records(session_id, record_seq)
+        ON DELETE CASCADE,
+    CHECK((session_id IS NULL) = (record_seq IS NULL)),
+    CHECK((kind = 'retention') = (session_id IS NULL)),
+    CHECK((kind = 'retention') = (timeline_state_digest IS NULL))
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX one_commit_per_record
+    ON projection_commits(session_id, record_seq)
+    WHERE session_id IS NOT NULL;
+
+CREATE UNIQUE INDEX one_retention_commit
+    ON projection_commits(kind) WHERE kind = 'retention';
+
 CREATE TABLE session_processing_state (
     session_id TEXT NOT NULL,
     processed_through_record_seq BLOB
         CHECK(processed_through_record_seq IS NULL
               OR length(processed_through_record_seq) = 8),
-    timeline_state_cbor BLOB,
+    timeline_state_digest BLOB
+        CHECK(timeline_state_digest IS NULL
+              OR length(timeline_state_digest) = 32),
+    projection_commit_seq BLOB
+        CHECK(projection_commit_seq IS NULL
+              OR length(projection_commit_seq) = 8),
     config_digest BLOB NOT NULL CHECK(length(config_digest) = 32),
     decoder_version TEXT NOT NULL,
     conditioning_version TEXT NOT NULL,
@@ -599,12 +692,28 @@ CREATE TABLE session_processing_state (
     PRIMARY KEY (session_id),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
         ON DELETE CASCADE,
-    FOREIGN KEY (session_id, processed_through_record_seq)
-        REFERENCES session_records(session_id, record_seq)
+    FOREIGN KEY (session_id, processed_through_record_seq,
+                 projection_commit_seq)
+        REFERENCES projection_commits(session_id, record_seq, commit_seq),
+    CHECK((processed_through_record_seq IS NULL)
+          = (timeline_state_digest IS NULL)),
+    CHECK((processed_through_record_seq IS NULL)
+          = (projection_commit_seq IS NULL))
 ) WITHOUT ROWID;
 
 CREATE INDEX processing_by_cursor
     ON session_processing_state(processed_through_record_seq, session_id);
+
+CREATE TABLE pending_session_handoff (
+    singleton INTEGER NOT NULL CHECK(singleton = 1),
+    source_session_id TEXT NOT NULL,
+    source_record_seq BLOB NOT NULL CHECK(length(source_record_seq) = 8),
+    source_projection_commit_seq BLOB NOT NULL
+        CHECK(length(source_projection_commit_seq) = 8),
+    handoff_cbor BLOB NOT NULL,
+    handoff_digest BLOB NOT NULL CHECK(length(handoff_digest) = 32),
+    PRIMARY KEY (singleton)
+) WITHOUT ROWID;
 
 CREATE TABLE csi_observations (
     session_id TEXT NOT NULL,
@@ -671,20 +780,43 @@ CREATE TABLE baseline_states (
     profile_id BLOB NOT NULL CHECK(length(profile_id) = 32),
     estimator_state_cbor BLOB NOT NULL,
     source_session_id TEXT NOT NULL,
-    source_record_seq BLOB
-        CHECK(source_record_seq IS NULL OR length(source_record_seq) = 8),
+    source_record_seq BLOB NOT NULL CHECK(length(source_record_seq) = 8),
     config_digest BLOB NOT NULL CHECK(length(config_digest) = 32),
     decoder_version TEXT NOT NULL,
     conditioning_version TEXT NOT NULL,
     algorithm_version TEXT NOT NULL,
-    PRIMARY KEY (deployment_id, link_id, profile_id),
-    FOREIGN KEY (source_session_id) REFERENCES sessions(session_id),
-    FOREIGN KEY (source_session_id, source_record_seq)
-        REFERENCES session_records(session_id, record_seq)
+    PRIMARY KEY (deployment_id, link_id, profile_id)
 ) WITHOUT ROWID;
 
 CREATE INDEX baseline_by_source
     ON baseline_states(source_session_id, source_record_seq);
+
+CREATE VIEW visible_sessions AS
+SELECT s.session_id,
+       s.started_utc_ns,
+       s.lifecycle,
+       s.sealed_utc_ns,
+       s.seal_reason,
+       p.processed_through_record_seq,
+       p.projection_commit_seq,
+       p.config_digest,
+       p.decoder_version,
+       p.conditioning_version,
+       p.algorithm_version
+FROM sessions AS s
+JOIN session_processing_state AS p USING (session_id)
+WHERE p.projection_commit_seq IS NOT NULL;
+
+CREATE VIEW visible_records AS
+SELECT r.session_id,
+       r.record_seq,
+       r.session_time,
+       r.kind,
+       r.body_cbor
+FROM session_records AS r
+JOIN session_processing_state AS p USING (session_id)
+WHERE p.processed_through_record_seq IS NOT NULL
+  AND r.record_seq <= p.processed_through_record_seq;
 
 PRAGMA user_version = 1;
 COMMIT;
@@ -714,10 +846,11 @@ global ReplayConfig digest are also deliberately excluded. The rationale and
 tradeoff are recorded in
 [ADR 0006](../adr/0006-bind-replay-admission-to-epoch-key.md).
 
-Provisioning MUST read the epoch key from the secret store, derive the identity,
-and store it with the configured window size. A retry is idempotent only when
-the stored identity and size match exactly and the admission row remains empty.
-A mismatch or an advanced row MUST fail closed and MUST NOT reset admission.
+Provisioning MUST read every configured epoch key from the secret store, derive
+each identity, and insert exactly one fresh empty admission row with its
+configured window size into the staged database. Missing keys, duplicate epoch
+identities, pre-existing staged rows, or any mismatch MUST fail closed and MUST
+NOT publish the staged store.
 
 Capture open MUST read the configured epoch keys, rederive every configured
 epoch identity, and compare both identity and window size with the stored rows.
@@ -759,35 +892,91 @@ clear in a nonempty row is corruption and MUST fail closed. Admission-window
 mutation and raw-record insertion remain one transaction, so any later insert
 failure rolls back this transition.
 
-A fresh `session_processing_state` row has NULL processed cursor and NULL
-Timeline state. Stage two advances only the cursor and leaves Timeline state
-NULL. Non-NULL Timeline, observation, snapshot, and evidence payloads must
-represent the exact semantic values owned by the
-[temporal Timeline](temporal-world-v1.md#timeline),
-[world state](temporal-world-v1.md#world-state), and
-[evidence](temporal-world-v1.md#evidence) contracts. Until those versioned
-sections define a language-neutral deterministic CBOR layout for a payload,
-that payload has no accepted persisted encoding and its row MUST NOT be
-written. A Rust serializer, generic bytes/value interface, or private type
-layout MUST NOT define the durable bytes implicitly.
+A fresh `session_processing_state` row has a NULL processed cursor, Timeline
+digest, and projection commit sequence. Transaction B writes all three together.
+`timeline_state_digest` is exactly SHA-256 of the canonical TimelineState v1
+bytes produced after replaying ordered facts through
+`processed_through_record_seq`. The cursor and digest form one determinism
+tripwire; the digest is never serialized resume state and cannot authorize
+skipping any fact.
 
-Operational open or recovery of a non-NULL Timeline state MUST reconstruct the
-typed facts and dynamic profile catalog from the manifest plus ordered raw
-records through the stored processed cursor, rebuild Timeline state through the
-same Timeline interface, and require byte-for-byte equality with the stored
-state before using it. This replay comparison proves session, decoder, route,
-and dynamic-profile receipts. A mismatch MUST enter the applicable deterministic
-rebuild path or fail closed under the recovery rules below; the stored state
-MUST NOT be trusted, repaired in place, or used before that proof succeeds.
+`projection_commits` is a retention-scoped structural commit index, not a
+second payload log and not an immutable history. Each transaction B inserts one row whose
+`commit_seq` is the same next value written to `store_state` and whose
+session/record pair is the exact consumed durable fact. The partial unique index
+provides at-most-once commit for each retained fact; recovery retry supplies the
+corresponding completion path. A duplicate record binding, sequence gap,
+sequence reuse, kind mismatch, or Timeline-digest mismatch MUST roll back the
+whole transaction. The index carries no semantic payload or independently
+encoded effect digest; normalized projection rows remain the query state and
+manifest plus facts remain replay authority. Retention cascade-deletes the
+index rows owned by each deleted session. Before inserting the new `retention`
+row for its newly advanced sequence, the same transaction deletes any prior
+retention row; the partial unique index therefore keeps at most one unowned
+retention marker. A retained processing state is foreign-key-bound to the
+commit row for that exact session and cursor. Callers MUST NOT treat row count
+or a contiguous retained prefix as historical proof.
+
+`observation_cbor`, `snapshot_cbor`, and `evidence_cbor` MUST respectively be
+the exact standalone
+[CsiObservation](temporal-world-v1.md#csiobservation-root),
+[WorldSnapshot](temporal-world-v1.md#worldsnapshot-root), and
+[LinkStepEvidence](temporal-world-v1.md#linkstepevidence-root) v1 bytes. Those
+language-neutral temporal tables are the sole payload authority. A Rust
+serializer, generic bytes/value interface, or private type layout MUST NOT
+define durable bytes implicitly.
+
+For `csi_observations`, the row session/record, session time, sensor, link,
+profile, decoder, conditioning, and configuration receipts MUST equal the
+decoded root. For `world_snapshots`, the row session/snapshot, interval, source
+range, algorithm, and configuration receipts MUST equal the decoded root. For
+`snapshot_link_evidence`, the row session/snapshot plus link/profile key
+identifies one present aggregate evidence item, and its row receipts MUST equal
+the decoded evidence and associated snapshot. Within one private semantic
+`EngineTransition`, every emitted row/root identity and ordered collection MUST
+be strictly ordered and unique. For each emitted snapshot, its present
+Link/Profile keys and the present evidence-row keys MUST be equal, including
+when both sets are empty.
+
+For `baseline_states`, the row deployment/link/profile and compatibility
+receipts MUST equal the decoded complete baseline map. Its source session and
+non-NULL source record identify the exact transaction B that most recently
+published that complete state. A new session's first transaction B binds every
+row in its complete baseline set to that new session and first record.
+
+The Engine owns semantic completeness. Persistence MUST validate canonical
+bytes, row/root identity, receipts, ordering, uniqueness, and present-key
+equality, but MUST NOT traverse facts or Timeline to recompute the window's
+contributor/baseline union, reconstruct a projection, or decide that the Engine
+omitted a semantic key. Such a mismatch is detected by Engine invariants or the
+recovery/replay comparison seam, not by a second persistence implementation of
+world semantics. Any independently observable mismatch or non-canonical value
+is corruption and MUST fail transaction B or fail closed on read.
+
+Operational recovery MUST construct a fresh Engine and Timeline from the
+manifest and ordered raw records. Through the stored processed cursor, the
+fresh processing path MUST compare each produced append-only observation and
+each complete WindowProjection with the retained committed rows they produced;
+the prefix writes nothing. Exactly at the cursor, recovery MUST compare the
+fresh Engine's complete current baseline set with the latest `baseline_states`
+rows and canonically encode rebuilt Timeline state to require its SHA-256 digest
+to equal the stored cursor-bound digest. Missing or extra rows, identity
+disagreement, byte disagreement, or digest mismatch is an explicit fail-closed
+determinism or corruption condition. `baseline_states` remains the latest state
+set and gains no history. A later session's first transaction B supersedes the
+prior session's baseline query projection without changing retained historical
+snapshots or evidence. Program 1 operational recovery MUST NOT restore from the
+digest, trust a serialized Timeline value, skip to the cursor, rewrite the prefix,
+or repair retained projections online.
 
 All BLOB integer columns use unsigned fixed-width big-endian bytes: `key_epoch`
-is two bytes, `highest_boot_generation` is four, and device IDs, record
-sequences, session times, session fact-byte counters, snapshot IDs, interval
-bounds, source-record bounds, and message sequences are eight. Equal-width
-SQLite BLOB comparison is therefore unsigned numeric order. Writers and
-readers MUST reject every other width and MUST NOT narrow, reinterpret as
-signed, or cast these values to SQLite INTEGER. UTC nanoseconds remain signed
-SQLite INTEGER because their domain is `i64`.
+is two bytes, `highest_boot_generation` is four, and projection commit
+sequences, device IDs, record sequences, session times, session fact-byte
+counters, snapshot IDs, interval bounds, source-record bounds, and message
+sequences are eight. Equal-width SQLite BLOB comparison is therefore unsigned
+numeric order. Writers and readers MUST reject every other width and MUST NOT
+narrow, reinterpret as signed, or cast these values to SQLite INTEGER. UTC
+nanoseconds remain signed SQLite INTEGER because their domain is `i64`.
 
 SQLite storage class is part of validation even where affinity or a `CHECK`
 does not enforce it: declared BLOB, TEXT, and INTEGER columns MUST contain that
@@ -804,58 +993,138 @@ is the pair of one manifest and that session's ordered records. Observation,
 processing, baseline, snapshot, and evidence rows remain derived state and MUST
 be reproducible from that pair without a predecessor session.
 
-The only persistent SQLite store-identity settings are `user_version=1` and
+The required persistent SQLite settings are `user_version=1` and
 `journal_mode=WAL`. Provisioning MUST establish both. Operational open of an
-existing store MUST query and require both before any database or application
-state mutation and MUST NOT silently repair either. Every connection MUST then
-apply and verify connection-local `foreign_keys=ON`. The writer connection MUST
-also apply and verify connection-local `synchronous=FULL`; readers do not
-require a synchronous setting.
+existing store MUST query and require both before any Host state mutation and
+MUST NOT silently repair either. Every connection MUST then apply and verify
+connection-local `foreign_keys=ON`. The writer connection MUST also apply and
+verify connection-local `synchronous=FULL`; readers do not require a
+synchronous setting.
 
-### Managed database path and lock
+### Managed store identity and cooperative lease
 
-All exclusive managed-data operations MUST use one application-owned path
-resolver and lock acquirer. For an existing target, it resolves relative paths
-and directory symlinks, canonicalizes the full database target, and follows a
-final-component symlink. For provisioning, it requires the canonical parent
-directory to exist and requires the final component to be absent and not a
-symlink; it does not canonicalize a nonexistent final component.
+Program 1 assumes a trusted local development namespace. The canonical parent
+of `database_path` is one dedicated Managed store root. That root MUST already
+exist, MUST be a non-symlink directory owned by the process effective user ID,
+and MUST have exact POSIX mode `0700`. The fixed root-relative lease and final
+database, every private staging database, and SQLite WAL or SHM companion when
+present MUST each be a non-symlink regular file with link count one, owned by
+the process effective user ID, and have exact POSIX mode `0600`. These checks
+use the object metadata obtained without following its final path component.
+Cooperative Whisper processes MUST NOT rename, replace, delete, or mutate any
+of those managed objects outside `HostLifecycle`.
 
-The lock path is in the same canonical directory as the resolved database and
-is formed injectively by appending `.whisper.lock` to the complete database
-filename. The sidecar may be created or opened, but MUST NOT be truncated or
-deleted as part of lock handling. Its existence is not lock authority. The
-exclusive OS advisory lock held on the still-open sidecar file descriptor is
-the sole lock authority until the operation completes.
+The application MUST fail closed on an observed missing required object,
+symlink, wrong file type, extra hard link, wrong effective-user ownership, or
+wrong exact mode. It does not claim to prevent hostile root or same-credential
+namespace mutation. A custom VFS, privileged broker, and hostile-namespace
+isolation are outside Program 1.
 
-Lock conflict, permission failure, canonicalization failure, and any path or
-sidecar I/O failure MUST fail closed. Hard-link aliases are unsupported and
-MUST NOT be treated as equivalent managed paths; when target metadata exposes
-multiple hard links, the resolver MUST reject the target explicitly.
+Every managed operation MUST enter through `HostLifecycle`, validate and
+canonicalize the configured existing root, open or create the fixed
+root-relative `.whisper.lease` with no-follow semantics and exact mode `0600`,
+acquire an exclusive OS advisory lock, and retain its open descriptor for the
+complete managed operation. Creation MUST fail rather than follow or replace an
+existing final component, and every existing managed component MUST pass the
+ownership, type, link-count, and mode checks above before use. Lease content and
+file existence are not authority. Connections MUST close before the descriptor
+and lock are released. Lock conflict, permission failure, canonicalization
+failure, metadata mismatch, and lease I/O failure MUST fail closed. Normal exit
+and process termination MUST release the OS lock for a later lifecycle.
+
+`store_state` contains exactly one row. `store_id` is 32 bytes generated once
+from the operating system's cryptographic random source during provisioning;
+it is stable for the store lifetime, public, and is not a credential or
+attestation. The same row holds the immutable Store topology manifest and its
+verified digest. `projection_commit_seq` begins at zero. The Store ID is a
+private strong value held by the managed lifecycle and verified by read-only
+query connections before they return a view. The retained OS lease, not a
+database generation counter, is the sole cooperative lifecycle writer fence.
+
+The Store ID and `projection_commit_seq` are the global query-visible Store
+state watermark. Every transaction that changes query-visible rows MUST advance
+the sequence exactly once in the same transaction; it MUST NOT reuse an earlier
+identity for different visible state. Ordinary transaction B and a retention
+transaction that actually deletes query-visible rows are the v1 mutation paths.
+A transaction-A-only fact lies beyond the processing cursor and is not visible.
+A newly created session with NULL
+`session_processing_state.projection_commit_seq` is not query-visible and MUST
+be omitted from topology. Its first successful transaction B both assigns its
+non-NULL session projection commit and makes that session query-visible under
+the newly advanced Store watermark. Its complete manifest-seeded baseline set
+MUST be materialized for that session in the same first transaction B, including
+when the record is a decode reject. A retention no-op does not advance the
+sequence. Sequence overflow MUST fail closed without mutation.
+
+`session_processing_state.projection_commit_seq` binds that session's processed
+cursor to its retained commit-index row and determines whether the session is
+visible. It is not the global query receipt watermark. Every Store-scoped or
+session-scoped HTTP receipt takes its Store ID and projection sequence from the
+current `store_state` row in the same SQLite read snapshot, including after a
+retention commit advances only the Store watermark.
+
+Program 1 query readers MUST obtain sessions through `visible_sessions` and raw
+fact-backed Timeline ranges through `visible_records`; they MUST NOT read the
+corresponding base tables. `ViewReceipt.last_record_seq` is exactly
+`processed_through_record_seq`, never `MAX(session_records.record_seq)`. The
+Store topology base comes only from the immutable topology manifest; profile
+collections may add identities only from committed observation or baseline-state
+projections in the same read snapshot. These rules are the visibility cut that makes
+transaction A structurally unable to change a query result.
+
+Program 1 MUST qualify one SQLite-bundled VFS on the identified current Apple
+Silicon Mac and MUST test the default VFS first. The SQLite qualification covers
+WAL plus writer `synchronous=FULL` under SIGKILL, SQLite recovery, lock
+reacquisition, and same-process bounded readers with one writer. An independent
+two-process qualification MUST prove the application root lease excludes the
+second cooperative lifecycle. These checks do not establish hostile namespace
+isolation or second-platform support, and Program 1 introduces no custom VFS.
 
 ## Initialization and runtime ownership
 
-`whisper init-admission <config> <device-id> <key-epoch>` MUST be the only host
-entry point allowed to create schema version 1. Under the managed-database lock,
-it MUST provision the persistent SQLite settings and schema and insert an empty
-replay admission row whose derived identity and bounded window size exactly
-match the configuration. Retry behavior is defined by
+`whisper init-admission <config>` MUST be the only host
+entry point allowed to create schema version 1. It MUST acquire the dedicated
+root lease while the configured final database component is absent. Before
+SQLite opens a staging database, provisioning MUST create its private
+collision-resistant name inside the validated `0700` root using create-new and
+no-follow semantics with exact mode `0600`; it MUST initialize only that staged
+database. Initialization establishes
+the required SQLite settings and schema, generates and inserts the one
+`store_state` row with the exact immutable topology manifest and digest, and
+inserts exactly one empty replay admission row for every configured route epoch.
+Every derived identity and bounded window size MUST
+match the configuration under
 [Replay-window identity](#replay-window-identity).
 
-Capture and replay MUST acquire the managed-database lock, open the canonical
-database path with a non-create operation, query and reject incompatible
-persistent settings, apply and verify their connection-local settings, and then
-validate schema and configured epochs, in that order. A missing file, corrupt
-SQLite database, wrong schema/version, incompatible setting, or epoch failure
-MUST fail closed. Operational open MUST NOT create, reset, repair, or replace
-the database or admission state as a side effect.
+Before publication, provisioning MUST commit all initialization, checkpoint
+all WAL content into the staged main database, synchronize the staged main
+database, close every staging connection, and validate the closed store with a
+non-creating open. No staged WAL or SHM may be required to interpret the closed
+store. It MUST then publish the staged main database to the final component
+with a current-Mac primitive qualified as atomic and no-replace, synchronize
+the Managed store root as required by that primitive, and re-open the final
+store without creation to verify the same Store ID, topology manifest and
+digest, schema, settings, and empty admission state. A pre-existing final
+component, crash, conflict, or validation,
+checkpoint, synchronization, close, publication, or re-open failure MUST fail
+without replacing the final component or reporting success.
+
+Capture and replay MUST acquire the root lease, open the existing database with
+a mechanically non-creating operation through the qualified VFS, allow SQLite
+to complete WAL recovery, query and reject incompatible persistent settings,
+apply and verify connection-local settings, and validate schema and configured
+epochs, in that order. A sealed-session faithful replay uses a verified
+read-only connection. A missing file, corrupt SQLite database, wrong
+schema/version, incompatible setting, Store ID failure, topology-manifest
+mismatch, or epoch failure MUST fail closed. Operational open MUST NOT create,
+reset, repair, or replace the database or admission state as a side effect.
 
 One sequential ingest owner MUST hold the sole synchronous writer connection.
 Synchronous database work MUST run off asynchronous runtime and ingest
 execution. Bounded read-only query connections MAY read the same WAL database,
-but no connection pool or database actor is introduced. The process MUST hold
-the managed-database advisory lock while performing mutually exclusive
-managed-data work.
+but no connection pool or database actor is introduced. The lifecycle MUST
+hold the Managed store root lease until all managed writer and reader work has
+stopped and every connection has closed.
 
 ## Durable admission and processing transactions
 
@@ -863,103 +1132,200 @@ Before database mutation, capture MUST validate datagram size, fixed header,
 exact peer route, exact key lookup, authentication, and per-route packet/byte
 budgets.
 
+Before accepting any input, `HostLifecycle` MUST compare the current replay
+configuration digest, executable fingerprint, decoder, conditioning, algorithm,
+and wire-admission pins with an existing active session manifest. Exact equality
+authorizes recovery and continuation of that same session. Any mismatch MUST
+fail closed without appending `Closed`, sealing the session, consuming a pending
+handoff, or creating another session. Program 1 requires an explicitly finished
+compatible session or another Managed database before changed replay identity
+may capture.
+
 After authentication, transaction A MUST use `BEGIN IMMEDIATE` to:
 
-1. consume the matching private validated `EpochHandle` and reread its
+1. when no active session exists, construct one manifest from the current
+   compatible identity and the exact pending handoff, or an empty genesis set,
+   insert that session as `active` with an all-NULL processing row, and consume
+   the pending handoff in the same transaction;
+2. consume the matching private validated `EpochHandle` and reread its
    provisioned admission epoch;
-2. reject replay or atomically advance its bounded boot/message window; and
-3. insert the exact encrypted packet record and receive context and atomically
+3. reject replay or atomically advance its bounded boot/message window; and
+4. insert the exact encrypted packet record and receive context and atomically
    add its logical cost to `sessions.fact_bytes`.
+
+The lazy creation and first fact either both commit or both roll back. No empty,
+prepared, or transaction-A-visible session exists. Ordered control and Timeline
+advance inputs use the same lazy-creation rule but do not mutate replay
+admission.
 
 Only a committed transaction A authorizes cleartext decoding or Engine
 advance. Failure MUST roll back both admission and raw insertion, leave Engine
 unchanged, and stop capture before publication.
 
-After raw commit, the shared decoder and Engine path may process the record.
-Transaction B MUST atomically persist the concrete transition: processing
-cursor and state, changed complete baseline states, typed observation when
-present, projections, and version/source receipts. Deterministic decode rejects
-and control records MUST advance the cursor atomically with their concrete
-state effect. The application MUST NOT reconstruct Engine state.
+After raw commit, and never before it, the shared decoder and Engine path may
+process the record. The `CaptureRun` processing coordinator MUST hold that
+committed `DurableRecord` plus exclusive access to the current Engine and
+Timeline and construct exactly one private, unforgeable, closed
+`ProcessedRecordTransition`: either `Semantic(EngineTransition)` from the normal
+Engine interface or `DecodeRejected` from the production decoder. For a
+session's first record, the coordinator MUST also attach the Engine's complete
+current baseline set after initialization from the manifest, regardless of the
+variant; later records carry no first-commit set. Transaction B MUST consume that
+value, read and retain the previous Store sequence, calculate its exact
+successor, insert the matching `projection_commits` row, conditionally advance
+`store_state.projection_commit_seq` from the retained previous value to that
+successor, and atomically persist the processing cursor, cursor-bound Timeline
+digest, the same projection commit sequence, and version/source receipts. The
+conditional Store update MUST affect exactly one row. For `Semantic`, it
+additionally persists
+changed complete baseline states, typed observation when present, and every
+complete `WindowProjection`; it fans each WindowProjection out to its one
+`world_snapshots` row and complete ordered set of aggregate
+`snapshot_link_evidence` rows inside that same transaction only after validating
+the whole transition. `DecodeRejected` MUST bind the record and cursor, the
+production decoder's typed authenticated unknown-kind,
+malformed/unsupported-body, capability, or source/radio reject, and the current
+unchanged Timeline digest, and MUST carry no changed semantic baseline state,
+observation, or World projection. The required first-commit complete baseline
+set is lifecycle publication, not a decode semantic effect. Transaction B MUST
+validate and materialize exactly that full set under the new session and first
+record, removing no-longer-present operational projection keys in the same
+transaction, before assigning the session's first non-NULL projection commit.
+No predecessor-owned baseline row may remain query-visible as if it belonged to
+the new session. It MUST NOT
+accept application-grouped, operator-selected, or caller-constructed variants
+or WindowProjections, commit a snapshot or evidence row separately, or use
+replace, upsert, delete-and-reinsert, or other per-row conflict handling.
 
-Memory mirrors, query-visible identifiers, and notifications MUST be replaced
-or published only after transaction B commits. Transaction B failure MUST
-leave the previous committed lifecycle, cursor, state, and projections intact
-and stop capture before anything from the failed transition is exposed.
+The next sequence and Store ID form the Committed projection identity for that
+transaction. Sequence zero is only a Projection watermark: it names the
+provisioned Store topology with no visible session, and no transaction B owns
+it. Every transaction B creates the next nonzero identity. Both processing
+variants, including deterministic decode rejects, and every control record MUST
+advance the cursor and projection commit identity atomically with their concrete
+state effect. Only `Semantic` may write an Engine semantic effect. Persistence
+MUST store the Engine's supplied semantic values and MUST NOT invent, regroup,
+sort, or reconstruct semantic state.
+
+Memory mirrors, query-visible identifiers, HTTP results, and notifications MUST
+be replaced or published only after transaction B commits. Transaction B
+failure MUST leave the previous committed lifecycle, cursor, digest,
+projection commit identity, state, and projections intact and stop capture
+before anything from the failed transition is exposed.
 
 An authenticated unknown kind, malformed or unsupported cleartext body, or
 source/radio mismatch remains a durable raw fact and a classified decode
 reject; it MUST NOT enter Timeline or estimator processing. Baseline commands
-and timeline advances MUST first be inserted in their own ordered transaction
-A and committed before their semantic effect runs.
+and timeline advances MUST first be durably inserted by their own ordered
+transaction A before their semantic effect runs.
 
-Each admitted packet uses one transaction in the v1 correctness baseline.
+Each admitted packet uses one transaction A and one transaction B in the v1
+correctness baseline.
 Batching or a separate writer task requires measured evidence and a later
 contract change. Transaction A and transaction B commits, WAL mode, and writer
 `synchronous=FULL` are the complete v1 durability and publication contract.
 
 ## Lifecycle, recovery, and rotation
 
-A fresh session is active. Inserting `Closed` makes its raw stream
-non-appendable but does not itself seal the lifecycle. Sealed and
-recovery-sealed sessions are immutable replay inputs; active or otherwise
-non-sealed sessions are not complete replay inputs.
+Session lifecycle is exactly `active | sealed`. There is no `prepared` or
+`recovery_sealed` state. Transaction A lazily creates an active session together
+with its first fact; an empty session cannot exist. Inserting `Closed` makes its
+raw stream non-appendable but does not itself seal the lifecycle. Only sealed
+sessions are immutable faithful-replay inputs; active sessions are not complete
+replay inputs.
 
 SQLite transaction rollback replaces file-tail scanning and CRC recovery. The
 application-owned `HostLifecycle` coordinates recovery; persistence MUST NOT
-expose a bare seal or recovery-seal operation.
+expose a bare seal, caller-selected lifecycle, or recovery-seal operation.
 
-Under the managed-database lock, recovery of an active session MUST first read
-and validate its complete ordered tail. If the last record is not `Closed`, one
-transaction A appends `Closed` at the next sequence and the last record's
-`SessionTime`; an empty tail uses sequence zero and `SessionTime` zero. That
-transaction also updates `fact_bytes`. No record may follow the resulting
-`Closed`.
+Under the Managed store root lease, recovery of an active session MUST first
+read and validate its manifest and complete ordered fact tail and require the
+current replay identity equality defined above. A tail without `Closed` remains
+open. Recovery MUST NOT append `Closed` merely because a process stopped, and
+MUST NOT seal or create a successor as a side effect of Host restart.
 
-Recovery MUST construct a fresh Engine from the manifest's complete baseline
-seed, replay every ordered fact including the exact `Closed` tail, and finish
-the Engine. The Engine produces a `FinishedTransition` and a complete
-`BaselineState` set that is strictly sorted and unique. Persistence validates
-and atomically stores those supplied strong values; it MUST NOT derive,
-reconstruct, or fill in semantic baseline values.
+The manifest and `session_records` in unsigned sequence order are the sole Host
+recovery authority. Recovery MUST construct a fresh Engine and Timeline from
+the manifest's complete baseline seed and feed every fact through the same
+production decoder and `CaptureRun` processing coordinator used by live capture.
+Through the stored committed processing cursor, if present, replay only rebuilds
+working state and compares every produced append-only observation and complete
+WindowProjection with the retained committed prefix bytes and identities. It
+MUST write nothing. Exactly at that cursor it MUST compare the fresh Engine's
+complete current baseline set with the latest `baseline_states` rows and compare
+the rebuilt cursor-bound Timeline digest with the stored digest. Missing, extra,
+corrupt, identity-mismatched, or byte-mismatched retained prefix state MUST fail
+closed; the comparison adds no baseline history, and Program 1 performs no
+online projection repair. Recovery MUST NOT restore or resume from a digest,
+derived row, memory snapshot, or serialized Timeline value.
 
-The application then constructs a private `FinishedRecovery` proof binding the
-manifest identity, exact `Closed` tail, final processing cursor and receipts,
-and the `FinishedTransition`. One final transaction B MUST reread and match the
-tail, cursor, and receipts, atomically commit the rebuilt derived state and
-complete baselines, and change lifecycle to `recovery_sealed`. Any failure MUST
-leave the session unsealed and MUST NOT create a successor. A durable `Closed`
-alone is insufficient; the next session may be created only after successful
-recovery sealing.
+For each ordered fact strictly after the committed cursor, recovery MUST obtain
+one complete private `ProcessedRecordTransition` from that normal
+decoder/coordinator path and immediately submit the unmodified transition to the
+normal transaction B before processing the next fact. Every successful
+transaction B advances the
+processing cursor to that fact, stores its cursor-bound Timeline digest and
+exact semantic effects, and advances `store_state.projection_commit_seq` by
+exactly one. The application MUST NOT aggregate, reorder, drop, split, or
+forge processing transitions in live capture or recovery. If recovery is
+interrupted, a later attempt constructs another fresh Engine and Timeline,
+rebuilds through the newly committed cursor without writes, validates its
+digest, and continues with the next fact.
 
-Graceful shutdown or rotation MUST first stop new input, drain accepted input,
-and commit `Closed` and its fact-byte update as transaction A. The Engine then
-finishes and returns the same complete, strictly sorted, unique baseline handoff
-with its `FinishedTransition`. Persistence validates and stores the supplied
-values only.
+If the durable tail has no `Closed`, successful recovery stops at the tail and
+then accepts later input in the same active session and record-sequence space.
+If an earlier explicit finish or limit rotation already committed `Closed`,
+recovery processes that exact tail through the ordinary finish path below. It
+does not synthesize a second close.
 
-For rotation, one final transaction B MUST atomically persist the final cursor,
-projections, and baselines, seal the old session, create the successor manifest,
-and rebind exactly the same handoff values as that manifest's initial baseline
-states and current baseline rows. An empty genesis set means Missing; it MUST
-NOT replace a predecessor's nonempty handoff with an empty placeholder.
-Graceful shutdown without a successor seals the session and leaves the baseline
-source on that predecessor. On the next startup, `HostLifecycle` MUST create the
-successor and rebind the exact handoff before retention can delete the
-predecessor.
+Explicit finish or limit rotation MUST first stop new input, drain accepted
+input, and commit `Closed` and its fact-byte update as transaction A. The Engine
+then finishes and returns `FinishedTransition` plus one complete, strictly
+sorted, unique baseline handoff. The `Closed` record's ordinary transaction B
+MUST consume a private finished proof, reread and match its manifest, record,
+cursor, digest, and transition bindings, then atomically:
+
+1. persist the final cursor, digest, semantic projections, and complete current
+   baseline projection;
+2. insert the `finish` projection-commit row and advance the Store watermark;
+3. change lifecycle to `sealed` with the exact finish or limit reason; and
+4. install the exact complete pending baseline handoff and its digest.
+
+Persistence validates and stores supplied strong values; it MUST NOT derive,
+reconstruct, or fill in semantic baseline values. Any failure leaves the last
+successful transaction-B state intact, leaves the session active with its
+durable `Closed` tail, and installs no pending handoff. A later compatible
+recovery retries that same final transaction. Final transaction B never creates
+a successor.
 
 Both `max_session_duration_ns` and `max_session_bytes` are configured nonzero
 rotation limits. Reaching the duration limit MUST pause new input and complete
 the same close, finish, and final-transaction sequence. Byte-limit behavior is
-defined by [Session fact bytes](#session-fact-bytes).
+defined by [Session fact bytes](#session-fact-bytes). After any successful seal,
+the next accepted fact triggers the ordinary lazy-creation transaction A, which
+copies and consumes the pending handoff. A process stop alone is neither finish
+nor rotation: after draining already accepted work, it closes the Managed store
+and leaves the session active.
 
 ### Program 1 minimal Host restart
 
 Program 1 minimal restart stops only the Host while the Sensor and Mac remain
 running and retains the managed SQLite database. On restart, `HostLifecycle`
-MUST acquire the managed lock and restore canonical Timeline, baseline, World,
-processing-cursor, and committed query state under the recovery rules above
-before accepting new input. The next datagram MUST be processed exactly once.
+MUST reacquire the root lease, complete SQLite WAL recovery, reconstruct fresh
+working Engine and Timeline state from the manifest and ordered facts, and
+validate the retained committed processing cursor and query state under the
+recovery rules above. It MUST NOT append `Closed`, seal, create a successor,
+consume or install a handoff, rebuild committed query rows, or repair them. The
+next datagram is admitted and processed exactly once in that same active session.
+
+The restart proof records both the last durable record sequence and the
+processed-through cursor before stop. Recovery first commits every A-only tail
+record through ordinary transaction B. The first newly admitted record after
+recovery is exactly one greater than the recovered durable tail, not necessarily
+one greater than the pre-stop processing cursor. A controlled input may also
+prove its exact device message sequence and resulting replay-window change;
+general correctness MUST NOT assume an accepted out-of-order message always
+raises `maximum_message_sequence`.
 
 Minimal Host restart MUST NOT require rebooting the Sensor or Mac. Acceptance
 MAY use the captured corpus, but that execution MUST NOT be classified as a new
@@ -970,18 +1336,32 @@ resynchronization remain owned by [API/UI v1](api-ui-v1.md#diagnostic-ui).
 
 `retention_max_sessions` MUST be positive. Retention MUST run in one
 transaction and delete only the oldest sealed sessions and their foreign-key
-owned records and projections. It MUST NOT delete an active or non-sealed
-session, an admission epoch, or the current operational baseline.
+owned records, projections, and retained commit-index rows. It MUST NOT delete
+an active session, an admission epoch, the current operational baseline, or the
+pending handoff bytes.
 
-Before deleting a predecessor, the complete operational baseline MUST already
-be rebound to the current manifest and baseline rows so predecessor deletion
-cannot remove resume authority. SQLite MAY reuse free pages. Hot-path `VACUUM`
-and a generic garbage-collection framework are forbidden.
+When retention deletes any query-visible row, the same transaction MUST delete
+the previous unowned retention marker, advance `store_state.projection_commit_seq`
+exactly once regardless of the number of rows or sessions deleted, and insert
+one `projection_commits(kind='retention')`
+row at that exact sequence. Persistence hands the new Store-bound identity to
+delivery only after commit. Rollback hands off nothing and preserves the prior
+identity and rows. No other query-visible mutation may reuse an existing
+identity. The API/UI specification alone owns the invalidation name and
+publication behavior.
+
+The complete handoff is already independent pending authority or has been
+copied into the active manifest before its sealed source becomes retention
+eligible; deleting that source cannot remove resume authority. Baseline source
+columns remain provenance values rather than foreign-key ownership. SQLite MAY
+reuse free pages. Hot-path `VACUUM` and a generic garbage-collection framework
+are forbidden.
 
 ## Faithful replay
 
-V1 implements faithful replay only. Replay MUST accept only a sealed or
-recovery-sealed session; a non-sealed session MUST complete recovery first.
+V1 implements faithful replay only. Replay MUST accept only a sealed session;
+an active session MUST remain under operational recovery or be explicitly
+finished before replay.
 
 Replay MUST read one selected session's records in unsigned `record_seq` order
 and validate strict record body/schema, nondecreasing session time,
@@ -997,6 +1377,12 @@ clock time, sleep, randomness, delivery mode, processing duration, or current
 host identity. Replay MUST produce typed results without HTTP, WebSocket, or
 notification side effects.
 
+An acceptance check that deletes projections and compares deterministic replay
+outputs MUST use an isolated copied store or isolated replay output sink. It
+compares the fresh Engine-produced canonical projection bytes and identities
+with the expected live outputs; it MUST NOT delete, rebuild, or write projection
+rows in the operational Managed store.
+
 A later explicit reinterpretation mode MAY process old bytes under a new
 contract and output namespace. It MUST NOT claim the original session's
 semantic identity and is outside v1.
@@ -1006,17 +1392,25 @@ semantic identity and is outside v1.
 Acceptance requires behavior-focused tests and retained execution receipts at
 the specified interfaces. At minimum they MUST cover:
 
-- schema, required connection state, version, foreign keys, indexes, fresh
-  NULL state, nullable manifest-seeded baseline source, managed-path and lock
-  identity, and transaction rollback;
+- schema, required connection state, version, foreign keys, visibility views,
+  fresh NULL state, Store ID, immutable topology manifest and digest, pending
+  handoff, retained commit index, root lease, projection sequence, and
+  transaction rollback;
 - strict ReplayConfig and complete BaselineState manifest/database roundtrips,
   with a persisted fixture proving exclusion of TOML source, RuntimeConfig,
   secrets, and lossy snapshot-only baseline state;
 - length limits before allocation and complete unsigned edge-value roundtrip
   and ordering;
 - missing and corrupt databases, wrong persistent settings or schema,
-  connection-local setting application, missing epochs, and no create/reset or
-  silent-repair side effect from capture open;
+  connection-local setting application, missing epochs, topology mismatch,
+  active-manifest replay-identity mismatch, and no create/reset, synthetic
+  close, rotation, or silent-repair side effect from capture open;
+- application-lease exclusion across two cooperative processes; chosen bundled
+  VFS current-Mac qualification with the default tested first; WAL plus
+  `synchronous=FULL` SIGKILL recovery, SQLite lock reacquisition, and
+  same-process bounded readers with one writer; private same-root staging,
+  closed-store validation, synchronization, and atomic no-replace publication
+  without final-object replacement;
 - cross-language replay-window identity fixtures covering exact key-bound
   derivation, explicit exclusions, size comparison, and mismatch rejection;
 - session fact-byte edge cases, reserved `Closed`, equality rotation,
@@ -1026,12 +1420,35 @@ the specified interfaces. At minimum they MUST cover:
   `Closed` or seal;
 - transaction A rollback preserving admission and raw state and preventing
   decode/Engine advance;
-- recovery and full rebuild before recovery seal or next-session creation;
-- operational-open and recovery replay requiring exact Timeline-state byte
-  equality through the processed cursor, with mismatch rebuild or fail-closed;
-- retention preserving active/non-sealed sessions, admission epochs, and
-  current operational baseline state; and
+- transaction B rollback preserving the prior projection commit identity and
+  preventing HTTP or WebSocket publication;
+- the first transaction B publishing the complete manifest-seeded baseline set
+  even for a decode rejection, while transaction A alone leaves its session,
+  facts, and baseline seed invisible;
+- one retained commit-index row per transaction B, duplicate record rejection,
+  exact Store-sequence agreement, and explicit cascade behavior under retention;
+- crash before transaction A, after A and before B, and after B before
+  invalidation, with exactly-once fact processing and no uncommitted exposure;
+- recovery prefix rebuild without writes followed by one ordinary transaction B
+  per uncommitted fact; an open tail continues the same active session, while a
+  previously durable `Closed` completes the ordinary atomic finish transaction;
+- byte/identity equality between Engine-produced recovery-prefix projections
+  and retained committed rows, with missing or mismatched rows failing closed
+  and no operational repair;
+- cursor-bound Timeline digest equality during fresh rebuild, with the digest
+  rejected as resume state and mismatch failing closed;
+- lazy creation atomically copying and consuming a pending handoff with the
+  first fact, rollback leaving both unchanged, and identity mismatch creating no
+  session or handoff mutation;
+- restart receipts distinguishing the pre-stop durable tail from the processing
+  cursor and proving the first new record continues at durable-tail plus one in
+  the same session;
+- retention preserving the active session, admission epochs, pending handoff,
+  and current operational baseline state while deleting owned commit-index rows
+  and atomically inserting and publishing one fresh retention commit for any
+  query-visible deletion; and
 - faithful live/replay equality for bytes, receive context, record order,
-  typed results, and deterministic rebuild after deleting projections.
+  typed results, and isolated deterministic output comparison after deleting
+  copied projections.
 
 Test source alone is not executed acceptance evidence.
