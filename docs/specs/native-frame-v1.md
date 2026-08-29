@@ -313,11 +313,24 @@ disposable credentials and makes no production-security claim.
 
 Program 1 provisioning MUST place the derived fixture key in this ordinary
 record field. Firmware authentication MUST NOT add a fixture-only branch.
-Raw key bytes, Wi-Fi credentials, real SSIDs, uncontrolled infrastructure
-identities, and secret-bearing provisioning artifacts MUST NOT be committed,
-logged, displayed, screenshotted, or retained in corpus manifests or evidence
-receipts. Sanitized receipts MAY retain the public seed, derivation version,
-Sensor identifier, key epoch, and a non-secret key identity digest.
+The production Host/fixture loader defined by
+[persistence v1](persistence-v1.md#program-1-development-secret-store) produces
+validated key material. The fixture producer MUST write exactly 32
+already-validated bytes to one inherited pipe or file descriptor and then close
+its write end. Firmware provisioning owns the one readable descriptor and MUST
+perform bounded repeated reads; partial reads are normal. It MUST retain at most
+33 bytes and accept only after observing end-of-file immediately after total
+byte 32. End-of-file after zero through 31 bytes is short input, and observing
+byte 33 is long input; either MUST fail.
+
+Firmware provisioning MUST close its descriptor on every success or failure
+and MUST NOT reuse it. It MUST receive no secret path, implement no filesystem
+trust policy, and log or emit no key material.
+
+Provisioning MUST NOT log, display, screenshot, or emit raw key bytes, Wi-Fi
+credentials, real SSIDs, or other secret provisioning values. Program 1
+evidence-artifact rules are owned by
+[development E2E v1](development-e2e-v1.md#provisioning-artifacts).
 
 Startup MUST validate the record, compute the running application digest and
 the pinned Wi-Fi ABI digest, reconstruct the capability descriptor, match its

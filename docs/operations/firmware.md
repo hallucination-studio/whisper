@@ -104,10 +104,11 @@ document or another project.
 Record the exact expanded commands, serial port, baud, probe outputs,
 `flasher_args.json`, image digests, write result, and verification result.
 
-## Provision disposable development identity
+## Legacy standalone provisioning (not Program 1)
 
-Generate new output paths in a protected external directory. Never reuse a key
-epoch after NVS erase. Invoke:
+Use this command only for bounded private smoke with disposable, non-real
+inputs. Generate all output paths in a protected external directory. Never
+reuse a key epoch after NVS erase. Invoke:
 
 ```sh
 python firmware/esp32-native-frame/provision.py \
@@ -119,14 +120,28 @@ python firmware/esp32-native-frame/provision.py \
   --collector-ip "$COLLECTOR_IP" \
   --collector-port "$COLLECTOR_PORT" \
   --capability-digest "$CAPABILITY_DIGEST" \
-  --key-output "$KEY_FILE" \
-  --receipt-output "$PROVISION_RECEIPT"
+  --key-output "$LEGACY_PRIVATE_KEY_FILE" \
+  --receipt-output "$LEGACY_PRIVATE_OUTPUT"
 ```
 
-The script probes first, writes only the NVS partition, verifies the same
-range, retains the raw 32-byte host key with restrictive permissions, and
-finalizes a JSON receipt. If application and provisioning flashes are separate
-operations, retain both receipts and their ordering.
+Treat this command and all of its outputs as private and secret-bearing. Keep
+them in protected external storage; do not add them to the repository or any
+evidence package. Its JSON output is legacy private output, not a Program 1
+`ProvisioningOperationRecord` or `ProvisioningReceipt`, and this command cannot
+satisfy either artifact contract.
+
+## Program 1 provisioning
+
+The legacy command above cannot satisfy Program 1. Do not infer a replacement
+command from this runbook. Follow the Host validation contract in
+[persistence v1](../specs/persistence-v1.md#program-1-development-secret-store),
+the provisioning handoff contract in
+[native-frame v1](../specs/native-frame-v1.md#provisioning-and-image-compatibility),
+and the artifact contract in
+[development E2E v1](../specs/development-e2e-v1.md#provisioning-artifacts).
+Implementation status remains live in
+[#63](https://github.com/hallucination-studio/whisper/issues/63) and
+[#114](https://github.com/hallucination-studio/whisper/issues/114).
 
 For the single-board development path, set both the firmware collector target
 and the Host capture listener to UDP port `9000`. The firmware target is the
@@ -167,7 +182,8 @@ gate open rather than replacing it with a synthetic decoder-only test.
 
 ## Receipts
 
-Each immutable receipt must include:
+For build, parity, QEMU, probe, flash, verification, live capture, and Host
+decode, each immutable procedure receipt must include:
 
 - UTC start and finish time;
 - repository commit and dirty-state classification;
@@ -178,8 +194,8 @@ Each immutable receipt must include:
 - non-secret device, key-epoch, boot-generation, build, capability, partition,
   and host-configuration identities;
 - exit status and unedited output or log path;
-- explicit result for build, parity execution, QEMU, probe, write, verify,
-  provisioning, live capture, and host decode.
+- explicit result for build, parity execution, QEMU, probe, write, verify, live
+  capture, and host decode.
 
 Never retain AES keys, Wi-Fi passwords, secret-bearing provisioning artifacts,
 or other raw secrets in a repository receipt. Sanitize immutable receipt

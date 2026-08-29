@@ -109,14 +109,51 @@ Program 1 fixture tooling MUST materialize the exact temporary key derived by
 [native-frame v1](native-frame-v1.md#identities-and-route-phases) only in a
 protected temporary secret store selected through the ordinary
 `RuntimeConfig.capture.secret_root` boundary. The production Host key loader
-MUST consume that material through its normal interface. Configuration MUST NOT
-gain a raw-key field, and Host authentication MUST NOT gain a fixture-only
-branch.
+MUST consume that material through its normal interface and is the sole owner
+of the `secret_root` filesystem trust policy. Configuration MUST NOT gain a
+raw-key field, and Host authentication MUST NOT gain a fixture-only branch.
 
-Missing, malformed, wrong-epoch, unreadable, or non-32-byte key material MUST
-fail explicitly. Raw key bytes, secret-store paths, and SQLite database bytes
-MUST NOT be committed, logged, displayed, screenshotted, or retained in corpus
-manifests or evidence receipts.
+The bounded Program 1 trust model accepted by
+[#105](https://github.com/hallucination-studio/whisper/issues/105) trusts the
+configured `secret_root`'s ancestor namespace. The loader does not validate or
+apply no-follow traversal to those ancestor components and does not require
+`openat`-style or capability-relative traversal. Alias and no-follow checks
+govern only the terminal `secret_root` component and the exact relative device
+and key components below it.
+
+For device ID `device_id` and nonzero key epoch `key_epoch`, the selected entry
+is exactly the `secret_root`-relative path
+`device-<device_id>/key-<key_epoch>.bin`. Both values use canonical unsigned
+decimal with no leading zero. `secret_root` and the selected device component
+MUST already exist, be directories, have non-symlink terminal components, and
+have exact Unix mode `0700`. The selected key terminal component MUST be a
+non-symlink regular file with exactly one hard link, exact Unix mode `0600`, and
+length exactly 32 bytes. A Program 1 platform that cannot enforce these checks
+MUST fail closed.
+
+The loader MUST capture filesystem identity and all governed metadata for the
+root, selected device directory, and selected key file before open and read,
+then capture and compare them again after the read. The opened file identity
+MUST equal the selected path's file identity. Any identity replacement, any
+root or device-directory type or mode change, or any key-file type, mode, link
+count, or length change MUST reject the load. The loader MUST read exactly 32
+bytes and then require end-of-file. Within this bounded scope it MUST reject a
+terminal symlink, key-file hard link, fallback path, alternate relative name,
+or replacement.
+
+If the requested key entry is absent, the result is `WrongEpoch` only when that
+exact device directory contains another canonical
+`key-<nonzero-u16>.bin` entry; otherwise the result is `Missing`. Malformed or
+extra names establish neither availability nor an epoch mismatch. Every other
+validation, open, read, identity, or metadata failure MUST fail explicitly.
+Diagnostics MAY identify the device ID, key epoch, and failure reason, but MUST
+NOT include raw key bytes or secret paths. A successful load returns a strong
+validated key-material result through the normal loader interface.
+
+This is the bounded Program 1 loader contract, not a same-credential or hostile
+namespace security guarantee. It requires no process-effective-user ownership
+check. The firmware-provisioning handoff and consumption contract is owned by
+[native-frame v1](native-frame-v1.md#provisioning-and-image-compatibility).
 
 ### ReplayConfig CBOR
 

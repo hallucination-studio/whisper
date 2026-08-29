@@ -534,7 +534,7 @@
     "ProvisioningReceipt": {
       "type": "object",
       "additionalProperties": false,
-      "$comment": "Prose requires exact RFC 8785 file bytes and exclusion of all secret-bearing provisioning material.",
+      "$comment": "This closed Program 1 evidence artifact is distinct from the private untracked ProvisioningOperationRecord. Prose also excludes raw keys, credentials, SSIDs, secret/output/serial paths, collector addresses, commands, logs and log paths, and uncontrolled infrastructure identities.",
       "required": [
         "schema_version",
         "fixture_seed",
