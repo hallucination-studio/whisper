@@ -718,10 +718,22 @@ pub struct SpaceConfig {
     id: SpaceId,
 }
 
+impl SpaceConfig {
+    pub(crate) const fn id(&self) -> &SpaceId {
+        &self.id
+    }
+}
+
 /// A configured transmitter.
 #[derive(Clone, Debug, Serialize)]
 pub struct TransmitterConfig {
     id: TransmitterId,
+}
+
+impl TransmitterConfig {
+    pub(crate) const fn id(&self) -> &TransmitterId {
+        &self.id
+    }
 }
 
 /// A channel allowlist for one physical link.
@@ -810,7 +822,6 @@ pub struct LinkConfig {
     channel_policy: ChannelPolicy,
 }
 
-#[expect(dead_code, reason = "consumed by the native-frame decoder and topology views")]
 impl LinkConfig {
     pub(crate) const fn id(&self) -> &RadioLinkId {
         &self.id
@@ -972,6 +983,14 @@ impl Registry {
         &self.sensors
     }
 
+    pub(crate) const fn spaces(&self) -> &BTreeMap<SpaceId, SpaceConfig> {
+        &self.spaces
+    }
+
+    pub(crate) const fn transmitters(&self) -> &BTreeMap<TransmitterId, TransmitterConfig> {
+        &self.transmitters
+    }
+
     /// Returns all configured links.
     #[must_use]
     pub const fn links(&self) -> &BTreeMap<RadioLinkId, LinkConfig> {
@@ -1112,7 +1131,6 @@ impl Config {
 
     /// Returns conditioning settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by later conditioning work package")]
     pub(crate) const fn conditioning(&self) -> &ConditioningConfig {
         self.replay.conditioning()
     }
