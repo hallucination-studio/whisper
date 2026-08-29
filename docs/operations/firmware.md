@@ -63,20 +63,31 @@ and any actual target or emulator execution output separately.
 
 ## Run production capability-binding QEMU
 
-After the production image build, run inside the same pinned container:
+After the production image build, select a validated runtime configuration and
+one configured Sensor. Its `capture.secret_root` must name an absent disposable
+directory whose parent already exists. Run the non-default fixture facade from
+the repository root; it creates and removes that secret root, validates the
+derived key through the production Host loader, and gives the container only an
+inherited input stream plus non-secret identity environment variables:
 
 ```sh
-docker run --rm \
-  -v "$PWD:/project" \
-  -w /project/firmware/esp32-native-frame \
-  "$IDF_IMAGE" \
-  bash -lc 'python tests/run_production_qemu.py'
+cargo run --quiet --features development-fixture -- \
+  development-fixture "$QEMU_CONFIG" "$QEMU_SENSOR_ID" \
+  docker run --rm -i \
+    --env WHISPER_FIXTURE_DEVICE_ID \
+    --env WHISPER_FIXTURE_KEY_EPOCH \
+    -v "$PWD:/project" \
+    -w /project/firmware/esp32-native-frame \
+    "$IDF_IMAGE" \
+    bash -lc 'python tests/run_production_qemu.py'
 ```
 
 The expected success marker is
 `PRODUCTION_CAPABILITY_BINDING_QEMU_PASS`. This procedure verifies application
-and Wi-Fi ABI digest binding before network startup. It does not verify Wi-Fi
-association, CSI callbacks, UDP transmission, physical flash, or host decode.
+and Wi-Fi ABI digest binding before network startup, plus the production Host
+loader and inherited-stream provisioning composition. It retains no static key
+CSV or disposable secret store. It does not verify Wi-Fi association, CSI
+callbacks, UDP transmission, physical flash, or host decode.
 
 ## Probe the board
 
