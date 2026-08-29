@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import csv
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -9,6 +9,37 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+PROJECT = Path(__file__).resolve().parent.parent
+PROVISION_SPEC = importlib.util.spec_from_file_location(
+    "whisper_firmware_provision", PROJECT / "provision.py")
+provision = importlib.util.module_from_spec(PROVISION_SPEC)
+PROVISION_SPEC.loader.exec_module(provision)
+
+
+def provisioning_config(capability_digest, device_id, key_epoch):
+    return {
+        "device_id": device_id,
+        "key_epoch": key_epoch,
+        "ssid": "native-frame-test",
+        "password": "test-only-password",
+        "probe_port": 9000,
+        "collector_ip": "192.0.2.10",
+        "collector_port": 9000,
+        "capability_digest": capability_digest,
+    }
+
+
+def write_provisioning(path, key, capability_digest, device_id, key_epoch):
+    provision.write_csv(
+        path,
+        provisioning_config(capability_digest, device_id, key_epoch),
+        key,
+    )
+
+
+def consume_runtime_key(stream):
+    return provision.consume_inherited_key(stream)
 
 
 def run(command, *, cwd=None, timeout=None):
@@ -30,9 +61,13 @@ def run(command, *, cwd=None, timeout=None):
 
 
 def main():
-    project = Path(__file__).resolve().parent.parent
-    build = project / "build"
+    key = consume_runtime_key(sys.stdin.buffer)
+    build = PROJECT / "build"
     idf_path = Path(os.environ["IDF_PATH"])
+    device_id = provision.bounded_int(
+        "device ID", os.environ["WHISPER_FIXTURE_DEVICE_ID"], 0, (1 << 64) - 1)
+    key_epoch = provision.bounded_int(
+        "key epoch", os.environ["WHISPER_FIXTURE_KEY_EPOCH"], 1, 65535)
     with (build / "flasher_args.json").open(encoding="utf-8") as source:
         flasher = json.load(source)
     with (build / "capability-build-facts.json").open(encoding="utf-8") as source:
@@ -70,16 +105,27 @@ def main():
         temporary = Path(temporary)
         generator = idf_path / "components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py"
         qemu = idf_path.parent / "tools/qemu-xtensa/esp_develop_9.0.0_20240606/qemu/bin/qemu-system-xtensa"
-        with (project / "tests/disposable-provision.csv").open(newline="", encoding="ascii") as source:
-            rows = list(csv.reader(source))
+        valid_csv = temporary / "valid.csv"
+        write_provisioning(
+            valid_csv,
+            key,
+            bytes.fromhex(capability_digest),
+            device_id,
+            key_epoch,
+        )
 
-        def boot(name, digest):
-            provision_csv = temporary / f"{name}.csv"
+        def boot(name, digest, provision_csv=None):
+            if provision_csv is None:
+                provision_csv = temporary / f"{name}.csv"
+                write_provisioning(
+                    provision_csv,
+                    key,
+                    bytes.fromhex(digest),
+                    device_id,
+                    key_epoch,
+                )
             provision_bin = temporary / f"{name}.bin"
             flash = temporary / f"{name}-flash.bin"
-            replaced = [row[:-1] + [digest] if row and row[0] == "cap_digest" else row for row in rows]
-            with provision_csv.open("w", newline="", encoding="ascii") as output:
-                csv.writer(output).writerows(replaced)
             generated = run([
                 sys.executable, str(generator), "generate",
                 str(provision_csv), str(provision_bin), "0x7000",
@@ -104,7 +150,7 @@ def main():
                 "-drive", f"file={flash},if=mtd,format=raw",
             ], timeout=15).stdout
 
-        output = boot("valid", capability_digest)
+        output = boot("valid", capability_digest, valid_csv)
         accepted = "provisioning accepted; boot generation 1; awaiting network prerequisites"
         if accepted not in output or "runtime startup failed" in output:
             sys.stdout.write(output)

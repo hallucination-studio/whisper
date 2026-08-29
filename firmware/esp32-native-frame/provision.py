@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import errno
 import getpass
 import hashlib
 import ipaddress
@@ -21,6 +22,9 @@ NVS_SIZE = 0x7000
 DEFAULT_BAUD = 115200
 ESPTOOL_VERSION = "5.3.1"
 PROVISIONING_SCHEMA = 2
+# AES-256 key bytes plus one sentinel byte used to prove immediate EOF.
+INHERITED_KEY_MAX_BYTES = 33
+AES_256_KEY_BYTES = 32
 
 # Extracted from espressif/idf@sha256:f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb.
 GENERATOR_SOURCE_SHA256 = "5adcd0e787ea41b8c3a1d42bdeb3dcc333e2d63949ee0778ba10c6ba901ad80e"
@@ -30,6 +34,49 @@ NVS_TOOL_SOURCE_SHA256 = {
     "nvs_logger.py": "bc309a7d2e594c8e471f3fe636e7e9d86860541777e6adbc91ac771cd09d4cd8",
     "nvs_parser.py": "621bdbf0ac60e34ae190f63be10f0f1a4dd4d18c25ebab0cf56ff53a6f2b6c2c",
 }
+
+
+def consume_inherited_key(stream):
+    """Consume and close one inherited binary stream containing exactly one AES-256 key."""
+    retained = bytearray()
+    try:
+        while len(retained) < INHERITED_KEY_MAX_BYTES:
+            remaining = INHERITED_KEY_MAX_BYTES - len(retained)
+            chunk = stream.read(remaining)
+            if not isinstance(chunk, (bytes, bytearray)):
+                raise RuntimeError("inherited key stream did not return binary data")
+            if not chunk:
+                break
+            retained.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                break
+        if len(retained) < AES_256_KEY_BYTES:
+            raise ValueError("inherited key stream ended before byte 32")
+        if len(retained) > AES_256_KEY_BYTES:
+            raise ValueError("inherited key stream contained byte 33")
+        return bytes(retained)
+    finally:
+        close_inherited_stream(stream)
+
+
+def close_inherited_stream(stream):
+    """Close an inherited binary stream and its descriptor even when closefd is false."""
+    descriptor = None
+    raw_stream = getattr(stream, "raw", stream)
+    closes_descriptor = getattr(raw_stream, "closefd", False)
+    try:
+        descriptor = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        stream.close()
+    finally:
+        if descriptor is not None and not closes_descriptor:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    raise
 
 
 def bounded_int(name, value, low, high):
@@ -60,21 +107,30 @@ def validate(args, password):
         raise ValueError("collector IPv6 address must not be link-local or IPv4-mapped")
     if re.fullmatch(r"[0-9A-Fa-f]{64}", args.capability_digest) is None:
         raise ValueError("capability digest must be exactly 32 hexadecimal bytes")
-    key_output = Path(args.key_output).expanduser().resolve()
-    receipt_output = Path(args.receipt_output).expanduser().resolve()
-    if key_output == receipt_output:
-        raise ValueError("key and receipt outputs must be different files")
-    for output in (key_output, receipt_output):
-        if output.exists():
-            raise ValueError(f"refusing to overwrite {output}")
-        if not output.parent.is_dir():
-            raise ValueError(f"output directory does not exist: {output.parent}")
+    key_output = None
+    receipt_output = None
+    if args.key_stdin:
+        if args.key_output is not None or args.receipt_output is not None:
+            raise ValueError("inherited key mode does not accept key or receipt outputs")
+    else:
+        if args.key_output is None or args.receipt_output is None:
+            raise ValueError("legacy random-key mode requires key and receipt outputs")
+        key_output = Path(args.key_output).expanduser().resolve()
+        receipt_output = Path(args.receipt_output).expanduser().resolve()
+        if key_output == receipt_output:
+            raise ValueError("key and receipt outputs must be different files")
+        for output in (key_output, receipt_output):
+            if output.exists():
+                raise ValueError(f"refusing to overwrite {output}")
+            if not output.parent.is_dir():
+                raise ValueError(f"output directory does not exist: {output.parent}")
     return {
         "device_id": device_id, "key_epoch": key_epoch, "ssid": args.ssid,
         "password": password, "probe_port": probe_port, "collector_ip": str(collector),
         "collector_port": collector_port,
         "capability_digest": bytes.fromhex(args.capability_digest), "baud": baud,
-        "key_output": key_output, "receipt_output": receipt_output,
+        "key_stdin": args.key_stdin, "key_output": key_output,
+        "receipt_output": receipt_output,
     }
 
 
@@ -185,15 +241,29 @@ def finalize_receipt(path, receipt):
             pass
 
 
-def provision(args, password, run=subprocess.run, random_bytes=secrets.token_bytes):
-    config = validate(args, password)
-    key = random_bytes(32)
+def provision(args, password, run=subprocess.run, random_bytes=secrets.token_bytes,
+              key_stream=None):
+    inherited_stream = None
+    if args.key_stdin:
+        inherited_stream = key_stream if key_stream is not None else sys.stdin.buffer
+    try:
+        config = validate(args, password)
+    except BaseException:
+        if inherited_stream is not None:
+            close_inherited_stream(inherited_stream)
+        raise
+    if config["key_stdin"]:
+        key = consume_inherited_key(inherited_stream)
+    else:
+        key = random_bytes(32)
     if len(key) != 32:
-        raise RuntimeError("random source did not return 32 bytes")
+        raise RuntimeError("key source did not return 32 bytes")
     esptool = command_prefix(args.python, args.esptool, "esptool")
     reserved = []
     try:
         for output in (config["key_output"], config["receipt_output"]):
+            if output is None:
+                continue
             reserve(output)
             reserved.append(output)
         version_output = checked(run, esptool + ["version"])
@@ -245,28 +315,44 @@ def provision(args, password, run=subprocess.run, random_bytes=secrets.token_byt
                     re.IGNORECASE) is None:
                 raise RuntimeError("connected ESP32-S3 does not report 8 MB flash")
 
-            receipt = {
-                "schema": PROVISIONING_SCHEMA, "target": "ESP32-S3", "port": args.port,
-                "baud": config["baud"], "device_id": config["device_id"],
-                "key_epoch": config["key_epoch"], "key_file": str(config["key_output"]),
-                "key_format": "raw-aes-256", "key_sha256": hashlib.sha256(key).hexdigest(),
-                "ssid": config["ssid"], "probe_port": config["probe_port"],
-                "collector_ip": config["collector_ip"],
-                "collector_port": config["collector_port"],
-                "capability_digest": config["capability_digest"].hex(),
-                "nvs_offset": NVS_OFFSET, "nvs_size": NVS_SIZE,
-                "esptool_version": ESPTOOL_VERSION, "flash_status": "prepared",
-                "verified": False,
-            }
-            persist_prepared(config, key, receipt)
-            reserved.clear()
+            receipt = None
+            if not config["key_stdin"]:
+                receipt = {
+                    "schema": PROVISIONING_SCHEMA, "target": "ESP32-S3", "port": args.port,
+                    "baud": config["baud"], "device_id": config["device_id"],
+                    "key_epoch": config["key_epoch"], "key_file": str(config["key_output"]),
+                    "key_format": "raw-aes-256", "key_sha256": hashlib.sha256(key).hexdigest(),
+                    "ssid": config["ssid"], "probe_port": config["probe_port"],
+                    "collector_ip": config["collector_ip"],
+                    "collector_port": config["collector_port"],
+                    "capability_digest": config["capability_digest"].hex(),
+                    "nvs_offset": NVS_OFFSET, "nvs_size": NVS_SIZE,
+                    "esptool_version": ESPTOOL_VERSION, "flash_status": "prepared",
+                    "verified": False,
+                }
+                persist_prepared(config, key, receipt)
+                reserved.clear()
             checked(run, common + ["write-flash", hex(NVS_OFFSET), str(bin_path)])
             checked(run, common + ["verify-flash", hex(NVS_OFFSET), str(bin_path)])
-            receipt["flash_status"] = "verified"
-            receipt["verified"] = True
-            finalize_receipt(config["receipt_output"], receipt)
-        print(f"Provisioned ESP32-S3; receipt: {config['receipt_output']}")
-        return receipt
+            if receipt is None:
+                result = {
+                    "schema": PROVISIONING_SCHEMA,
+                    "target": "ESP32-S3",
+                    "device_id": config["device_id"],
+                    "key_epoch": config["key_epoch"],
+                    "flash_status": "verified",
+                    "verified": True,
+                }
+            else:
+                receipt["flash_status"] = "verified"
+                receipt["verified"] = True
+                finalize_receipt(config["receipt_output"], receipt)
+                result = receipt
+        if config["key_stdin"]:
+            print("Provisioned ESP32-S3 using inherited key material")
+        else:
+            print(f"Provisioned ESP32-S3; receipt: {config['receipt_output']}")
+        return result
     except BaseException:
         for output in reserved:
             try:
@@ -286,8 +372,10 @@ def parser():
     result.add_argument("--collector-ip", required=True)
     result.add_argument("--collector-port", required=True)
     result.add_argument("--capability-digest", required=True)
-    result.add_argument("--key-output", required=True)
-    result.add_argument("--receipt-output", required=True)
+    result.add_argument("--key-stdin", action="store_true",
+                        help="consume exactly 32 key bytes from inherited stdin")
+    result.add_argument("--key-output")
+    result.add_argument("--receipt-output")
     result.add_argument("--baud", default=str(DEFAULT_BAUD))
     result.add_argument("--python", default=sys.executable)
     result.add_argument("--esptool", help="esptool 5.3.1 script; default: Python module")

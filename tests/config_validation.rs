@@ -219,3 +219,14 @@ fn cli_check_config_reports_success_and_failure() {
     assert!(!failure.status.success());
     std::fs::remove_file(failure_fixture).expect("remove temporary invalid fixture");
 }
+
+#[cfg(not(feature = "development-fixture"))]
+#[test]
+fn default_cli_does_not_expose_development_fixture_commands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_whisper")).output().expect("run default CLI");
+    let visible = String::from_utf8_lossy(&output.stdout).to_string()
+        + &String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!visible.contains("development-fixture"));
+}

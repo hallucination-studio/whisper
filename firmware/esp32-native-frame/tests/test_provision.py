@@ -1,6 +1,8 @@
 import csv
+import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,21 @@ SCRIPT = Path(__file__).resolve().parents[1] / "provision.py"
 SPEC = importlib.util.spec_from_file_location("world_provision", SCRIPT)
 provision = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(provision)
+
+
+class PartialStream(io.BytesIO):
+    def __init__(self, data, chunk_sizes):
+        super().__init__(data)
+        self.chunk_sizes = iter(chunk_sizes)
+        self.requests = []
+
+    def read(self, size=-1):
+        self.requests.append(size)
+        try:
+            size = min(size, next(self.chunk_sizes))
+        except StopIteration:
+            pass
+        return super().read(size)
 
 
 class FakeRun:
@@ -73,6 +90,106 @@ class ProvisionTest(unittest.TestCase):
     def tearDown(self):
         self.digest_patch.stop()
         self.temporary.cleanup()
+
+    def test_inherited_key_accepts_partial_reads_only_after_exact_eof(self):
+        stream = PartialStream(bytes(range(32)), [1, 2, 3, 5, 8, 13])
+
+        key = provision.consume_inherited_key(stream)
+
+        self.assertEqual(key, bytes(range(32)))
+        self.assertTrue(stream.closed)
+        self.assertGreater(len(stream.requests), 2)
+        self.assertEqual(stream.requests[-1], 1)
+
+    def test_inherited_key_closes_the_actual_closefd_false_descriptor(self):
+        read_descriptor, write_descriptor = os.pipe()
+        os.write(write_descriptor, bytes(range(32)))
+        os.close(write_descriptor)
+        stream = os.fdopen(read_descriptor, "rb", closefd=False)
+
+        key = provision.consume_inherited_key(stream)
+
+        self.assertEqual(key, bytes(range(32)))
+        self.assertTrue(stream.closed)
+        with self.assertRaises(OSError) as error:
+            os.fstat(read_descriptor)
+        self.assertEqual(error.exception.errno, errno.EBADF)
+
+    def test_inherited_key_rejects_every_short_length_and_closes_stream(self):
+        for length in range(32):
+            stream = PartialStream(bytes(range(length)), [1] * 33)
+            with self.subTest(length=length):
+                with self.assertRaisesRegex(ValueError, "ended before byte 32"):
+                    provision.consume_inherited_key(stream)
+                self.assertTrue(stream.closed)
+
+    def test_inherited_key_rejects_byte_33_after_partial_reads_and_closes_stream(self):
+        stream = PartialStream(bytes(range(33)), [30, 2, 1])
+
+        with self.assertRaisesRegex(ValueError, "contained byte 33"):
+            provision.consume_inherited_key(stream)
+
+        self.assertTrue(stream.closed)
+        self.assertEqual(stream.requests, [33, 3, 1])
+        self.assertTrue(all(1 <= request <= 33 for request in stream.requests))
+
+    def test_inherited_provisioning_closes_stream_when_argument_validation_fails(self):
+        args = provision.parser().parse_args([
+            "--port", "/dev/test", "--device-id", "0x12", "--key-epoch", "7",
+            "--ssid", "fixture-network",
+            "--probe-port", "9000", "--collector-ip", "127.0.0.1",
+            "--collector-port", "9000", "--capability-digest", "5a" * 32,
+            "--key-stdin",
+        ])
+        read_descriptor, write_descriptor = os.pipe()
+        os.write(write_descriptor, bytes(range(32)))
+        os.close(write_descriptor)
+        stream = os.fdopen(read_descriptor, "rb", closefd=False)
+
+        with self.assertRaisesRegex(ValueError, "collector IP must be unicast and non-loopback"):
+            provision.provision(args, "secret-pass", key_stream=stream)
+
+        self.assertTrue(stream.closed)
+        with self.assertRaises(OSError) as error:
+            os.fstat(read_descriptor)
+        self.assertEqual(error.exception.errno, errno.EBADF)
+
+    def test_inherited_provisioning_uses_stream_without_retaining_key_or_receipt(self):
+        root = Path(self.temporary.name)
+        args = provision.parser().parse_args([
+            "--port", "/dev/test", "--device-id", "0x12", "--key-epoch", "7",
+            "--ssid", "fixture-network",
+            "--probe-port", "9000", "--collector-ip", "192.0.2.10",
+            "--collector-port", "9000", "--capability-digest", "5a" * 32,
+            "--key-stdin",
+            "--generator-source", str(self.generator),
+            "--nvs-tool", str(self.tool_directory / "nvs_tool.py"),
+        ])
+        stream = PartialStream(bytes(range(32)), [7, 11, 14])
+        fake = FakeRun()
+
+        result = provision.provision(
+            args,
+            "secret-pass",
+            run=fake,
+            random_bytes=lambda _length: self.fail("random source must not be used"),
+            key_stream=stream,
+        )
+
+        self.assertEqual(result, {
+            "schema": 2,
+            "target": "ESP32-S3",
+            "device_id": 0x12,
+            "key_epoch": 7,
+            "flash_status": "verified",
+            "verified": True,
+        })
+        self.assertTrue(stream.closed)
+        self.assertEqual(list(root.glob("*.bin")), [])
+        self.assertEqual(list(root.glob("*.json")), [])
+        flattened = "\n".join(" ".join(command) for command in fake.commands)
+        self.assertNotIn(bytes(range(32)).hex(), flattened)
+        self.assertNotIn("secret-pass", flattened)
 
     def test_full_mapping_utf8_and_safe_flash_order(self):
         fake = FakeRun()

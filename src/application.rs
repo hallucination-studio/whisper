@@ -5,7 +5,6 @@
     expect(dead_code, reason = "external lifecycle wiring is implemented in a later work package")
 )]
 
-use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,6 +13,7 @@ use crate::Config;
 use crate::config::RouteConfig;
 use crate::database::{Database, DatabaseError, EpochHandle, ReplayWindowIdentity};
 use crate::domain::identity::{DeploymentId, DeviceId, KeyEpoch};
+use crate::key_material::{EpochKey, SecretStoreError, load_epoch_key};
 use sha2::{Digest, Sha256};
 
 const REPLAY_WINDOW_IDENTITY_DOMAIN: &[u8] = b"whisper.replay-window.identity";
@@ -157,14 +157,6 @@ fn managed_lock_path(database_path: &Path) -> Result<PathBuf, HostError> {
     Ok(database_path.with_file_name(lock_name))
 }
 
-struct EpochKey([u8; 32]);
-
-impl fmt::Debug for EpochKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("EpochKey([REDACTED])")
-    }
-}
-
 fn checked_deployment_length(length: usize) -> Result<u32, HostError> {
     u32::try_from(length).map_err(|_| HostError::DeploymentIdTooLong { length })
 }
@@ -188,7 +180,7 @@ fn replay_window_identity_preimage(
     preimage.extend_from_slice(deployment);
     preimage.extend_from_slice(&device.get().to_be_bytes());
     preimage.extend_from_slice(&key_epoch.get().to_be_bytes());
-    preimage.extend_from_slice(&epoch_key.0);
+    preimage.extend_from_slice(epoch_key.as_bytes());
     Ok(preimage)
 }
 
@@ -235,6 +227,17 @@ fn provision_admission_epoch(
     config: &Config,
     device: DeviceId,
     key_epoch: KeyEpoch,
+) -> Result<(), HostError> {
+    replay_admission_config(config, device, key_epoch)?;
+    let epoch_key = load_epoch_key(config, device, key_epoch)?;
+    provision_admission_epoch_with_key(database, config, device, key_epoch, &epoch_key)
+}
+
+fn provision_admission_epoch_with_key(
+    database: &mut Database,
+    config: &Config,
+    device: DeviceId,
+    key_epoch: KeyEpoch,
     epoch_key: &EpochKey,
 ) -> Result<(), HostError> {
     let (deployment, replay_window_size) = replay_admission_config(config, device, key_epoch)?;
@@ -244,6 +247,17 @@ fn provision_admission_epoch(
 }
 
 fn validate_capture_epoch(
+    database: &Database,
+    config: &Config,
+    device: DeviceId,
+    key_epoch: KeyEpoch,
+) -> Result<EpochHandle, HostError> {
+    replay_admission_config(config, device, key_epoch)?;
+    let epoch_key = load_epoch_key(config, device, key_epoch)?;
+    validate_capture_epoch_with_key(database, config, device, key_epoch, &epoch_key)
+}
+
+fn validate_capture_epoch_with_key(
     database: &Database,
     config: &Config,
     device: DeviceId,
@@ -287,6 +301,8 @@ pub(crate) enum HostError {
     },
     #[error(transparent)]
     Database(#[from] DatabaseError),
+    #[error(transparent)]
+    SecretStore(#[from] SecretStoreError),
 }
 
 pub(crate) fn open_capture_database(config: &Config) -> Result<Database, HostError> {
@@ -327,6 +343,23 @@ mod tests {
             &format!("database_path = \"{}\"", path.display()),
         ))
         .expect("config with temporary database path")
+    }
+
+    #[cfg(unix)]
+    fn config_with_database_and_secret_root(database: &Path, secret_root: &Path) -> Config {
+        let source = include_str!("../tests/fixtures/config/valid-two-esp32.toml");
+        parse_config(
+            &source
+                .replace(
+                    "database_path = \"./data/whisper.sqlite3\"",
+                    &format!("database_path = \"{}\"", database.display()),
+                )
+                .replace(
+                    "secret_root = \"./data/secrets\"",
+                    &format!("secret_root = \"{}\"", secret_root.display()),
+                ),
+        )
+        .expect("config with temporary database and secret root")
     }
 
     #[cfg(unix)]
@@ -673,7 +706,9 @@ mod tests {
     }
 
     fn epoch_key(name: &str) -> EpochKey {
-        EpochKey(decode_hex(vector_value(name)).try_into().expect("32-byte epoch key"))
+        EpochKey::from_test_bytes(
+            decode_hex(vector_value(name)).try_into().expect("32-byte epoch key"),
+        )
     }
 
     fn fixture_identity(name: &str) -> ReplayWindowIdentity {
@@ -702,7 +737,7 @@ mod tests {
 
     #[test]
     fn epoch_key_debug_redacts_secret_bytes() {
-        let debug = format!("{:?}", EpochKey([0xa5; 32]));
+        let debug = format!("{:?}", EpochKey::from_test_bytes([0xa5; 32]));
 
         assert_eq!(debug, "EpochKey([REDACTED])");
         assert!(!debug.contains("a5"));
@@ -824,25 +859,44 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn application_derives_identity_for_provisioning_and_capture_validation() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let path = database_path();
+        let secret_root = path.with_extension("secrets");
+        let device_directory = secret_root.join("device-1");
+        std::fs::create_dir(&secret_root).expect("create secret root");
+        std::fs::set_permissions(&secret_root, std::fs::Permissions::from_mode(0o700))
+            .expect("set secret root mode");
+        std::fs::create_dir(&device_directory).expect("create device key directory");
+        std::fs::set_permissions(&device_directory, std::fs::Permissions::from_mode(0o700))
+            .expect("set device key directory mode");
+        let key_path = device_directory.join("key-1.bin");
+        let mut key_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_path)
+            .expect("create epoch key");
+        key_file.write_all(&[0x11; 32]).expect("write epoch key");
+        drop(key_file);
+
         let mut database = Database::create_new(&path).expect("create database");
-        let config = config_with_database_path(&path);
+        let config = config_with_database_and_secret_root(&path, &secret_root);
         let device = DeviceId::new(1);
         let key_epoch = KeyEpoch::try_new(1).expect("key epoch");
-        let epoch_key = EpochKey([0x11; 32]);
 
-        provision_admission_epoch(&mut database, &config, device, key_epoch, &epoch_key)
-            .expect("provision");
-        validate_capture_epoch(&database, &config, device, key_epoch, &epoch_key)
-            .expect("capture validation");
-        assert!(
-            validate_capture_epoch(&database, &config, device, key_epoch, &EpochKey([0x12; 32]),)
-                .is_err()
-        );
+        provision_admission_epoch(&mut database, &config, device, key_epoch).expect("provision");
+        validate_capture_epoch(&database, &config, device, key_epoch).expect("capture validation");
+        std::fs::write(&key_path, [0x12; 32]).expect("replace epoch key bytes");
+        assert!(validate_capture_epoch(&database, &config, device, key_epoch).is_err());
         drop(database);
         std::fs::remove_file(path).expect("cleanup");
+        std::fs::remove_dir_all(secret_root).expect("cleanup secret store");
     }
 
     #[test]
@@ -859,7 +913,6 @@ mod tests {
                 &config,
                 device,
                 key_epoch,
-                &EpochKey([0x11; 32]),
             ),
             Err(HostError::MissingAdmissionRoute {
                 device: actual_device,

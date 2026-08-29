@@ -4,7 +4,10 @@ pub(crate) mod application;
 pub(crate) mod capture;
 mod config;
 pub(crate) mod database;
+#[cfg(feature = "development-fixture")]
+pub mod development_fixture;
 pub(crate) mod domain;
+pub(crate) mod key_material;
 pub(crate) mod session;
 #[cfg_attr(
     not(test),
