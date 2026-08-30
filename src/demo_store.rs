@@ -622,6 +622,22 @@ fn validate_closed(
     Ok(())
 }
 
+pub(crate) fn open_query_reader(path: &Path) -> Result<Connection, DemoStoreError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    connection.pragma_update(None, "trusted_schema", false)?;
+    connection.pragma_update(None, "query_only", true)?;
+    verify_persistent_settings(&connection)?;
+    verify_connection(&connection, ConnectionKind::Reader)?;
+    validate_schema(&connection)?;
+    Ok(connection)
+}
+
 fn configure_writer(connection: &Connection) -> Result<(), DemoStoreError> {
     connection.pragma_update(None, "foreign_keys", true)?;
     connection.pragma_update(None, "trusted_schema", false)?;
