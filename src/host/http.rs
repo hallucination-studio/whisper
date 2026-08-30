@@ -21,9 +21,11 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 use super::{RuntimeControl, RuntimeError, RuntimeErrorKind, SocketOperation, SocketRole};
-use crate::{
-    ErrorEnvelope, Metric, ProjectionCommit, QueryError, QueryLimits, QueryStore, SessionTime,
-    SignalPath, SignalQuery, SignalRange,
+use crate::ProjectionCommit;
+use crate::domain::time::SessionTime;
+use crate::store::{
+    ErrorEnvelope, Metric, QueryError, QueryLimits, QueryStore, SignalPath, SignalQuery,
+    SignalRange, SignalSelection,
 };
 
 /// Maximum digits in the canonical decimal representation of a `u64`.
@@ -329,7 +331,7 @@ fn decode_signal_query(parameters: SignalParameters) -> Result<SignalQuery, Quer
         _ => return Err(invalid_query()),
     };
     let selection =
-        crate::SignalSelection::try_new(&parameters.session, &parameters.sensor, &parameters.link)?;
+        SignalSelection::try_new(&parameters.session, &parameters.sensor, &parameters.link)?;
     let mut builder = SignalQuery::builder(
         selection,
         SignalRange::try_new(SessionTime::from_nanos(from), SessionTime::from_nanos(to))?,

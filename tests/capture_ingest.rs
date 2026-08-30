@@ -19,9 +19,10 @@ use aes_gcm::{
 use ciborium::{de::from_reader, ser::into_writer, value::Value};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
-use whisper::{
+use whisper::parse_config;
+use whisper::test_support::{
     CaptureRecordSequence, CapturedDatagram, CommitError, CommitOutcome, PacketDisposition,
-    ProjectionSequence, SubmitError, parse_config,
+    ProjectionSequence, SubmitError, serve_capture,
 };
 
 const HEADER_BYTES: usize = 32;
@@ -270,7 +271,7 @@ fn decode_hex_fixture(source: &str) -> Vec<u8> {
 fn authenticated_unknown_kind_commits_one_packet_cursor_and_watermark() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
         Instant::now(),
@@ -317,7 +318,7 @@ fn authenticated_unknown_kind_commits_one_packet_cursor_and_watermark() {
 fn replay_rejection_has_no_packet_cursor_or_watermark_effect() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let bytes = seal_raw(0x7f, 1, 1, &[0xa5]);
     let first = CapturedDatagram::new(
@@ -362,7 +363,7 @@ fn replay_rejection_has_no_packet_cursor_or_watermark_effect() {
 fn malformed_known_body_commits_before_capability_resolution() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
         Instant::now(),
@@ -397,7 +398,7 @@ fn malformed_known_body_commits_before_capability_resolution() {
 fn first_conforming_capability_commits_exact_epoch_row() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let body = capability_body([0x01; 32], [0x22; 32], 1024);
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -431,7 +432,7 @@ fn first_conforming_capability_commits_exact_epoch_row() {
 fn capability_pin_precedence_checks_build_before_digest() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let build_and_digest_mismatch = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -477,7 +478,7 @@ fn capability_pin_precedence_checks_build_before_digest() {
 fn capability_descriptor_budget_above_route_is_rejected_before_epoch_commit() {
     let fixture = CaptureFixture::with_first_capability_budget(2049);
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let capability = capability_body([0x01; 32], [0x22; 32], 2049);
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -514,7 +515,7 @@ fn capability_descriptor_budget_above_route_is_rejected_before_epoch_commit() {
 fn repeated_equal_capability_validates_one_durable_epoch_row() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let body = capability_body([0x01; 32], [0x22; 32], 1024);
     for (offset, message_sequence) in [1_u64, 2].into_iter().enumerate() {
@@ -555,7 +556,7 @@ fn repeated_equal_capability_validates_one_durable_epoch_row() {
 fn conforming_health_commits_without_capability_or_observation_rows() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -590,7 +591,7 @@ fn conforming_health_commits_without_capability_or_observation_rows() {
 fn csi_unavailable_precedes_source_and_radio_mismatches() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -626,7 +627,7 @@ fn csi_unavailable_precedes_source_and_radio_mismatches() {
 fn conforming_csi_commits_native_coordinate_observation() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -690,7 +691,7 @@ fn conforming_csi_commits_native_coordinate_observation() {
 fn csi_mismatch_precedence_runs_through_body_budget() {
     let fixture = CaptureFixture::with_first_sensor_raw_limit(4);
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -761,7 +762,7 @@ fn csi_mismatch_precedence_runs_through_body_budget() {
 fn csi_detects_durable_capability_build_mismatch_before_candidate_digest() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -821,7 +822,7 @@ fn csi_detects_durable_capability_build_mismatch_before_candidate_digest() {
 fn csi_body_budget_mismatch_commits_without_observation() {
     let fixture = CaptureFixture::with_first_sensor_raw_limit(4);
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -865,7 +866,7 @@ fn csi_body_budget_mismatch_commits_without_observation() {
 fn decoded_domain_rejection_commits_packet_without_observation() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -879,7 +880,7 @@ fn decoded_domain_rejection_commits_packet_without_observation() {
         .expect("submit capability")
         .wait()
         .expect("commit capability");
-    run.reject_next_csi_domain_for_test();
+    run.reject_next_csi_domain();
     let csi_datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
         first_receive + Duration::from_nanos(1),
@@ -916,7 +917,7 @@ fn decoded_domain_rejection_commits_packet_without_observation() {
 fn csi_body_budget_precedes_decoded_domain_rejection() {
     let fixture = CaptureFixture::with_first_sensor_raw_limit(4);
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -930,7 +931,7 @@ fn csi_body_budget_precedes_decoded_domain_rejection() {
         .expect("submit capability")
         .wait()
         .expect("commit capability");
-    run.reject_next_csi_domain_for_test();
+    run.reject_next_csi_domain();
     let csi_datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
         first_receive + Duration::from_nanos(1),
@@ -954,7 +955,7 @@ fn csi_body_budget_precedes_decoded_domain_rejection() {
 fn capability_conflict_rolls_back_complete_write_set_and_stops_writer() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let first = CapturedDatagram::new(
@@ -1025,7 +1026,7 @@ fn record_and_watermark_overflow_fail_closed_before_publication() {
     for overflow in ["record", "watermark"] {
         let fixture = CaptureFixture::new();
         whisper::init_admission(&fixture.config).expect("initialize Store");
-        let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+        let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
         let connection = Connection::open(&fixture.database).expect("open overflow fixture");
         match overflow {
             "record" => {
@@ -1080,7 +1081,7 @@ fn record_and_watermark_overflow_fail_closed_before_publication() {
 fn nonmonotonic_session_time_and_corrupt_replay_bitmap_fail_closed() {
     let time_fixture = CaptureFixture::new();
     whisper::init_admission(&time_fixture.config).expect("initialize time Store");
-    let mut time_run = whisper::serve(&time_fixture.config).expect("start time Capture runtime");
+    let mut time_run = serve_capture(&time_fixture.config).expect("start time Capture runtime");
     let first_receive = Instant::now();
     let first = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -1116,7 +1117,7 @@ fn nonmonotonic_session_time_and_corrupt_replay_bitmap_fail_closed() {
     let replay_fixture = CaptureFixture::new();
     whisper::init_admission(&replay_fixture.config).expect("initialize replay Store");
     let mut replay_run =
-        whisper::serve(&replay_fixture.config).expect("start replay Capture runtime");
+        serve_capture(&replay_fixture.config).expect("start replay Capture runtime");
     Connection::open(&replay_fixture.database)
         .expect("open replay corruption fixture")
         .execute(
@@ -1153,7 +1154,7 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
     whisper::init_admission(&fixture.config).expect("initialize Store");
     let first_capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let second_capability = capability_body([0x03; 32], [0x44; 32], 2048);
-    let mut first_run = whisper::serve(&fixture.config).expect("start first Capture runtime");
+    let mut first_run = serve_capture(&fixture.config).expect("start first Capture runtime");
     let first_receive = Instant::now();
     let first_run_packets = [
         ("192.0.2.10:5000", seal_raw_for(&[0x11; 32], 1, 1, 1, 1, &first_capability)),
@@ -1196,7 +1197,7 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
     }
     first_run.shutdown().expect("stop first Capture runtime");
 
-    let mut second_run = whisper::serve(&fixture.config).expect("start second Capture runtime");
+    let mut second_run = serve_capture(&fixture.config).expect("start second Capture runtime");
     let second_receive = Instant::now();
     let second_run_packets = [
         (
@@ -1278,7 +1279,7 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
 fn pre_transaction_route_byte_and_auth_rejects_have_no_store_effect() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
 
     let unknown_route = CapturedDatagram::new(
@@ -1330,7 +1331,7 @@ fn pre_transaction_route_byte_and_auth_rejects_have_no_store_effect() {
 fn authenticated_rate_reject_does_not_advance_replay_or_session() {
     let fixture = CaptureFixture::with_first_route_packet_rate(1);
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let first = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -1372,7 +1373,7 @@ fn authenticated_byte_rate_reject_does_not_advance_replay_or_session() {
     let byte_limit = u64::try_from(first_bytes.len()).expect("datagram length fits u64");
     let fixture = CaptureFixture::with_first_route_byte_rate(byte_limit);
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let first = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -1410,7 +1411,7 @@ fn authenticated_byte_rate_reject_does_not_advance_replay_or_session() {
 fn out_of_order_receive_time_is_rejected_before_store_admission() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let earlier_receive = Instant::now();
     let first = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -1448,7 +1449,7 @@ fn out_of_order_receive_time_is_rejected_before_store_admission() {
 fn session_time_conversion_overflow_is_rejected_without_store_effect() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let overflow_receive = Instant::now()
         .checked_add(Duration::from_nanos(u64::MAX))
         .expect("platform Instant represents the capture overflow fixture");
@@ -1485,8 +1486,8 @@ fn session_time_conversion_overflow_is_rejected_without_store_effect() {
 fn full_writer_queue_drops_candidate_without_store_effect_and_counts_it() {
     let fixture = CaptureFixture::with_writer_queue_capacity(1);
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
-    let hold = run.hold_writer_for_test().expect("pause writer");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
+    let hold = run.hold_writer().expect("pause writer");
     let first_receive = Instant::now();
     let queued = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -1529,11 +1530,11 @@ fn full_writer_queue_drops_candidate_without_store_effect_and_counts_it() {
 fn shutdown_releases_an_active_writer_hold_before_joining() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
 
     thread::spawn(move || {
-        let _hold = run.hold_writer_for_test().expect("pause writer");
+        let _hold = run.hold_writer().expect("pause writer");
         let stopped = run.shutdown().is_ok();
         let _ = finished_tx.send(stopped);
     });

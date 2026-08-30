@@ -1,8 +1,237 @@
 //! Transport-neutral packet envelopes used by the deterministic ingest path.
 
+use std::fmt;
 use std::net::SocketAddr;
+use std::time::{Instant, SystemTime};
 
 use crate::domain::identity::SessionId;
+
+/// One UDP datagram with receive facts captured before bounded delivery admission.
+#[derive(Debug)]
+pub struct CapturedDatagram {
+    peer: SocketAddr,
+    received_monotonic: Instant,
+    received_utc: SystemTime,
+    bytes: Box<[u8]>,
+}
+
+impl CapturedDatagram {
+    /// Creates a captured datagram from exact receive facts and encrypted bytes.
+    #[must_use]
+    pub fn new(
+        peer: SocketAddr,
+        received_monotonic: Instant,
+        received_utc: SystemTime,
+        bytes: impl Into<Box<[u8]>>,
+    ) -> Self {
+        Self { peer, received_monotonic, received_utc, bytes: bytes.into() }
+    }
+
+    pub(crate) const fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    pub(crate) const fn received_monotonic(&self) -> Instant {
+        self.received_monotonic
+    }
+
+    pub(crate) const fn received_utc(&self) -> SystemTime {
+        self.received_utc
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn into_bytes(self) -> Box<[u8]> {
+        self.bytes
+    }
+}
+
+/// Durable outcome for one candidate accepted by the capture writer queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitOutcome {
+    /// Store-scoped replay admission rejected the packet without writes.
+    ReplayRejected,
+    /// The admitted packet and its complete write set committed atomically.
+    Committed(CommitReceipt),
+}
+
+/// Committed packet disposition stored by the bounded delivery ingest path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketDisposition {
+    /// The authenticated native-frame kind is not defined by version 1.
+    UnknownKind,
+    /// A known native-frame kind did not satisfy its exact body grammar.
+    MalformedKnownBody,
+    /// The authenticated capability firmware digest did not match its configured pin.
+    BuildMismatch,
+    /// The authenticated capability digest did not match its configured pin.
+    CapabilityPinMismatch,
+    /// A conforming capability epoch row was inserted or exactly validated.
+    CapabilityCommitted,
+    /// A conforming authenticated health packet committed.
+    HealthCommitted,
+    /// Authenticated body capability identity did not match durable/configured authority.
+    CapabilityMismatch,
+    /// CSI arrived before a capability row was committed for its device epoch.
+    CapabilityUnavailable,
+    /// Authenticated CSI source identity did not match the configured link.
+    SourceMismatch,
+    /// Authenticated CSI radio facts did not match the configured link policy.
+    RadioMismatch,
+    /// Authenticated CSI exceeded the configured decoded-body budget.
+    BodyBudgetMismatch,
+    /// Authenticated CSI could not satisfy the imported typed observation domain.
+    DecodedDomainRejected,
+    /// A fully conforming native-coordinate CSI observation committed.
+    CsiCommitted,
+}
+
+impl PacketDisposition {
+    pub(crate) const fn as_store_text(self) -> &'static str {
+        match self {
+            Self::UnknownKind => "unknown_kind",
+            Self::MalformedKnownBody => "malformed_known_body",
+            Self::BuildMismatch => "build_mismatch",
+            Self::CapabilityPinMismatch => "capability_pin_mismatch",
+            Self::CapabilityCommitted => "capability_committed",
+            Self::HealthCommitted => "health_committed",
+            Self::CapabilityMismatch => "capability_mismatch",
+            Self::CapabilityUnavailable => "capability_unavailable",
+            Self::SourceMismatch => "source_mismatch",
+            Self::RadioMismatch => "radio_mismatch",
+            Self::BodyBudgetMismatch => "body_budget_mismatch",
+            Self::DecodedDomainRejected => "decoded_domain_rejected",
+            Self::CsiCommitted => "csi_committed",
+        }
+    }
+}
+
+/// Monotonic packet position within one Capture Session.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize)]
+pub struct CaptureRecordSequence(u64);
+
+impl CaptureRecordSequence {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    /// Returns the numeric Capture Session position.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for CaptureRecordSequence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Monotonic query-visible commit position within one Store.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProjectionSequence(u64);
+
+impl ProjectionSequence {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    /// Returns the numeric Store projection position.
+    #[must_use]
+    #[cfg(feature = "ingest-test-hooks")]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ProjectionSequence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectionCommit {
+    store_id: [u8; 32],
+    sequence: ProjectionSequence,
+}
+
+impl ProjectionCommit {
+    pub(crate) const fn new(store_id: [u8; 32], sequence: ProjectionSequence) -> Self {
+        Self { store_id, sequence }
+    }
+
+    pub(crate) const fn store_id(self) -> [u8; 32] {
+        self.store_id
+    }
+
+    pub(crate) const fn sequence(self) -> ProjectionSequence {
+        self.sequence
+    }
+}
+
+/// Post-commit identity for one admitted capture packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitReceipt {
+    disposition: PacketDisposition,
+    record_sequence: CaptureRecordSequence,
+    projection_sequence: ProjectionSequence,
+}
+
+impl CommitReceipt {
+    pub(crate) const fn new(
+        disposition: PacketDisposition,
+        record_sequence: CaptureRecordSequence,
+        projection_sequence: ProjectionSequence,
+    ) -> Self {
+        Self { disposition, record_sequence, projection_sequence }
+    }
+
+    /// Returns the packet's committed first-match disposition.
+    #[must_use]
+    #[cfg(feature = "ingest-test-hooks")]
+    pub const fn disposition(self) -> PacketDisposition {
+        self.disposition
+    }
+
+    /// Returns the committed Capture Session record sequence.
+    #[must_use]
+    #[cfg(feature = "ingest-test-hooks")]
+    pub const fn record_sequence(self) -> CaptureRecordSequence {
+        self.record_sequence
+    }
+
+    /// Returns the committed Store projection sequence.
+    #[must_use]
+    pub const fn projection_sequence(self) -> ProjectionSequence {
+        self.projection_sequence
+    }
+}
 
 /// The only transport family understood by the first native-frame decoder.
 #[allow(dead_code)]
