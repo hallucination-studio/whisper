@@ -10,7 +10,7 @@ trusted-root, cooperative-lease, staged-publication, and non-creating-open
 seams, are shared by the bounded Demo and deferred Semantic Program. The
 two-transaction processing, same-session recovery, rotation, retention,
 handoff, and semantic replay seams belong only to the deferred Semantic
-Program. The Demo Store schema and its per-serve, single-transaction path are
+Program. The bounded Store schema and its per-serve, single-transaction path are
 first-applicable in [Demo Slice architecture](demo-slice.md).
 
 ## Module responsibilities
@@ -30,7 +30,7 @@ The application module owns the only external lifecycle interface.
 replay, and corpus export, then coordinates trusted-root validation,
 cooperative leasing, secrets, open, same-session recovery, lazy session
 creation, and retention. A successful capture open
-returns `CaptureRun`, which owns the complete managed-store lease, sole
+returns `CaptureRuntime`, which owns the complete managed-store lease, sole
 synchronous writer connection, ingest order, rotation, shutdown, and publication
 sequencing without exposing internal persistence or Engine operations. A
 successful corpus-export open returns `CorpusExport`, a bounded read-only shell
@@ -75,7 +75,7 @@ classification.
 ```text
 operator intent
   -> HostLifecycle interface
-  -> CaptureRun interface
+  -> CaptureRuntime interface
 
 validated configuration + secrets
   -> managed-open seam
@@ -84,7 +84,7 @@ validated configuration + secrets
 
 authenticated datagram + receive context
   -> durable fact seam
-  -> decoder + CaptureRun processing coordinator
+  -> decoder + CaptureRuntime processing coordinator
   -> Engine semantic seam or typed decode-reject seam
   -> transition commit seam
   -> publication seam
@@ -112,13 +112,13 @@ concrete error representation.
 
 ```text
 HostLifecycle::provision(ProvisionIntent) -> StoreId
-HostLifecycle::capture(CaptureIntent) -> CaptureRun
+HostLifecycle::capture(CaptureIntent) -> CaptureRuntime
 HostLifecycle::replay(ReplayIntent) -> ReplayResult
 HostLifecycle::corpus_export(CorpusExportIntent) -> CorpusExport
 
-CaptureRun::ingest(ReceivedDatagram) -> CommittedProjectionIdentity
-CaptureRun::control(CaptureControl) -> CommittedProjectionIdentity
-CaptureRun::finish(FinishIntent) -> FinishedCapture
+CaptureRuntime::ingest(ReceivedDatagram) -> CommittedProjectionIdentity
+CaptureRuntime::control(CaptureControl) -> CommittedProjectionIdentity
+CaptureRuntime::finish(FinishIntent) -> FinishedCapture
 ```
 
 `ProvisionIntent`, `CaptureIntent`, `ReplayIntent`, and `CorpusExportIntent`
@@ -127,7 +127,7 @@ existing Managed database and immutable Store topology through validated
 current configuration and identifies one sealed session; it does not accept an
 arbitrary database path. Historical route and replay identities come exclusively
 from that sealed session's manifest, not current replay configuration.
-`CaptureRun` is the
+`CaptureRuntime` is the
 sole live ingest owner. A complete encrypted datagram and its receive
 context enter at `ingest`; no caller can enter at decoded observation, Engine
 transition, persistence-row, or projection publication level. `control`
@@ -136,7 +136,7 @@ session contract. `finish` owns stop-input, drain, durable `Closed`, Engine
 finish, final transition commit, seal, and pending handoff publication; it does
 not create a successor, and there is no separate caller-visible seal operation.
 
-Behind `CaptureRun`, transaction A returns a private, unforgeable
+Behind `CaptureRuntime`, transaction A returns a private, unforgeable
 `DurableRecord` capability only after replay admission and the exact encrypted
 fact commit together. Decoder and Engine entry requires that capability and
 cannot be invoked with caller-constructed bytes. An ordered control obtains the
@@ -209,7 +209,7 @@ generic migration framework.
 
 - One configuration root supplies every module; replay identity and runtime
   operation remain distinct.
-- `HostLifecycle`, `CaptureRun`, and `CorpusExport` own external lifecycle
+- `HostLifecycle`, `CaptureRuntime`, and `CorpusExport` own external lifecycle
   sequencing. Persistence exposes no bare seal, caller-selected recovery state,
   or general database-path opener.
 - One dedicated trusted local root and one lifecycle-owned OS lease coordinate

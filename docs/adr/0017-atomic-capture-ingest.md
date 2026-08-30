@@ -2,7 +2,7 @@
 status: accepted
 ---
 
-# Commit complete Demo ingest in one transaction
+# Commit complete capture ingest in one transaction
 
 The Demo Slice publishes committed native-coordinate CSI but has no independent
 Timeline or Engine step that justifies the larger persistence contract's raw

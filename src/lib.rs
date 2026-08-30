@@ -4,8 +4,6 @@ pub(crate) mod application;
 pub(crate) mod capture;
 mod config;
 pub(crate) mod database;
-#[cfg(unix)]
-mod demo_store;
 #[cfg(feature = "development-fixture")]
 pub mod development_fixture;
 pub(crate) mod domain;
@@ -16,7 +14,11 @@ pub(crate) mod key_material;
 mod managed_store;
 #[cfg(unix)]
 mod query;
+#[cfg(unix)]
+mod runtime;
 pub(crate) mod session;
+#[cfg(unix)]
+mod store;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "Timeline is integrated by a later Engine work package")
@@ -26,13 +28,24 @@ pub(crate) mod timeline;
 pub(crate) mod wire;
 
 pub use config::{Config, ConfigError, RouteError, parse_config};
+#[doc(inline)]
+pub use domain::identity::SessionId;
 pub use domain::time::SessionTime;
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+#[doc(hidden)]
+pub use query::QueryHold;
 #[cfg(unix)]
 pub use query::{
     EmptyEnvelope, ErrorEnvelope, Metric, QueryError, QueryLimits, QueryStore, SignalPath,
     SignalQuery, SignalQueryBuilder, SignalRange, SignalSelection, SignalsOk, SignalsResponse,
     TopologyOk,
 };
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+#[doc(hidden)]
+pub use runtime::TeardownHold;
+#[cfg(unix)]
+#[doc(inline)]
+pub use runtime::{HostRuntime, RuntimeError, RuntimeFailure, SocketOperation, SocketRole};
 
 use std::backtrace::Backtrace;
 use std::error::Error;
@@ -40,9 +53,9 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::{Instant, SystemTime};
 
-/// An application lifecycle failure from a bounded Demo command.
+/// An application lifecycle failure from a bounded delivery command.
 #[derive(Debug)]
-pub struct DemoError {
+pub struct LifecycleError {
     source: application::HostError,
     backtrace: Backtrace,
 }
@@ -57,18 +70,18 @@ pub struct SubmitError {
 /// A writer failure while waiting for one queued candidate's durable outcome.
 #[derive(Debug)]
 pub struct CommitError {
-    source: application::HostError,
+    source: std::sync::Arc<application::HostError>,
     backtrace: Backtrace,
 }
 
-/// A failure while stopping and joining a Capture Run writer.
+/// A failure while stopping and joining a Capture runtime writer.
 #[derive(Debug)]
 pub struct ShutdownError {
     source: application::HostError,
     backtrace: Backtrace,
 }
 
-/// One UDP datagram with receive facts captured before bounded Demo admission.
+/// One UDP datagram with receive facts captured before bounded delivery admission.
 #[derive(Debug)]
 pub struct CapturedDatagram {
     peer: SocketAddr,
@@ -110,7 +123,7 @@ impl CapturedDatagram {
     }
 }
 
-/// Durable outcome for one candidate accepted by the Demo writer queue.
+/// Durable outcome for one candidate accepted by the capture writer queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitOutcome {
     /// Store-scoped replay admission rejected the packet without writes.
@@ -119,7 +132,7 @@ pub enum CommitOutcome {
     Committed(CommitReceipt),
 }
 
-/// Committed packet disposition stored by the bounded Demo ingest path.
+/// Committed packet disposition stored by the bounded delivery ingest path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketDisposition {
     /// The authenticated native-frame kind is not defined by version 1.
@@ -203,7 +216,7 @@ impl fmt::Display for CaptureRecordSequence {
     }
 }
 
-/// Monotonic query-visible commit position within one Demo Store.
+/// Monotonic query-visible commit position within one Store.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProjectionSequence(u64);
 
@@ -236,7 +249,27 @@ impl fmt::Display for ProjectionSequence {
     }
 }
 
-/// Post-commit identity for one admitted Demo packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectionCommit {
+    store_id: [u8; 32],
+    sequence: ProjectionSequence,
+}
+
+impl ProjectionCommit {
+    pub(crate) const fn new(store_id: [u8; 32], sequence: ProjectionSequence) -> Self {
+        Self { store_id, sequence }
+    }
+
+    pub(crate) const fn store_id(self) -> [u8; 32] {
+        self.store_id
+    }
+
+    pub(crate) const fn sequence(self) -> ProjectionSequence {
+        self.sequence
+    }
+}
+
+/// Post-commit identity for one admitted capture packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommitReceipt {
     disposition: PacketDisposition,
@@ -279,7 +312,7 @@ pub struct CommitTicket {
     inner: application::CommitTicket,
 }
 
-/// A test-only lease that pauses the Demo writer until dropped.
+/// A test-only lease that pauses the capture writer until dropped.
 #[cfg(all(unix, feature = "ingest-test-hooks"))]
 #[doc(hidden)]
 #[derive(Debug)]
@@ -300,14 +333,17 @@ impl CommitTicket {
 }
 
 /// A newly created Capture Session and its retained Managed-store lifecycle lease.
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+#[doc(hidden)]
 #[derive(Debug)]
-#[must_use = "dropping the Capture Run stops its writer and releases its lifecycle lease"]
-pub struct CaptureRun {
-    inner: application::CaptureRun,
+#[must_use = "dropping the Capture runtime stops its writer and releases its lifecycle lease"]
+pub struct CaptureRuntime {
+    inner: application::CaptureRuntime,
 }
 
-impl CaptureRun {
-    /// Returns the Store-scoped random identity read from the validated Demo Store.
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+impl CaptureRuntime {
+    /// Returns the Store-scoped random identity read from the validated Store.
     #[must_use]
     pub const fn store_id(&self) -> [u8; 32] {
         self.inner.store_id()
@@ -331,7 +367,7 @@ impl CaptureRun {
     ///
     /// # Errors
     ///
-    /// Returns an error when the existing Demo Store cannot be opened and validated read-only.
+    /// Returns an error when the existing Store cannot be opened and validated read-only.
     #[cfg(unix)]
     pub fn query_store(&self) -> Result<QueryStore, QueryError> {
         query::QueryStore::from_managed(self.inner.managed_root())
@@ -347,8 +383,11 @@ impl CaptureRun {
     /// Pauses the writer until the returned test lease is dropped.
     #[cfg(all(unix, feature = "ingest-test-hooks"))]
     #[doc(hidden)]
-    pub fn hold_writer_for_test(&mut self) -> Result<WriterHold, DemoError> {
-        self.inner.hold_writer().map(|inner| WriterHold { _inner: inner }).map_err(DemoError::host)
+    pub fn hold_writer_for_test(&mut self) -> Result<WriterHold, LifecycleError> {
+        self.inner
+            .hold_writer()
+            .map(|inner| WriterHold { _inner: inner })
+            .map_err(LifecycleError::host)
     }
 
     /// Forces the next conforming CSI candidate through decoded-domain rejection.
@@ -371,7 +410,7 @@ impl CaptureRun {
             .map_err(SubmitError::host)
     }
 
-    /// Stops and joins the Demo writer before releasing the lifecycle lease.
+    /// Stops and joins the capture writer before releasing the lifecycle lease.
     ///
     /// # Errors
     ///
@@ -382,19 +421,19 @@ impl CaptureRun {
     }
 }
 
-impl fmt::Display for DemoError {
+impl fmt::Display for LifecycleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.source.fmt(formatter)
     }
 }
 
-impl Error for DemoError {
+impl Error for LifecycleError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.source)
     }
 }
 
-impl DemoError {
+impl LifecycleError {
     /// Returns whether another process or session holds the Managed-store lease.
     #[must_use]
     pub const fn is_lease_conflict(&self) -> bool {
@@ -436,7 +475,7 @@ impl SubmitError {
         self.source.is_writer_queue_full()
     }
 
-    /// Returns whether the sole Demo writer had already stopped.
+    /// Returns whether the sole capture writer had already stopped.
     #[must_use]
     pub const fn is_writer_stopped(&self) -> bool {
         self.source.is_writer_stopped()
@@ -460,14 +499,14 @@ impl fmt::Display for CommitError {
 
 impl Error for CommitError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
+        Some(self.source.as_ref())
     }
 }
 
 impl CommitError {
     /// Returns whether the writer stopped before returning a durable outcome.
     #[must_use]
-    pub const fn is_writer_stopped(&self) -> bool {
+    pub fn is_writer_stopped(&self) -> bool {
         self.source.is_writer_stopped()
     }
 
@@ -476,7 +515,7 @@ impl CommitError {
         &self.backtrace
     }
 
-    fn host(source: application::HostError) -> Self {
+    fn host(source: std::sync::Arc<application::HostError>) -> Self {
         Self { source, backtrace: Backtrace::capture() }
     }
 }
@@ -504,18 +543,18 @@ impl ShutdownError {
     }
 }
 
-/// Initializes the configured Demo Store and its empty admission epochs.
+/// Initializes the configured Store and its empty admission epochs.
 ///
 /// # Errors
 ///
 /// Returns an error if Managed-store trust, secret loading, SQLite initialization,
 /// validation, or no-replace publication fails. Non-Unix platforms always return
 /// an error because they cannot enforce the Managed-store contract.
-pub fn init_admission(config: &Config) -> Result<(), DemoError> {
-    application::init_admission(config).map_err(DemoError::host)
+pub fn init_admission(config: &Config) -> Result<(), LifecycleError> {
+    application::init_admission(config).map_err(LifecycleError::host)
 }
 
-/// Opens an existing Demo Store and starts one empty Capture Session.
+/// Opens an existing Store and starts one empty Capture Session.
 ///
 /// The returned handle retains the Managed-store lifecycle lease and the
 /// Capture Session's monotonic origin until it is dropped.
@@ -525,6 +564,8 @@ pub fn init_admission(config: &Config) -> Result<(), DemoError> {
 /// Returns an error if the Store is missing, untrusted, incompatible, or cannot
 /// atomically create the Capture Session. Non-Unix platforms always return an
 /// error because they cannot enforce the Managed-store contract.
-pub fn serve(config: &Config) -> Result<CaptureRun, DemoError> {
-    application::serve(config).map(|inner| CaptureRun { inner }).map_err(DemoError::host)
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+#[doc(hidden)]
+pub fn serve(config: &Config) -> Result<CaptureRuntime, LifecycleError> {
+    application::serve(config).map(|inner| CaptureRuntime { inner }).map_err(LifecycleError::host)
 }

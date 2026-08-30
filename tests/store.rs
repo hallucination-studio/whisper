@@ -1,6 +1,6 @@
-//! Demo Store lifecycle behavior through the command-line seam.
+//! Store lifecycle behavior through the public application seam.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "ingest-test-hooks"))]
 
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
@@ -15,16 +15,16 @@ static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 type AdmissionRow = (Vec<u8>, Vec<u8>, u16, Option<Vec<u8>>, Option<Vec<u8>>, Vec<u8>);
 
-struct DemoFixture {
+struct StoreFixture {
     root: PathBuf,
     config: PathBuf,
     database: PathBuf,
 }
 
-impl DemoFixture {
+impl StoreFixture {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
-            "whisper-demo-store-{}-{}",
+            "whisper-store-{}-{}",
             std::process::id(),
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -32,7 +32,7 @@ impl DemoFixture {
 
         let managed_root = root.join("managed");
         create_directory(&managed_root, 0o700);
-        let database = managed_root.join("demo.sqlite3");
+        let database = managed_root.join("host.sqlite3");
 
         let secret_root = root.join("secrets");
         create_directory(&secret_root, 0o700);
@@ -58,19 +58,19 @@ impl DemoFixture {
             "database_path = \"./data/whisper.sqlite3\"",
             &format!("database_path = \"{}\"", database.display()),
         );
-        let config = root.join("demo.toml");
-        fs::write(&config, source).expect("write Demo configuration");
+        let config = root.join("host.toml");
+        fs::write(&config, source).expect("write runtime configuration");
 
         Self { root, config, database }
     }
 
     fn parsed_config(&self) -> Config {
-        let source = fs::read_to_string(&self.config).expect("read Demo configuration");
-        parse_config(&source).expect("parse Demo configuration")
+        let source = fs::read_to_string(&self.config).expect("read runtime configuration");
+        parse_config(&source).expect("parse runtime configuration")
     }
 }
 
-impl Drop for DemoFixture {
+impl Drop for StoreFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
@@ -106,8 +106,8 @@ fn decode_hex(encoded: &str) -> Vec<u8> {
 }
 
 #[test]
-fn init_admission_creates_the_closed_demo_store_and_empty_epochs() {
-    let fixture = DemoFixture::new();
+fn init_admission_creates_the_closed_store_and_empty_epochs() {
+    let fixture = StoreFixture::new();
     let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", fixture.config.to_str().expect("UTF-8 config path")])
         .output()
@@ -124,11 +124,11 @@ fn init_admission_creates_the_closed_demo_store_and_empty_epochs() {
     managed_names.sort();
     assert_eq!(
         managed_names,
-        [".whisper.lease", "demo.sqlite3"],
+        [".whisper.lease", "host.sqlite3"],
         "closed initialization must not retain staging, WAL, or SHM companions"
     );
 
-    let connection = Connection::open(&fixture.database).expect("open initialized Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open initialized Store");
     let application_id: i64 = connection
         .pragma_query_value(None, "application_id", |row| row.get(0))
         .expect("application ID");
@@ -218,7 +218,7 @@ fn init_admission_persists_imported_canonical_receipts() {
         "9673fe9ee066f20a2b4e6b73bf2a35f551e46289499a75932e36ee68af4ab226",
     ];
 
-    let fixture = DemoFixture::new();
+    let fixture = StoreFixture::new();
     let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", fixture.config.to_str().expect("UTF-8 config path")])
         .output()
@@ -229,7 +229,7 @@ fn init_admission_persists_imported_canonical_receipts() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let connection = Connection::open(&fixture.database).expect("open initialized Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open initialized Store");
     let (topology, topology_digest, replay, replay_digest): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) =
         connection
             .query_row(
@@ -269,16 +269,12 @@ fn init_admission_persists_imported_canonical_receipts() {
 
 #[test]
 fn serve_requires_an_existing_store_and_creates_one_empty_capture_session() {
-    let fixture = DemoFixture::new();
-    let missing = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run serve without a Store");
-    assert!(!missing.status.success());
+    let fixture = StoreFixture::new();
+    let config = fixture.parsed_config();
+    let missing = whisper::serve(&config).expect_err("serve without a Store must fail");
     assert!(
-        String::from_utf8_lossy(&missing.stderr).contains(&fixture.database.display().to_string()),
-        "managed I/O error omitted the failing Store path: {}",
-        String::from_utf8_lossy(&missing.stderr)
+        missing.to_string().contains(&fixture.database.display().to_string()),
+        "managed I/O error omitted the failing Store path: {missing}"
     );
     assert!(!fixture.database.exists(), "serve must not create the configured Store");
 
@@ -291,22 +287,12 @@ fn serve_requires_an_existing_store_and_creates_one_empty_capture_session() {
         "init-admission failed: {}",
         String::from_utf8_lossy(&initialized.stderr)
     );
-    let served = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run serve");
-    assert!(served.status.success(), "serve failed: {}", String::from_utf8_lossy(&served.stderr));
-    let served_again = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run serve again");
-    assert!(
-        served_again.status.success(),
-        "second serve failed: {}",
-        String::from_utf8_lossy(&served_again.stderr)
-    );
+    let served = whisper::serve(&config).expect("serve initialized Store");
+    drop(served);
+    let served_again = whisper::serve(&config).expect("serve initialized Store again");
+    drop(served_again);
 
-    let connection = Connection::open(&fixture.database).expect("open served Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open served Store");
     let sessions = connection
         .prepare(
             "SELECT session_id, length(started_utc_ns), replay_config_digest,
@@ -355,12 +341,12 @@ fn serve_requires_an_existing_store_and_creates_one_empty_capture_session() {
 
 #[test]
 fn serve_returns_committed_session_authority_and_retains_the_lifecycle_lease() {
-    let fixture = DemoFixture::new();
+    let fixture = StoreFixture::new();
     let config = fixture.parsed_config();
-    whisper::init_admission(&config).expect("initialize Demo Store");
+    whisper::init_admission(&config).expect("initialize Store");
 
-    let session = whisper::serve(&config).expect("open first Demo Session");
-    let connection = Connection::open(&fixture.database).expect("open served Demo Store");
+    let session = whisper::serve(&config).expect("open first Capture Session");
+    let connection = Connection::open(&fixture.database).expect("open served Store");
     let (store_id, session_count): (Vec<u8>, u64) = connection
         .query_row(
             "SELECT store_id, (SELECT count(*) FROM capture_sessions WHERE session_id = ?1)
@@ -378,32 +364,30 @@ fn serve_returns_committed_session_authority_and_retains_the_lifecycle_lease() {
     assert!(conflict.is_lease_conflict());
     drop(session);
 
-    let _next = whisper::serve(&config).expect("open Demo Session after releasing lifecycle lease");
+    let _next =
+        whisper::serve(&config).expect("open Capture Session after releasing lifecycle lease");
 }
 
 #[test]
 fn serve_rejects_a_same_named_but_incompatible_schema_without_mutation() {
-    let fixture = DemoFixture::new();
+    let fixture = StoreFixture::new();
     let initialized = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", fixture.config.to_str().expect("UTF-8 config path")])
         .output()
         .expect("run init-admission");
     assert!(initialized.status.success());
-    let connection = Connection::open(&fixture.database).expect("open Demo Store for corruption");
+    let connection = Connection::open(&fixture.database).expect("open Store for corruption");
     connection
         .execute_batch(
             "DROP INDEX csi_by_link_time;
              CREATE INDEX csi_by_link_time ON csi_observations(session_id, record_seq);",
         )
         .expect("replace required index with an incompatible same-named index");
-    connection.close().expect("close corrupted Demo Store");
+    connection.close().expect("close corrupted Store");
     let before = fs::read(&fixture.database).expect("snapshot corrupted Store");
 
-    let served = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run serve");
-    assert!(!served.status.success(), "serve accepted an incompatible same-named index");
+    let config = fixture.parsed_config();
+    whisper::serve(&config).expect_err("serve accepted an incompatible same-named index");
     assert_eq!(fs::read(&fixture.database).expect("read rejected Store"), before);
     let connection = Connection::open(&fixture.database).expect("reopen rejected Store");
     let sessions: u64 = connection
@@ -413,22 +397,19 @@ fn serve_rejects_a_same_named_but_incompatible_schema_without_mutation() {
 }
 
 fn assert_serve_rejects_corruption(sql: &str) {
-    let fixture = DemoFixture::new();
+    let fixture = StoreFixture::new();
     let initialized = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", fixture.config.to_str().expect("UTF-8 config path")])
         .output()
         .expect("run init-admission");
     assert!(initialized.status.success());
-    let connection = Connection::open(&fixture.database).expect("open Demo Store for corruption");
+    let connection = Connection::open(&fixture.database).expect("open Store for corruption");
     connection.execute_batch(sql).expect("apply Store corruption");
-    connection.close().expect("close corrupted Demo Store");
+    connection.close().expect("close corrupted Store");
     let before = fs::read(&fixture.database).expect("snapshot corrupted Store");
 
-    let served = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run serve");
-    assert!(!served.status.success(), "serve accepted Store corruption from SQL: {sql}");
+    let config = fixture.parsed_config();
+    assert!(whisper::serve(&config).is_err(), "serve accepted Store corruption from SQL: {sql}");
     assert_eq!(
         fs::read(&fixture.database).expect("read rejected Store"),
         before,
@@ -461,7 +442,7 @@ fn serve_rejects_incompatible_identity_schema_and_state_without_mutation() {
 
 #[test]
 fn managed_root_lease_and_final_trust_fail_closed() {
-    let wrong_root = DemoFixture::new();
+    let wrong_root = StoreFixture::new();
     let managed_root = wrong_root.database.parent().expect("Managed root");
     fs::set_permissions(managed_root, fs::Permissions::from_mode(0o755))
         .expect("weaken Managed-root mode");
@@ -473,7 +454,7 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     assert!(!wrong_root.database.exists());
     assert!(private_stages(managed_root).is_empty());
 
-    let wrong_lease = DemoFixture::new();
+    let wrong_lease = StoreFixture::new();
     let managed_root = wrong_lease.database.parent().expect("Managed root");
     let lease = managed_root.join(".whisper.lease");
     fs::write(&lease, []).expect("create untrusted lease");
@@ -486,7 +467,7 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     assert!(!wrong_lease.database.exists());
     assert!(private_stages(managed_root).is_empty());
 
-    let conflict = DemoFixture::new();
+    let conflict = StoreFixture::new();
     let managed_root = conflict.database.parent().expect("Managed root");
     let lease = managed_root.join(".whisper.lease");
     fs::write(&lease, []).expect("create trusted lease");
@@ -502,7 +483,7 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     assert!(!conflict.database.exists());
     assert!(private_stages(managed_root).is_empty());
 
-    let occupied = DemoFixture::new();
+    let occupied = StoreFixture::new();
     fs::write(&occupied.database, b"pre-existing final").expect("create occupied final");
     fs::set_permissions(&occupied.database, fs::Permissions::from_mode(0o600))
         .expect("protect occupied final");
@@ -514,7 +495,7 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     assert_eq!(fs::read(&occupied.database).expect("read occupied final"), b"pre-existing final");
     assert!(private_stages(occupied.database.parent().expect("Managed root")).is_empty());
 
-    let wrong_final = DemoFixture::new();
+    let wrong_final = StoreFixture::new();
     let initialized = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", wrong_final.config.to_str().expect("UTF-8 config path")])
         .output()
@@ -523,11 +504,8 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     let store_bytes = fs::read(&wrong_final.database).expect("snapshot initialized Store");
     fs::set_permissions(&wrong_final.database, fs::Permissions::from_mode(0o644))
         .expect("weaken final mode");
-    let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", wrong_final.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run serve against wrong-mode final");
-    assert!(!output.status.success());
+    let config = wrong_final.parsed_config();
+    assert!(whisper::serve(&config).is_err());
     assert_eq!(fs::read(&wrong_final.database).expect("read rejected final"), store_bytes);
     assert!(private_stages(wrong_final.database.parent().expect("Managed root")).is_empty());
 
@@ -535,14 +513,10 @@ fn managed_root_lease_and_final_trust_fail_closed() {
         .expect("restore final mode");
     let extra_link = wrong_final.database.with_file_name("extra-link.sqlite3");
     fs::hard_link(&wrong_final.database, &extra_link).expect("add untrusted final hard link");
-    let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", wrong_final.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run serve against hard-linked final");
-    assert!(!output.status.success());
+    assert!(whisper::serve(&config).is_err());
     assert_eq!(fs::read(&wrong_final.database).expect("read hard-linked final"), store_bytes);
 
-    let stale_companion = DemoFixture::new();
+    let stale_companion = StoreFixture::new();
     let stale_wal = PathBuf::from(format!("{}-wal", stale_companion.database.display()));
     fs::write(&stale_wal, []).expect("create stale final WAL");
     fs::set_permissions(&stale_wal, fs::Permissions::from_mode(0o600))
@@ -555,7 +529,7 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     assert!(!stale_companion.database.exists());
     assert!(stale_wal.exists(), "initialization must not adopt or remove a stale companion");
 
-    let wrong_companion = DemoFixture::new();
+    let wrong_companion = StoreFixture::new();
     let initialized = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", wrong_companion.config.to_str().expect("UTF-8 config path")])
         .output()
@@ -565,15 +539,12 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     let wal = PathBuf::from(format!("{}-wal", wrong_companion.database.display()));
     fs::write(&wal, []).expect("create untrusted final WAL");
     fs::set_permissions(&wal, fs::Permissions::from_mode(0o644)).expect("weaken final WAL mode");
-    let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", wrong_companion.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run serve against untrusted WAL");
-    assert!(!output.status.success());
+    let config = wrong_companion.parsed_config();
+    assert!(whisper::serve(&config).is_err());
     assert_eq!(fs::read(&wrong_companion.database).expect("read rejected Store"), store_bytes);
 }
 
-fn assert_failed_initialization_has_no_store_or_stage(fixture: &DemoFixture) {
+fn assert_failed_initialization_has_no_store_or_stage(fixture: &StoreFixture) {
     let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", fixture.config.to_str().expect("UTF-8 config path")])
         .output()
@@ -585,11 +556,11 @@ fn assert_failed_initialization_has_no_store_or_stage(fixture: &DemoFixture) {
 
 #[test]
 fn init_admission_loads_every_route_key_and_rejects_invalid_epoch_material() {
-    let missing = DemoFixture::new();
+    let missing = StoreFixture::new();
     fs::remove_file(missing.root.join("secrets/device-2/key-1.bin")).expect("remove route key");
     assert_failed_initialization_has_no_store_or_stage(&missing);
 
-    let advanced = DemoFixture::new();
+    let advanced = StoreFixture::new();
     fs::rename(
         advanced.root.join("secrets/device-1/key-1.bin"),
         advanced.root.join("secrets/device-1/key-2.bin"),
@@ -597,13 +568,13 @@ fn init_admission_loads_every_route_key_and_rejects_invalid_epoch_material() {
     .expect("advance route key");
     assert_failed_initialization_has_no_store_or_stage(&advanced);
 
-    let wrong_size = DemoFixture::new();
+    let wrong_size = StoreFixture::new();
     fs::write(wrong_size.root.join("secrets/device-1/key-1.bin"), [0x11; 31])
         .expect("truncate route key");
     assert_failed_initialization_has_no_store_or_stage(&wrong_size);
 
-    let duplicate = DemoFixture::new();
-    let source = fs::read_to_string(&duplicate.config).expect("read Demo configuration");
+    let duplicate = StoreFixture::new();
+    let source = fs::read_to_string(&duplicate.config).expect("read runtime configuration");
     fs::write(
         &duplicate.config,
         format!(
@@ -617,7 +588,7 @@ fn init_admission_loads_every_route_key_and_rejects_invalid_epoch_material() {
 #[test]
 fn serve_rederives_every_route_epoch_without_repairing_conflicts() {
     for mutation in ["missing", "changed", "advanced"] {
-        let fixture = DemoFixture::new();
+        let fixture = StoreFixture::new();
         let initialized = Command::new(env!("CARGO_BIN_EXE_whisper"))
             .args(["init-admission", fixture.config.to_str().expect("UTF-8 config path")])
             .output()
@@ -633,18 +604,15 @@ fn serve_rederives_every_route_epoch_without_repairing_conflicts() {
             _ => unreachable!("test mutation is exhaustive"),
         }
         let before = fs::read(&fixture.database).expect("snapshot initialized Store");
-        let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
-            .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-            .output()
-            .expect("run rejected serve");
-        assert!(!output.status.success(), "serve accepted {mutation} epoch material");
+        let config = fixture.parsed_config();
+        assert!(whisper::serve(&config).is_err(), "serve accepted {mutation} epoch material");
         assert_eq!(fs::read(&fixture.database).expect("read rejected Store"), before);
     }
 }
 
 #[test]
 fn serve_writer_uses_a_zero_busy_timeout() {
-    let fixture = DemoFixture::new();
+    let fixture = StoreFixture::new();
     let initialized = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", fixture.config.to_str().expect("UTF-8 config path")])
         .output()
@@ -653,15 +621,11 @@ fn serve_writer_uses_a_zero_busy_timeout() {
     let lock = Connection::open(&fixture.database).expect("open competing SQLite writer");
     lock.execute_batch("BEGIN IMMEDIATE").expect("hold SQLite writer transaction");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run blocked serve");
-    assert!(!output.status.success());
+    let config = fixture.parsed_config();
+    let error = whisper::serve(&config).expect_err("serve accepted a blocked writer");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("database is locked"),
-        "writer conflict did not retain SQLite's lock classification: {}",
-        String::from_utf8_lossy(&output.stderr)
+        error.to_string().contains("database is locked"),
+        "writer conflict did not retain SQLite's lock classification: {error}"
     );
     lock.execute_batch("ROLLBACK").expect("release SQLite writer transaction");
     let sessions: u64 = lock
@@ -672,13 +636,13 @@ fn serve_writer_uses_a_zero_busy_timeout() {
 
 #[test]
 fn serve_preserves_valid_advanced_replay_state() {
-    let fixture = DemoFixture::new();
+    let fixture = StoreFixture::new();
     let initialized = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", fixture.config.to_str().expect("UTF-8 config path")])
         .output()
         .expect("run init-admission");
     assert!(initialized.status.success());
-    let connection = Connection::open(&fixture.database).expect("open Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open Store");
     connection
         .execute(
             "UPDATE admission_epochs
@@ -693,14 +657,12 @@ fn serve_preserves_valid_advanced_replay_state() {
             ],
         )
         .expect("advance valid replay state");
-    connection.close().expect("close advanced Demo Store");
+    connection.close().expect("close advanced Store");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run serve");
-    assert!(output.status.success(), "serve failed: {}", String::from_utf8_lossy(&output.stderr));
-    let connection = Connection::open(&fixture.database).expect("reopen Demo Store");
+    let config = fixture.parsed_config();
+    let served = whisper::serve(&config).expect("serve advanced replay state");
+    drop(served);
+    let connection = Connection::open(&fixture.database).expect("reopen Store");
     let replay_state: (Vec<u8>, Vec<u8>, Vec<u8>) = connection
         .query_row(
             "SELECT highest_boot_generation, maximum_message_sequence, seen_bitmap
@@ -725,18 +687,16 @@ fn serve_preserves_valid_advanced_replay_state() {
 
 #[test]
 fn serve_preserves_an_advanced_store_watermark_and_starts_a_fresh_session() {
-    let fixture = DemoFixture::new();
+    let fixture = StoreFixture::new();
     let initialized = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", fixture.config.to_str().expect("UTF-8 config path")])
         .output()
         .expect("run init-admission");
     assert!(initialized.status.success());
-    let first_serve = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run first serve");
-    assert!(first_serve.status.success());
-    let connection = Connection::open(&fixture.database).expect("open Demo Store");
+    let config = fixture.parsed_config();
+    let first_serve = whisper::serve(&config).expect("serve initialized Store");
+    drop(first_serve);
+    let connection = Connection::open(&fixture.database).expect("open Store");
     let first_session: String = connection
         .query_row("SELECT session_id FROM capture_sessions", [], |row| row.get(0))
         .expect("read first Capture Session");
@@ -760,18 +720,11 @@ fn serve_preserves_an_advanced_store_watermark_and_starts_a_fresh_session() {
             rusqlite::params![1_u64.to_be_bytes()],
         )
         .expect("advance Store watermark");
-    connection.close().expect("close advanced Demo Store");
+    connection.close().expect("close advanced Store");
 
-    let second_serve = Command::new(env!("CARGO_BIN_EXE_whisper"))
-        .args(["serve", fixture.config.to_str().expect("UTF-8 config path")])
-        .output()
-        .expect("run second serve");
-    assert!(
-        second_serve.status.success(),
-        "serve rejected valid advanced Store state: {}",
-        String::from_utf8_lossy(&second_serve.stderr)
-    );
-    let connection = Connection::open(&fixture.database).expect("reopen Demo Store");
+    let second_serve = whisper::serve(&config).expect("serve valid advanced Store state");
+    drop(second_serve);
+    let connection = Connection::open(&fixture.database).expect("reopen Store");
     let watermark: Vec<u8> = connection
         .query_row("SELECT projection_commit_seq FROM store_state", [], |row| row.get(0))
         .expect("read preserved Store watermark");

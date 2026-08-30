@@ -12,9 +12,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::{
-    Arc,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering as AtomicOrdering},
-    mpsc::{self, Receiver, SyncSender, TrySendError},
+    mpsc::{self, Receiver, SyncSender},
 };
 #[cfg(unix)]
 use std::thread::{self, JoinHandle};
@@ -23,16 +23,16 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use crate::Config;
 use crate::config::RouteConfig;
 use crate::database::{Database, DatabaseError, EpochHandle, ReplayWindowIdentity};
-#[cfg(unix)]
-use crate::demo_store::{self, AdmissionEpochSeed, DemoStoreError};
 use crate::domain::identity::{DeploymentId, DeviceId, KeyEpoch};
 use crate::key_material::{EpochKey, SecretStoreError, load_epoch_key};
 #[cfg(unix)]
 use crate::managed_store::{ManagedRoot, ManagedStoreError};
 #[cfg(unix)]
+use crate::store::{self, AdmissionEpochSeed, StoreError};
+#[cfg(unix)]
 use crate::wire::{self, IngestError};
 #[cfg(unix)]
-use crate::{CapturedDatagram, CommitOutcome};
+use crate::{CapturedDatagram, CommitOutcome, ProjectionSequence};
 use sha2::{Digest, Sha256};
 
 const REPLAY_WINDOW_IDENTITY_DOMAIN: &[u8] = b"whisper.replay-window.identity";
@@ -327,7 +327,7 @@ pub(crate) enum HostError {
     ManagedStore(#[from] ManagedStoreError),
     #[cfg(unix)]
     #[error(transparent)]
-    DemoStore(#[from] DemoStoreError),
+    Store(#[from] StoreError),
     #[cfg(unix)]
     #[error(transparent)]
     Ingest(#[from] IngestError),
@@ -338,10 +338,10 @@ pub(crate) enum HostError {
     #[error("captured datagrams were submitted out of receive-monotonic order")]
     ReceiveOrder,
     #[cfg(unix)]
-    #[error("capture receive time exceeds the Demo u64 nanosecond range")]
+    #[error("capture receive time exceeds the capture u64 nanosecond range")]
     CaptureTimeOverflow,
     #[cfg(unix)]
-    #[error("capture UTC time is outside the Demo timestamp range")]
+    #[error("capture UTC time is outside the capture timestamp range")]
     CaptureClock,
     #[cfg(unix)]
     #[error("authenticated route rate limit was exceeded")]
@@ -359,16 +359,16 @@ pub(crate) enum HostError {
     #[error("the bounded writer queue is full")]
     WriterQueueFull,
     #[cfg(unix)]
-    #[error("the Capture Run queue-drop counter overflowed")]
+    #[error("the Capture runtime queue-drop counter overflowed")]
     QueueDropOverflow,
     #[cfg(unix)]
-    #[error("the Demo writer has stopped")]
+    #[error("the capture writer has stopped")]
     WriterStopped,
     #[cfg(unix)]
-    #[error("the Demo writer thread could not be started: {0}")]
+    #[error("the capture writer thread could not be started: {0}")]
     WriterSpawn(#[source] io::Error),
     #[cfg(unix)]
-    #[error("the Demo writer thread panicked")]
+    #[error("the capture writer thread panicked")]
     WriterPanicked,
     #[cfg(not(unix))]
     #[error("this platform cannot enforce the Unix Managed-store contract")]
@@ -376,14 +376,14 @@ pub(crate) enum HostError {
 }
 
 #[derive(Debug)]
-pub(crate) struct CaptureRun {
+pub(crate) struct CaptureRuntime {
     store_id: [u8; 32],
     session_id: String,
     monotonic_origin: Instant,
     #[cfg(unix)]
     config: Config,
     #[cfg(unix)]
-    writer_tx: Option<SyncSender<WriterCommand>>,
+    writer_inbox: Arc<WriterInbox>,
     #[cfg(unix)]
     writer: Option<JoinHandle<()>>,
     #[cfg(unix)]
@@ -396,37 +396,40 @@ pub(crate) struct CaptureRun {
     queue_drop_count: u64,
     #[cfg(all(unix, feature = "ingest-test-hooks"))]
     reject_next_csi_domain: bool,
-    #[cfg(all(unix, feature = "ingest-test-hooks"))]
-    writer_hold_release: Option<SyncSender<()>>,
     #[cfg(unix)]
     managed: Arc<ManagedRoot>,
 }
 
-impl CaptureRun {
+impl CaptureRuntime {
     #[cfg(unix)]
     fn new(
         managed: ManagedRoot,
         config: Config,
-        capture: demo_store::CaptureSession,
+        capture: store::CaptureSession,
     ) -> Result<Self, HostError> {
         let store_id = capture.store_id;
         let session_id = capture.session_id.clone();
         let monotonic_origin = capture.monotonic_origin;
         let capacity = usize::try_from(config.server().command_queue_capacity())
             .map_err(|_| HostError::WriterQueueCapacity)?;
-        let (writer_tx, writer_rx) = mpsc::sync_channel(capacity);
         let writer_stopped = Arc::new(AtomicBool::new(false));
-        let writer_stopped_for_thread = Arc::clone(&writer_stopped);
+        let writer_panicked = Arc::new(AtomicBool::new(false));
+        let writer_inbox = Arc::new(WriterInbox::new(
+            capacity,
+            Arc::clone(&writer_stopped),
+            Arc::clone(&writer_panicked),
+        ));
+        let writer_inbox_for_thread = Arc::clone(&writer_inbox);
         let writer = thread::Builder::new()
-            .name("whisper-demo-writer".to_owned())
-            .spawn(move || writer_loop(capture, writer_rx, writer_stopped_for_thread))
+            .name("whisper-capture-writer".to_owned())
+            .spawn(move || writer_loop(capture, writer_inbox_for_thread))
             .map_err(HostError::WriterSpawn)?;
         Ok(Self {
             store_id,
             session_id,
             monotonic_origin,
             config,
-            writer_tx: Some(writer_tx),
+            writer_inbox,
             writer: Some(writer),
             writer_stopped,
             rate_windows: BTreeMap::new(),
@@ -434,8 +437,6 @@ impl CaptureRun {
             queue_drop_count: 0,
             #[cfg(feature = "ingest-test-hooks")]
             reject_next_csi_domain: false,
-            #[cfg(feature = "ingest-test-hooks")]
-            writer_hold_release: None,
             managed: Arc::new(managed),
         })
     }
@@ -453,6 +454,7 @@ impl CaptureRun {
         &self.session_id
     }
 
+    #[cfg(feature = "ingest-test-hooks")]
     pub(crate) fn elapsed(&self) -> Duration {
         self.monotonic_origin.elapsed()
     }
@@ -505,21 +507,26 @@ impl CaptureRun {
         self.last_receive = Some(received_monotonic);
         let candidate = authenticated.into_candidate(session_time, receive_utc_ns);
         let (response_tx, response_rx) = mpsc::sync_channel(1);
-        let command = WriterCommand::Commit {
+        let pending = PendingCandidate {
             candidate,
             response: response_tx,
             #[cfg(feature = "ingest-test-hooks")]
             reject_csi_domain: std::mem::take(&mut self.reject_next_csi_domain),
         };
-        match self.writer_tx.as_ref().ok_or(HostError::WriterStopped)?.try_send(command) {
+        match self.writer_inbox.try_push(pending) {
             Ok(()) => Ok(CommitTicket { response: response_rx }),
-            Err(TrySendError::Full(_)) => {
+            Err(PushError::Full) => {
                 self.queue_drop_count =
                     self.queue_drop_count.checked_add(1).ok_or(HostError::QueueDropOverflow)?;
                 Err(HostError::WriterQueueFull)
             }
-            Err(TrySendError::Disconnected(_)) => Err(HostError::WriterStopped),
+            Err(PushError::Stopped) => Err(HostError::WriterStopped),
         }
+    }
+
+    pub(crate) fn observe_writer(&self, observer: WriterObserver) -> Result<(), HostError> {
+        self.writer_inbox.observe(observer);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -534,16 +541,8 @@ impl CaptureRun {
 
     #[cfg(all(unix, feature = "ingest-test-hooks"))]
     pub(crate) fn hold_writer(&mut self) -> Result<WriterHold, HostError> {
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::sync_channel(1);
-        self.writer_tx
-            .as_ref()
-            .ok_or(HostError::WriterStopped)?
-            .send(WriterCommand::Hold { started: started_tx, release: release_rx })
-            .map_err(|_| HostError::WriterStopped)?;
-        started_rx.recv().map_err(|_| HostError::WriterStopped)?;
-        self.writer_hold_release = Some(release_tx.clone());
-        Ok(WriterHold { release: Some(release_tx) })
+        self.writer_inbox.hold()?;
+        Ok(WriterHold { inbox: Arc::clone(&self.writer_inbox), active: true })
     }
 
     #[cfg(all(unix, feature = "ingest-test-hooks"))]
@@ -551,15 +550,14 @@ impl CaptureRun {
         self.reject_next_csi_domain = true;
     }
 
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    pub(crate) fn panic_writer_for_test(&self) -> Result<(), HostError> {
+        self.writer_inbox.request_panic()
+    }
+
     #[cfg(unix)]
     fn stop_writer(&mut self) -> Result<(), HostError> {
-        #[cfg(feature = "ingest-test-hooks")]
-        if let Some(release) = self.writer_hold_release.take() {
-            let _ = release.try_send(());
-        }
-        if let Some(writer_tx) = self.writer_tx.take() {
-            let _ = writer_tx.send(WriterCommand::Shutdown);
-        }
+        self.writer_inbox.close();
         if let Some(writer) = self.writer.take() {
             writer.join().map_err(|_| HostError::WriterPanicked)?;
         }
@@ -568,7 +566,7 @@ impl CaptureRun {
 }
 
 #[cfg(unix)]
-impl Drop for CaptureRun {
+impl Drop for CaptureRuntime {
     fn drop(&mut self) {
         let _ = self.stop_writer();
     }
@@ -577,100 +575,282 @@ impl Drop for CaptureRun {
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct CommitTicket {
-    response: Receiver<Result<CommitOutcome, HostError>>,
+    response: Receiver<Result<CommitOutcome, Arc<HostError>>>,
 }
 
 #[cfg(unix)]
 impl CommitTicket {
-    pub(crate) fn wait(self) -> Result<CommitOutcome, HostError> {
+    pub(crate) fn wait(self) -> Result<CommitOutcome, Arc<HostError>> {
         self.response.recv().map_err(|_| HostError::WriterStopped)?
     }
 }
 
 #[cfg(unix)]
-#[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Keeping the bounded candidate inline avoids one allocation on every admitted packet"
-)]
-enum WriterCommand {
-    Commit {
-        candidate: crate::wire::WireCandidate,
-        response: SyncSender<Result<CommitOutcome, HostError>>,
-        #[cfg(feature = "ingest-test-hooks")]
-        reject_csi_domain: bool,
-    },
+pub(crate) type WriterObserver = Arc<dyn Fn(WriterEvent) + Send + Sync>;
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub(crate) enum WriterEvent {
+    Committed(ProjectionSequence),
+    Fatal(Arc<HostError>),
+    Stopped { panicked: bool },
+}
+
+#[cfg(unix)]
+struct PendingCandidate {
+    candidate: crate::wire::WireCandidate,
+    response: SyncSender<Result<CommitOutcome, Arc<HostError>>>,
     #[cfg(feature = "ingest-test-hooks")]
-    Hold {
-        started: SyncSender<()>,
-        release: Receiver<()>,
-    },
-    Shutdown,
+    reject_csi_domain: bool,
+}
+
+#[cfg(unix)]
+enum PushError {
+    Full,
+    Stopped,
+}
+
+#[cfg(unix)]
+struct WriterInbox {
+    capacity: usize,
+    state: Mutex<WriterInboxState>,
+    changed: Condvar,
+    stopped: Arc<AtomicBool>,
+    panicked: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for WriterInbox {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WriterInbox")
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct WriterInboxState {
+    candidates: VecDeque<PendingCandidate>,
+    observer: Option<WriterObserver>,
+    closed: bool,
+    #[cfg(feature = "ingest-test-hooks")]
+    hold_requested: bool,
+    #[cfg(feature = "ingest-test-hooks")]
+    held: bool,
+    #[cfg(feature = "ingest-test-hooks")]
+    panic_requested: bool,
+}
+
+#[cfg(unix)]
+impl WriterInbox {
+    fn new(capacity: usize, stopped: Arc<AtomicBool>, panicked: Arc<AtomicBool>) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(WriterInboxState::default()),
+            changed: Condvar::new(),
+            stopped,
+            panicked,
+        }
+    }
+
+    fn try_push(&self, candidate: PendingCandidate) -> Result<(), PushError> {
+        if self.stopped.load(AtomicOrdering::Acquire) {
+            return Err(PushError::Stopped);
+        }
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            return Err(PushError::Stopped);
+        }
+        if state.candidates.len() >= self.capacity {
+            return Err(PushError::Full);
+        }
+        state.candidates.push_back(candidate);
+        drop(state);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    fn next(&self) -> Option<PendingCandidate> {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            #[cfg(feature = "ingest-test-hooks")]
+            if state.panic_requested {
+                panic!("test-only writer panic requested through the guarded test seam");
+            }
+            #[cfg(feature = "ingest-test-hooks")]
+            if state.hold_requested {
+                state.held = true;
+                self.changed.notify_all();
+                state = self
+                    .changed
+                    .wait_while(state, |state| state.hold_requested && !state.closed)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.held = false;
+                continue;
+            }
+            if let Some(candidate) = state.candidates.pop_front() {
+                return Some(candidate);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.changed.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn observe(&self, observer: WriterObserver) {
+        let (stopped, panicked) = {
+            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.observer = Some(Arc::clone(&observer));
+            (
+                self.stopped.load(AtomicOrdering::Acquire),
+                self.panicked.load(AtomicOrdering::Acquire),
+            )
+        };
+        if stopped {
+            observer(WriterEvent::Stopped { panicked });
+        }
+    }
+
+    fn notify(&self, event: WriterEvent) {
+        let observer =
+            self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).observer.clone();
+        if let Some(observer) = observer {
+            observer(event);
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
+        #[cfg(feature = "ingest-test-hooks")]
+        {
+            state.hold_requested = false;
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    fn hold(&self) -> Result<(), HostError> {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed || self.stopped.load(AtomicOrdering::Acquire) {
+            return Err(HostError::WriterStopped);
+        }
+        state.hold_requested = true;
+        self.changed.notify_all();
+        state = self
+            .changed
+            .wait_while(state, |state| {
+                !state.held && !state.closed && !self.stopped.load(AtomicOrdering::Acquire)
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.held { Ok(()) } else { Err(HostError::WriterStopped) }
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    fn release_hold(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.hold_requested = false;
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    fn request_panic(&self) -> Result<(), HostError> {
+        if self.stopped.load(AtomicOrdering::Acquire) {
+            return Err(HostError::WriterStopped);
+        }
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            return Err(HostError::WriterStopped);
+        }
+        state.panic_requested = true;
+        drop(state);
+        self.changed.notify_all();
+        Ok(())
+    }
 }
 
 #[cfg(all(unix, feature = "ingest-test-hooks"))]
 #[derive(Debug)]
 pub(crate) struct WriterHold {
-    release: Option<SyncSender<()>>,
+    inbox: Arc<WriterInbox>,
+    active: bool,
 }
 
 #[cfg(all(unix, feature = "ingest-test-hooks"))]
 impl Drop for WriterHold {
     fn drop(&mut self) {
-        if let Some(release) = self.release.take() {
-            let _ = release.try_send(());
+        if self.active {
+            self.inbox.release_hold();
+            self.active = false;
         }
     }
 }
 
 #[cfg(unix)]
-fn writer_loop(
-    mut capture: demo_store::CaptureSession,
-    commands: Receiver<WriterCommand>,
-    writer_stopped: Arc<AtomicBool>,
-) {
-    while let Ok(command) = commands.recv() {
-        match command {
-            WriterCommand::Commit {
-                candidate,
-                response,
-                #[cfg(feature = "ingest-test-hooks")]
-                reject_csi_domain,
-            } => {
-                let outcome = {
-                    #[cfg(feature = "ingest-test-hooks")]
-                    {
-                        if reject_csi_domain {
-                            capture.commit_with_domain_rejection(candidate)
-                        } else {
-                            capture.commit(candidate)
-                        }
-                    }
-                    #[cfg(not(feature = "ingest-test-hooks"))]
-                    {
-                        capture.commit(candidate)
-                    }
-                };
-                match outcome {
-                    Ok(outcome) => {
-                        let _ = response.send(Ok(outcome));
-                    }
-                    Err(error) => {
-                        writer_stopped.store(true, AtomicOrdering::Release);
-                        let _ = response.send(Err(HostError::DemoStore(error)));
-                        break;
-                    }
+fn writer_loop(mut capture: store::CaptureSession, inbox: Arc<WriterInbox>) {
+    let _stopped = WriterStoppedGuard(Arc::clone(&inbox));
+    while let Some(PendingCandidate {
+        candidate,
+        response,
+        #[cfg(feature = "ingest-test-hooks")]
+        reject_csi_domain,
+    }) = inbox.next()
+    {
+        let outcome = {
+            #[cfg(feature = "ingest-test-hooks")]
+            {
+                if reject_csi_domain {
+                    capture.commit_with_domain_rejection(candidate)
+                } else {
+                    capture.commit(candidate)
                 }
             }
-            #[cfg(feature = "ingest-test-hooks")]
-            WriterCommand::Hold { started, release } => {
-                let _ = started.send(());
-                let _ = release.recv();
+            #[cfg(not(feature = "ingest-test-hooks"))]
+            {
+                capture.commit(candidate)
             }
-            WriterCommand::Shutdown => break,
+        };
+        match outcome {
+            Ok(outcome) => {
+                let _ = response.send(Ok(outcome));
+                if let CommitOutcome::Committed(receipt) = outcome {
+                    inbox.notify(WriterEvent::Committed(receipt.projection_sequence()));
+                }
+            }
+            Err(error) => {
+                inbox.stopped.store(true, AtomicOrdering::Release);
+                let error = Arc::new(HostError::Store(error));
+                let _ = response.send(Err(Arc::clone(&error)));
+                inbox.notify(WriterEvent::Fatal(error));
+                break;
+            }
         }
     }
-    writer_stopped.store(true, AtomicOrdering::Release);
+}
+
+#[cfg(unix)]
+struct WriterStoppedGuard(Arc<WriterInbox>);
+
+#[cfg(unix)]
+impl Drop for WriterStoppedGuard {
+    fn drop(&mut self) {
+        let panicked = std::thread::panicking();
+        let observer = {
+            let state = self.0.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.0.panicked.store(panicked, AtomicOrdering::Release);
+            self.0.stopped.store(true, AtomicOrdering::Release);
+            state.observer.clone()
+        };
+        self.0.changed.notify_all();
+        if panicked && let Some(observer) = observer {
+            observer(WriterEvent::Stopped { panicked: true });
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -763,7 +943,7 @@ pub(crate) fn init_admission(config: &Config) -> Result<(), HostError> {
 
     let stage = managed.create_stage()?;
     let stage_identity = stage.identity();
-    let initialized = demo_store::initialize(&stage, config, admissions)?;
+    let initialized = store::initialize(&stage, config, admissions)?;
     let final_path = managed.publish(stage)?;
     if let Err(error) = initialized.validate(&final_path) {
         managed.remove_published_if_owned(stage_identity)?;
@@ -782,16 +962,16 @@ pub(crate) fn init_admission(_config: &Config) -> Result<(), HostError> {
 }
 
 #[cfg(unix)]
-pub(crate) fn serve(config: &Config) -> Result<CaptureRun, HostError> {
+pub(crate) fn serve(config: &Config) -> Result<CaptureRuntime, HostError> {
     let managed = ManagedRoot::acquire_existing(config.session().database_path())?;
     let admissions = admission_seeds(config)?;
     let capture =
-        demo_store::open_and_create_capture_session(managed.database_path(), config, admissions)?;
-    CaptureRun::new(managed, config.clone(), capture)
+        store::open_and_create_capture_session(managed.database_path(), config, admissions)?;
+    CaptureRuntime::new(managed, config.clone(), capture)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn serve(_config: &Config) -> Result<CaptureRun, HostError> {
+pub(crate) fn serve(_config: &Config) -> Result<CaptureRuntime, HostError> {
     Err(HostError::UnsupportedManagedStorePlatform)
 }
 

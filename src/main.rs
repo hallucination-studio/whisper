@@ -76,16 +76,17 @@ fn init_admission_command(args: Vec<OsString>) -> ExitCode {
     };
     match whisper::init_admission(&config) {
         Ok(()) => {
-            println!("initialized Demo admission Store");
+            println!("initialized admission Store");
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("Demo Store initialization failed: {error}");
+            eprintln!("Store initialization failed: {error}");
             ExitCode::from(1)
         }
     }
 }
 
+#[cfg(unix)]
 fn serve_command(args: Vec<OsString>) -> ExitCode {
     let [path] = args.as_slice() else {
         print_usage();
@@ -98,16 +99,55 @@ fn serve_command(args: Vec<OsString>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match whisper::serve(&config) {
-        Ok(_session) => {
-            println!("opened Demo Store and created Capture Session");
-            ExitCode::SUCCESS
-        }
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("Demo Store startup failed: {error}");
-            ExitCode::from(1)
+            eprintln!("Host async runtime startup failed: {error}");
+            return ExitCode::from(1);
         }
+    };
+    runtime.block_on(async move {
+        let host = match whisper::HostRuntime::start(&config).await {
+            Ok(host) => host,
+            Err(error) => {
+                eprintln!("Host runtime startup failed: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let capture = host.capture_address();
+        let http = host.http_address();
+        println!("Host runtime started: capture={capture} http={http}");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    eprintln!("Host shutdown signal failed: {error}");
+                    return ExitCode::from(1);
+                }
+            }
+            () = host.wait_for_stop() => {}
+        }
+        match host.shutdown().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Host runtime shutdown failed: {error}");
+                ExitCode::from(1)
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn serve_command(args: Vec<OsString>) -> ExitCode {
+    let [path] = args.as_slice() else {
+        print_usage();
+        return ExitCode::from(2);
+    };
+    if let Err(error) = check_config(Path::new(path)) {
+        eprintln!("invalid configuration: {error}");
+        return ExitCode::from(1);
     }
+    eprintln!("Host runtime startup failed: unsupported Managed-store platform");
+    ExitCode::from(1)
 }
 
 #[cfg(feature = "development-fixture")]

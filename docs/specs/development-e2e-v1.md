@@ -738,7 +738,7 @@ Chrome recovery contract from [API/UI v1](api-ui-v1.md), and the current-Mac
 resource contract from [evaluation v1](evaluation-v1.md). Those specifications
 remain the sole owners of their exact component behavior.
 
-The highest repeatable application seam is one lifecycle-owned `CaptureRun`:
+The highest repeatable application seam is one lifecycle-owned `CaptureRuntime`:
 the runner feeds received encrypted datagrams through the ordinary admission
 path and observes committed Projection commit identities and HTTP results.
 Tests MUST NOT bypass transaction A, inject decoded observations below capture,

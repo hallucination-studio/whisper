@@ -1151,7 +1151,6 @@ impl Config {
 
     /// Returns view settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by later view work package")]
     pub(crate) const fn view(&self) -> &ViewConfig {
         self.runtime.view()
     }

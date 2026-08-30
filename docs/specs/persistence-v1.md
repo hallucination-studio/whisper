@@ -8,7 +8,7 @@ cooperative `HostLifecycle` lease, staged initialization and atomic no-replace
 publication, and common non-creating open are shared by the bounded Demo and
 deferred Semantic Program. This specification also owns the deferred Semantic
 Session Store and its two-stage processing, recovery, rotation, retention, and
-faithful replay contract. For the Demo Store schema, per-serve Capture Session,
+faithful replay contract. For the bounded Store schema, per-serve Capture Session,
 and one-transaction ingest path,
 [Demo Slice v1](demo-slice-v1.md) is first-applicable. The two Stores share the
 named key-loading and lifecycle subsets, ReplayConfig, topology, replay-window,
@@ -1271,7 +1271,7 @@ advance. Failure MUST roll back both admission and raw insertion, leave Engine
 unchanged, and stop capture before publication.
 
 After raw commit, and never before it, the shared decoder and Engine path may
-process the record. The `CaptureRun` processing coordinator MUST hold that
+process the record. The `CaptureRuntime` processing coordinator MUST hold that
 committed `DurableRecord` plus exclusive access to the current Engine and
 Timeline and construct exactly one private, unforgeable, closed
 `ProcessedRecordTransition`: either `Semantic(EngineTransition)` from the normal
@@ -1355,7 +1355,7 @@ MUST NOT seal or create a successor as a side effect of Host restart.
 The manifest and `session_records` in unsigned sequence order are the sole Host
 recovery authority. Recovery MUST construct a fresh Engine and Timeline from
 the manifest's complete baseline seed and feed every fact through the same
-production decoder and `CaptureRun` processing coordinator used by live capture.
+production decoder and `CaptureRuntime` processing coordinator used by live capture.
 Through the stored committed processing cursor, if present, replay only rebuilds
 working state and compares every produced append-only observation and complete
 WindowProjection with the retained committed prefix bytes and identities. It

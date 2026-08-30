@@ -1056,7 +1056,7 @@ An `EngineTransition` is only the semantic variant of the application-owned
 private processed-record transition. An authenticated decoder reject never
 enters Timeline or Engine and cannot be represented as an `EngineTransition`.
 The persistence specification owns the closed wrapper, its unforgeable
-construction by the `CaptureRun` processing coordinator, and transaction-B
+construction by the `CaptureRuntime` processing coordinator, and transaction-B
 cursor/commit behavior for both variants.
 
 Engine operations MUST be applied sequentially.

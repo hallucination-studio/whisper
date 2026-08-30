@@ -47,7 +47,7 @@ contract for a Semantic Session.
 
 ## Scope and deferrals
 
-A Demo Store and each Capture Session remain dynamic in configured Sensor,
+A Store and each Capture Session remain dynamic in configured Sensor,
 Link, Profile, packet, and observation count. One physical ESP32-S3 is the
 executed `demo-smoke` scope, not a runtime cardinality limit. No implementation
 may select the first configured Sensor, Link, Profile, Capture Session, or
@@ -80,10 +80,10 @@ survive that boundary.
 
 `parse_config` and the accepted `ReplayConfig`/`RuntimeConfig` split from host
 persistence v1 remain the sole TOML grammar and general validation contract.
-Demo implementation may ignore deferred semantic values at runtime, but it
+The bounded implementation may ignore deferred semantic values at runtime, but it
 MUST parse, validate, canonicalize, digest, persist, and compare the complete
 imported ReplayConfig. It MUST NOT create a second configuration root or a
-Demo-only key field.
+delivery-only key field.
 
 The accepted commands are:
 
@@ -94,10 +94,10 @@ whisper serve <config>
 ```
 
 `check-config` performs only the imported TOML parse and general validation. It
-MUST NOT apply the Demo-only network-role admission below or create or mutate a
+MUST NOT apply the `serve` network-role admission below or create or mutate a
 Store.
 
-`init-admission` is the only command allowed to create a Demo Store. It creates,
+`init-admission` is the only command allowed to create a Store. It creates,
 validates, closes, and exits; it never starts capture, HTTP, or WebSocket work.
 It MUST enter through the imported `HostLifecycle`, retain the Managed store
 root lease through final validation and connection close, and fail rather than
@@ -114,20 +114,37 @@ Managed store root lease before opening the Store or committing the Capture
 Session, and retain the lease until capture and delivery have stopped and every
 SQLite connection has closed.
 
+The public running handle MUST NOT own final cleanup. Cancelling its shutdown
+future or dropping the handle MUST request stop while an independent supervisor
+continues until capture and delivery have stopped, the writer has joined, all
+SQLite connections have closed, and the lifecycle lease has been released.
+Writer join and final SQLite close MUST NOT execute on a Tokio worker.
+
+A slow, idle, or incomplete ordinary HTTP connection MUST NOT wait without a
+bound during shutdown. The Host MUST first request graceful transport shutdown,
+then force-close remaining accepted connections after a documented finite
+grace interval and interrupt an active Store read. A query job MUST report its
+panic or fatal result even when its HTTP waiter has already been cancelled.
+Every capture, writer, query, socket, delivery, or supervised task panic or
+fatal result MUST immediately request Host-wide stop. The first fatal result
+remains the stable primary error and is returned only after full cleanup. A
+socket error MUST retain its socket role, operation, configured or bound
+address, and operating-system source.
+
 After the imported configuration parse succeeds and before lease acquisition or
-Store mutation, `serve` applies the Demo network-role admission. The
+Store mutation, `serve` applies the bounded-path network-role admission. The
 `RuntimeConfig.server.bind` value MUST name a loopback IP socket address; a
 wildcard, LAN, multicast, or other non-loopback server address is invalid. The
 `RuntimeConfig.capture.bind` value MUST permit packets from the configured
 board-facing network: its IP is either unspecified or a local non-loopback
 unicast address. A loopback-only, multicast, or non-local capture address is
 invalid. These are `serve` admission rules, not additions to `parse_config`'s
-shared grammar. They prevent exposing the Demo HTTP service while still
+shared grammar. They prevent exposing the Host HTTP service while still
 allowing the physical board to reach UDP capture.
 
-## Demo Store identity and initialization
+## Store identity and initialization
 
-A Demo Store is one SQLite database whose header has both:
+A Store for this delivery path is one SQLite database whose header has both:
 
 ```text
 PRAGMA application_id = 0x57535044; -- decimal 1465077828, ASCII WSPD
@@ -140,7 +157,7 @@ user-defined table/index/trigger/view, malformed state, or incompatible SQLite
 setting MUST fail closed. The implementation MUST NOT adopt, migrate, repair,
 overwrite, or reinterpret a legacy database.
 
-The Demo uses the imported Managed store root, fixed root-relative lease, and
+This delivery path uses the imported Managed store root, fixed root-relative lease, and
 managed-object ownership, file-type, link-count, exact-mode, and no-follow
 rules unchanged. Both `init-admission` and `serve` hold the root lease as the
 sole cooperative lifecycle writer fence; Store ID is never a second fence.
@@ -377,7 +394,7 @@ constraint failure, capability conflict, non-monotonic session time, or a Store
 compare-and-set failure rolls back replay admission, packet, capability,
 observation, cursor, and watermark, then stops the running Host before any
 publication. There is no transaction A/B split and no `projection_commits`
-table in the Demo Store.
+table in the Store.
 
 SQLite is the sole capability, Profile-membership, visibility, and query
 authority. A derived map may exist only inside one writer or reader transaction
@@ -638,8 +655,10 @@ closed schema, non-creating `serve`, per-serve Capture Sessions, exact candidate
 dispositions, replay/capability persistence across Capture Sessions, complete
 transaction rollback, monotonic time/cursors/watermarks, dynamic topology and
 signals, same-snapshot receipts, WebSocket invalidation, bounded queue behavior,
-250 millisecond polling, missing-versus-zero rendering, and loopback/LAN bind
-role validation at `serve` admission.
+slow ordinary HTTP and Store-query shutdown, shutdown cancellation, blocking
+teardown, fatal and panic propagation, contextual socket errors, 250
+millisecond polling, missing-versus-zero rendering, and loopback/LAN bind role
+validation at `serve` admission.
 
 Executed `demo-smoke` acceptance additionally requires a clean firmware image
 and Host binary, a real ESP32-S3 packet committed as native-coordinate CSI,

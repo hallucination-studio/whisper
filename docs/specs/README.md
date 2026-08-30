@@ -6,7 +6,7 @@ execution.
 
 | Trigger | Owner |
 | --- | --- |
-| Demo Store, per-serve Capture Session, atomic Demo ingest, topology/signals/live subset, polling fallback, or demo-smoke | [Demo Slice v1](demo-slice-v1.md), first-applicable for the bounded Demo |
+| Store, per-serve Capture Session, atomic capture ingest, topology/signals/live subset, polling fallback, or demo-smoke | [Demo Slice v1](demo-slice-v1.md), first-applicable for the bounded delivery path |
 | Native-frame bytes, authentication, capability, provisioning, CSI validity, sender behavior, or host admission | [Native-frame v1](native-frame-v1.md) |
 | Shared host configuration identity, Managed store lifecycle, or deferred Semantic Session SQLite, recovery, retention, and faithful replay input | [Host persistence v1](persistence-v1.md); the Demo imports only the named shared subset |
 | Capture Profile identity, native-coordinate `CsiObservation`, or deferred time, sequence, windows, conditioning, statistical baseline, world aggregation, Engine, and semantic replay | [Temporal world v1](temporal-world-v1.md); the Demo imports only the named Profile and observation subset |
