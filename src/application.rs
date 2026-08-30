@@ -6,11 +6,19 @@
 )]
 
 #[cfg(unix)]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    mpsc::{self, Receiver, SyncSender, TrySendError},
+};
+#[cfg(unix)]
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::Config;
 use crate::config::RouteConfig;
@@ -21,6 +29,10 @@ use crate::domain::identity::{DeploymentId, DeviceId, KeyEpoch};
 use crate::key_material::{EpochKey, SecretStoreError, load_epoch_key};
 #[cfg(unix)]
 use crate::managed_store::{ManagedRoot, ManagedStoreError};
+#[cfg(unix)]
+use crate::wire::{self, IngestError};
+#[cfg(unix)]
+use crate::{CapturedDatagram, CommitOutcome};
 use sha2::{Digest, Sha256};
 
 const REPLAY_WINDOW_IDENTITY_DOMAIN: &[u8] = b"whisper.replay-window.identity";
@@ -316,29 +328,116 @@ pub(crate) enum HostError {
     #[cfg(unix)]
     #[error(transparent)]
     DemoStore(#[from] DemoStoreError),
+    #[cfg(unix)]
+    #[error(transparent)]
+    Ingest(#[from] IngestError),
+    #[cfg(unix)]
+    #[error("capture receive time precedes the Capture Session origin")]
+    ReceiveBeforeSession,
+    #[cfg(unix)]
+    #[error("captured datagrams were submitted out of receive-monotonic order")]
+    ReceiveOrder,
+    #[cfg(unix)]
+    #[error("capture receive time exceeds the Demo u64 nanosecond range")]
+    CaptureTimeOverflow,
+    #[cfg(unix)]
+    #[error("capture UTC time is outside the Demo timestamp range")]
+    CaptureClock,
+    #[cfg(unix)]
+    #[error("authenticated route rate limit was exceeded")]
+    RateLimited,
+    #[cfg(unix)]
+    #[error("authenticated route rate accounting overflowed")]
+    RateOverflow,
+    #[cfg(unix)]
+    #[error("authenticated route rate accounting is corrupt")]
+    RateStateCorrupt,
+    #[cfg(unix)]
+    #[error("writer queue capacity cannot be represented on this platform")]
+    WriterQueueCapacity,
+    #[cfg(unix)]
+    #[error("the bounded writer queue is full")]
+    WriterQueueFull,
+    #[cfg(unix)]
+    #[error("the Capture Run queue-drop counter overflowed")]
+    QueueDropOverflow,
+    #[cfg(unix)]
+    #[error("the Demo writer has stopped")]
+    WriterStopped,
+    #[cfg(unix)]
+    #[error("the Demo writer thread could not be started: {0}")]
+    WriterSpawn(#[source] io::Error),
+    #[cfg(unix)]
+    #[error("the Demo writer thread panicked")]
+    WriterPanicked,
     #[cfg(not(unix))]
     #[error("this platform cannot enforce the Unix Managed-store contract")]
     UnsupportedManagedStorePlatform,
 }
 
 #[derive(Debug)]
-pub(crate) struct DemoSession {
+pub(crate) struct CaptureRun {
     store_id: [u8; 32],
     session_id: String,
     monotonic_origin: Instant,
     #[cfg(unix)]
+    config: Config,
+    #[cfg(unix)]
+    writer_tx: Option<SyncSender<WriterCommand>>,
+    #[cfg(unix)]
+    writer: Option<JoinHandle<()>>,
+    #[cfg(unix)]
+    writer_stopped: Arc<AtomicBool>,
+    #[cfg(unix)]
+    rate_windows: BTreeMap<crate::domain::route::HeaderRoute, RouteRateWindow>,
+    #[cfg(unix)]
+    last_receive: Option<Instant>,
+    #[cfg(unix)]
+    queue_drop_count: u64,
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    reject_next_csi_domain: bool,
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    writer_hold_release: Option<SyncSender<()>>,
+    #[cfg(unix)]
     _managed: ManagedRoot,
 }
 
-impl DemoSession {
+impl CaptureRun {
     #[cfg(unix)]
-    fn new(managed: ManagedRoot, capture: demo_store::CaptureSession) -> Self {
-        Self {
-            store_id: capture.store_id,
-            session_id: capture.session_id,
-            monotonic_origin: capture.monotonic_origin,
+    fn new(
+        managed: ManagedRoot,
+        config: Config,
+        capture: demo_store::CaptureSession,
+    ) -> Result<Self, HostError> {
+        let store_id = capture.store_id;
+        let session_id = capture.session_id.clone();
+        let monotonic_origin = capture.monotonic_origin;
+        let capacity = usize::try_from(config.server().command_queue_capacity())
+            .map_err(|_| HostError::WriterQueueCapacity)?;
+        let (writer_tx, writer_rx) = mpsc::sync_channel(capacity);
+        let writer_stopped = Arc::new(AtomicBool::new(false));
+        let writer_stopped_for_thread = Arc::clone(&writer_stopped);
+        let writer = thread::Builder::new()
+            .name("whisper-demo-writer".to_owned())
+            .spawn(move || writer_loop(capture, writer_rx, writer_stopped_for_thread))
+            .map_err(HostError::WriterSpawn)?;
+        Ok(Self {
+            store_id,
+            session_id,
+            monotonic_origin,
+            config,
+            writer_tx: Some(writer_tx),
+            writer: Some(writer),
+            writer_stopped,
+            rate_windows: BTreeMap::new(),
+            last_receive: None,
+            queue_drop_count: 0,
+            #[cfg(feature = "ingest-test-hooks")]
+            reject_next_csi_domain: false,
+            #[cfg(feature = "ingest-test-hooks")]
+            writer_hold_release: None,
             _managed: managed,
-        }
+        })
     }
 
     pub(crate) const fn store_id(&self) -> [u8; 32] {
@@ -352,6 +451,258 @@ impl DemoSession {
     pub(crate) fn elapsed(&self) -> Duration {
         self.monotonic_origin.elapsed()
     }
+
+    #[cfg(unix)]
+    pub(crate) fn try_submit(
+        &mut self,
+        datagram: CapturedDatagram,
+    ) -> Result<CommitTicket, HostError> {
+        if self.writer_stopped.load(AtomicOrdering::Acquire) {
+            return Err(HostError::WriterStopped);
+        }
+        let peer = datagram.peer();
+        let received_monotonic = datagram.received_monotonic();
+        if self.last_receive.is_some_and(|last| received_monotonic < last) {
+            return Err(HostError::ReceiveOrder);
+        }
+        let session_time = received_monotonic
+            .checked_duration_since(self.monotonic_origin)
+            .ok_or(HostError::ReceiveBeforeSession)?;
+        let session_time_ns =
+            u64::try_from(session_time.as_nanos()).map_err(|_| HostError::CaptureTimeOverflow)?;
+        let session_time = crate::domain::time::SessionTime::from_nanos(session_time_ns);
+        let receive_utc_ns = datagram
+            .received_utc()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| HostError::CaptureClock)?;
+        let receive_utc_ns =
+            u64::try_from(receive_utc_ns.as_nanos()).map_err(|_| HostError::CaptureClock)?;
+        let header_route = wire::select_header_route(
+            peer,
+            datagram.bytes(),
+            self.config.capture().max_datagram_bytes(),
+            self.config.registry(),
+        )?;
+        let key = load_epoch_key(&self.config, header_route.device(), header_route.key_epoch())?;
+        let authenticated = wire::admit_datagram(
+            peer,
+            crate::capture::WireFormat::NativeFrameUdp,
+            datagram.into_bytes(),
+            self.config.capture().max_datagram_bytes(),
+            self.config.registry(),
+            key.as_bytes(),
+        )?;
+        self.rate_windows.entry(header_route).or_default().admit(
+            received_monotonic,
+            authenticated.bytes().len(),
+            header_route,
+        )?;
+        self.last_receive = Some(received_monotonic);
+        let candidate = authenticated.into_candidate(session_time, receive_utc_ns);
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let command = WriterCommand::Commit {
+            candidate,
+            response: response_tx,
+            #[cfg(feature = "ingest-test-hooks")]
+            reject_csi_domain: std::mem::take(&mut self.reject_next_csi_domain),
+        };
+        match self.writer_tx.as_ref().ok_or(HostError::WriterStopped)?.try_send(command) {
+            Ok(()) => Ok(CommitTicket { response: response_rx }),
+            Err(TrySendError::Full(_)) => {
+                self.queue_drop_count =
+                    self.queue_drop_count.checked_add(1).ok_or(HostError::QueueDropOverflow)?;
+                Err(HostError::WriterQueueFull)
+            }
+            Err(TrySendError::Disconnected(_)) => Err(HostError::WriterStopped),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn shutdown(mut self) -> Result<(), HostError> {
+        self.stop_writer()
+    }
+
+    #[cfg(unix)]
+    pub(crate) const fn queue_drop_count(&self) -> u64 {
+        self.queue_drop_count
+    }
+
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    pub(crate) fn hold_writer(&mut self) -> Result<WriterHold, HostError> {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        self.writer_tx
+            .as_ref()
+            .ok_or(HostError::WriterStopped)?
+            .send(WriterCommand::Hold { started: started_tx, release: release_rx })
+            .map_err(|_| HostError::WriterStopped)?;
+        started_rx.recv().map_err(|_| HostError::WriterStopped)?;
+        self.writer_hold_release = Some(release_tx.clone());
+        Ok(WriterHold { release: Some(release_tx) })
+    }
+
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    pub(crate) fn reject_next_csi_domain(&mut self) {
+        self.reject_next_csi_domain = true;
+    }
+
+    #[cfg(unix)]
+    fn stop_writer(&mut self) -> Result<(), HostError> {
+        #[cfg(feature = "ingest-test-hooks")]
+        if let Some(release) = self.writer_hold_release.take() {
+            let _ = release.try_send(());
+        }
+        if let Some(writer_tx) = self.writer_tx.take() {
+            let _ = writer_tx.send(WriterCommand::Shutdown);
+        }
+        if let Some(writer) = self.writer.take() {
+            writer.join().map_err(|_| HostError::WriterPanicked)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CaptureRun {
+    fn drop(&mut self) {
+        let _ = self.stop_writer();
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct CommitTicket {
+    response: Receiver<Result<CommitOutcome, HostError>>,
+}
+
+#[cfg(unix)]
+impl CommitTicket {
+    pub(crate) fn wait(self) -> Result<CommitOutcome, HostError> {
+        self.response.recv().map_err(|_| HostError::WriterStopped)?
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Keeping the bounded candidate inline avoids one allocation on every admitted packet"
+)]
+enum WriterCommand {
+    Commit {
+        candidate: crate::wire::WireCandidate,
+        response: SyncSender<Result<CommitOutcome, HostError>>,
+        #[cfg(feature = "ingest-test-hooks")]
+        reject_csi_domain: bool,
+    },
+    #[cfg(feature = "ingest-test-hooks")]
+    Hold {
+        started: SyncSender<()>,
+        release: Receiver<()>,
+    },
+    Shutdown,
+}
+
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+#[derive(Debug)]
+pub(crate) struct WriterHold {
+    release: Option<SyncSender<()>>,
+}
+
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+impl Drop for WriterHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.try_send(());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn writer_loop(
+    mut capture: demo_store::CaptureSession,
+    commands: Receiver<WriterCommand>,
+    writer_stopped: Arc<AtomicBool>,
+) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            WriterCommand::Commit {
+                candidate,
+                response,
+                #[cfg(feature = "ingest-test-hooks")]
+                reject_csi_domain,
+            } => {
+                let outcome = {
+                    #[cfg(feature = "ingest-test-hooks")]
+                    {
+                        if reject_csi_domain {
+                            capture.commit_with_domain_rejection(candidate)
+                        } else {
+                            capture.commit(candidate)
+                        }
+                    }
+                    #[cfg(not(feature = "ingest-test-hooks"))]
+                    {
+                        capture.commit(candidate)
+                    }
+                };
+                match outcome {
+                    Ok(outcome) => {
+                        let _ = response.send(Ok(outcome));
+                    }
+                    Err(error) => {
+                        writer_stopped.store(true, AtomicOrdering::Release);
+                        let _ = response.send(Err(HostError::DemoStore(error)));
+                        break;
+                    }
+                }
+            }
+            #[cfg(feature = "ingest-test-hooks")]
+            WriterCommand::Hold { started, release } => {
+                let _ = started.send(());
+                let _ = release.recv();
+            }
+            WriterCommand::Shutdown => break,
+        }
+    }
+    writer_stopped.store(true, AtomicOrdering::Release);
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct RouteRateWindow {
+    entries: VecDeque<(Instant, u64)>,
+    authenticated_bytes: u64,
+}
+
+#[cfg(unix)]
+impl RouteRateWindow {
+    fn admit(
+        &mut self,
+        received: Instant,
+        bytes: usize,
+        route: crate::domain::route::HeaderRoute,
+    ) -> Result<(), HostError> {
+        while self.entries.front().is_some_and(|(at, _)| {
+            received.checked_duration_since(*at).is_some_and(|age| age >= Duration::from_secs(1))
+        }) {
+            let (_, expired) = self.entries.pop_front().ok_or(HostError::RateStateCorrupt)?;
+            self.authenticated_bytes =
+                self.authenticated_bytes.checked_sub(expired).ok_or(HostError::RateStateCorrupt)?;
+        }
+        let bytes = u64::try_from(bytes).map_err(|_| HostError::RateOverflow)?;
+        let next_bytes =
+            self.authenticated_bytes.checked_add(bytes).ok_or(HostError::RateOverflow)?;
+        let limits = route.admission_limits();
+        if self.entries.len() >= limits.peak_packets_per_second() as usize
+            || next_bytes > limits.maximum_authenticated_bytes_per_second()
+        {
+            return Err(HostError::RateLimited);
+        }
+        self.entries.push_back((received, bytes));
+        self.authenticated_bytes = next_bytes;
+        Ok(())
+    }
 }
 
 impl HostError {
@@ -359,6 +710,39 @@ impl HostError {
         #[cfg(unix)]
         {
             matches!(self, Self::ManagedStore(ManagedStoreError::LeaseConflict))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub(crate) const fn is_rate_limited(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::RateLimited)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub(crate) const fn is_writer_queue_full(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::WriterQueueFull)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub(crate) const fn is_writer_stopped(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::WriterStopped)
         }
         #[cfg(not(unix))]
         {
@@ -393,16 +777,16 @@ pub(crate) fn init_admission(_config: &Config) -> Result<(), HostError> {
 }
 
 #[cfg(unix)]
-pub(crate) fn serve(config: &Config) -> Result<DemoSession, HostError> {
+pub(crate) fn serve(config: &Config) -> Result<CaptureRun, HostError> {
     let managed = ManagedRoot::acquire_existing(config.session().database_path())?;
     let admissions = admission_seeds(config)?;
     let capture =
         demo_store::open_and_create_capture_session(managed.database_path(), config, admissions)?;
-    Ok(DemoSession::new(managed, capture))
+    CaptureRun::new(managed, config.clone(), capture)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn serve(_config: &Config) -> Result<DemoSession, HostError> {
+pub(crate) fn serve(_config: &Config) -> Result<CaptureRun, HostError> {
     Err(HostError::UnsupportedManagedStorePlatform)
 }
 

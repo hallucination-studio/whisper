@@ -63,6 +63,8 @@ const CSI_OBSERVATION_KEYS: &[&str] = &[
     "profile",
     "csi",
 ];
+const CSI_OBSERVATION_ROOT_KEYS: &[&str] =
+    &["schema_version", "config_digest", "conditioning_version", "observation"];
 const INPUT_RECEIPT_KEYS: &[&str] = &["session", "record_seq", "decoder_version"];
 const DEVICE_TIMESTAMP_KEYS: &[&str] = &["ticks", "clock_domain"];
 const FRAME_TIMING_KEYS: &[&str] =
@@ -525,6 +527,26 @@ pub(super) fn encode(timeline: &Timeline) -> Box<[u8]> {
     bytes.into_boxed_slice()
 }
 
+pub(super) fn encode_observation_root(
+    config_digest: [u8; 32],
+    conditioning_version: &str,
+    observation: &CsiObservation,
+) -> Box<[u8]> {
+    let root = table_map(
+        CSI_OBSERVATION_ROOT_KEYS,
+        vec![
+            unsigned(1),
+            Value::Bytes(config_digest.to_vec()),
+            text(conditioning_version),
+            csi_observation(observation),
+        ],
+    );
+    let mut bytes = Vec::new();
+    into_writer(&root, &mut bytes)
+        .expect("serializing a validated CsiObservation root into memory must not fail");
+    bytes.into_boxed_slice()
+}
+
 fn source_states(timeline: &Timeline) -> Value {
     Value::Array(
         timeline
@@ -673,7 +695,7 @@ fn open_windows(timeline: &Timeline) -> Value {
 
 fn observation_key(
     observation: &WindowObservation,
-) -> (&StreamInstanceId, super::StreamSegmentId, u64) {
+) -> (&StreamInstanceId, super::StreamSegmentId, crate::CaptureRecordSequence) {
     (
         &observation.stream_instance,
         observation.segment_id,
@@ -757,7 +779,7 @@ fn csi_observation(observation: &CsiObservation) -> Value {
                 INPUT_RECEIPT_KEYS,
                 vec![
                     text(observation.input().session().as_str()),
-                    unsigned(observation.input().record_seq()),
+                    unsigned(observation.input().record_seq().get()),
                     text(observation.input().decoder_version().as_str()),
                 ],
             ),

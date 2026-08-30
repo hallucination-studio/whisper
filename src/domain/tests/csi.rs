@@ -167,7 +167,7 @@ fn capture_profile_rejects_zero_known_radio_values() {
 fn csi_observation_roundtrips_all_fields() {
     let input = InputReceipt::new(
         SessionId::new("session").expect("session"),
-        17,
+        crate::CaptureRecordSequence::new(17),
         DecoderVersion::new("decoder-v1").expect("decoder"),
     );
     let sensor = SensorId::new("sensor").expect("sensor");
@@ -208,7 +208,7 @@ fn csi_observation_roundtrips_all_fields() {
 
     assert_eq!(observation.input(), &input);
     assert_eq!(observation.input().session(), input.session());
-    assert_eq!(observation.input().record_seq(), 17);
+    assert_eq!(observation.input().record_seq().get(), 17);
     assert_eq!(observation.input().decoder_version(), input.decoder_version());
     assert_eq!(observation.sensor(), &sensor);
     assert_eq!(observation.hardware(), HardwareKind::Esp32S3);
@@ -257,7 +257,7 @@ fn intel_three_by_three_by_thirty_has_270_distinct_native_coordinates() {
     let observation = CsiObservation::new(
         InputReceipt::new(
             SessionId::new("intel-session").expect("session"),
-            4,
+            crate::CaptureRecordSequence::new(4),
             DecoderVersion::new("intel-decoder").expect("decoder"),
         ),
         SensorId::new("intel-sensor").expect("sensor"),

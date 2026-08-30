@@ -21,6 +21,14 @@ use crate::wire::{CSI_FIXED_BODY_BYTES, HEADER_BYTES, LTF_BLOCK_BYTES, TAG_BYTES
 
 use self::state_codec::{RouteReceiptCaps, StateBoundError, StateBoundInput};
 
+pub(crate) fn encode_csi_observation_root(
+    config_digest: [u8; 32],
+    conditioning_version: &str,
+    observation: &CsiObservation,
+) -> Box<[u8]> {
+    state_codec::encode_observation_root(config_digest, conditioning_version, observation)
+}
+
 fn encode_window_contract(config: &WindowConfig) -> Vec<u8> {
     let contract = Value::Map(vec![
         (Value::Text("schema_version".into()), Value::Integer(1u64.into())),
@@ -828,7 +836,7 @@ impl Timeline {
         &mut self,
         observation: CsiObservation,
     ) -> Result<StagedTransition, TimelineError> {
-        let record_seq = observation.input().record_seq();
+        let record_seq = observation.input().record_seq().get();
         let received = observation.timing().received();
         self.validate_order(record_seq, received)?;
         let event = observation.timing().event();
@@ -1593,7 +1601,7 @@ mod tests {
         CsiObservation::new(
             InputReceipt::new(
                 SessionId::new(session).expect("session ID"),
-                record_seq,
+                crate::CaptureRecordSequence::new(record_seq),
                 DecoderVersion::new(decoder).expect("decoder version"),
             ),
             SensorId::new("sensor-a").expect("sensor ID"),
@@ -1633,7 +1641,7 @@ mod tests {
         CsiObservation::new(
             InputReceipt::new(
                 SessionId::new("session-1").expect("session ID"),
-                3,
+                crate::CaptureRecordSequence::new(3),
                 DecoderVersion::new("native-frame-v1").expect("decoder version"),
             ),
             SensorId::new("sensor-a").expect("sensor ID"),
@@ -1980,7 +1988,7 @@ mod tests {
         let original = timeline.open_windows[&WindowId::new(0)]
             .observations
             .iter()
-            .find(|observation| observation.observation.input().record_seq() == 0)
+            .find(|observation| observation.observation.input().record_seq().get() == 0)
             .expect("original observation remains buffered");
         assert_eq!(Arc::as_ptr(&original.observation), before);
     }
@@ -2213,7 +2221,7 @@ mod tests {
         assert_eq!(published.interval().start(), SessionTime::from_nanos(0));
         assert_eq!(published.interval().end(), SessionTime::from_nanos(10));
         assert_eq!(published.observations().len(), 1);
-        assert_eq!(published.observations()[0].observation().input().record_seq(), 0);
+        assert_eq!(published.observations()[0].observation().input().record_seq().get(), 0);
     }
 
     #[test]
@@ -2371,7 +2379,7 @@ mod tests {
         let published = &retry.published_windows()[0];
         assert_eq!(published.id(), WindowId::new(0));
         assert_eq!(published.observations().len(), 1);
-        assert_eq!(published.observations()[0].observation().input().record_seq(), 0);
+        assert_eq!(published.observations()[0].observation().input().record_seq().get(), 0);
     }
 
     #[test]
@@ -2463,7 +2471,7 @@ mod tests {
         let published = &transition.published_windows()[0];
         assert_eq!(published.id(), WindowId::new(0));
         assert_eq!(published.observations().len(), 1);
-        assert_eq!(published.observations()[0].observation().input().record_seq(), 0);
+        assert_eq!(published.observations()[0].observation().input().record_seq().get(), 0);
         assert!(published.missing_spans().is_empty());
     }
 
@@ -2675,7 +2683,8 @@ mod tests {
             next_advance.published_windows()[0].observations()[0]
                 .observation()
                 .input()
-                .record_seq(),
+                .record_seq()
+                .get(),
             0
         );
     }
@@ -2728,7 +2737,8 @@ mod tests {
             next_advance.published_windows()[0].observations()[0]
                 .observation()
                 .input()
-                .record_seq(),
+                .record_seq()
+                .get(),
             0
         );
     }
@@ -3174,7 +3184,7 @@ mod tests {
             published
                 .observations()
                 .iter()
-                .map(|windowed| windowed.observation().input().record_seq())
+                .map(|windowed| windowed.observation().input().record_seq().get())
                 .collect::<Vec<_>>(),
             [1, 0]
         );
@@ -3265,7 +3275,7 @@ mod tests {
         );
         assert_eq!(later.published_windows()[0].observations()[0].classification(), First);
         assert_eq!(
-            later.published_windows()[0].observations()[0].observation().input().record_seq(),
+            later.published_windows()[0].observations()[0].observation().input().record_seq().get(),
             0
         );
 

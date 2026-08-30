@@ -12,6 +12,7 @@ license = "MIT"
 [features]
 default = []
 development-fixture = []
+ingest-test-hooks = []
 
 [dependencies]
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }

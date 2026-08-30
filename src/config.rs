@@ -1158,7 +1158,6 @@ impl Config {
 
     /// Returns server settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by later server work package")]
     pub(crate) const fn server(&self) -> &ServerConfig {
         self.runtime.server()
     }

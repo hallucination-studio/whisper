@@ -598,6 +598,17 @@ pub(crate) struct EpochHandle {
     replay_window_size: u16,
 }
 
+impl EpochHandle {
+    pub(crate) const fn new(
+        device: DeviceId,
+        key_epoch: KeyEpoch,
+        replay_window_identity: ReplayWindowIdentity,
+        replay_window_size: u16,
+    ) -> Self {
+        Self { device, key_epoch, replay_window_identity, replay_window_size }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Admission<'a> {
     epoch: &'a EpochHandle,
@@ -688,7 +699,7 @@ fn verify_connection(connection: &Connection, writer: bool) -> Result<(), Databa
     Ok(())
 }
 
-fn advance_admission(
+pub(crate) fn advance_admission(
     transaction: &Transaction<'_>,
     admission: Admission<'_>,
 ) -> Result<(), DatabaseError> {

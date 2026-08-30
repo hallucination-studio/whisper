@@ -9,10 +9,16 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::Config;
-use crate::database::ReplayWindowIdentity;
+use crate::database::{
+    Admission, DatabaseError, EpochHandle, ReplayWindowIdentity, advance_admission,
+};
 use crate::domain::identity::{DeviceId, HardwareKind, KeyEpoch};
 use crate::hex;
 use crate::managed_store::{ManagedStage, ManagedStoreError, fill_random};
+use crate::wire::{CandidateBody, WireCandidate};
+use crate::{
+    CaptureRecordSequence, CommitOutcome, CommitReceipt, PacketDisposition, ProjectionSequence,
+};
 
 // Demo Slice v1 fixes `WSPD` as the SQLite application identity. Changing it
 // makes every existing Demo Store incompatible.
@@ -60,6 +66,8 @@ pub(crate) enum DemoStoreError {
     Checkpoint,
     #[error("current UTC time cannot be represented as a Demo timestamp")]
     Clock,
+    #[error("Demo Store replay admission failed: {0}")]
+    Admission(#[source] DatabaseError),
     #[error(transparent)]
     Managed(#[from] ManagedStoreError),
 }
@@ -102,6 +110,354 @@ pub(crate) struct CaptureSession {
     pub(crate) store_id: [u8; STORE_ID_BYTES],
     pub(crate) session_id: String,
     pub(crate) monotonic_origin: Instant,
+    connection: Connection,
+    admissions: Vec<AdmissionEpochSeed>,
+    config: Config,
+}
+
+impl CaptureSession {
+    pub(crate) fn commit(
+        &mut self,
+        candidate: WireCandidate,
+    ) -> Result<CommitOutcome, DemoStoreError> {
+        self.commit_inner(candidate, false)
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    pub(crate) fn commit_with_domain_rejection(
+        &mut self,
+        candidate: WireCandidate,
+    ) -> Result<CommitOutcome, DemoStoreError> {
+        self.commit_inner(candidate, true)
+    }
+
+    fn commit_inner(
+        &mut self,
+        candidate: WireCandidate,
+        reject_csi_domain: bool,
+    ) -> Result<CommitOutcome, DemoStoreError> {
+        let transaction =
+            self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (cursor, previous_time, session_projection) = transaction
+            .query_row(
+                "SELECT committed_through_record_seq, last_session_time_ns, projection_commit_seq
+                 FROM capture_sessions WHERE session_id = ?1",
+                [&self.session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DemoStoreError::Incompatible)?;
+        let watermark: Vec<u8> = transaction
+            .query_row(
+                "SELECT projection_commit_seq FROM store_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(DemoStoreError::Incompatible)?;
+        let watermark = ProjectionSequence::new(decode_u64(&watermark)?);
+
+        let route = candidate.header_route();
+        let admission = self
+            .admissions
+            .iter()
+            .find(|admission| {
+                admission.device == route.device() && admission.key_epoch == route.key_epoch()
+            })
+            .ok_or(DemoStoreError::Incompatible)?;
+        let epoch = EpochHandle::new(
+            admission.device,
+            admission.key_epoch,
+            admission.replay_window_identity,
+            admission.replay_window_size,
+        );
+        let header = candidate.header();
+        match advance_admission(
+            &transaction,
+            Admission::new(&epoch, header.boot_generation(), header.message_seq()),
+        ) {
+            Ok(()) => {}
+            Err(DatabaseError::Replay) => return Ok(CommitOutcome::ReplayRejected),
+            Err(error) => return Err(DemoStoreError::Admission(error)),
+        }
+
+        let (record_sequence, previous_projection) = match (&cursor, &previous_time) {
+            (None, None) => {
+                if session_projection.is_some() {
+                    return Err(DemoStoreError::Incompatible);
+                }
+                (CaptureRecordSequence::new(0), None)
+            }
+            (Some(cursor), Some(previous_time)) => {
+                let cursor = CaptureRecordSequence::new(decode_u64(cursor)?);
+                let previous_time =
+                    crate::domain::time::SessionTime::from_nanos(decode_u64(previous_time)?);
+                if candidate.session_time() < previous_time {
+                    return Err(DemoStoreError::Incompatible);
+                }
+                let next = cursor.checked_next().ok_or(DemoStoreError::Incompatible)?;
+                (next, session_projection.as_deref())
+            }
+            _ => return Err(DemoStoreError::Incompatible),
+        };
+        if let Some(previous_projection) = previous_projection
+            && ProjectionSequence::new(decode_u64(previous_projection)?) != watermark
+        {
+            return Err(DemoStoreError::Incompatible);
+        }
+        let projection_sequence = watermark.checked_next().ok_or(DemoStoreError::Incompatible)?;
+        let mut capability_row = None;
+        let mut observation_row = None;
+        let disposition = match candidate.body() {
+            CandidateBody::UnknownKind { .. } => PacketDisposition::UnknownKind,
+            CandidateBody::MalformedKnownBody => PacketDisposition::MalformedKnownBody,
+            CandidateBody::Capabilities(capability) => {
+                let resolved = self
+                    .config
+                    .registry()
+                    .resolve_authenticated_route(route)
+                    .map_err(|_| DemoStoreError::Incompatible)?;
+                if capability.descriptor().firmware_build_digest()
+                    != resolved.sensor.firmware_build_digest()
+                {
+                    PacketDisposition::BuildMismatch
+                } else if capability.capability_digest() != resolved.sensor.capability_digest()
+                    || capability.descriptor().datagram_budget_bytes()
+                        > resolved.route.admission_limits().maximum_datagram_bytes()
+                {
+                    PacketDisposition::CapabilityPinMismatch
+                } else {
+                    capability_row =
+                        Some((capability.capability_digest(), capability.descriptor().to_bytes()));
+                    PacketDisposition::CapabilityCommitted
+                }
+            }
+            CandidateBody::Health(health) => {
+                let resolved = self
+                    .config
+                    .registry()
+                    .resolve_authenticated_route(route)
+                    .map_err(|_| DemoStoreError::Incompatible)?;
+                if health.capability_digest() == resolved.sensor.capability_digest() {
+                    PacketDisposition::HealthCommitted
+                } else {
+                    PacketDisposition::CapabilityMismatch
+                }
+            }
+            CandidateBody::CsiData(data) => {
+                let capability_row = transaction
+                    .query_row(
+                        "SELECT capability_digest, descriptor_bytes FROM capability_epochs
+                         WHERE device_id = ?1 AND key_epoch = ?2 AND boot_generation = ?3",
+                        params![
+                            header.device_id().to_be_bytes(),
+                            header.key_epoch().to_be_bytes(),
+                            header.boot_generation().to_be_bytes(),
+                        ],
+                        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                    )
+                    .optional()?;
+                if let Some((digest, descriptor)) = capability_row {
+                    let capability =
+                        crate::wire::CapabilitiesV1::from_persisted(&digest, &descriptor)
+                            .map_err(|_| DemoStoreError::Incompatible)?;
+                    let resolved = self
+                        .config
+                        .registry()
+                        .resolve_authenticated_route(route)
+                        .map_err(|_| DemoStoreError::Incompatible)?;
+                    let radio = data.radio();
+                    let plaintext_bytes = crate::wire::CSI_FIXED_BODY_BYTES
+                        .checked_add(
+                            data.blocks()
+                                .len()
+                                .checked_mul(crate::wire::LTF_BLOCK_BYTES)
+                                .ok_or(DemoStoreError::Incompatible)?,
+                        )
+                        .and_then(|bytes| bytes.checked_add(data.raw_csi().len()))
+                        .ok_or(DemoStoreError::Incompatible)?;
+                    if capability.descriptor().firmware_build_digest()
+                        != resolved.sensor.firmware_build_digest()
+                    {
+                        PacketDisposition::BuildMismatch
+                    } else if capability.capability_digest() != resolved.sensor.capability_digest()
+                        || data.capability_digest() != capability.capability_digest()
+                    {
+                        PacketDisposition::CapabilityMismatch
+                    } else if data.source_mac() != resolved.link.expected_transmitter_mac() {
+                        PacketDisposition::SourceMismatch
+                    } else if !resolved.link.channel_policy().allowed().contains(&radio.channel())
+                        || resolved
+                            .link
+                            .channel_policy()
+                            .expected()
+                            .is_some_and(|expected| expected != radio.channel())
+                    {
+                        PacketDisposition::RadioMismatch
+                    } else if data.raw_csi().len()
+                        > usize::from(resolved.sensor.maximum_raw_csi_bytes())
+                        || plaintext_bytes > usize::from(resolved.sensor.maximum_plaintext_bytes())
+                    {
+                        PacketDisposition::BodyBudgetMismatch
+                    } else if reject_csi_domain {
+                        PacketDisposition::DecodedDomainRejected
+                    } else {
+                        let input = crate::wire::DemoObservationInput::try_new(
+                            &self.session_id,
+                            record_sequence,
+                            candidate.session_time(),
+                        )
+                        .map_err(|_| DemoStoreError::Incompatible)?;
+                        match crate::wire::resolve_demo_csi(
+                            input,
+                            route,
+                            header,
+                            self.config.registry(),
+                            data.clone(),
+                            &capability,
+                        ) {
+                            Ok((profile, observation)) => {
+                                let observation_cbor = crate::timeline::encode_csi_observation_root(
+                                    self.config.replay().digest(),
+                                    self.config.conditioning().version().as_str(),
+                                    &observation,
+                                );
+                                observation_row = Some((
+                                    observation.sensor().as_str().to_owned(),
+                                    observation.link().as_str().to_owned(),
+                                    profile.id().as_bytes(),
+                                    observation_cbor,
+                                ));
+                                PacketDisposition::CsiCommitted
+                            }
+                            Err(_) => PacketDisposition::DecodedDomainRejected,
+                        }
+                    }
+                } else {
+                    PacketDisposition::CapabilityUnavailable
+                }
+            }
+        };
+
+        transaction.execute(
+            "INSERT INTO packet_records
+             (session_id, record_seq, session_time_ns, receive_utc_ns, peer_ip, peer_port,
+              device_id, key_epoch, boot_generation, message_sequence, message_kind,
+              disposition, encrypted_datagram)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                &self.session_id,
+                record_sequence.to_be_bytes(),
+                candidate.session_time().as_nanos().to_be_bytes(),
+                candidate.receive_utc_ns().to_be_bytes(),
+                candidate.peer().ip().to_string(),
+                candidate.peer().port(),
+                header.device_id().to_be_bytes(),
+                header.key_epoch().to_be_bytes(),
+                header.boot_generation().to_be_bytes(),
+                header.message_seq().to_be_bytes(),
+                header.kind_byte(),
+                disposition.as_store_text(),
+                candidate.bytes(),
+            ],
+        )?;
+        if let Some((digest, descriptor)) = capability_row {
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO capability_epochs
+                 (device_id, key_epoch, boot_generation, capability_digest, descriptor_bytes,
+                  first_session_id, first_record_seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    header.device_id().to_be_bytes(),
+                    header.key_epoch().to_be_bytes(),
+                    header.boot_generation().to_be_bytes(),
+                    digest,
+                    descriptor,
+                    &self.session_id,
+                    record_sequence.to_be_bytes(),
+                ],
+            )?;
+            if inserted == 0 {
+                let existing: (Vec<u8>, Vec<u8>) = transaction
+                    .query_row(
+                        "SELECT capability_digest, descriptor_bytes FROM capability_epochs
+                         WHERE device_id = ?1 AND key_epoch = ?2 AND boot_generation = ?3",
+                        params![
+                            header.device_id().to_be_bytes(),
+                            header.key_epoch().to_be_bytes(),
+                            header.boot_generation().to_be_bytes(),
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?
+                    .ok_or(DemoStoreError::Incompatible)?;
+                if existing.0.as_slice() != digest || existing.1.as_slice() != descriptor {
+                    return Err(DemoStoreError::Incompatible);
+                }
+            }
+        }
+        if let Some((sensor, link, profile, observation_cbor)) = observation_row {
+            transaction.execute(
+                "INSERT INTO csi_observations
+                 (session_id, record_seq, session_time_ns, sensor_id, link_id, profile_id,
+                  observation_cbor, decoder_version, conditioning_version, replay_config_digest)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    &self.session_id,
+                    record_sequence.to_be_bytes(),
+                    candidate.session_time().as_nanos().to_be_bytes(),
+                    sensor,
+                    link,
+                    profile,
+                    observation_cbor,
+                    DECODER_VERSION,
+                    self.config.conditioning().version().as_str(),
+                    self.config.replay().digest(),
+                ],
+            )?;
+        }
+        let updated_session = transaction.execute(
+            "UPDATE capture_sessions
+             SET committed_through_record_seq = ?1, last_session_time_ns = ?2,
+                 projection_commit_seq = ?3
+             WHERE session_id = ?4
+               AND committed_through_record_seq IS ?5
+               AND last_session_time_ns IS ?6
+               AND projection_commit_seq IS ?7",
+            params![
+                record_sequence.to_be_bytes(),
+                candidate.session_time().as_nanos().to_be_bytes(),
+                projection_sequence.to_be_bytes(),
+                &self.session_id,
+                cursor,
+                previous_time,
+                session_projection,
+            ],
+        )?;
+        if updated_session != 1 {
+            return Err(DemoStoreError::Incompatible);
+        }
+        let updated_store = transaction.execute(
+            "UPDATE store_state SET projection_commit_seq = ?1
+             WHERE singleton = 1 AND projection_commit_seq = ?2",
+            params![projection_sequence.to_be_bytes(), watermark.to_be_bytes()],
+        )?;
+        if updated_store != 1 {
+            return Err(DemoStoreError::Incompatible);
+        }
+        transaction.commit()?;
+        Ok(CommitOutcome::Committed(CommitReceipt::new(
+            disposition,
+            record_sequence,
+            projection_sequence,
+        )))
+    }
 }
 
 pub(crate) fn initialize(
@@ -226,8 +582,19 @@ pub(crate) fn open_and_create_capture_session(
         ],
     )?;
     transaction.commit()?;
-    connection.close().map_err(|(_, error)| DemoStoreError::Sql(error))?;
-    Ok(CaptureSession { store_id, session_id, monotonic_origin })
+    Ok(CaptureSession {
+        store_id,
+        session_id,
+        monotonic_origin,
+        connection,
+        admissions: expected.admissions,
+        config: config.clone(),
+    })
+}
+
+fn decode_u64(bytes: &[u8]) -> Result<u64, DemoStoreError> {
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| DemoStoreError::Incompatible)?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 fn validate_closed(

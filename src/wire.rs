@@ -8,6 +8,7 @@ use aes_gcm::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::CaptureRecordSequence;
 use crate::capture::{CapturedPacket, WireFormat};
 use crate::config::{Registry, RouteError};
 use crate::domain::csi::{
@@ -1316,7 +1317,7 @@ impl CapabilityDescriptor {
         self.datagram_budget_bytes
     }
 
-    fn to_bytes(&self) -> [u8; CAPABILITY_DESCRIPTOR_BYTES] {
+    pub(crate) fn to_bytes(&self) -> [u8; CAPABILITY_DESCRIPTOR_BYTES] {
         let mut bytes = [0_u8; CAPABILITY_DESCRIPTOR_BYTES];
         bytes[0] = 1;
         bytes[1] = 1;
@@ -1406,6 +1407,20 @@ impl CapabilitiesV1 {
     #[must_use]
     pub const fn descriptor(&self) -> &CapabilityDescriptor {
         &self.descriptor
+    }
+
+    pub(crate) fn from_persisted(digest: &[u8], descriptor: &[u8]) -> Result<Self, BodyError> {
+        let digest: [u8; 32] = digest
+            .try_into()
+            .map_err(|_| BodyError::ExactLength { expected: 32, actual: digest.len() })?;
+        let expected_digest: [u8; 32] = Sha256::digest(descriptor).into();
+        if digest != expected_digest {
+            return Err(BodyError::CapabilityDigestMismatch);
+        }
+        Ok(Self {
+            capability_digest: digest,
+            descriptor: CapabilityDescriptor::from_bytes(descriptor)?,
+        })
     }
 }
 
@@ -1717,10 +1732,6 @@ pub(crate) struct AdmittedDatagram {
 impl AdmittedDatagram {
     /// Returns the exact encrypted datagram bytes that must be appended.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the work-package 2 capture/session owner")
-    )]
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -1733,6 +1744,29 @@ impl AdmittedDatagram {
     )]
     pub(crate) const fn header(&self) -> Header {
         self.authenticated.header()
+    }
+
+    /// Converts authenticated bytes into a pure, bounded Demo candidate.
+    #[must_use]
+    pub(crate) fn into_candidate(
+        self,
+        session_time: SessionTime,
+        receive_utc_ns: u64,
+    ) -> WireCandidate {
+        let Self { peer, wire_format: _, bytes, authenticated, header_route } = self;
+        let header = authenticated.header();
+        let body = match header.kind() {
+            None => CandidateBody::UnknownKind { kind: header.kind_byte() },
+            Some(kind) => match decode_body(kind, authenticated.plaintext()) {
+                Ok(Message::Capabilities(capabilities)) => {
+                    CandidateBody::Capabilities(capabilities)
+                }
+                Ok(Message::CsiData(data)) => CandidateBody::CsiData(data),
+                Ok(Message::Health(health)) => CandidateBody::Health(health),
+                Err(_) => CandidateBody::MalformedKnownBody,
+            },
+        };
+        WireCandidate { peer, bytes, header_route, header, session_time, receive_utc_ns, body }
     }
 
     /// Moves one successfully appended admission into its session record.
@@ -1764,6 +1798,70 @@ impl AdmittedDatagram {
             authenticated,
             header_route,
         }
+    }
+}
+
+/// A syntactically bounded authenticated body with no durable authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateBody {
+    /// An authenticated kind outside the native-frame v1 message set.
+    UnknownKind { kind: u8 },
+    /// A known kind whose body did not satisfy its exact grammar.
+    MalformedKnownBody,
+    /// A syntactically valid capability body.
+    Capabilities(CapabilitiesV1),
+    /// A syntactically valid CSI body.
+    CsiData(CsiDataV1),
+    /// A syntactically valid health body.
+    Health(HealthV1),
+}
+
+/// A pure authenticated candidate awaiting Store-scoped admission and disposition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WireCandidate {
+    peer: SocketAddr,
+    bytes: Box<[u8]>,
+    header_route: HeaderRoute,
+    header: Header,
+    session_time: SessionTime,
+    receive_utc_ns: u64,
+    body: CandidateBody,
+}
+
+impl WireCandidate {
+    #[must_use]
+    pub(crate) const fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    #[must_use]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub(crate) const fn header_route(&self) -> HeaderRoute {
+        self.header_route
+    }
+
+    #[must_use]
+    pub(crate) const fn header(&self) -> Header {
+        self.header
+    }
+
+    #[must_use]
+    pub(crate) const fn session_time(&self) -> SessionTime {
+        self.session_time
+    }
+
+    #[must_use]
+    pub(crate) const fn receive_utc_ns(&self) -> u64 {
+        self.receive_utc_ns
+    }
+
+    #[must_use]
+    pub(crate) const fn body(&self) -> &CandidateBody {
+        &self.body
     }
 }
 
@@ -2439,16 +2537,28 @@ pub(crate) fn admit_datagram(
     registry: &Registry,
     key: &[u8; 32],
 ) -> Result<AdmittedDatagram, IngestError> {
+    if wire_format != WireFormat::NativeFrameUdp {
+        return Err(IngestError::Wire(WireError::UnknownVersion { version: 0 }));
+    }
+    let header_route = select_header_route(peer, &bytes, maximum_live_datagram_bytes, registry)?;
+    let authenticated = authenticate_datagram(key, &bytes)?;
+    debug_assert_eq!(header_route.device().get(), authenticated.header().device_id);
+    Ok(AdmittedDatagram { peer, wire_format, bytes, authenticated, header_route })
+}
+
+/// Selects the exact configured route after validating the bounded fixed header.
+pub(crate) fn select_header_route(
+    peer: SocketAddr,
+    bytes: &[u8],
+    maximum_live_datagram_bytes: u32,
+    registry: &Registry,
+) -> Result<HeaderRoute, IngestError> {
     let actual = bytes.len();
     let global_maximum = maximum_live_datagram_bytes as usize;
     if actual > global_maximum {
         return Err(IngestError::GlobalDatagramTooLarge { actual, maximum: global_maximum });
     }
-    if wire_format != WireFormat::NativeFrameUdp {
-        return Err(IngestError::Wire(WireError::UnknownVersion { version: 0 }));
-    }
-
-    let header = parse_header(&bytes)?;
+    let header = parse_header(bytes)?;
     let device_id = DeviceId::new(header.device_id);
     let key_epoch = KeyEpoch::try_new(header.key_epoch).map_err(|_| WireError::ZeroKeyEpoch)?;
     let header_route = registry.resolve_header_route(peer.ip(), device_id, key_epoch)?;
@@ -2456,9 +2566,7 @@ pub(crate) fn admit_datagram(
     if actual > route_maximum {
         return Err(IngestError::RouteDatagramTooLarge { actual, maximum: route_maximum });
     }
-    let authenticated = authenticate_datagram(key, &bytes)?;
-    debug_assert_eq!(header_route.device().get(), authenticated.header().device_id);
-    Ok(AdmittedDatagram { peer, wire_format, bytes, authenticated, header_route })
+    Ok(header_route)
 }
 
 /// Resolves one recorded and authenticated datagram through the body boundary.
@@ -2549,7 +2657,66 @@ fn resolve_csi(
     {
         return Err(IngestError::CapabilityUnavailable);
     }
-    let capability = &accepted.capability;
+    let input = ObservationInput::from_packet(packet);
+    let (profile, observation) =
+        build_csi(&input, header, sensor, link, route, data, &accepted.capability)?;
+    profiles.intern(profile)?;
+    Ok(DecodedInput::Csi(observation))
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DemoObservationInput(ObservationInput);
+
+impl DemoObservationInput {
+    pub(crate) fn try_new(
+        session_id: &str,
+        record_sequence: CaptureRecordSequence,
+        session_time: SessionTime,
+    ) -> Result<Self, IngestError> {
+        let session = SessionId::new(session_id)
+            .map_err(|error| IngestError::DecodedRoute(error.to_string()))?;
+        Ok(Self(ObservationInput { session, record_sequence, session_time }))
+    }
+}
+
+pub(crate) fn resolve_demo_csi(
+    input: DemoObservationInput,
+    header_route: HeaderRoute,
+    header: Header,
+    registry: &Registry,
+    data: CsiDataV1,
+    capability: &CapabilitiesV1,
+) -> Result<(CaptureProfile, CsiObservation), IngestError> {
+    let resolved = registry.resolve_authenticated_route(header_route)?;
+    build_csi(&input.0, header, resolved.sensor, resolved.link, resolved.route, data, capability)
+}
+
+#[derive(Clone, Debug)]
+struct ObservationInput {
+    session: SessionId,
+    record_sequence: CaptureRecordSequence,
+    session_time: SessionTime,
+}
+
+impl ObservationInput {
+    fn from_packet(packet: &CapturedPacket) -> Self {
+        Self {
+            session: packet.session_id().clone(),
+            record_sequence: CaptureRecordSequence::new(packet.record_seq()),
+            session_time: SessionTime::from_nanos(packet.receive_monotonic_ns()),
+        }
+    }
+}
+
+fn build_csi(
+    input: &ObservationInput,
+    header: Header,
+    sensor: &crate::config::SensorConfig,
+    link: &crate::config::LinkConfig,
+    route: &crate::config::RouteConfig,
+    data: CsiDataV1,
+    capability: &CapabilitiesV1,
+) -> Result<(CaptureProfile, CsiObservation), IngestError> {
     if data.capability_digest() != capability.capability_digest() {
         return Err(IngestError::UnsupportedCapability);
     }
@@ -2608,7 +2775,7 @@ fn resolve_csi(
     let profile = CaptureProfile::try_new(ProfileDescriptor {
         hardware: HardwareKind::Esp32S3,
         firmware: digest_hex(sensor.firmware_build_digest()).into_boxed_str(),
-        decoder_version: "whisper-native-frame-v1".into(),
+        decoder_version: "native-frame-v1".into(),
         capability_id: digest_hex(capability.capability_digest()).into_boxed_str(),
         acquisition: AcquisitionCapabilities {
             mode: AcquisitionMode::WifiCsi,
@@ -2638,7 +2805,7 @@ fn resolve_csi(
         time_quality: crate::domain::time::TimeQuality::ReceiveOnly,
         clock_domain: None,
     })?;
-    let profile_id = profiles.intern(profile)?;
+    let profile_id = profile.id();
     let decoded_route = DecodedRoute::try_new(
         device_epoch,
         sensor.id().clone(),
@@ -2657,7 +2824,7 @@ fn resolve_csi(
         PhaseState::Raw,
     )
     .map_err(|error| IngestError::CsiCapture(error.to_string()))?;
-    let received = SessionTime::from_nanos(packet.receive_monotonic_ns());
+    let received = input.session_time;
     let device_timestamp =
         DeviceTimestamp::try_new(u64::from(data.driver_rx_timestamp_us()), "esp32s3-driver-ticks")?;
     let timing = FrameTiming::try_new(
@@ -2684,24 +2851,27 @@ fn resolve_csi(
     )
     .map_err(|error| IngestError::DecodedRoute(error.to_string()))?;
     let input = crate::domain::csi::InputReceipt::new(
-        packet.session_id().clone(),
-        packet.record_seq(),
-        DecoderVersion::new("whisper-native-frame-v1")
+        input.session.clone(),
+        input.record_sequence,
+        DecoderVersion::new("native-frame-v1")
             .map_err(|error| IngestError::DecodedRoute(error.to_string()))?,
     );
-    Ok(DecodedInput::Csi(CsiObservation::new(
-        input,
-        sensor.id().clone(),
-        HardwareKind::Esp32S3,
-        link.id().clone(),
-        device_epoch,
-        data.capture_sequence(),
-        data.callback_tick_us(),
-        timing,
-        radio_metadata,
-        profile_id,
-        csi,
-    )))
+    Ok((
+        profile,
+        CsiObservation::new(
+            input,
+            sensor.id().clone(),
+            HardwareKind::Esp32S3,
+            link.id().clone(),
+            device_epoch,
+            data.capture_sequence(),
+            data.callback_tick_us(),
+            timing,
+            radio_metadata,
+            profile_id,
+            csi,
+        ),
+    ))
 }
 
 #[allow(dead_code)]
@@ -3010,6 +3180,28 @@ mod tests {
             ),
             Err(IngestError::Wire(WireError::AuthenticationFailed))
         ));
+    }
+
+    #[test]
+    fn demo_candidate_preserves_authenticated_unknown_kind_without_store_authority() {
+        let config = config();
+        let datagram = sealed_raw(0x7f, 1, &[0xa5]);
+        let candidate = admit_datagram(
+            PEER.parse().expect("valid peer"),
+            WireFormat::NativeFrameUdp,
+            datagram.clone(),
+            config.capture().max_datagram_bytes(),
+            config.registry(),
+            &KEY,
+        )
+        .expect("authenticated unknown kind")
+        .into_candidate(SessionTime::from_nanos(100), 200);
+
+        assert_eq!(candidate.bytes(), datagram.as_ref());
+        assert_eq!(candidate.header().message_seq(), 1);
+        assert_eq!(candidate.session_time().as_nanos(), 100);
+        assert_eq!(candidate.receive_utc_ns(), 200);
+        assert_eq!(candidate.body(), &CandidateBody::UnknownKind { kind: 0x7f });
     }
 
     #[test]
