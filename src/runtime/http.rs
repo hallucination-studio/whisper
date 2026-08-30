@@ -29,11 +29,9 @@ use crate::{
 /// Maximum digits in the canonical decimal representation of a `u64`.
 const MAX_U64_DECIMAL_DIGITS: usize = 20;
 
-const PAGE_SHELL: &str = r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Whisper Signals</title></head>
-<body><main><h1>Whisper Signals</h1><p id="connection-state">POLLING</p><div id="signals" aria-live="polite"></div></main></body>
-</html>"#;
+const PAGE_SHELL: &str = include_str!("assets/index.html");
+const PAGE_STYLES: &str = include_str!("assets/app.css");
+const PAGE_SCRIPT: &str = include_str!("assets/app.js");
 
 #[derive(Clone)]
 pub(super) struct HttpState {
@@ -235,6 +233,8 @@ pub(super) fn router(
 ) -> Router {
     Router::new()
         .route("/", on(MethodFilter::GET, index))
+        .route("/assets/app.css", on(MethodFilter::GET, stylesheet))
+        .route("/assets/app.js", on(MethodFilter::GET, script))
         .route(
             "/api/topology",
             on(MethodFilter::GET, topology).on(MethodFilter::HEAD, method_not_allowed),
@@ -263,8 +263,16 @@ pub(super) fn bind_socket(address: SocketAddr) -> Result<TcpListener, RuntimeErr
     })
 }
 
-async fn index() -> Html<&'static str> {
-    Html(PAGE_SHELL)
+async fn index(State(state): State<HttpState>) -> Html<String> {
+    Html(PAGE_SHELL.replace("__MAX_TIME_BUCKETS__", &state.limits.max_time_buckets().to_string()))
+}
+
+async fn stylesheet() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], PAGE_STYLES)
+}
+
+async fn script() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], PAGE_SCRIPT)
 }
 
 async fn method_not_allowed() -> StatusCode {

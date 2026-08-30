@@ -427,6 +427,10 @@ impl QueryLimits {
             .ok_or_else(|| QueryError::new(QueryErrorKind::InvalidRequest("zero bucket limit")))?;
         Ok(Self { max_signal_points, max_time_buckets })
     }
+
+    pub(crate) const fn max_time_buckets(self) -> u32 {
+        self.max_time_buckets.get()
+    }
 }
 
 /// A validated typed signal selection independent of URL parsing.
