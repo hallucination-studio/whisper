@@ -14,6 +14,8 @@ mod hex;
 pub(crate) mod key_material;
 #[cfg(unix)]
 mod managed_store;
+#[cfg(unix)]
+mod query;
 pub(crate) mod session;
 #[cfg_attr(
     not(test),
@@ -24,6 +26,13 @@ pub(crate) mod timeline;
 pub(crate) mod wire;
 
 pub use config::{Config, ConfigError, RouteError, parse_config};
+pub use domain::time::SessionTime;
+#[cfg(unix)]
+pub use query::{
+    EmptyEnvelope, ErrorEnvelope, Metric, QueryError, QueryLimits, QueryStore, SignalPath,
+    SignalQuery, SignalQueryBuilder, SignalRange, SignalSelection, SignalsOk, SignalsResponse,
+    TopologyOk,
+};
 
 use std::backtrace::Backtrace;
 use std::error::Error;

@@ -266,6 +266,47 @@ impl ManagedRoot {
     }
 }
 
+pub(crate) fn validate_existing_for_reader(
+    database_path: &Path,
+) -> Result<(PathBuf, Identity), ManagedStoreError> {
+    let file_name = database_path.file_name().ok_or(ManagedStoreError::InvalidTarget)?;
+    if file_name == LEASE_NAME {
+        return Err(ManagedStoreError::InvalidTarget);
+    }
+    let configured_root = database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let root_before = fs::symlink_metadata(configured_root)
+        .map_err(|source| io_error(configured_root, source))?;
+    validate_root(&root_before)?;
+    let root_path =
+        fs::canonicalize(configured_root).map_err(|source| io_error(configured_root, source))?;
+    let canonical_metadata =
+        fs::symlink_metadata(&root_path).map_err(|source| io_error(&root_path, source))?;
+    validate_root(&canonical_metadata)?;
+    require_same_identity(&root_before, &canonical_metadata, ManagedStoreError::RootTrust)?;
+
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&root_path)
+        .map_err(|source| io_error(&root_path, source))?;
+    let opened_root = root.metadata().map_err(|source| io_error(&root_path, source))?;
+    validate_root(&opened_root)?;
+    require_same_identity(&canonical_metadata, &opened_root, ManagedStoreError::RootTrust)?;
+
+    let final_path = root_path.join(file_name);
+    let final_identity = validate_existing_file_read_only(&final_path)?;
+    validate_optional_file_read_only(&companion_path(&final_path, "-wal"))?;
+    validate_optional_file_read_only(&companion_path(&final_path, "-shm"))?;
+    let root_after =
+        fs::symlink_metadata(&root_path).map_err(|source| io_error(&root_path, source))?;
+    validate_root(&root_after)?;
+    require_same_identity(&opened_root, &root_after, ManagedStoreError::RootTrust)?;
+    Ok((final_path, final_identity))
+}
+
 #[derive(Debug)]
 pub(crate) struct ManagedStage {
     path: PathBuf,
@@ -378,9 +419,34 @@ fn validate_existing_file(path: &Path) -> Result<(), ManagedStoreError> {
     require_same_identity(&opened_metadata, &path_after, ManagedStoreError::ObjectTrust)
 }
 
+fn validate_existing_file_read_only(path: &Path) -> Result<Identity, ManagedStoreError> {
+    let path_metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    validate_file(&path_metadata, FILE_MODE)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    let opened_metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    validate_file(&opened_metadata, FILE_MODE)?;
+    require_same_identity(&path_metadata, &opened_metadata, ManagedStoreError::ObjectTrust)?;
+    let path_after = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    validate_file(&path_after, FILE_MODE)?;
+    require_same_identity(&opened_metadata, &path_after, ManagedStoreError::ObjectTrust)?;
+    Ok(identity(&opened_metadata))
+}
+
 fn validate_optional_file(path: &Path) -> Result<(), ManagedStoreError> {
     match fs::symlink_metadata(path) {
         Ok(_) => validate_existing_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error(path, source)),
+    }
+}
+
+fn validate_optional_file_read_only(path: &Path) -> Result<(), ManagedStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_existing_file_read_only(path).map(|_| ()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(io_error(path, source)),
     }
