@@ -21,8 +21,9 @@ A deployment configured with more than one sensor.
 _Avoid_: mesh, because sensor count does not imply a network topology.
 
 **Demo Slice**:
-The bounded development product path from an authenticated physical Sensor to
-committed native-coordinate CSI and a read-only browser.
+The bounded delivery maturity from an authenticated physical Sensor to
+committed native-coordinate CSI and a read-only browser. It is a scope label,
+not an architecture layer, runtime, lifecycle, or capability.
 _Avoid_: Semantic Program or Program 1, which name the broader deferred target.
 
 **Semantic Program**:
@@ -35,10 +36,11 @@ The contract-local name for the full Single-sensor development E2E target now
 assigned to the Semantic Program.
 _Avoid_: Demo Slice, which does not satisfy that target.
 
-**Demo Store**:
-The persistent identity containing one Demo Slice's admission, capture, and
-query history.
-_Avoid_: Semantic Store, because no semantic processing is implied.
+**Store**:
+The persistent identity containing admission, capture, and query history for
+the bounded delivery path.
+_Avoid_: Demo Store, because delivery maturity is not part of Store identity;
+Semantic Store, because no semantic processing is implied.
 
 **Capture Session**:
 A non-semantic grouping of admitted packet facts from one uninterrupted Host

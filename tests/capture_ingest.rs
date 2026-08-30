@@ -1,6 +1,6 @@
-//! Bounded Demo ingest behavior through the Capture Run interface.
+//! Bounded capture ingest behavior through the Capture runtime interface.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "ingest-test-hooks"))]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -33,13 +33,13 @@ const EXPECTED_PROFILE_ID: [u8; 32] = [
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 type RejectedStoreEffects = (u64, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>);
 
-struct DemoFixture {
+struct CaptureFixture {
     root: PathBuf,
     config: whisper::Config,
     database: PathBuf,
 }
 
-impl DemoFixture {
+impl CaptureFixture {
     fn new() -> Self {
         Self::from_source(include_str!("fixtures/config/valid-two-esp32.toml").to_owned())
     }
@@ -91,7 +91,7 @@ impl DemoFixture {
 
     fn from_source(source: String) -> Self {
         let root = std::env::temp_dir().join(format!(
-            "whisper-demo-ingest-{}-{}",
+            "whisper-ingest-{}-{}",
             std::process::id(),
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -99,7 +99,7 @@ impl DemoFixture {
 
         let managed_root = root.join("managed");
         create_directory(&managed_root, 0o700);
-        let database = managed_root.join("demo.sqlite3");
+        let database = managed_root.join("host.sqlite3");
 
         let secret_root = root.join("secrets");
         create_directory(&secret_root, 0o700);
@@ -133,12 +133,12 @@ impl DemoFixture {
                 "database_path = \"./data/whisper.sqlite3\"",
                 &format!("database_path = \"{}\"", database.display()),
             );
-        let config = parse_config(&source).expect("parse Demo configuration");
+        let config = parse_config(&source).expect("parse runtime configuration");
         Self { root, config, database }
     }
 }
 
-impl Drop for DemoFixture {
+impl Drop for CaptureFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
@@ -268,9 +268,9 @@ fn decode_hex_fixture(source: &str) -> Vec<u8> {
 
 #[test]
 fn authenticated_unknown_kind_commits_one_packet_cursor_and_watermark() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
         Instant::now(),
@@ -287,9 +287,9 @@ fn authenticated_unknown_kind_commits_one_packet_cursor_and_watermark() {
     let projection_sequence: ProjectionSequence = receipt.projection_sequence();
     assert_eq!(record_sequence.get(), 0);
     assert_eq!(projection_sequence.get(), 1);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let packet: (Vec<u8>, Vec<u8>, String) = connection
         .query_row(
             "SELECT record_seq, session_time_ns, disposition FROM packet_records",
@@ -315,9 +315,9 @@ fn authenticated_unknown_kind_commits_one_packet_cursor_and_watermark() {
 
 #[test]
 fn replay_rejection_has_no_packet_cursor_or_watermark_effect() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let bytes = seal_raw(0x7f, 1, 1, &[0xa5]);
     let first = CapturedDatagram::new(
@@ -341,9 +341,9 @@ fn replay_rejection_has_no_packet_cursor_or_watermark_effect() {
         run.try_submit(replay).expect("submit replay").wait().expect("reject replay"),
         CommitOutcome::ReplayRejected
     );
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, cursor, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
             "SELECT (SELECT count(*) FROM packet_records), committed_through_record_seq,
@@ -360,9 +360,9 @@ fn replay_rejection_has_no_packet_cursor_or_watermark_effect() {
 
 #[test]
 fn malformed_known_body_commits_before_capability_resolution() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
         Instant::now(),
@@ -376,9 +376,9 @@ fn malformed_known_body_commits_before_capability_resolution() {
         panic!("first authenticated packet cannot be a replay")
     };
     assert_eq!(receipt.disposition(), PacketDisposition::MalformedKnownBody);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (disposition, capabilities, observations): (String, u64, u64) = connection
         .query_row(
             "SELECT disposition, (SELECT count(*) FROM capability_epochs),
@@ -395,9 +395,9 @@ fn malformed_known_body_commits_before_capability_resolution() {
 
 #[test]
 fn first_conforming_capability_commits_exact_epoch_row() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let body = capability_body([0x01; 32], [0x22; 32], 1024);
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -412,9 +412,9 @@ fn first_conforming_capability_commits_exact_epoch_row() {
         panic!("first authenticated packet cannot be a replay")
     };
     assert_eq!(receipt.disposition(), PacketDisposition::CapabilityCommitted);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (digest, descriptor, first_record): (Vec<u8>, Vec<u8>, Vec<u8>) = connection
         .query_row(
             "SELECT capability_digest, descriptor_bytes, first_record_seq FROM capability_epochs",
@@ -429,9 +429,9 @@ fn first_conforming_capability_commits_exact_epoch_row() {
 
 #[test]
 fn capability_pin_precedence_checks_build_before_digest() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let build_and_digest_mismatch = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -464,9 +464,9 @@ fn capability_pin_precedence_checks_build_before_digest() {
     };
     assert_eq!(build_receipt.disposition(), PacketDisposition::BuildMismatch);
     assert_eq!(digest_receipt.disposition(), PacketDisposition::CapabilityPinMismatch);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let capabilities: u64 = connection
         .query_row("SELECT count(*) FROM capability_epochs", [], |row| row.get(0))
         .expect("read capability count");
@@ -475,9 +475,9 @@ fn capability_pin_precedence_checks_build_before_digest() {
 
 #[test]
 fn capability_descriptor_budget_above_route_is_rejected_before_epoch_commit() {
-    let fixture = DemoFixture::with_first_capability_budget(2049);
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::with_first_capability_budget(2049);
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let capability = capability_body([0x01; 32], [0x22; 32], 2049);
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -495,9 +495,9 @@ fn capability_descriptor_budget_above_route_is_rejected_before_epoch_commit() {
         panic!("first authenticated packet cannot be a replay")
     };
     assert_eq!(receipt.disposition(), PacketDisposition::CapabilityPinMismatch);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (disposition, capabilities): (String, u64) = connection
         .query_row(
             "SELECT disposition, (SELECT count(*) FROM capability_epochs)
@@ -512,9 +512,9 @@ fn capability_descriptor_budget_above_route_is_rejected_before_epoch_commit() {
 
 #[test]
 fn repeated_equal_capability_validates_one_durable_epoch_row() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let body = capability_body([0x01; 32], [0x22; 32], 1024);
     for (offset, message_sequence) in [1_u64, 2].into_iter().enumerate() {
@@ -534,9 +534,9 @@ fn repeated_equal_capability_validates_one_durable_epoch_row() {
         };
         assert_eq!(receipt.disposition(), PacketDisposition::CapabilityCommitted);
     }
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, capabilities, first_record, watermark): (u64, u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
             "SELECT (SELECT count(*) FROM packet_records), count(*), first_record_seq,
@@ -553,9 +553,9 @@ fn repeated_equal_capability_validates_one_durable_epoch_row() {
 
 #[test]
 fn conforming_health_commits_without_capability_or_observation_rows() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -570,9 +570,9 @@ fn conforming_health_commits_without_capability_or_observation_rows() {
         panic!("first authenticated packet cannot be a replay")
     };
     assert_eq!(receipt.disposition(), PacketDisposition::HealthCommitted);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (disposition, capabilities, observations): (String, u64, u64) = connection
         .query_row(
             "SELECT disposition, (SELECT count(*) FROM capability_epochs),
@@ -588,9 +588,9 @@ fn conforming_health_commits_without_capability_or_observation_rows() {
 
 #[test]
 fn csi_unavailable_precedes_source_and_radio_mismatches() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let datagram = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -605,9 +605,9 @@ fn csi_unavailable_precedes_source_and_radio_mismatches() {
         panic!("first authenticated packet cannot be a replay")
     };
     assert_eq!(receipt.disposition(), PacketDisposition::CapabilityUnavailable);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (disposition, observations, watermark): (String, u64, Vec<u8>) = connection
         .query_row(
             "SELECT disposition, (SELECT count(*) FROM csi_observations),
@@ -624,9 +624,9 @@ fn csi_unavailable_precedes_source_and_radio_mismatches() {
 
 #[test]
 fn conforming_csi_commits_native_coordinate_observation() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -655,9 +655,9 @@ fn conforming_csi_commits_native_coordinate_observation() {
     assert_eq!(receipt.disposition(), PacketDisposition::CsiCommitted);
     assert_eq!(receipt.record_sequence().get(), 1);
     assert_eq!(receipt.projection_sequence().get(), 2);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (session_time, sensor, link, profile, observation, decoder): (
         Vec<u8>,
         String,
@@ -688,9 +688,9 @@ fn conforming_csi_commits_native_coordinate_observation() {
 
 #[test]
 fn csi_mismatch_precedence_runs_through_body_budget() {
-    let fixture = DemoFixture::with_first_sensor_raw_limit(4);
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::with_first_sensor_raw_limit(4);
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -737,9 +737,9 @@ fn csi_mismatch_precedence_runs_through_body_budget() {
         };
         assert_eq!(receipt.disposition(), expected);
     }
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let dispositions = connection
         .prepare("SELECT disposition FROM packet_records ORDER BY record_seq")
         .expect("prepare disposition query")
@@ -759,9 +759,9 @@ fn csi_mismatch_precedence_runs_through_body_budget() {
 
 #[test]
 fn csi_detects_durable_capability_build_mismatch_before_candidate_digest() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -802,9 +802,9 @@ fn csi_detects_durable_capability_build_mismatch_before_candidate_digest() {
         panic!("increasing sequence cannot be a replay")
     };
     assert_eq!(receipt.disposition(), PacketDisposition::BuildMismatch);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (disposition, observations): (String, u64) = connection
         .query_row(
             "SELECT disposition, (SELECT count(*) FROM csi_observations)
@@ -819,9 +819,9 @@ fn csi_detects_durable_capability_build_mismatch_before_candidate_digest() {
 
 #[test]
 fn csi_body_budget_mismatch_commits_without_observation() {
-    let fixture = DemoFixture::with_first_sensor_raw_limit(4);
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::with_first_sensor_raw_limit(4);
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -851,9 +851,9 @@ fn csi_body_budget_mismatch_commits_without_observation() {
         panic!("increasing sequence cannot be a replay")
     };
     assert_eq!(receipt.disposition(), PacketDisposition::BodyBudgetMismatch);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let observations: u64 = connection
         .query_row("SELECT count(*) FROM csi_observations", [], |row| row.get(0))
         .expect("read observation count");
@@ -863,9 +863,9 @@ fn csi_body_budget_mismatch_commits_without_observation() {
 #[cfg(feature = "ingest-test-hooks")]
 #[test]
 fn decoded_domain_rejection_commits_packet_without_observation() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -896,9 +896,9 @@ fn decoded_domain_rejection_commits_packet_without_observation() {
         panic!("increasing sequence cannot be a replay")
     };
     assert_eq!(receipt.disposition(), PacketDisposition::DecodedDomainRejected);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (disposition, observations): (String, u64) = connection
         .query_row(
             "SELECT disposition, (SELECT count(*) FROM csi_observations)
@@ -914,9 +914,9 @@ fn decoded_domain_rejection_commits_packet_without_observation() {
 #[cfg(feature = "ingest-test-hooks")]
 #[test]
 fn csi_body_budget_precedes_decoded_domain_rejection() {
-    let fixture = DemoFixture::with_first_sensor_raw_limit(4);
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::with_first_sensor_raw_limit(4);
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let capability_datagram = CapturedDatagram::new(
@@ -947,14 +947,14 @@ fn csi_body_budget_precedes_decoded_domain_rejection() {
         panic!("increasing sequence cannot be a replay")
     };
     assert_eq!(receipt.disposition(), PacketDisposition::BodyBudgetMismatch);
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 }
 
 #[test]
 fn capability_conflict_rolls_back_complete_write_set_and_stops_writer() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let first = CapturedDatagram::new(
@@ -1000,7 +1000,7 @@ fn capability_conflict_rolls_back_complete_write_set_and_stops_writer() {
     assert!(submit_error.is_writer_stopped());
     run.shutdown().expect("join stopped writer");
 
-    let connection = Connection::open(&fixture.database).expect("open rolled-back Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open rolled-back Store");
     let (packets, maximum_sequence, cursor, watermark): (u64, Vec<u8>, Vec<u8>, Vec<u8>) =
         connection
             .query_row(
@@ -1023,9 +1023,9 @@ fn capability_conflict_rolls_back_complete_write_set_and_stops_writer() {
 #[test]
 fn record_and_watermark_overflow_fail_closed_before_publication() {
     for overflow in ["record", "watermark"] {
-        let fixture = DemoFixture::new();
-        whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-        let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+        let fixture = CaptureFixture::new();
+        whisper::init_admission(&fixture.config).expect("initialize Store");
+        let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
         let connection = Connection::open(&fixture.database).expect("open overflow fixture");
         match overflow {
             "record" => {
@@ -1078,9 +1078,9 @@ fn record_and_watermark_overflow_fail_closed_before_publication() {
 
 #[test]
 fn nonmonotonic_session_time_and_corrupt_replay_bitmap_fail_closed() {
-    let time_fixture = DemoFixture::new();
+    let time_fixture = CaptureFixture::new();
     whisper::init_admission(&time_fixture.config).expect("initialize time Store");
-    let mut time_run = whisper::serve(&time_fixture.config).expect("start time Capture Run");
+    let mut time_run = whisper::serve(&time_fixture.config).expect("start time Capture runtime");
     let first_receive = Instant::now();
     let first = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -1113,9 +1113,10 @@ fn nonmonotonic_session_time_and_corrupt_replay_bitmap_fail_closed() {
     assert_eq!(packets, 1);
     assert_eq!(maximum_sequence, 1_u64.to_be_bytes());
 
-    let replay_fixture = DemoFixture::new();
+    let replay_fixture = CaptureFixture::new();
     whisper::init_admission(&replay_fixture.config).expect("initialize replay Store");
-    let mut replay_run = whisper::serve(&replay_fixture.config).expect("start replay Capture Run");
+    let mut replay_run =
+        whisper::serve(&replay_fixture.config).expect("start replay Capture runtime");
     Connection::open(&replay_fixture.database)
         .expect("open replay corruption fixture")
         .execute(
@@ -1148,11 +1149,11 @@ fn nonmonotonic_session_time_and_corrupt_replay_bitmap_fail_closed() {
 
 #[test]
 fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
     let first_capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let second_capability = capability_body([0x03; 32], [0x44; 32], 2048);
-    let mut first_run = whisper::serve(&fixture.config).expect("start first Capture Run");
+    let mut first_run = whisper::serve(&fixture.config).expect("start first Capture runtime");
     let first_receive = Instant::now();
     let first_run_packets = [
         ("192.0.2.10:5000", seal_raw_for(&[0x11; 32], 1, 1, 1, 1, &first_capability)),
@@ -1193,9 +1194,9 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
             .wait()
             .expect("commit first-run packet");
     }
-    first_run.shutdown().expect("stop first Capture Run");
+    first_run.shutdown().expect("stop first Capture runtime");
 
-    let mut second_run = whisper::serve(&fixture.config).expect("start second Capture Run");
+    let mut second_run = whisper::serve(&fixture.config).expect("start second Capture runtime");
     let second_receive = Instant::now();
     let second_run_packets = [
         (
@@ -1235,9 +1236,9 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
             .wait()
             .expect("commit second-run packet");
     }
-    second_run.shutdown().expect("stop second Capture Run");
+    second_run.shutdown().expect("stop second Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open dynamic Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open dynamic Store");
     let counts: (u64, u64, u64, u64, u64, u64) = connection
         .query_row(
             "SELECT (SELECT count(*) FROM capture_sessions),
@@ -1275,9 +1276,9 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
 
 #[test]
 fn pre_transaction_route_byte_and_auth_rejects_have_no_store_effect() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
 
     let unknown_route = CapturedDatagram::new(
@@ -1305,9 +1306,9 @@ fn pre_transaction_route_byte_and_auth_rejects_have_no_store_effect() {
         unauthenticated,
     );
     assert!(run.try_submit(unauthenticated).is_err());
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, cursor, watermark, replay_boot): RejectedStoreEffects = connection
         .query_row(
             "SELECT (SELECT count(*) FROM packet_records), committed_through_record_seq,
@@ -1327,9 +1328,9 @@ fn pre_transaction_route_byte_and_auth_rejects_have_no_store_effect() {
 
 #[test]
 fn authenticated_rate_reject_does_not_advance_replay_or_session() {
-    let fixture = DemoFixture::with_first_route_packet_rate(1);
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::with_first_route_packet_rate(1);
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let first = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -1348,9 +1349,9 @@ fn authenticated_rate_reject_does_not_advance_replay_or_session() {
     let error: SubmitError =
         run.try_submit(rate_rejected).expect_err("packet rate must reject the second datagram");
     assert!(error.is_rate_limited());
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, maximum_sequence, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
             "SELECT (SELECT count(*) FROM packet_records), maximum_message_sequence,
@@ -1369,9 +1370,9 @@ fn authenticated_rate_reject_does_not_advance_replay_or_session() {
 fn authenticated_byte_rate_reject_does_not_advance_replay_or_session() {
     let first_bytes = seal_raw(0x7f, 1, 1, &[0xa5]);
     let byte_limit = u64::try_from(first_bytes.len()).expect("datagram length fits u64");
-    let fixture = DemoFixture::with_first_route_byte_rate(byte_limit);
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::with_first_route_byte_rate(byte_limit);
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
     let first = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -1388,9 +1389,9 @@ fn authenticated_byte_rate_reject_does_not_advance_replay_or_session() {
 
     let _ = run.try_submit(first).expect("submit first").wait().expect("commit first");
     assert!(run.try_submit(byte_rate_rejected).is_err());
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, maximum_sequence, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
             "SELECT (SELECT count(*) FROM packet_records), maximum_message_sequence,
@@ -1407,9 +1408,9 @@ fn authenticated_byte_rate_reject_does_not_advance_replay_or_session() {
 
 #[test]
 fn out_of_order_receive_time_is_rejected_before_store_admission() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let earlier_receive = Instant::now();
     let first = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
@@ -1426,9 +1427,9 @@ fn out_of_order_receive_time_is_rejected_before_store_admission() {
 
     let _ = run.try_submit(first).expect("submit first").wait().expect("commit first");
     assert!(run.try_submit(out_of_order).is_err());
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, maximum_sequence, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
             "SELECT (SELECT count(*) FROM packet_records), maximum_message_sequence,
@@ -1445,12 +1446,12 @@ fn out_of_order_receive_time_is_rejected_before_store_admission() {
 
 #[test]
 fn session_time_conversion_overflow_is_rejected_without_store_effect() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let overflow_receive = Instant::now()
         .checked_add(Duration::from_nanos(u64::MAX))
-        .expect("platform Instant represents the Demo overflow fixture");
+        .expect("platform Instant represents the capture overflow fixture");
     let overflow = CapturedDatagram::new(
         "192.0.2.10:5000".parse().expect("peer"),
         overflow_receive,
@@ -1459,9 +1460,9 @@ fn session_time_conversion_overflow_is_rejected_without_store_effect() {
     );
 
     assert!(run.try_submit(overflow).is_err());
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, cursor, watermark, replay_boot): RejectedStoreEffects = connection
         .query_row(
             "SELECT (SELECT count(*) FROM packet_records), committed_through_record_seq,
@@ -1482,9 +1483,9 @@ fn session_time_conversion_overflow_is_rejected_without_store_effect() {
 #[cfg(feature = "ingest-test-hooks")]
 #[test]
 fn full_writer_queue_drops_candidate_without_store_effect_and_counts_it() {
-    let fixture = DemoFixture::with_writer_queue_capacity(1);
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::with_writer_queue_capacity(1);
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let hold = run.hold_writer_for_test().expect("pause writer");
     let first_receive = Instant::now();
     let queued = CapturedDatagram::new(
@@ -1506,9 +1507,9 @@ fn full_writer_queue_drops_candidate_without_store_effect_and_counts_it() {
     assert_eq!(run.queue_drop_count(), 1);
     drop(hold);
     let _ = ticket.wait().expect("commit queued packet");
-    run.shutdown().expect("stop Capture Run");
+    run.shutdown().expect("stop Capture runtime");
 
-    let connection = Connection::open(&fixture.database).expect("open committed Demo Store");
+    let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, maximum_sequence, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
             "SELECT (SELECT count(*) FROM packet_records), maximum_message_sequence,
@@ -1526,9 +1527,9 @@ fn full_writer_queue_drops_candidate_without_store_effect_and_counts_it() {
 #[cfg(feature = "ingest-test-hooks")]
 #[test]
 fn shutdown_releases_an_active_writer_hold_before_joining() {
-    let fixture = DemoFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let mut run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let fixture = CaptureFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Store");
+    let mut run = whisper::serve(&fixture.config).expect("start Capture runtime");
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
 
     thread::spawn(move || {

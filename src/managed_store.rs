@@ -558,7 +558,7 @@ mod tests {
     #[test]
     fn tampered_private_stage_is_rejected_and_removed() {
         let root = TestRoot::new();
-        let final_path = root.path().join("demo.sqlite3");
+        let final_path = root.path().join("host.sqlite3");
         let managed =
             ManagedRoot::acquire_for_initialization(&final_path).expect("acquire lifecycle");
         let stage = managed.create_stage().expect("create private stage");
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn post_link_trust_failure_removes_the_new_final_component() {
         let root = TestRoot::new();
-        let final_path = root.path().join("demo.sqlite3");
+        let final_path = root.path().join("host.sqlite3");
         let extra_path = root.path().join("unexpected-link.sqlite3");
         let managed =
             ManagedRoot::acquire_for_initialization(&final_path).expect("acquire lifecycle");

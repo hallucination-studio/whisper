@@ -36,7 +36,7 @@ Engine owns Timeline, conditioning, estimator mutation, and current world
 state behind one synchronous semantic interface. It is the only module that can
 produce a world transition.
 
-The application owns runtime composition: `CaptureRun` orders socket and command
+The application owns runtime composition: `CaptureRuntime` orders socket and command
 input, owns the sole persistence writer connection, coordinates decoding,
 requests Engine semantic transitions, and sequences publication, shutdown, and
 bounded delivery. Engine alone owns its mutable Timeline, estimator, and World

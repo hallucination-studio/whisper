@@ -1,4 +1,4 @@
-//! Read-only Demo Store snapshots and canonical query DTOs.
+//! Read-only Store snapshots and canonical query DTOs.
 
 use std::backtrace::Backtrace;
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,23 +8,26 @@ use std::io::Cursor;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(feature = "ingest-test-hooks")]
+use std::sync::{Condvar, mpsc};
 
 use ciborium::{de::from_reader, ser::into_writer};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::demo_store::{DemoStoreError, open_query_reader};
 use crate::domain::identity::{
     DeploymentId, RadioLinkId, SensorId, SessionId, SpaceId, TransmitterId,
 };
 use crate::domain::time::SessionTime;
 use crate::hex;
 use crate::managed_store::{Identity, ManagedRoot, validate_existing_for_reader};
+use crate::store::{StoreError, open_query_reader};
+use crate::{ProjectionCommit, ProjectionSequence};
 
 const TOPOLOGY_MANIFEST_SCHEMA: u8 = 1;
 
-/// A failure to open or derive one complete read-only Demo query response.
+/// A failure to open or derive one complete read-only Store query response.
 #[derive(Debug)]
 pub struct QueryError {
     source: QueryErrorKind,
@@ -33,14 +36,17 @@ pub struct QueryError {
 
 #[derive(Debug, thiserror::Error)]
 enum QueryErrorKind {
-    #[error("Demo query Store validation failed: {0}")]
-    Store(#[source] DemoStoreError),
-    #[error("Demo query SQLite operation failed: {0}")]
+    #[error("Store query Store validation failed: {0}")]
+    Store(#[source] StoreError),
+    #[error("Store query SQLite operation failed: {0}")]
     Sql(#[source] rusqlite::Error),
-    #[error("invalid Demo query: {0}")]
+    #[error("invalid Store query: {0}")]
     InvalidRequest(&'static str),
-    #[error("Demo query Store contents are incompatible")]
+    #[error("Store query Store contents are incompatible")]
     Incompatible,
+    #[cfg(feature = "ingest-test-hooks")]
+    #[error("Store query was interrupted for runtime shutdown")]
+    Interrupted,
 }
 
 impl fmt::Display for QueryError {
@@ -77,10 +83,14 @@ impl QueryError {
     fn new(source: QueryErrorKind) -> Self {
         Self { source, backtrace: Backtrace::capture() }
     }
+
+    pub(crate) fn invalid_request(message: &'static str) -> Self {
+        Self::new(QueryErrorKind::InvalidRequest(message))
+    }
 }
 
-impl From<DemoStoreError> for QueryError {
-    fn from(source: DemoStoreError) -> Self {
+impl From<StoreError> for QueryError {
+    fn from(source: StoreError) -> Self {
         Self::new(QueryErrorKind::Store(source))
     }
 }
@@ -95,6 +105,61 @@ impl From<rusqlite::Error> for QueryError {
 #[derive(Clone)]
 pub struct QueryStore {
     inner: Arc<Mutex<PinnedReader>>,
+    interrupt: Arc<rusqlite::InterruptHandle>,
+    #[cfg(feature = "ingest-test-hooks")]
+    gate: Option<Arc<QueryGate>>,
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+struct QueryGate {
+    released: Mutex<bool>,
+    changed: Condvar,
+    entered: mpsc::SyncSender<()>,
+}
+
+/// Test-only gate that holds a Store query until runtime interruption.
+#[cfg(feature = "ingest-test-hooks")]
+#[doc(hidden)]
+pub struct QueryHold {
+    gate: Arc<QueryGate>,
+    entered: Option<mpsc::Receiver<()>>,
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+impl fmt::Debug for QueryHold {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("QueryHold").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+impl QueryHold {
+    /// Blocks until one query reaches the test gate.
+    pub fn wait_until_blocked(&mut self) {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.recv();
+        }
+    }
+
+    /// Releases the held query.
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        let mut released =
+            self.gate.released.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *released = true;
+        drop(released);
+        self.gate.changed.notify_all();
+    }
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+impl Drop for QueryHold {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
 }
 
 struct PinnedReader {
@@ -125,9 +190,10 @@ impl QueryStore {
     pub(crate) fn from_managed(managed: Arc<ManagedRoot>) -> Result<Self, QueryError> {
         let database_path = managed.database_path();
         let (database_path, file_identity) =
-            validate_existing_for_reader(database_path).map_err(DemoStoreError::from)?;
+            validate_existing_for_reader(database_path).map_err(StoreError::from)?;
         let connection = open_query_reader(&database_path)?;
         let (store_id, replay_digest) = read_store_identity(&connection)?;
+        let interrupt = Arc::new(connection.get_interrupt_handle());
         Ok(Self {
             inner: Arc::new(Mutex::new(PinnedReader {
                 connection: Some(connection),
@@ -137,7 +203,60 @@ impl QueryStore {
                 store_id,
                 replay_digest,
             })),
+            interrupt,
+            #[cfg(feature = "ingest-test-hooks")]
+            gate: None,
         })
+    }
+
+    pub(crate) fn interrupt(&self) {
+        self.interrupt.interrupt();
+        #[cfg(feature = "ingest-test-hooks")]
+        if let Some(gate) = self.gate.as_ref() {
+            let mut released =
+                gate.released.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *released = true;
+            drop(released);
+            gate.changed.notify_all();
+        }
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    pub(crate) fn hold_for_test(mut self) -> (Self, QueryHold) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let gate = Arc::new(QueryGate {
+            released: Mutex::new(false),
+            changed: Condvar::new(),
+            entered: entered_tx,
+        });
+        self.gate = Some(Arc::clone(&gate));
+        (self, QueryHold { gate, entered: Some(entered_rx) })
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    fn wait_for_test_gate(&self) -> Result<(), QueryError> {
+        let Some(gate) = self.gate.as_ref() else {
+            return Ok(());
+        };
+        let _ = gate.entered.try_send(());
+        let released = gate.released.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _released = gate
+            .changed
+            .wait_while(released, |released| !*released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Err(QueryError::new(QueryErrorKind::Interrupted))
+    }
+
+    pub(crate) fn close(self) -> Result<(), QueryError> {
+        let mut reader = Arc::try_unwrap(self.inner)
+            .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(connection) = reader.connection.take() {
+            connection.close().map_err(|(_, source)| QueryError::from(source))?;
+        }
+        reader.managed.take();
+        Ok(())
     }
 
     /// Derives canonical provisioned and committed topology from one read snapshot.
@@ -146,6 +265,8 @@ impl QueryStore {
     ///
     /// Returns an error without a partial DTO when the Store cannot be read or validated.
     pub fn topology(&self) -> Result<TopologyOk, QueryError> {
+        #[cfg(feature = "ingest-test-hooks")]
+        self.wait_for_test_gate()?;
         let mut reader = self.reader()?;
         validate_pinned_path(&reader)?;
         let store_id = reader.store_id;
@@ -170,6 +291,8 @@ impl QueryStore {
         query: &SignalQuery,
         limits: QueryLimits,
     ) -> Result<SignalsResponse, QueryError> {
+        #[cfg(feature = "ingest-test-hooks")]
+        self.wait_for_test_gate()?;
         let mut reader = self.reader()?;
         validate_pinned_path(&reader)?;
         let store_id = reader.store_id;
@@ -185,6 +308,38 @@ impl QueryStore {
         Ok(response)
     }
 
+    pub(crate) fn projection_watermark(&self) -> Result<ProjectionCommit, QueryError> {
+        #[cfg(feature = "ingest-test-hooks")]
+        self.wait_for_test_gate()?;
+        let mut reader = self.reader()?;
+        validate_pinned_path(&reader)?;
+        let expected_store_id = reader.store_id;
+        let connection = reader
+            .connection
+            .as_mut()
+            .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let (store_id, sequence): (Vec<u8>, Vec<u8>) = transaction
+            .query_row(
+                "SELECT store_id, projection_commit_seq FROM store_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
+        let store_id: [u8; 32] = store_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
+        if store_id != expected_store_id {
+            return Err(QueryError::new(QueryErrorKind::Incompatible));
+        }
+        let sequence = ProjectionSequence::new(decode_u64(&sequence)?);
+        transaction.commit()?;
+        validate_pinned_path(&reader)?;
+        Ok(ProjectionCommit::new(store_id, sequence))
+    }
+
     fn reader(&self) -> Result<MutexGuard<'_, PinnedReader>, QueryError> {
         self.inner.lock().map_err(|_| QueryError::new(QueryErrorKind::Incompatible))
     }
@@ -192,7 +347,7 @@ impl QueryStore {
 
 fn validate_pinned_path(reader: &PinnedReader) -> Result<(), QueryError> {
     let (path, identity) =
-        validate_existing_for_reader(&reader.database_path).map_err(DemoStoreError::from)?;
+        validate_existing_for_reader(&reader.database_path).map_err(StoreError::from)?;
     if path != reader.database_path || identity != reader.file_identity {
         return Err(QueryError::new(QueryErrorKind::Incompatible));
     }
@@ -410,6 +565,20 @@ pub enum SignalsResponse {
     Error(ErrorEnvelope),
 }
 
+impl SignalsResponse {
+    pub(crate) const fn http_status(&self) -> u16 {
+        match self {
+            Self::Ok(_) | Self::Empty(_) => 200,
+            Self::Error(error) => match &error.error {
+                ApiError::Invalid(_) => 400,
+                ApiError::Range(_) => 416,
+                ApiError::Phase(_) => 422,
+                ApiError::Projection(_) => 500,
+            },
+        }
+    }
+}
+
 /// Canonical nonempty `SignalsOk` body imported by Demo Slice v1.
 #[derive(Clone, Debug, Serialize)]
 pub struct SignalsOk {
@@ -509,6 +678,19 @@ pub struct ErrorEnvelope {
 }
 
 impl ErrorEnvelope {
+    /// Creates the canonical invalid-request body without partial query data.
+    #[must_use]
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            http_schema_version: 1,
+            kind: "error",
+            error: ApiError::Invalid(InvalidRequestError {
+                code: "invalid_request",
+                message: message.into(),
+            }),
+        }
+    }
+
     /// Creates the canonical no-partial-body projection failure envelope.
     #[must_use]
     pub fn projection_failed() -> Self {

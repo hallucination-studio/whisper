@@ -1746,7 +1746,7 @@ impl AdmittedDatagram {
         self.authenticated.header()
     }
 
-    /// Converts authenticated bytes into a pure, bounded Demo candidate.
+    /// Converts authenticated bytes into a pure, bounded delivery candidate.
     #[must_use]
     pub(crate) fn into_candidate(
         self,
@@ -2665,9 +2665,9 @@ fn resolve_csi(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DemoObservationInput(ObservationInput);
+pub(crate) struct ObservationCandidateInput(ObservationInput);
 
-impl DemoObservationInput {
+impl ObservationCandidateInput {
     pub(crate) fn try_new(
         session_id: &str,
         record_sequence: CaptureRecordSequence,
@@ -2679,8 +2679,8 @@ impl DemoObservationInput {
     }
 }
 
-pub(crate) fn resolve_demo_csi(
-    input: DemoObservationInput,
+pub(crate) fn resolve_capture_csi(
+    input: ObservationCandidateInput,
     header_route: HeaderRoute,
     header: Header,
     registry: &Registry,
@@ -3183,7 +3183,7 @@ mod tests {
     }
 
     #[test]
-    fn demo_candidate_preserves_authenticated_unknown_kind_without_store_authority() {
+    fn candidate_preserves_authenticated_unknown_kind_without_store_authority() {
         let config = config();
         let datagram = sealed_raw(0x7f, 1, &[0xa5]);
         let candidate = admit_datagram(

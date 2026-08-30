@@ -11,13 +11,13 @@ source files. It does not define routes, DTO fields, status codes, UI content,
 implementation status, or acceptance results.
 
 Applicability: this full semantic query, command, and reconnect architecture
-belongs to the deferred Semantic Program. The bounded Demo query subset,
+belongs to the deferred Semantic Program. The bounded delivery query subset,
 watermark-only WebSocket, and polling fallback are first-applicable in
 [Demo Slice architecture](demo-slice.md).
 
 ## Ownership
 
-`CaptureRun` owns ingest order and the sole synchronous database writer
+`CaptureRuntime` owns ingest order and the sole synchronous database writer
 connection. Engine alone owns the mutable Timeline, estimator, and current
 World state. The persistence module owns committed rows and creates their
 projection commit identities. No one of these owners exposes its mutation
@@ -51,7 +51,7 @@ watermark but is not a Committed projection identity.
 HTTP adapter ------------------------------------+
     |                                             |
     | bounded query                              v
-    v                                         CaptureRun
+    v                                         CaptureRuntime
 query projection module                 ingest order + DB writer
     |                                             |
     |                                      exclusive Engine
@@ -86,7 +86,7 @@ loss make HTTP resynchronization a real second interaction mode.
   cursor, and Store topology never comes from mutable runtime configuration.
   Committed observation and baseline projections supply only dynamic Profile
   membership, including first-B baseline publication after a decode reject.
-- `CaptureRun` alone orders ingest and owns the writer connection; Engine alone
+- `CaptureRuntime` alone orders ingest and owns the writer connection; Engine alone
   mutates Timeline, estimator, and World. HTTP submits commands but does not
   directly mutate baselines or hold mutable Engine access.
 - A live invalidation is published only after the corresponding projection
