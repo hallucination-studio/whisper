@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
-const root = resolve('src/runtime/assets');
+const root = resolve('src/host/assets');
 const assets = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/assets/app.css', ['app.css', 'text/css; charset=utf-8']],

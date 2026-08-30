@@ -566,11 +566,19 @@ impl Drop for CaptureRuntime {
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct CommitTicket {
+    #[cfg_attr(
+        not(feature = "ingest-test-hooks"),
+        expect(
+            dead_code,
+            reason = "production capture drops the outcome ticket after enqueue; test support waits for it"
+        )
+    )]
     response: Receiver<Result<CommitOutcome, Arc<HostError>>>,
 }
 
 #[cfg(unix)]
 impl CommitTicket {
+    #[cfg(feature = "ingest-test-hooks")]
     pub(crate) fn wait(self) -> Result<CommitOutcome, Arc<HostError>> {
         self.response.recv().map_err(|_| HostError::WriterStopped)?
     }
@@ -893,6 +901,7 @@ impl HostError {
         }
     }
 
+    #[cfg(feature = "ingest-test-hooks")]
     pub(crate) const fn is_rate_limited(&self) -> bool {
         #[cfg(unix)]
         {
@@ -904,6 +913,7 @@ impl HostError {
         }
     }
 
+    #[cfg(feature = "ingest-test-hooks")]
     pub(crate) const fn is_writer_queue_full(&self) -> bool {
         #[cfg(unix)]
         {

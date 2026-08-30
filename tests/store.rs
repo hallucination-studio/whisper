@@ -9,6 +9,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
+use whisper::test_support::serve_capture;
 use whisper::{Config, parse_config};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -271,7 +272,7 @@ fn init_admission_persists_imported_canonical_receipts() {
 fn serve_requires_an_existing_store_and_creates_one_empty_capture_session() {
     let fixture = StoreFixture::new();
     let config = fixture.parsed_config();
-    let missing = whisper::serve(&config).expect_err("serve without a Store must fail");
+    let missing = serve_capture(&config).expect_err("serve without a Store must fail");
     assert!(
         missing.to_string().contains(&fixture.database.display().to_string()),
         "managed I/O error omitted the failing Store path: {missing}"
@@ -287,9 +288,9 @@ fn serve_requires_an_existing_store_and_creates_one_empty_capture_session() {
         "init-admission failed: {}",
         String::from_utf8_lossy(&initialized.stderr)
     );
-    let served = whisper::serve(&config).expect("serve initialized Store");
+    let served = serve_capture(&config).expect("serve initialized Store");
     drop(served);
-    let served_again = whisper::serve(&config).expect("serve initialized Store again");
+    let served_again = serve_capture(&config).expect("serve initialized Store again");
     drop(served_again);
 
     let connection = Connection::open(&fixture.database).expect("open served Store");
@@ -345,7 +346,7 @@ fn serve_returns_committed_session_authority_and_retains_the_lifecycle_lease() {
     let config = fixture.parsed_config();
     whisper::init_admission(&config).expect("initialize Store");
 
-    let session = whisper::serve(&config).expect("open first Capture Session");
+    let session = serve_capture(&config).expect("open first Capture Session");
     let connection = Connection::open(&fixture.database).expect("open served Store");
     let (store_id, session_count): (Vec<u8>, u64) = connection
         .query_row(
@@ -360,12 +361,12 @@ fn serve_returns_committed_session_authority_and_retains_the_lifecycle_lease() {
     let first_elapsed = session.elapsed();
     assert!(session.elapsed() >= first_elapsed);
 
-    let conflict = whisper::serve(&config).expect_err("second lifecycle lease must conflict");
+    let conflict = serve_capture(&config).expect_err("second lifecycle lease must conflict");
     assert!(conflict.is_lease_conflict());
     drop(session);
 
     let _next =
-        whisper::serve(&config).expect("open Capture Session after releasing lifecycle lease");
+        serve_capture(&config).expect("open Capture Session after releasing lifecycle lease");
 }
 
 #[test]
@@ -374,18 +375,18 @@ fn lifecycle_lease_precedes_epoch_key_reads() {
     let config = fixture.parsed_config();
     whisper::init_admission(&config).expect("initialize Store");
 
-    let session = whisper::serve(&config).expect("open first Capture Session");
+    let session = serve_capture(&config).expect("open first Capture Session");
     fs::remove_file(fixture.root.join("secrets/device-1/key-1.bin"))
         .expect("remove epoch key while lifecycle lease is retained");
 
-    let conflict = whisper::serve(&config).expect_err("second lifecycle must fail at the lease");
+    let conflict = serve_capture(&config).expect_err("second lifecycle must fail at the lease");
     assert!(
         conflict.is_lease_conflict(),
         "epoch-key access ran before lifecycle lease acquisition: {conflict}"
     );
 
     drop(session);
-    let missing_key = whisper::serve(&config).expect_err("missing epoch key must fail after lease");
+    let missing_key = serve_capture(&config).expect_err("missing epoch key must fail after lease");
     assert!(!missing_key.is_lease_conflict());
 }
 
@@ -408,7 +409,7 @@ fn serve_rejects_a_same_named_but_incompatible_schema_without_mutation() {
     let before = fs::read(&fixture.database).expect("snapshot corrupted Store");
 
     let config = fixture.parsed_config();
-    whisper::serve(&config).expect_err("serve accepted an incompatible same-named index");
+    serve_capture(&config).expect_err("serve accepted an incompatible same-named index");
     assert_eq!(fs::read(&fixture.database).expect("read rejected Store"), before);
     let connection = Connection::open(&fixture.database).expect("reopen rejected Store");
     let sessions: u64 = connection
@@ -430,7 +431,7 @@ fn assert_serve_rejects_corruption(sql: &str) {
     let before = fs::read(&fixture.database).expect("snapshot corrupted Store");
 
     let config = fixture.parsed_config();
-    assert!(whisper::serve(&config).is_err(), "serve accepted Store corruption from SQL: {sql}");
+    assert!(serve_capture(&config).is_err(), "serve accepted Store corruption from SQL: {sql}");
     assert_eq!(
         fs::read(&fixture.database).expect("read rejected Store"),
         before,
@@ -528,7 +529,7 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     fs::set_permissions(&wrong_final.database, fs::Permissions::from_mode(0o644))
         .expect("weaken final mode");
     let config = wrong_final.parsed_config();
-    assert!(whisper::serve(&config).is_err());
+    assert!(serve_capture(&config).is_err());
     assert_eq!(fs::read(&wrong_final.database).expect("read rejected final"), store_bytes);
     assert!(private_stages(wrong_final.database.parent().expect("Managed root")).is_empty());
 
@@ -536,7 +537,7 @@ fn managed_root_lease_and_final_trust_fail_closed() {
         .expect("restore final mode");
     let extra_link = wrong_final.database.with_file_name("extra-link.sqlite3");
     fs::hard_link(&wrong_final.database, &extra_link).expect("add untrusted final hard link");
-    assert!(whisper::serve(&config).is_err());
+    assert!(serve_capture(&config).is_err());
     assert_eq!(fs::read(&wrong_final.database).expect("read hard-linked final"), store_bytes);
 
     let stale_companion = StoreFixture::new();
@@ -563,7 +564,7 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     fs::write(&wal, []).expect("create untrusted final WAL");
     fs::set_permissions(&wal, fs::Permissions::from_mode(0o644)).expect("weaken final WAL mode");
     let config = wrong_companion.parsed_config();
-    assert!(whisper::serve(&config).is_err());
+    assert!(serve_capture(&config).is_err());
     assert_eq!(fs::read(&wrong_companion.database).expect("read rejected Store"), store_bytes);
 }
 
@@ -628,7 +629,7 @@ fn serve_rederives_every_route_epoch_without_repairing_conflicts() {
         }
         let before = fs::read(&fixture.database).expect("snapshot initialized Store");
         let config = fixture.parsed_config();
-        assert!(whisper::serve(&config).is_err(), "serve accepted {mutation} epoch material");
+        assert!(serve_capture(&config).is_err(), "serve accepted {mutation} epoch material");
         assert_eq!(fs::read(&fixture.database).expect("read rejected Store"), before);
     }
 }
@@ -645,7 +646,7 @@ fn serve_writer_uses_a_zero_busy_timeout() {
     lock.execute_batch("BEGIN IMMEDIATE").expect("hold SQLite writer transaction");
 
     let config = fixture.parsed_config();
-    let error = whisper::serve(&config).expect_err("serve accepted a blocked writer");
+    let error = serve_capture(&config).expect_err("serve accepted a blocked writer");
     assert!(
         error.to_string().contains("database is locked"),
         "writer conflict did not retain SQLite's lock classification: {error}"
@@ -683,7 +684,7 @@ fn serve_preserves_valid_advanced_replay_state() {
     connection.close().expect("close advanced Store");
 
     let config = fixture.parsed_config();
-    let served = whisper::serve(&config).expect("serve advanced replay state");
+    let served = serve_capture(&config).expect("serve advanced replay state");
     drop(served);
     let connection = Connection::open(&fixture.database).expect("reopen Store");
     let replay_state: (Vec<u8>, Vec<u8>, Vec<u8>) = connection
@@ -717,7 +718,7 @@ fn serve_preserves_an_advanced_store_watermark_and_starts_a_fresh_session() {
         .expect("run init-admission");
     assert!(initialized.status.success());
     let config = fixture.parsed_config();
-    let first_serve = whisper::serve(&config).expect("serve initialized Store");
+    let first_serve = serve_capture(&config).expect("serve initialized Store");
     drop(first_serve);
     let connection = Connection::open(&fixture.database).expect("open Store");
     let first_session: String = connection
@@ -745,7 +746,7 @@ fn serve_preserves_an_advanced_store_watermark_and_starts_a_fresh_session() {
         .expect("advance Store watermark");
     connection.close().expect("close advanced Store");
 
-    let second_serve = whisper::serve(&config).expect("serve valid advanced Store state");
+    let second_serve = serve_capture(&config).expect("serve valid advanced Store state");
     drop(second_serve);
     let connection = Connection::open(&fixture.database).expect("reopen Store");
     let watermark: Vec<u8> = connection

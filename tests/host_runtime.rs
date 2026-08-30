@@ -20,6 +20,11 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+#[cfg(feature = "ingest-test-hooks")]
+use whisper::test_support::{
+    release_writer, start_host_with_panicked_writer, start_host_with_query_held,
+    start_host_with_teardown_held, start_host_with_writer_held,
+};
 use whisper::{HostRuntime, RuntimeFailure, SocketOperation, SocketRole, parse_config};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -675,9 +680,8 @@ async fn runtime_routes_a_nonfirst_configured_sensor_without_singleton_shortcuts
 #[tokio::test]
 async fn runtime_queue_exhaustion_counts_the_drop_without_store_effect() {
     let fixture = RuntimeFixture::with_queue_capacity(1);
-    let mut runtime = HostRuntime::start_with_writer_held_for_test(&fixture.config)
-        .await
-        .expect("start held Host runtime");
+    let mut runtime =
+        start_host_with_writer_held(&fixture.config).await.expect("start held Host runtime");
     let destination = std::net::SocketAddr::new(
         "127.0.0.1".parse().expect("loopback"),
         runtime.capture_address().port(),
@@ -694,7 +698,7 @@ async fn runtime_queue_exhaustion_counts_the_drop_without_store_effect() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(runtime.queue_drop_count(), 1);
-    runtime.release_writer_for_test();
+    release_writer(&mut runtime);
 
     let mut committed = false;
     for _ in 0..100 {
@@ -765,9 +769,8 @@ async fn slow_ordinary_http_connection_is_force_closed_before_shutdown_deadline(
 #[tokio::test]
 async fn slow_store_query_is_interrupted_before_shutdown_releases_the_lease() {
     let fixture = RuntimeFixture::new();
-    let (runtime, mut query_hold) = HostRuntime::start_with_query_held_for_test(&fixture.config)
-        .await
-        .expect("start query-gated Host runtime");
+    let (runtime, mut query_hold) =
+        start_host_with_query_held(&fixture.config).await.expect("start query-gated Host runtime");
     let address = runtime.http_address();
     let request = tokio::spawn(async move {
         http_request(
@@ -823,9 +826,8 @@ async fn query_failure_stops_the_host_and_is_returned_after_cleanup() {
 #[tokio::test]
 async fn idle_writer_panic_stops_the_host_without_another_datagram() {
     let fixture = RuntimeFixture::new();
-    let runtime = HostRuntime::start_with_panicked_writer_for_test(&fixture.config)
-        .await
-        .expect("start writer-panic runtime");
+    let runtime =
+        start_host_with_panicked_writer(&fixture.config).await.expect("start writer-panic runtime");
     tokio::time::timeout(Duration::from_secs(1), runtime.wait_for_stop())
         .await
         .expect("idle writer panic did not stop the Host");
@@ -837,9 +839,8 @@ async fn idle_writer_panic_stops_the_host_without_another_datagram() {
 #[tokio::test]
 async fn cancelled_shutdown_finishes_cleanup_and_releases_the_lease() {
     let fixture = RuntimeFixture::with_queue_capacity(1);
-    let runtime = HostRuntime::start_with_writer_held_for_test(&fixture.config)
-        .await
-        .expect("start held Host runtime");
+    let runtime =
+        start_host_with_writer_held(&fixture.config).await.expect("start held Host runtime");
     let mut shutdown = Box::pin(runtime.shutdown());
     assert!(matches!(futures_util::poll!(&mut shutdown), std::task::Poll::Pending));
     drop(shutdown);
@@ -868,7 +869,7 @@ async fn cancelled_shutdown_finishes_cleanup_and_releases_the_lease() {
 #[tokio::test]
 async fn blocking_teardown_never_stalls_the_callers_tokio_worker() {
     let fixture = RuntimeFixture::new();
-    let (runtime, mut teardown) = HostRuntime::start_with_teardown_held_for_test(&fixture.config)
+    let (runtime, mut teardown) = start_host_with_teardown_held(&fixture.config)
         .await
         .expect("start teardown-gated Host runtime");
     let heartbeat = std::sync::Arc::new(AtomicU64::new(0));
@@ -910,7 +911,7 @@ fn dropping_the_handle_and_callers_executor_cannot_cancel_supervisor_cleanup() {
         .build()
         .expect("build caller executor");
     let (runtime, mut teardown) = caller
-        .block_on(HostRuntime::start_with_teardown_held_for_test(&fixture.config))
+        .block_on(start_host_with_teardown_held(&fixture.config))
         .expect("start teardown-gated Host runtime");
     drop(caller);
     drop(runtime);

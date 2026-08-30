@@ -111,7 +111,7 @@ pub(super) async fn run(
                 match result {
                     Ok(ticket) => drop(ticket),
                     Err(error) if error.is_writer_stopped() => {
-                        return Err(crate::SubmitError::host(error).into());
+                        return Err(RuntimeError::submit(error));
                     }
                     Err(_) => {}
                 }

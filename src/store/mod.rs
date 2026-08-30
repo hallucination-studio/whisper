@@ -6,9 +6,10 @@ mod sqlite;
 
 #[cfg(all(unix, feature = "ingest-test-hooks"))]
 pub use query::QueryHold;
+#[cfg(feature = "ingest-test-hooks")]
+pub use query::{EmptyEnvelope, SignalQueryBuilder, SignalsOk, SignalsResponse, TopologyOk};
 pub use query::{
-    EmptyEnvelope, ErrorEnvelope, Metric, QueryError, QueryLimits, QueryStore, SignalPath,
-    SignalQuery, SignalQueryBuilder, SignalRange, SignalSelection, SignalsOk, SignalsResponse,
-    TopologyOk,
+    ErrorEnvelope, Metric, QueryError, QueryLimits, QueryStore, SignalPath, SignalQuery,
+    SignalRange, SignalSelection,
 };
 pub(crate) use sqlite::{AdmissionEpochSeed, CaptureSession, Store, StoreError};

@@ -16,11 +16,19 @@ creating intent. The running intent owns one complete lifetime from
 non-creating Store validation through Capture Session creation, capture,
 delivery shutdown, and connection close.
 
-`HostRuntime` is the sole public running-lifecycle module. Its interface owns
-startup, stop observation, shutdown, and immutable bound-address/session facts.
+The Host module's concrete `HostRuntime` is the sole public running-lifecycle
+interface. It owns startup, stop observation, shutdown, and immutable
+bound-address/session facts.
 Callers never own capture, HTTP, WebSocket, query, writer, socket, task, or
 lease handles. Dropping `HostRuntime` or cancelling its shutdown future only
 requests stop; neither action owns or cancels cleanup.
+
+The Host's private supervisor implementation is also the composition root. It
+is the only production location that selects the concrete UDP capture, HTTP,
+WebSocket, and Store implementations. Those implementations remain private
+submodules rather than public Adapter types or trait Ports. Non-default test
+support may expose bounded fault controls, but it is not a production lifecycle
+interface or a second authority.
 
 An independent `HostSupervisor` thread owns cleanup from successful startup
 until final completion. It retains the last `CaptureRuntime` and `QueryStore`
