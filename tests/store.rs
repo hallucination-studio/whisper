@@ -369,6 +369,27 @@ fn serve_returns_committed_session_authority_and_retains_the_lifecycle_lease() {
 }
 
 #[test]
+fn lifecycle_lease_precedes_epoch_key_reads() {
+    let fixture = StoreFixture::new();
+    let config = fixture.parsed_config();
+    whisper::init_admission(&config).expect("initialize Store");
+
+    let session = whisper::serve(&config).expect("open first Capture Session");
+    fs::remove_file(fixture.root.join("secrets/device-1/key-1.bin"))
+        .expect("remove epoch key while lifecycle lease is retained");
+
+    let conflict = whisper::serve(&config).expect_err("second lifecycle must fail at the lease");
+    assert!(
+        conflict.is_lease_conflict(),
+        "epoch-key access ran before lifecycle lease acquisition: {conflict}"
+    );
+
+    drop(session);
+    let missing_key = whisper::serve(&config).expect_err("missing epoch key must fail after lease");
+    assert!(!missing_key.is_lease_conflict());
+}
+
+#[test]
 fn serve_rejects_a_same_named_but_incompatible_schema_without_mutation() {
     let fixture = StoreFixture::new();
     let initialized = Command::new(env!("CARGO_BIN_EXE_whisper"))
@@ -474,6 +495,8 @@ fn managed_root_lease_and_final_trust_fail_closed() {
     fs::set_permissions(&lease, fs::Permissions::from_mode(0o600)).expect("protect lease");
     let lease_file = OpenOptions::new().read(true).write(true).open(&lease).expect("open lease");
     lease_file.try_lock().expect("hold lifecycle lease");
+    fs::remove_file(conflict.root.join("secrets/device-1/key-1.bin"))
+        .expect("remove epoch key while lifecycle lease is held");
     let output = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["init-admission", conflict.config.to_str().expect("UTF-8 config path")])
         .output()

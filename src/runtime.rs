@@ -834,7 +834,7 @@ fn supervise(
     #[cfg(feature = "ingest-test-hooks")]
     let mut capture = capture;
     let store_id = capture.store_id();
-    let query = QueryStore::from_managed(capture.managed_root())?;
+    let query = capture.query_store()?;
     #[cfg(feature = "ingest-test-hooks")]
     let query = if hold_query {
         let (query, hold) = query.hold_for_test();

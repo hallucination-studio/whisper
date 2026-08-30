@@ -1,7 +1,7 @@
 # Demo Slice architecture
 
 - Status: accepted architecture
-- Scope: bounded Store, capture, query, delivery, and browser seams
+- Scope: bounded Store, capture, delivery, and browser seams
 - Normative behavior: [Demo Slice v2](../specs/demo-slice-v2.md)
 
 This document owns the non-discoverable responsibility boundaries and
@@ -29,11 +29,12 @@ blocking teardown, and releases the lifecycle lease. Tokio workers may request
 stop and report task results, but never close the final SQLite connection or
 join the writer thread.
 
-The shared `HostLifecycle` boundary owns Managed store root validation and the
-retained cooperative lease for both creating and running intents. The
-managed-store module owns private staged initialization, atomic no-replace
-publication, and non-creating opens. Bounded-path schema validation and
-Capture Session behavior remain behind that shared boundary.
+The Store module owns the shared Managed store root validation and retained
+cooperative lease for both creating and running intents. Its concrete `Store`,
+`CaptureSession`, and `QueryStore` interfaces hide staged initialization,
+atomic no-replace publication, non-creating opens, schema validation, SQLite
+connections, transactions, and committed reads. No SQLite type crosses the
+Store module interface.
 
 The `CaptureRuntime` module owns UDP receipt, receive timestamps, exact
 HeaderRoute selection, authentication, and in-memory rate admission. It creates
@@ -53,9 +54,10 @@ SQLite is the only persistent and query authority. A transaction-local derived
 map may simplify one candidate or read, but it ends with that transaction and
 cannot become a process-lifetime capability or Profile catalog.
 
-The query module owns bounded reads of committed topology and native-coordinate
-CSI. Each read returns a complete typed body and receipt from one SQLite
-snapshot. It cannot read current configuration or writer memory.
+The Store module's `QueryStore` interface owns bounded reads of committed
+topology and native-coordinate CSI. Each read returns a complete typed body and
+receipt from one SQLite snapshot. Its private query implementation cannot read
+current configuration or writer memory.
 
 The HTTP module owns loopback listener admission, strict JSON serialization,
 ordinary-connection tracking, and bounded shutdown. Its tracked stream adapter
