@@ -127,7 +127,10 @@ fn serve_command(args: Vec<OsString>) -> ExitCode {
             () = host.wait_for_stop() => {}
         }
         match host.shutdown().await {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(queue_drop_count) => {
+                println!("Host runtime stopped: queue_drop_count={queue_drop_count}");
+                ExitCode::SUCCESS
+            }
             Err(error) => {
                 eprintln!("Host runtime shutdown failed: {error}");
                 ExitCode::from(1)

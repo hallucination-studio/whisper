@@ -671,18 +671,20 @@ impl HostRuntime {
         }
     }
 
-    /// Stops socket and delivery tasks, closes query state, and releases the lifecycle lease.
+    /// Stops the Host and returns its final capture-to-writer queue drop count.
     ///
     /// Cleanup continues on the independent supervisor if the returned future is cancelled.
     ///
     /// # Errors
     ///
     /// Returns the first writer, query, socket, task, or shutdown failure after all tasks join.
-    pub async fn shutdown(self) -> Result<(), RuntimeError> {
+    pub async fn shutdown(self) -> Result<u64, RuntimeError> {
         self.control.stop();
         #[cfg(feature = "ingest-test-hooks")]
         self.writer_hold.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
-        self.completion.wait().await
+        let result = self.completion.wait().await;
+        let queue_drop_count = self.queue_drop_count();
+        result.map(|()| queue_drop_count)
     }
 }
 

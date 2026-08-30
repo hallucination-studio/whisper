@@ -184,7 +184,9 @@ fn response_json(response: &[u8]) -> serde_json::Value {
     serde_json::from_slice(&response[separator + 4..]).expect("JSON response")
 }
 
-fn spawn_serve_cli(config_path: &Path) -> (std::process::Child, String) {
+fn spawn_serve_cli(
+    config_path: &Path,
+) -> (std::process::Child, String, BufReader<std::process::ChildStdout>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_whisper"))
         .args(["serve", config_path.to_str().expect("UTF-8 config path")])
         .stdout(Stdio::piped())
@@ -194,15 +196,16 @@ fn spawn_serve_cli(config_path: &Path) -> (std::process::Child, String) {
     let stdout = child.stdout.take().expect("capture serve stdout");
     let (line_tx, line_rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
         let mut line = String::new();
-        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        let result = stdout.read_line(&mut line).map(|_| (line, stdout));
         let _ = line_tx.send(result);
     });
-    let line = line_rx
+    let (line, stdout) = line_rx
         .recv_timeout(Duration::from_secs(3))
         .expect("serve CLI did not report startup")
         .expect("read serve startup");
-    (child, line)
+    (child, line, stdout)
 }
 
 fn wait_for_cli_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
@@ -321,7 +324,8 @@ async fn runtime_binds_roles_and_shutdown_releases_every_connection_and_lease() 
     assert!(http.ip().is_loopback());
     assert_ne!(http.port(), 0);
 
-    runtime.shutdown().await.expect("stop Host runtime");
+    let queue_drop_count = runtime.shutdown().await.expect("stop Host runtime");
+    assert_eq!(queue_drop_count, 0);
     HostRuntime::start(&fixture.config)
         .await
         .expect("lifecycle lease is reusable after runtime shutdown")
@@ -705,7 +709,8 @@ async fn runtime_queue_exhaustion_counts_the_drop_without_store_effect() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(committed, "the sole queued packet did not commit");
-    runtime.shutdown().await.expect("stop Host runtime");
+    let queue_drop_count = runtime.shutdown().await.expect("stop Host runtime");
+    assert_eq!(queue_drop_count, 1);
 }
 
 #[tokio::test]
@@ -959,7 +964,7 @@ fn cli_serve_runs_until_sigint_and_reports_network_role_failure() {
     assert!(String::from_utf8_lossy(&failed.stderr).contains("network bind roles are invalid"));
 
     let fixture = RuntimeFixture::new();
-    let (mut child, line) = spawn_serve_cli(&fixture.config_path);
+    let (mut child, line, mut stdout) = spawn_serve_cli(&fixture.config_path);
     assert!(line.starts_with("Host runtime started: capture="));
     assert!(line.contains(" http=127.0.0.1:"));
 
@@ -968,6 +973,8 @@ fn cli_serve_runs_until_sigint_and_reports_network_role_failure() {
         .status()
         .expect("signal serve CLI");
     assert!(signal.success());
+    let mut stopped = String::new();
+    stdout.read_to_string(&mut stopped).expect("read serve shutdown report");
     let status = child.wait().expect("wait for serve CLI");
     let mut stderr = String::new();
     child
@@ -977,12 +984,13 @@ fn cli_serve_runs_until_sigint_and_reports_network_role_failure() {
         .read_to_string(&mut stderr)
         .expect("read stderr");
     assert!(status.success(), "serve CLI failed after SIGINT: {stderr}");
+    assert_eq!(stopped, "Host runtime stopped: queue_drop_count=0\n");
 }
 
 #[test]
 fn cli_serve_reports_a_fatal_query_and_exits_unsuccessfully() {
     let fixture = RuntimeFixture::new();
-    let (mut child, line) = spawn_serve_cli(&fixture.config_path);
+    let (mut child, line, mut stdout) = spawn_serve_cli(&fixture.config_path);
     let http_address: std::net::SocketAddr = line
         .split_once(" http=")
         .expect("startup line HTTP address")
@@ -1005,6 +1013,8 @@ fn cli_serve_reports_a_fatal_query_and_exits_unsuccessfully() {
     assert!(response.starts_with(b"HTTP/1.1 500 Internal Server Error\r\n"));
 
     let status = wait_for_cli_exit(&mut child);
+    let mut stopped = String::new();
+    stdout.read_to_string(&mut stopped).expect("read fatal CLI stdout");
     let mut stderr = String::new();
     child
         .stderr
@@ -1013,6 +1023,7 @@ fn cli_serve_reports_a_fatal_query_and_exits_unsuccessfully() {
         .read_to_string(&mut stderr)
         .expect("read stderr");
     assert!(!status.success());
+    assert!(stopped.is_empty(), "fatal CLI reported a passing queue-drop count: {stopped}");
     assert!(stderr.contains("Host runtime shutdown failed"));
     assert!(stderr.contains("Query Store"));
 }
