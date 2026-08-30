@@ -399,7 +399,7 @@ pub(crate) struct CaptureRun {
     #[cfg(all(unix, feature = "ingest-test-hooks"))]
     writer_hold_release: Option<SyncSender<()>>,
     #[cfg(unix)]
-    _managed: ManagedRoot,
+    managed: Arc<ManagedRoot>,
 }
 
 impl CaptureRun {
@@ -436,8 +436,13 @@ impl CaptureRun {
             reject_next_csi_domain: false,
             #[cfg(feature = "ingest-test-hooks")]
             writer_hold_release: None,
-            _managed: managed,
+            managed: Arc::new(managed),
         })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn managed_root(&self) -> Arc<ManagedRoot> {
+        Arc::clone(&self.managed)
     }
 
     pub(crate) const fn store_id(&self) -> [u8; 32] {

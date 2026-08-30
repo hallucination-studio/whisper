@@ -325,6 +325,18 @@ impl CaptureRun {
         self.inner.elapsed()
     }
 
+    /// Opens the pinned read-only query capability for this Managed-store lifecycle.
+    ///
+    /// QueryStore clones retain the lifecycle lease until their pinned reader closes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the existing Demo Store cannot be opened and validated read-only.
+    #[cfg(unix)]
+    pub fn query_store(&self) -> Result<QueryStore, QueryError> {
+        query::QueryStore::from_managed(self.inner.managed_root())
+    }
+
     /// Returns the number of candidates dropped because the writer queue was full.
     #[cfg(unix)]
     #[must_use]
