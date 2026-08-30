@@ -31,7 +31,7 @@ const MAX_STAGE_NAME_ATTEMPTS: usize = 16;
 const RANDOM_SOURCE: &str = "/dev/urandom";
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ManagedStoreError {
+pub(super) enum ManagedStoreError {
     #[error("the Managed store root is not trusted")]
     RootTrust,
     #[error("the Managed store lease is not trusted")]
@@ -59,13 +59,13 @@ fn io_error(path: &Path, source: io::Error) -> ManagedStoreError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Identity {
+pub(super) struct Identity {
     device: u64,
     inode: u64,
 }
 
 #[derive(Debug)]
-pub(crate) struct ManagedRoot {
+pub(super) struct ManagedRoot {
     root_path: PathBuf,
     final_path: PathBuf,
     root: File,
@@ -85,13 +85,13 @@ enum ManagedTarget {
 }
 
 impl ManagedRoot {
-    pub(crate) fn acquire_for_initialization(
+    pub(super) fn acquire_for_initialization(
         database_path: &Path,
     ) -> Result<Self, ManagedStoreError> {
         Self::acquire(database_path, ManagedTarget::Absent)
     }
 
-    pub(crate) fn acquire_existing(database_path: &Path) -> Result<Self, ManagedStoreError> {
+    pub(super) fn acquire_existing(database_path: &Path) -> Result<Self, ManagedStoreError> {
         Self::acquire(database_path, ManagedTarget::Existing)
     }
 
@@ -173,11 +173,11 @@ impl ManagedRoot {
         Ok(Self { root_path, final_path, root, lease })
     }
 
-    pub(crate) fn database_path(&self) -> &Path {
+    pub(super) fn database_path(&self) -> &Path {
         &self.final_path
     }
 
-    pub(crate) fn create_stage(&self) -> Result<ManagedStage, ManagedStoreError> {
+    pub(super) fn create_stage(&self) -> Result<ManagedStage, ManagedStoreError> {
         for _ in 0..MAX_STAGE_NAME_ATTEMPTS {
             let mut random = [0_u8; STAGE_NAME_RANDOM_BYTES];
             fill_random(&mut random)?;
@@ -207,7 +207,7 @@ impl ManagedRoot {
         Err(ManagedStoreError::StageNameExhausted)
     }
 
-    pub(crate) fn publish(&self, mut stage: ManagedStage) -> Result<PathBuf, ManagedStoreError> {
+    pub(super) fn publish(&self, mut stage: ManagedStage) -> Result<PathBuf, ManagedStoreError> {
         require_absent(&self.final_path)?;
         stage.prepare_for_publication()?;
         fs::hard_link(&stage.path, &self.final_path).map_err(|error| {
@@ -248,7 +248,7 @@ impl ManagedRoot {
         Ok(())
     }
 
-    pub(crate) fn remove_published_if_owned(
+    pub(super) fn remove_published_if_owned(
         &self,
         identity: Identity,
     ) -> Result<(), ManagedStoreError> {
@@ -258,7 +258,7 @@ impl ManagedRoot {
         self.root.sync_all().map_err(|source| io_error(&self.root_path, source))
     }
 
-    pub(crate) fn finish_closed_database(&self) -> Result<(), ManagedStoreError> {
+    pub(super) fn finish_closed_database(&self) -> Result<(), ManagedStoreError> {
         remove_sqlite_companion_checked(&self.final_path, "-wal", true)?;
         remove_sqlite_companion_checked(&self.final_path, "-shm", false)?;
         validate_existing_file(&self.final_path)?;
@@ -266,7 +266,7 @@ impl ManagedRoot {
     }
 }
 
-pub(crate) fn validate_existing_for_reader(
+pub(super) fn validate_existing_for_reader(
     database_path: &Path,
 ) -> Result<(PathBuf, Identity), ManagedStoreError> {
     let file_name = database_path.file_name().ok_or(ManagedStoreError::InvalidTarget)?;
@@ -308,22 +308,22 @@ pub(crate) fn validate_existing_for_reader(
 }
 
 #[derive(Debug)]
-pub(crate) struct ManagedStage {
+pub(super) struct ManagedStage {
     path: PathBuf,
     identity: Identity,
     published: bool,
 }
 
 impl ManagedStage {
-    pub(crate) fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) const fn identity(&self) -> Identity {
+    pub(super) const fn identity(&self) -> Identity {
         self.identity
     }
 
-    pub(crate) fn sync(&self) -> Result<(), ManagedStoreError> {
+    pub(super) fn sync(&self) -> Result<(), ManagedStoreError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -365,7 +365,7 @@ impl Drop for ManagedStage {
     }
 }
 
-pub(crate) fn fill_random(bytes: &mut [u8]) -> Result<(), ManagedStoreError> {
+pub(super) fn fill_random(bytes: &mut [u8]) -> Result<(), ManagedStoreError> {
     let path = Path::new(RANDOM_SOURCE);
     let mut source = File::open(path).map_err(|source| io_error(path, source))?;
     source.read_exact(bytes).map_err(|source| io_error(path, source))

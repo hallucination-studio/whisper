@@ -11,10 +11,6 @@ pub(crate) mod domain;
 mod hex;
 pub(crate) mod key_material;
 #[cfg(unix)]
-mod managed_store;
-#[cfg(unix)]
-mod query;
-#[cfg(unix)]
 mod runtime;
 pub(crate) mod session;
 #[cfg(unix)]
@@ -33,19 +29,19 @@ pub use domain::identity::SessionId;
 pub use domain::time::SessionTime;
 #[cfg(all(unix, feature = "ingest-test-hooks"))]
 #[doc(hidden)]
-pub use query::QueryHold;
-#[cfg(unix)]
-pub use query::{
-    EmptyEnvelope, ErrorEnvelope, Metric, QueryError, QueryLimits, QueryStore, SignalPath,
-    SignalQuery, SignalQueryBuilder, SignalRange, SignalSelection, SignalsOk, SignalsResponse,
-    TopologyOk,
-};
-#[cfg(all(unix, feature = "ingest-test-hooks"))]
-#[doc(hidden)]
 pub use runtime::TeardownHold;
 #[cfg(unix)]
 #[doc(inline)]
 pub use runtime::{HostRuntime, RuntimeError, RuntimeFailure, SocketOperation, SocketRole};
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+#[doc(hidden)]
+pub use store::QueryHold;
+#[cfg(unix)]
+pub use store::{
+    EmptyEnvelope, ErrorEnvelope, Metric, QueryError, QueryLimits, QueryStore, SignalPath,
+    SignalQuery, SignalQueryBuilder, SignalRange, SignalSelection, SignalsOk, SignalsResponse,
+    TopologyOk,
+};
 
 use std::backtrace::Backtrace;
 use std::error::Error;
@@ -370,7 +366,7 @@ impl CaptureRuntime {
     /// Returns an error when the existing Store cannot be opened and validated read-only.
     #[cfg(unix)]
     pub fn query_store(&self) -> Result<QueryStore, QueryError> {
-        query::QueryStore::from_managed(self.inner.managed_root())
+        self.inner.query_store()
     }
 
     /// Returns the number of candidates dropped because the writer queue was full.

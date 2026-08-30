@@ -1,6 +1,10 @@
-//! Closed Store schema, initialization, and validation.
+//! SQLite implementation of the Store interfaces.
 
+use std::backtrace::Backtrace;
+use std::error::Error;
+use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ciborium::ser::into_writer;
@@ -8,13 +12,14 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::managed::{ManagedRoot, ManagedStage, ManagedStoreError, fill_random};
+use super::query::{QueryError, QueryStore};
 use crate::Config;
 use crate::database::{
     Admission, DatabaseError, EpochHandle, ReplayWindowIdentity, advance_admission,
 };
 use crate::domain::identity::{DeviceId, HardwareKind, KeyEpoch};
 use crate::hex;
-use crate::managed_store::{ManagedStage, ManagedStoreError, fill_random};
 use crate::wire::{CandidateBody, WireCandidate};
 use crate::{
     CaptureRecordSequence, CommitOutcome, CommitReceipt, PacketDisposition, ProjectionSequence,
@@ -52,8 +57,77 @@ pub(crate) struct AdmissionEpochSeed {
     pub(crate) replay_window_size: u16,
 }
 
+/// One validated Store and its retained Managed-root lifecycle lease.
+#[derive(Debug)]
+pub(crate) struct Store {
+    managed: Arc<ManagedRoot>,
+}
+
+impl Store {
+    pub(crate) fn acquire_for_initialization(config: &Config) -> Result<Self, StoreError> {
+        let managed = ManagedRoot::acquire_for_initialization(config.session().database_path())?;
+        Ok(Self { managed: Arc::new(managed) })
+    }
+
+    pub(crate) fn initialize(
+        self,
+        config: &Config,
+        admissions: Vec<AdmissionEpochSeed>,
+    ) -> Result<(), StoreError> {
+        let stage = self.managed.create_stage()?;
+        let stage_identity = stage.identity();
+        let initialized = initialize_stage(&stage, config, admissions)?;
+        let final_path = self.managed.publish(stage)?;
+        if let Err(error) = initialized.validate(&final_path) {
+            self.managed.remove_published_if_owned(stage_identity)?;
+            return Err(error);
+        }
+        if let Err(error) = self.managed.finish_closed_database() {
+            self.managed.remove_published_if_owned(stage_identity)?;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn acquire_existing(config: &Config) -> Result<Self, StoreError> {
+        let managed = ManagedRoot::acquire_existing(config.session().database_path())?;
+        Ok(Self { managed: Arc::new(managed) })
+    }
+
+    pub(crate) fn create_capture_session(
+        &self,
+        config: &Config,
+        admissions: Vec<AdmissionEpochSeed>,
+    ) -> Result<CaptureSession, StoreError> {
+        open_and_create_capture_session(self.managed.database_path(), config, admissions)
+    }
+
+    pub(crate) fn query_store(&self) -> Result<QueryStore, QueryError> {
+        QueryStore::from_managed(Arc::clone(&self.managed))
+    }
+}
+
+pub(crate) struct StoreError {
+    inner: Box<StoreErrorInner>,
+}
+
+struct StoreErrorInner {
+    source: StoreErrorKind,
+    backtrace: Backtrace,
+}
+
+impl fmt::Debug for StoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoreError")
+            .field("source", &self.inner.source)
+            .field("backtrace", &self.inner.backtrace)
+            .finish()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum StoreError {
+enum StoreErrorKind {
     #[error("Store SQLite operation failed: {0}")]
     Sql(#[source] rusqlite::Error),
     #[error("Store configuration encoding failed")]
@@ -68,24 +142,72 @@ pub(crate) enum StoreError {
     Clock,
     #[error("Store replay admission failed: {0}")]
     Admission(#[source] DatabaseError),
-    #[error(transparent)]
-    Managed(#[from] ManagedStoreError),
+    #[error("Managed Store operation failed: {0}")]
+    Managed(#[source] ManagedStoreError),
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.source.fmt(formatter)
+    }
+}
+
+impl Error for StoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.inner.source)
+    }
 }
 
 impl From<rusqlite::Error> for StoreError {
     fn from(source: rusqlite::Error) -> Self {
-        Self::Sql(source)
+        Self::new(StoreErrorKind::Sql(source))
     }
 }
 
 impl From<crate::ConfigError> for StoreError {
     fn from(source: crate::ConfigError) -> Self {
-        Self::Config(source)
+        Self::new(StoreErrorKind::Config(source))
+    }
+}
+
+impl From<ManagedStoreError> for StoreError {
+    fn from(source: ManagedStoreError) -> Self {
+        Self::new(StoreErrorKind::Managed(source))
+    }
+}
+
+impl StoreError {
+    fn new(source: StoreErrorKind) -> Self {
+        Self { inner: Box::new(StoreErrorInner { source, backtrace: Backtrace::capture() }) }
+    }
+
+    fn incompatible() -> Self {
+        Self::new(StoreErrorKind::Incompatible)
+    }
+
+    fn admission(source: DatabaseError) -> Self {
+        Self::new(StoreErrorKind::Admission(source))
+    }
+
+    fn checkpoint() -> Self {
+        Self::new(StoreErrorKind::Checkpoint)
+    }
+
+    fn clock() -> Self {
+        Self::new(StoreErrorKind::Clock)
+    }
+
+    fn topology(message: String) -> Self {
+        Self::new(StoreErrorKind::Topology(message))
+    }
+
+    pub(crate) const fn is_lease_conflict(&self) -> bool {
+        matches!(self.inner.source, StoreErrorKind::Managed(ManagedStoreError::LeaseConflict))
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct InitializedStore {
+struct InitializedStore {
     expected: ExpectedStore,
     store_id: [u8; STORE_ID_BYTES],
 }
@@ -107,15 +229,27 @@ struct ExpectedStore {
 
 #[derive(Debug)]
 pub(crate) struct CaptureSession {
-    pub(crate) store_id: [u8; STORE_ID_BYTES],
-    pub(crate) session_id: String,
-    pub(crate) monotonic_origin: Instant,
+    store_id: [u8; STORE_ID_BYTES],
+    session_id: String,
+    monotonic_origin: Instant,
     connection: Connection,
     admissions: Vec<AdmissionEpochSeed>,
     config: Config,
 }
 
 impl CaptureSession {
+    pub(crate) const fn store_id(&self) -> [u8; STORE_ID_BYTES] {
+        self.store_id
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) const fn monotonic_origin(&self) -> Instant {
+        self.monotonic_origin
+    }
+
     pub(crate) fn commit(&mut self, candidate: WireCandidate) -> Result<CommitOutcome, StoreError> {
         self.commit_inner(candidate, false)
     }
@@ -149,7 +283,7 @@ impl CaptureSession {
                 },
             )
             .optional()?
-            .ok_or(StoreError::Incompatible)?;
+            .ok_or(StoreError::incompatible())?;
         let watermark: Vec<u8> = transaction
             .query_row(
                 "SELECT projection_commit_seq FROM store_state WHERE singleton = 1",
@@ -157,7 +291,7 @@ impl CaptureSession {
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or(StoreError::Incompatible)?;
+            .ok_or(StoreError::incompatible())?;
         let watermark = ProjectionSequence::new(decode_u64(&watermark)?);
 
         let route = candidate.header_route();
@@ -167,7 +301,7 @@ impl CaptureSession {
             .find(|admission| {
                 admission.device == route.device() && admission.key_epoch == route.key_epoch()
             })
-            .ok_or(StoreError::Incompatible)?;
+            .ok_or(StoreError::incompatible())?;
         let epoch = EpochHandle::new(
             admission.device,
             admission.key_epoch,
@@ -181,13 +315,13 @@ impl CaptureSession {
         ) {
             Ok(()) => {}
             Err(DatabaseError::Replay) => return Ok(CommitOutcome::ReplayRejected),
-            Err(error) => return Err(StoreError::Admission(error)),
+            Err(error) => return Err(StoreError::admission(error)),
         }
 
         let (record_sequence, previous_projection) = match (&cursor, &previous_time) {
             (None, None) => {
                 if session_projection.is_some() {
-                    return Err(StoreError::Incompatible);
+                    return Err(StoreError::incompatible());
                 }
                 (CaptureRecordSequence::new(0), None)
             }
@@ -196,19 +330,19 @@ impl CaptureSession {
                 let previous_time =
                     crate::domain::time::SessionTime::from_nanos(decode_u64(previous_time)?);
                 if candidate.session_time() < previous_time {
-                    return Err(StoreError::Incompatible);
+                    return Err(StoreError::incompatible());
                 }
-                let next = cursor.checked_next().ok_or(StoreError::Incompatible)?;
+                let next = cursor.checked_next().ok_or(StoreError::incompatible())?;
                 (next, session_projection.as_deref())
             }
-            _ => return Err(StoreError::Incompatible),
+            _ => return Err(StoreError::incompatible()),
         };
         if let Some(previous_projection) = previous_projection
             && ProjectionSequence::new(decode_u64(previous_projection)?) != watermark
         {
-            return Err(StoreError::Incompatible);
+            return Err(StoreError::incompatible());
         }
-        let projection_sequence = watermark.checked_next().ok_or(StoreError::Incompatible)?;
+        let projection_sequence = watermark.checked_next().ok_or(StoreError::incompatible())?;
         let mut capability_row = None;
         let mut observation_row = None;
         let disposition = match candidate.body() {
@@ -219,7 +353,7 @@ impl CaptureSession {
                     .config
                     .registry()
                     .resolve_authenticated_route(route)
-                    .map_err(|_| StoreError::Incompatible)?;
+                    .map_err(|_| StoreError::incompatible())?;
                 if capability.descriptor().firmware_build_digest()
                     != resolved.sensor.firmware_build_digest()
                 {
@@ -240,7 +374,7 @@ impl CaptureSession {
                     .config
                     .registry()
                     .resolve_authenticated_route(route)
-                    .map_err(|_| StoreError::Incompatible)?;
+                    .map_err(|_| StoreError::incompatible())?;
                 if health.capability_digest() == resolved.sensor.capability_digest() {
                     PacketDisposition::HealthCommitted
                 } else {
@@ -263,22 +397,22 @@ impl CaptureSession {
                 if let Some((digest, descriptor)) = capability_row {
                     let capability =
                         crate::wire::CapabilitiesV1::from_persisted(&digest, &descriptor)
-                            .map_err(|_| StoreError::Incompatible)?;
+                            .map_err(|_| StoreError::incompatible())?;
                     let resolved = self
                         .config
                         .registry()
                         .resolve_authenticated_route(route)
-                        .map_err(|_| StoreError::Incompatible)?;
+                        .map_err(|_| StoreError::incompatible())?;
                     let radio = data.radio();
                     let plaintext_bytes = crate::wire::CSI_FIXED_BODY_BYTES
                         .checked_add(
                             data.blocks()
                                 .len()
                                 .checked_mul(crate::wire::LTF_BLOCK_BYTES)
-                                .ok_or(StoreError::Incompatible)?,
+                                .ok_or(StoreError::incompatible())?,
                         )
                         .and_then(|bytes| bytes.checked_add(data.raw_csi().len()))
-                        .ok_or(StoreError::Incompatible)?;
+                        .ok_or(StoreError::incompatible())?;
                     if capability.descriptor().firmware_build_digest()
                         != resolved.sensor.firmware_build_digest()
                     {
@@ -310,7 +444,7 @@ impl CaptureSession {
                             record_sequence,
                             candidate.session_time(),
                         )
-                        .map_err(|_| StoreError::Incompatible)?;
+                        .map_err(|_| StoreError::incompatible())?;
                         match crate::wire::resolve_capture_csi(
                             input,
                             route,
@@ -393,9 +527,9 @@ impl CaptureSession {
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?
-                    .ok_or(StoreError::Incompatible)?;
+                    .ok_or(StoreError::incompatible())?;
                 if existing.0.as_slice() != digest || existing.1.as_slice() != descriptor {
-                    return Err(StoreError::Incompatible);
+                    return Err(StoreError::incompatible());
                 }
             }
         }
@@ -438,7 +572,7 @@ impl CaptureSession {
             ],
         )?;
         if updated_session != 1 {
-            return Err(StoreError::Incompatible);
+            return Err(StoreError::incompatible());
         }
         let updated_store = transaction.execute(
             "UPDATE store_state SET projection_commit_seq = ?1
@@ -446,7 +580,7 @@ impl CaptureSession {
             params![projection_sequence.to_be_bytes(), watermark.to_be_bytes()],
         )?;
         if updated_store != 1 {
-            return Err(StoreError::Incompatible);
+            return Err(StoreError::incompatible());
         }
         transaction.commit()?;
         Ok(CommitOutcome::Committed(CommitReceipt::new(
@@ -457,7 +591,7 @@ impl CaptureSession {
     }
 }
 
-pub(crate) fn initialize(
+fn initialize_stage(
     stage: &ManagedStage,
     config: &Config,
     admissions: Vec<AdmissionEpochSeed>,
@@ -523,15 +657,15 @@ pub(crate) fn initialize(
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
     if busy != 0 || log_frames != checkpointed {
-        return Err(StoreError::Checkpoint);
+        return Err(StoreError::checkpoint());
     }
-    connection.close().map_err(|(_, error)| StoreError::Sql(error))?;
+    connection.close().map_err(|(_, error)| StoreError::from(error))?;
     stage.sync()?;
     validate_closed(stage.path(), &expected, store_id)?;
     Ok(InitializedStore { expected, store_id })
 }
 
-pub(crate) fn open_and_create_capture_session(
+fn open_and_create_capture_session(
     path: &Path,
     config: &Config,
     admissions: Vec<AdmissionEpochSeed>,
@@ -556,9 +690,9 @@ pub(crate) fn open_and_create_capture_session(
     let store_id = validate_state(&connection, &expected, AdmissionExpectation::Existing)?;
 
     let started_utc_ns =
-        SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| StoreError::Clock)?.as_nanos();
+        SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| StoreError::clock())?.as_nanos();
     let started_utc_ns =
-        u64::try_from(started_utc_ns).map_err(|_| StoreError::Clock)?.to_be_bytes();
+        u64::try_from(started_utc_ns).map_err(|_| StoreError::clock())?.to_be_bytes();
     let mut random = [0_u8; CAPTURE_SESSION_RANDOM_BYTES];
     fill_random(&mut random)?;
     let session_id = format!("{CAPTURE_SESSION_ID_PREFIX}{}", hex::encode(&random));
@@ -590,7 +724,7 @@ pub(crate) fn open_and_create_capture_session(
 }
 
 fn decode_u64(bytes: &[u8]) -> Result<u64, StoreError> {
-    let bytes: [u8; 8] = bytes.try_into().map_err(|_| StoreError::Incompatible)?;
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| StoreError::incompatible())?;
     Ok(u64::from_be_bytes(bytes))
 }
 
@@ -613,13 +747,13 @@ fn validate_closed(
     validate_schema(&connection)?;
     let store_id = validate_state(&connection, expected, AdmissionExpectation::Empty)?;
     if store_id != expected_store_id {
-        return Err(StoreError::Incompatible);
+        return Err(StoreError::incompatible());
     }
-    connection.close().map_err(|(_, error)| StoreError::Sql(error))?;
+    connection.close().map_err(|(_, error)| StoreError::from(error))?;
     Ok(())
 }
 
-pub(crate) fn open_query_reader(path: &Path) -> Result<Connection, StoreError> {
+pub(super) fn open_query_reader(path: &Path) -> Result<Connection, StoreError> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -654,7 +788,7 @@ fn verify_persistent_settings(connection: &Connection) -> Result<(), StoreError>
     let user_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if application_id != STORE_APPLICATION_ID || user_version != STORE_USER_VERSION {
-        return Err(StoreError::Incompatible);
+        return Err(StoreError::incompatible());
     }
     verify_journal_mode(connection)
 }
@@ -663,7 +797,7 @@ fn verify_journal_mode(connection: &Connection) -> Result<(), StoreError> {
     let journal_mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
-        return Err(StoreError::Incompatible);
+        return Err(StoreError::incompatible());
     }
     Ok(())
 }
@@ -674,21 +808,21 @@ fn verify_connection(connection: &Connection, kind: ConnectionKind) -> Result<()
     let trusted_schema: i64 =
         connection.pragma_query_value(None, "trusted_schema", |row| row.get(0))?;
     if foreign_keys != 1 || trusted_schema != 0 {
-        return Err(StoreError::Incompatible);
+        return Err(StoreError::incompatible());
     }
     match kind {
         ConnectionKind::Writer => {
             let synchronous: i64 =
                 connection.pragma_query_value(None, "synchronous", |row| row.get(0))?;
             if synchronous != SQLITE_SYNCHRONOUS_FULL {
-                return Err(StoreError::Incompatible);
+                return Err(StoreError::incompatible());
             }
         }
         ConnectionKind::Reader => {
             let query_only: i64 =
                 connection.pragma_query_value(None, "query_only", |row| row.get(0))?;
             if query_only != 1 {
-                return Err(StoreError::Incompatible);
+                return Err(StoreError::incompatible());
             }
         }
     }
@@ -699,7 +833,7 @@ fn validate_schema(connection: &Connection) -> Result<(), StoreError> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(STORE_SCHEMA)?;
     if read_schema(connection)? != read_schema(&expected)? {
-        return Err(StoreError::Incompatible);
+        return Err(StoreError::incompatible());
     }
     Ok(())
 }
@@ -768,7 +902,7 @@ fn validate_state(
             },
         )
         .optional()?
-        .ok_or(StoreError::Incompatible)?;
+        .ok_or(StoreError::incompatible())?;
     let state_count: u64 =
         connection.query_row("SELECT count(*) FROM store_state", [], |row| row.get(0))?;
     if state_count != 1
@@ -781,9 +915,9 @@ fn validate_state(
         || matches!(admission_expectation, AdmissionExpectation::Empty)
             && state.projection_commit_sequence.as_slice() != PROJECTION_SEQUENCE_ZERO
     {
-        return Err(StoreError::Incompatible);
+        return Err(StoreError::incompatible());
     }
-    let store_id = state.store_id.as_slice().try_into().map_err(|_| StoreError::Incompatible)?;
+    let store_id = state.store_id.as_slice().try_into().map_err(|_| StoreError::incompatible())?;
 
     let rows = connection
         .prepare(
@@ -804,7 +938,7 @@ fn validate_state(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     if rows.len() != expected.admissions.len() {
-        return Err(StoreError::Incompatible);
+        return Err(StoreError::incompatible());
     }
     for (row, admission) in rows.iter().zip(&expected.admissions) {
         let bitmap_bytes = usize::from(admission.replay_window_size).div_ceil(8);
@@ -814,7 +948,7 @@ fn validate_state(
             || row.replay_window_size != admission.replay_window_size
             || row.seen_bitmap.len() != bitmap_bytes
         {
-            return Err(StoreError::Incompatible);
+            return Err(StoreError::incompatible());
         }
         match admission_expectation {
             AdmissionExpectation::Empty => {
@@ -822,7 +956,7 @@ fn validate_state(
                     || row.maximum_message_sequence.is_some()
                     || row.seen_bitmap.iter().any(|byte| *byte != 0)
                 {
-                    return Err(StoreError::Incompatible);
+                    return Err(StoreError::incompatible());
                 }
             }
             AdmissionExpectation::Existing => validate_replay_state(
@@ -845,24 +979,24 @@ fn validate_replay_state(
     match (boot_generation, maximum_message_sequence) {
         (None, None) if bitmap.iter().all(|byte| *byte == 0) => {}
         (Some(boot), Some(sequence)) => {
-            let boot: [u8; 4] = boot.try_into().map_err(|_| StoreError::Incompatible)?;
-            let sequence: [u8; 8] = sequence.try_into().map_err(|_| StoreError::Incompatible)?;
+            let boot: [u8; 4] = boot.try_into().map_err(|_| StoreError::incompatible())?;
+            let sequence: [u8; 8] = sequence.try_into().map_err(|_| StoreError::incompatible())?;
             if u32::from_be_bytes(boot) == 0
                 || u64::from_be_bytes(sequence) == 0
                 || bitmap.first().is_none_or(|byte| byte & 1 == 0)
             {
-                return Err(StoreError::Incompatible);
+                return Err(StoreError::incompatible());
             }
         }
-        _ => return Err(StoreError::Incompatible),
+        _ => return Err(StoreError::incompatible()),
     }
     let unused_bits = bitmap
         .len()
         .checked_mul(8)
         .and_then(|bits| bits.checked_sub(usize::from(window_size)))
-        .ok_or(StoreError::Incompatible)?;
+        .ok_or(StoreError::incompatible())?;
     if unused_bits != 0 && bitmap.last().is_some_and(|byte| byte >> (8 - unused_bits) != 0) {
-        return Err(StoreError::Incompatible);
+        return Err(StoreError::incompatible());
     }
     Ok(())
 }
@@ -929,7 +1063,7 @@ fn encode_topology(config: &Config) -> Result<Vec<u8>, StoreError> {
         links,
     };
     let mut bytes = Vec::new();
-    into_writer(&manifest, &mut bytes).map_err(|error| StoreError::Topology(error.to_string()))?;
+    into_writer(&manifest, &mut bytes).map_err(|error| StoreError::topology(error.to_string()))?;
     Ok(bytes)
 }
 

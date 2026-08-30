@@ -16,13 +16,13 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::managed::{Identity, ManagedRoot, validate_existing_for_reader};
+use super::sqlite::{StoreError, open_query_reader};
 use crate::domain::identity::{
     DeploymentId, RadioLinkId, SensorId, SessionId, SpaceId, TransmitterId,
 };
 use crate::domain::time::SessionTime;
 use crate::hex;
-use crate::managed_store::{Identity, ManagedRoot, validate_existing_for_reader};
-use crate::store::{StoreError, open_query_reader};
 use crate::{ProjectionCommit, ProjectionSequence};
 
 const TOPOLOGY_MANIFEST_SCHEMA: u8 = 1;
@@ -187,7 +187,7 @@ impl fmt::Debug for QueryStore {
 }
 
 impl QueryStore {
-    pub(crate) fn from_managed(managed: Arc<ManagedRoot>) -> Result<Self, QueryError> {
+    pub(super) fn from_managed(managed: Arc<ManagedRoot>) -> Result<Self, QueryError> {
         let database_path = managed.database_path();
         let (database_path, file_identity) =
             validate_existing_for_reader(database_path).map_err(StoreError::from)?;

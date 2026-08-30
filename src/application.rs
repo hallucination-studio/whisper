@@ -26,9 +26,7 @@ use crate::database::{Database, DatabaseError, EpochHandle, ReplayWindowIdentity
 use crate::domain::identity::{DeploymentId, DeviceId, KeyEpoch};
 use crate::key_material::{EpochKey, SecretStoreError, load_epoch_key};
 #[cfg(unix)]
-use crate::managed_store::{ManagedRoot, ManagedStoreError};
-#[cfg(unix)]
-use crate::store::{self, AdmissionEpochSeed, StoreError};
+use crate::store::{AdmissionEpochSeed, CaptureSession, QueryError, QueryStore, Store, StoreError};
 #[cfg(unix)]
 use crate::wire::{self, IngestError};
 #[cfg(unix)]
@@ -324,9 +322,6 @@ pub(crate) enum HostError {
     SecretStore(#[from] SecretStoreError),
     #[cfg(unix)]
     #[error(transparent)]
-    ManagedStore(#[from] ManagedStoreError),
-    #[cfg(unix)]
-    #[error(transparent)]
     Store(#[from] StoreError),
     #[cfg(unix)]
     #[error(transparent)]
@@ -397,19 +392,15 @@ pub(crate) struct CaptureRuntime {
     #[cfg(all(unix, feature = "ingest-test-hooks"))]
     reject_next_csi_domain: bool,
     #[cfg(unix)]
-    managed: Arc<ManagedRoot>,
+    store: Store,
 }
 
 impl CaptureRuntime {
     #[cfg(unix)]
-    fn new(
-        managed: ManagedRoot,
-        config: Config,
-        capture: store::CaptureSession,
-    ) -> Result<Self, HostError> {
-        let store_id = capture.store_id;
-        let session_id = capture.session_id.clone();
-        let monotonic_origin = capture.monotonic_origin;
+    fn new(store: Store, config: Config, capture: CaptureSession) -> Result<Self, HostError> {
+        let store_id = capture.store_id();
+        let session_id = capture.session_id().to_owned();
+        let monotonic_origin = capture.monotonic_origin();
         let capacity = usize::try_from(config.server().command_queue_capacity())
             .map_err(|_| HostError::WriterQueueCapacity)?;
         let writer_stopped = Arc::new(AtomicBool::new(false));
@@ -437,13 +428,13 @@ impl CaptureRuntime {
             queue_drop_count: 0,
             #[cfg(feature = "ingest-test-hooks")]
             reject_next_csi_domain: false,
-            managed: Arc::new(managed),
+            store,
         })
     }
 
     #[cfg(unix)]
-    pub(crate) fn managed_root(&self) -> Arc<ManagedRoot> {
-        Arc::clone(&self.managed)
+    pub(crate) fn query_store(&self) -> Result<QueryStore, QueryError> {
+        self.store.query_store()
     }
 
     pub(crate) const fn store_id(&self) -> [u8; 32] {
@@ -792,7 +783,7 @@ impl Drop for WriterHold {
 }
 
 #[cfg(unix)]
-fn writer_loop(mut capture: store::CaptureSession, inbox: Arc<WriterInbox>) {
+fn writer_loop(mut capture: CaptureSession, inbox: Arc<WriterInbox>) {
     let _stopped = WriterStoppedGuard(Arc::clone(&inbox));
     while let Some(PendingCandidate {
         candidate,
@@ -894,7 +885,7 @@ impl HostError {
     pub(crate) const fn is_lease_conflict(&self) -> bool {
         #[cfg(unix)]
         {
-            matches!(self, Self::ManagedStore(ManagedStoreError::LeaseConflict))
+            matches!(self, Self::Store(error) if error.is_lease_conflict())
         }
         #[cfg(not(unix))]
         {
@@ -938,22 +929,9 @@ impl HostError {
 
 #[cfg(unix)]
 pub(crate) fn init_admission(config: &Config) -> Result<(), HostError> {
-    let managed = ManagedRoot::acquire_for_initialization(config.session().database_path())?;
+    let store = Store::acquire_for_initialization(config)?;
     let admissions = admission_seeds(config)?;
-
-    let stage = managed.create_stage()?;
-    let stage_identity = stage.identity();
-    let initialized = store::initialize(&stage, config, admissions)?;
-    let final_path = managed.publish(stage)?;
-    if let Err(error) = initialized.validate(&final_path) {
-        managed.remove_published_if_owned(stage_identity)?;
-        return Err(error.into());
-    }
-    if let Err(error) = managed.finish_closed_database() {
-        managed.remove_published_if_owned(stage_identity)?;
-        return Err(error.into());
-    }
-    Ok(())
+    store.initialize(config, admissions).map_err(Into::into)
 }
 
 #[cfg(not(unix))]
@@ -963,11 +941,10 @@ pub(crate) fn init_admission(_config: &Config) -> Result<(), HostError> {
 
 #[cfg(unix)]
 pub(crate) fn serve(config: &Config) -> Result<CaptureRuntime, HostError> {
-    let managed = ManagedRoot::acquire_existing(config.session().database_path())?;
+    let store = Store::acquire_existing(config)?;
     let admissions = admission_seeds(config)?;
-    let capture =
-        store::open_and_create_capture_session(managed.database_path(), config, admissions)?;
-    CaptureRuntime::new(managed, config.clone(), capture)
+    let capture = store.create_capture_session(config, admissions)?;
+    CaptureRuntime::new(store, config.clone(), capture)
 }
 
 #[cfg(not(unix))]
