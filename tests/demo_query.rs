@@ -102,6 +102,10 @@ fn signal_selection(session: &str, sensor: &str, link: &str) -> SignalSelection 
     SignalSelection::try_new(session, sensor, link).expect("signal selection")
 }
 
+fn query_store(run: &whisper::CaptureRun) -> QueryStore {
+    run.query_store().expect("open lifecycle-owned Query Store")
+}
+
 fn capability_body(
     firmware_digest: [u8; 32],
     abi_digest: [u8; 32],
@@ -254,10 +258,9 @@ fn commit_one_observation(
 fn empty_store_topology_comes_only_from_the_persisted_manifest_snapshot() {
     let fixture = DemoFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let topology = QueryStore::open(&fixture.database)
-        .expect("open Query Store")
-        .topology()
-        .expect("read topology snapshot");
+    let run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let store = query_store(&run);
+    let topology = store.topology().expect("read topology snapshot");
     let actual = serde_json::to_value(topology).expect("serialize topology DTO");
     let store_id =
         actual["receipt"]["projection_commit"]["store_id"].as_str().expect("hex Store ID");
@@ -291,27 +294,20 @@ fn empty_store_topology_comes_only_from_the_persisted_manifest_snapshot() {
             "receipt": {"projection_commit": {"store_id": store_id, "sequence": "0"}}
         })
     );
-}
-
-#[test]
-fn query_store_open_is_non_creating() {
-    let root = std::env::temp_dir().join(format!(
-        "whisper-missing-query-{}-{}",
-        std::process::id(),
-        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir(&root).expect("create query root");
-    let database = root.join("missing.sqlite3");
-    assert!(QueryStore::open(&database).is_err());
-    assert!(!database.exists());
-    fs::remove_dir(root).expect("remove query root");
+    drop(store);
+    run.shutdown().expect("stop Capture Run");
 }
 
 #[test]
 fn query_store_rejects_store_replacement_across_snapshots() {
     let fixture = DemoFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize original Demo Store");
-    let store = QueryStore::open(&fixture.database).expect("open original Query Store");
+    let run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let store = query_store(&run);
+    let replacement = fixture.root.join("replacement.sqlite3");
+    fs::write(&replacement, b"replacement").expect("create replacement file");
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+        .expect("protect replacement file");
     let replaced = fixture.root.join("replaced.sqlite3");
     fs::rename(&fixture.database, &replaced).expect("move original Store aside");
     for (suffix, name) in [("-wal", "replaced.sqlite3-wal"), ("-shm", "replaced.sqlite3-shm")] {
@@ -322,9 +318,38 @@ fn query_store_rejects_store_replacement_across_snapshots() {
             fs::rename(&companion, fixture.root.join(name)).expect("move original companion aside");
         }
     }
-    whisper::init_admission(&fixture.config).expect("initialize replacement Demo Store");
+    fs::rename(&replacement, &fixture.database).expect("publish replacement path");
 
     assert!(store.topology().is_err(), "a QueryStore must remain pinned to its opened Store");
+    drop(store);
+    run.shutdown().expect("stop Capture Run");
+}
+
+#[test]
+fn query_store_clones_retain_the_lifecycle_lease_until_the_reader_closes() {
+    let fixture = DemoFixture::new();
+    whisper::init_admission(&fixture.config).expect("initialize Demo Store");
+    let run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let store = query_store(&run);
+    let clone = store.clone();
+    run.shutdown().expect("stop Capture Run writer");
+
+    assert!(
+        whisper::serve(&fixture.config)
+            .expect_err("query reader must retain the lifecycle lease")
+            .is_lease_conflict()
+    );
+    drop(store);
+    assert!(
+        whisper::serve(&fixture.config)
+            .expect_err("last QueryStore clone still retains the lease")
+            .is_lease_conflict()
+    );
+    drop(clone);
+    whisper::serve(&fixture.config)
+        .expect("lease is reusable after the pinned reader closes")
+        .shutdown()
+        .expect("stop replacement Capture Run");
 }
 
 #[test]
@@ -358,15 +383,11 @@ fn topology_orders_visible_sessions_and_profiles_across_dynamic_links() {
         [2, 0, 0, 0, 0, 11],
         6,
     );
+    let store = query_store(&second);
     second.shutdown().expect("stop second Capture Run");
 
-    let actual = serde_json::to_value(
-        QueryStore::open(&fixture.database)
-            .expect("open Query Store")
-            .topology()
-            .expect("read topology snapshot"),
-    )
-    .expect("serialize topology DTO");
+    let actual = serde_json::to_value(store.topology().expect("read topology snapshot"))
+        .expect("serialize topology DTO");
     let mut expected_sessions = vec![first_session, second_session];
     expected_sessions.sort();
     assert_eq!(actual["data"]["sessions"], json!(expected_sessions));
@@ -402,6 +423,7 @@ fn raw_i_signals_preserve_native_axes_cells_and_same_snapshot_receipts() {
         [2, 0, 0, 0, 0, 10],
         1,
     );
+    let store = query_store(&run);
     run.shutdown().expect("stop Capture Run");
 
     let query = SignalQuery::builder(
@@ -413,8 +435,7 @@ fn raw_i_signals_preserve_native_axes_cells_and_same_snapshot_receipts() {
     .max_time_buckets(16)
     .build()
     .expect("signal query");
-    let response = QueryStore::open(&fixture.database)
-        .expect("open Query Store")
+    let response = store
         .signals(&query, QueryLimits::try_new(1024, 64).expect("query limits"))
         .expect("read signals snapshot");
     let actual = serde_json::to_value(response).expect("serialize signals DTO");
@@ -451,7 +472,6 @@ fn raw_i_signals_preserve_native_axes_cells_and_same_snapshot_receipts() {
     assert_eq!(actual["receipt"]["conditioning_version"], "amplitude-v1");
     assert_eq!(actual["receipt"]["algorithm_version"], "demo-native-coordinate-v1");
 
-    let store = QueryStore::open(&fixture.database).expect("reopen Query Store");
     let range = SignalRange::try_new(SessionTime::from_nanos(0), SessionTime::from_nanos(u64::MAX))
         .expect("metric range");
     for (metric, expected) in
@@ -495,8 +515,8 @@ fn signals_apply_empty_selectors_aggregation_and_phase_budget_without_fabricatio
         [2, 0, 0, 0, 0, 10],
         1,
     );
+    let store = query_store(&run);
     run.shutdown().expect("stop Capture Run");
-    let store = QueryStore::open(&fixture.database).expect("open Query Store");
     let range = SignalRange::try_new(SessionTime::from_nanos(0), SessionTime::from_nanos(u64::MAX))
         .expect("query range");
 
@@ -611,8 +631,8 @@ fn invalid_samples_and_valid_zero_remain_distinct_with_duplicate_timestamp_order
         equal_receive,
         &csi_body_with_samples(&capability[..32], [2, 0, 0, 0, 0, 10], 1, 0, [0, 0, 3, 4, 5, 6]),
     );
+    let store = query_store(&run);
     run.shutdown().expect("stop Capture Run");
-    let store = QueryStore::open(&fixture.database).expect("open Query Store");
     let range = SignalRange::try_new(SessionTime::from_nanos(0), SessionTime::from_nanos(u64::MAX))
         .expect("query range");
     let limits = QueryLimits::try_new(1024, 64).expect("query limits");
@@ -709,8 +729,8 @@ fn aggregation_uses_exact_half_open_buckets_and_ordered_valid_samples() {
             &csi_body_with_samples(&capability[..32], [2, 0, 0, 0, 0, 10], 1, 0, raw),
         );
     }
+    let store = query_store(&run);
     run.shutdown().expect("stop Capture Run");
-    let store = QueryStore::open(&fixture.database).expect("open Query Store");
     let full_range =
         SignalRange::try_new(SessionTime::from_nanos(0), SessionTime::from_nanos(u64::MAX))
             .expect("full range");
@@ -790,8 +810,8 @@ fn omitted_and_explicit_profile_selectors_preserve_separate_ordered_tiles() {
             &csi_body(&capability[..32], [2, 0, 0, 0, 0, 10], channel),
         );
     }
+    let store = query_store(&run);
     run.shutdown().expect("stop Capture Run");
-    let store = QueryStore::open(&fixture.database).expect("open Query Store");
     let range = SignalRange::try_new(SessionTime::from_nanos(0), SessionTime::from_nanos(u64::MAX))
         .expect("query range");
     let limits = QueryLimits::try_new(1024, 64).expect("query limits");
@@ -859,9 +879,9 @@ fn signals_keep_device_epochs_as_separate_strictly_ordered_tiles() {
             &csi_body(&capability[..32], [2, 0, 0, 0, 0, 10], 1),
         );
     }
+    let store = query_store(&run);
     run.shutdown().expect("stop Capture Run");
-    let response = QueryStore::open(&fixture.database)
-        .expect("open Query Store")
+    let response = store
         .signals(
             &SignalQuery::builder(
                 signal_selection(&session, "sensor-a", "link-a"),
@@ -904,7 +924,8 @@ fn invalid_absent_and_projection_failures_have_canonical_error_shapes() {
 
     let fixture = DemoFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Demo Store");
-    let store = QueryStore::open(&fixture.database).expect("open Query Store");
+    let run = whisper::serve(&fixture.config).expect("start Capture Run");
+    let store = query_store(&run);
     let absent = store
         .signals(
             &SignalQuery::builder(
@@ -935,12 +956,17 @@ fn invalid_absent_and_projection_failures_have_canonical_error_shapes() {
             }
         })
     );
+    drop(store);
+    run.shutdown().expect("stop Capture Run");
 }
 
 #[test]
 fn queries_fail_closed_on_noncanonical_manifest_and_projection_envelope_mismatch() {
     let topology_fixture = DemoFixture::new();
     whisper::init_admission(&topology_fixture.config).expect("initialize topology Store");
+    let topology_run =
+        whisper::serve(&topology_fixture.config).expect("start topology Capture Run");
+    let topology_store = query_store(&topology_run);
     let connection = Connection::open(&topology_fixture.database).expect("open topology Store");
     let topology: Vec<u8> = connection
         .query_row("SELECT topology_manifest_cbor FROM store_state", [], |row| row.get(0))
@@ -963,9 +989,9 @@ fn queries_fail_closed_on_noncanonical_manifest_and_projection_envelope_mismatch
         )
         .expect("install noncanonical topology");
     drop(connection);
-    assert!(
-        QueryStore::open(&topology_fixture.database).expect("open Query Store").topology().is_err()
-    );
+    assert!(topology_store.topology().is_err());
+    drop(topology_store);
+    topology_run.shutdown().expect("stop topology Capture Run");
 
     let signal_fixture = DemoFixture::new();
     whisper::init_admission(&signal_fixture.config).expect("initialize signal Store");
@@ -981,6 +1007,7 @@ fn queries_fail_closed_on_noncanonical_manifest_and_projection_envelope_mismatch
         [2, 0, 0, 0, 0, 10],
         1,
     );
+    let store = query_store(&run);
     run.shutdown().expect("stop Capture Run");
     let connection = Connection::open(&signal_fixture.database).expect("open signal Store");
     connection
@@ -995,7 +1022,6 @@ fn queries_fail_closed_on_noncanonical_manifest_and_projection_envelope_mismatch
     .max_time_buckets(8)
     .build()
     .expect("signal query");
-    let store = QueryStore::open(&signal_fixture.database).expect("open Query Store");
     let limits = QueryLimits::try_new(1024, 64).expect("query limits");
     assert!(store.signals(&query, limits).is_err());
 

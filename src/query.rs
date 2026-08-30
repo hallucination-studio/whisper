@@ -6,7 +6,7 @@ use std::error::Error;
 use std::fmt;
 use std::io::Cursor;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ciborium::{de::from_reader, ser::into_writer};
@@ -20,7 +20,7 @@ use crate::domain::identity::{
 };
 use crate::domain::time::SessionTime;
 use crate::hex;
-use crate::managed_store::{Identity, validate_existing_for_reader};
+use crate::managed_store::{Identity, ManagedRoot, validate_existing_for_reader};
 
 const TOPOLOGY_MANIFEST_SCHEMA: u8 = 1;
 
@@ -98,11 +98,21 @@ pub struct QueryStore {
 }
 
 struct PinnedReader {
-    connection: rusqlite::Connection,
+    connection: Option<rusqlite::Connection>,
+    managed: Option<Arc<ManagedRoot>>,
     database_path: PathBuf,
     file_identity: Identity,
     store_id: [u8; 32],
     replay_digest: [u8; 32],
+}
+
+impl Drop for PinnedReader {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.close();
+        }
+        let _ = self.managed.take();
+    }
 }
 
 impl fmt::Debug for QueryStore {
@@ -112,19 +122,16 @@ impl fmt::Debug for QueryStore {
 }
 
 impl QueryStore {
-    /// Validates an existing Demo Store for later read-only snapshots.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the path is missing, creating, untrusted, or not the exact Demo schema.
-    pub fn open(database_path: &Path) -> Result<Self, QueryError> {
+    pub(crate) fn from_managed(managed: Arc<ManagedRoot>) -> Result<Self, QueryError> {
+        let database_path = managed.database_path();
         let (database_path, file_identity) =
             validate_existing_for_reader(database_path).map_err(DemoStoreError::from)?;
         let connection = open_query_reader(&database_path)?;
         let (store_id, replay_digest) = read_store_identity(&connection)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(PinnedReader {
-                connection,
+                connection: Some(connection),
+                managed: Some(managed),
                 database_path,
                 file_identity,
                 store_id,
@@ -142,8 +149,11 @@ impl QueryStore {
         let mut reader = self.reader()?;
         validate_pinned_path(&reader)?;
         let store_id = reader.store_id;
-        let transaction =
-            reader.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let connection = reader
+            .connection
+            .as_mut()
+            .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let response = topology_snapshot(&transaction, store_id)?;
         transaction.commit()?;
         validate_pinned_path(&reader)?;
@@ -164,8 +174,11 @@ impl QueryStore {
         validate_pinned_path(&reader)?;
         let store_id = reader.store_id;
         let replay_digest = reader.replay_digest;
-        let transaction =
-            reader.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let connection = reader
+            .connection
+            .as_mut()
+            .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let response = signals_snapshot(&transaction, query, limits, store_id, replay_digest)?;
         transaction.commit()?;
         validate_pinned_path(&reader)?;
