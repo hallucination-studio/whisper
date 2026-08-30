@@ -8,6 +8,8 @@ use ciborium::value::{CanonicalValue, Value};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::CaptureRecordSequence;
+
 use super::identity::{
     DecoderVersion, DeviceEpoch, HardwareKind, RadioLinkId, SensorId, SessionId,
 };
@@ -722,7 +724,7 @@ pub enum CsiCaptureError {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct InputReceipt {
     session: SessionId,
-    record_seq: u64,
+    record_seq: CaptureRecordSequence,
     decoder_version: DecoderVersion,
 }
 
@@ -731,7 +733,7 @@ impl InputReceipt {
     #[must_use]
     pub(crate) fn new(
         session: SessionId,
-        record_seq: u64,
+        record_seq: CaptureRecordSequence,
         decoder_version: DecoderVersion,
     ) -> Self {
         Self { session, record_seq, decoder_version }
@@ -745,7 +747,7 @@ impl InputReceipt {
 
     /// Returns the total session record sequence.
     #[must_use]
-    pub(crate) const fn record_seq(&self) -> u64 {
+    pub(crate) const fn record_seq(&self) -> CaptureRecordSequence {
         self.record_seq
     }
 
