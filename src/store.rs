@@ -20,30 +20,30 @@ use crate::{
     CaptureRecordSequence, CommitOutcome, CommitReceipt, PacketDisposition, ProjectionSequence,
 };
 
-// Demo Slice v1 fixes `WSPD` as the SQLite application identity. Changing it
-// makes every existing Store incompatible.
+// `WSPD` is the SQLite application identity. Changing it makes every existing
+// Store incompatible.
 const STORE_APPLICATION_ID: i64 = 0x5753_5044;
-// Demo Slice v1 fixes schema version 1. Bump only with an explicit migration
-// contract; the bounded delivery path intentionally performs no migration.
+// Store schema version 1 is exact. Bump only with an explicit migration
+// contract; the current delivery path intentionally performs no migration.
 const STORE_USER_VERSION: i64 = 1;
 // Host persistence v1 defines Store IDs as 32 operating-system-random bytes.
 const STORE_ID_BYTES: usize = 32;
-// Demo Slice v1 fixes Capture Session IDs to 16 random bytes rendered as 32
-// lowercase hexadecimal digits after this exact prefix.
+// Capture Session IDs use 16 random bytes rendered as 32 lowercase hexadecimal
+// digits after this exact prefix.
 const CAPTURE_SESSION_RANDOM_BYTES: usize = 16;
 const CAPTURE_SESSION_ID_PREFIX: &str = "capture-";
-// Demo Slice v1 initializes the eight-byte big-endian Store watermark to zero.
+// A new Store initializes its eight-byte big-endian Projection watermark to zero.
 const PROJECTION_SEQUENCE_ZERO: [u8; 8] = [0; 8];
 // SQLite reports synchronous=FULL as numeric pragma value 2. Changing this
-// comparison would reject the durability mode required by Demo Slice v1.
+// comparison would reject the Store's required durability mode.
 const SQLITE_SYNCHRONOUS_FULL: i64 = 2;
 // Host persistence v1 fixes StoreTopologyManifestV1 schema to 1. Changing it
 // changes digest-covered bytes and makes every existing Store incompatible.
 const TOPOLOGY_MANIFEST_SCHEMA_VERSION: u8 = 1;
-// Demo Slice v1 freezes these Capture Session compatibility identities. A
-// change would claim a different decoder or projection algorithm.
+// These Capture Session compatibility identities name the decoder and ingest
+// behavior used for newly committed observations.
 const DECODER_VERSION: &str = "native-frame-v1";
-const ALGORITHM_VERSION: &str = "demo-native-coordinate-v1";
+const CAPTURE_ALGORITHM_VERSION: &str = "native-coordinate-ingest-v1";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AdmissionEpochSeed {
     pub(crate) device: DeviceId,
@@ -575,7 +575,7 @@ pub(crate) fn open_and_create_capture_session(
             expected.replay_digest,
             DECODER_VERSION,
             config.conditioning().version().as_str(),
-            ALGORITHM_VERSION,
+            CAPTURE_ALGORITHM_VERSION,
         ],
     )?;
     transaction.commit()?;

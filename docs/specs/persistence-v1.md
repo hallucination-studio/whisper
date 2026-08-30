@@ -10,7 +10,7 @@ deferred Semantic Program. This specification also owns the deferred Semantic
 Session Store and its two-stage processing, recovery, rotation, retention, and
 faithful replay contract. For the bounded Store schema, per-serve Capture Session,
 and one-transaction ingest path,
-[Demo Slice v1](demo-slice-v1.md) is first-applicable. The two Stores share the
+[Demo Slice v2](demo-slice-v2.md) is first-applicable. The two Stores share the
 named key-loading and lifecycle subsets, ReplayConfig, topology, replay-window,
 Store-ID, and watermark definitions but do not share a SQLite schema or session
 lifecycle.

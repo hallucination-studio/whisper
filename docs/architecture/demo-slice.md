@@ -2,7 +2,7 @@
 
 - Status: accepted architecture
 - Scope: bounded Store, capture, query, delivery, and browser seams
-- Normative behavior: [Demo Slice v1](../specs/demo-slice-v1.md)
+- Normative behavior: [Demo Slice v2](../specs/demo-slice-v2.md)
 
 This document owns the non-discoverable responsibility boundaries and
 invariants for the bounded Demo Slice. It does not define exact schema, API

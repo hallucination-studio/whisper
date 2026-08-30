@@ -6,7 +6,7 @@ Applicability: the typed claim graph, BrowserTrace, formal execution
 classifications, qualification reports, Host-restart claim, and Program
 Completion receipt belong to the deferred Semantic Program. The bounded Demo's
 sanitized `demo-smoke` is owned by
-[Demo Slice v1](demo-slice-v1.md#sanitized-demo-smoke-receipt) and MUST NOT be
+[Demo Slice v2](demo-slice-v2.md#sanitized-demo-smoke-receipt) and MUST NOT be
 treated as any classification defined here.
 
 This specification is the sole normative owner of Program 1's bounded fixture

@@ -13,4 +13,4 @@ Session, while replay admission and committed capability authority remain in
 the Store across Host lifetimes. This makes process failure an explicit
 Demo capture boundary without turning it into a product cardinality rule or
 prejudging the future Semantic Session contract. Exact behavior is owned by the
-[Demo Slice v1 specification](../specs/demo-slice-v1.md).
+[Demo Slice v2 specification](../specs/demo-slice-v2.md).

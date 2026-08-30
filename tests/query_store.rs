@@ -473,7 +473,7 @@ fn raw_i_signals_preserve_native_axes_cells_and_same_snapshot_receipts() {
     assert_eq!(actual["receipt"]["projection_commit"]["sequence"], "2");
     assert_eq!(actual["receipt"]["decoder_version"], "native-frame-v1");
     assert_eq!(actual["receipt"]["conditioning_version"], "amplitude-v1");
-    assert_eq!(actual["receipt"]["algorithm_version"], "demo-native-coordinate-v1");
+    assert_eq!(actual["receipt"]["algorithm_version"], "native-coordinate-ingest-v1");
 
     let range = SignalRange::try_new(SessionTime::from_nanos(0), SessionTime::from_nanos(u64::MAX))
         .expect("metric range");

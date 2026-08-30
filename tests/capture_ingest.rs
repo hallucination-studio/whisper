@@ -682,7 +682,7 @@ fn conforming_csi_commits_native_coordinate_observation() {
     assert_eq!(decoder, "native-frame-v1");
     assert_eq!(
         normalized_observation_bytes(&observation),
-        decode_hex_fixture(include_str!("fixtures/demo/observation-v1.hex"))
+        decode_hex_fixture(include_str!("fixtures/capture/observation-v1.hex"))
     );
 }
 

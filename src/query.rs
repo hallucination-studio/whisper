@@ -583,7 +583,7 @@ impl SignalsResponse {
     }
 }
 
-/// Canonical nonempty `SignalsOk` body imported by Demo Slice v1.
+/// Canonical nonempty `SignalsOk` body imported from API/UI v1.
 #[derive(Clone, Debug, Serialize)]
 pub struct SignalsOk {
     http_schema_version: u8,
@@ -664,7 +664,7 @@ struct ViewReceipt {
     algorithm_version: String,
 }
 
-/// Canonical visible-session empty response imported by Demo Slice v1.
+/// Canonical visible-session empty response imported from API/UI v1.
 #[derive(Clone, Debug, Serialize)]
 pub struct EmptyEnvelope {
     http_schema_version: u8,
@@ -673,7 +673,7 @@ pub struct EmptyEnvelope {
     receipt: ViewReceipt,
 }
 
-/// Canonical typed query error response imported by Demo Slice v1.
+/// Canonical typed query error response imported from API/UI v1.
 #[derive(Clone, Debug, Serialize)]
 pub struct ErrorEnvelope {
     http_schema_version: u8,
@@ -896,7 +896,7 @@ struct ObservationAuthority<'a> {
     boot_generation: u32,
 }
 
-/// Canonical `TopologyOk` body imported by Demo Slice v1.
+/// Canonical `TopologyOk` body imported from API/UI v1.
 #[derive(Clone, Debug, Serialize)]
 pub struct TopologyOk {
     http_schema_version: u8,
