@@ -71,7 +71,7 @@ export function signalsFor(url, responseStoreId = storeId, sequence = '5') {
     last_record_seq: '1',
     decoder_version: 'native-frame-v1',
     conditioning_version: 'amplitude-v1',
-    algorithm_version: 'demo-native-coordinate-v1',
+    algorithm_version: 'native-coordinate-ingest-v1',
   };
   return {
     http_schema_version: 1,

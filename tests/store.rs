@@ -327,7 +327,7 @@ fn serve_requires_an_existing_store_and_creates_one_empty_capture_session() {
         assert_eq!(session.2.len(), 32);
         assert_eq!(session.3, "native-frame-v1");
         assert_eq!(session.4, "amplitude-v1");
-        assert_eq!(session.5, "demo-native-coordinate-v1");
+        assert_eq!(session.5, "native-coordinate-ingest-v1");
         assert_eq!(
             (session.6.as_ref(), session.7.as_ref(), session.8.as_ref()),
             (None, None, None)

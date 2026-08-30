@@ -1,9 +1,9 @@
-# Demo Slice v1 specification
+# Demo Slice v2 specification
 
 - Status: accepted target
-- Version: `demo-slice-v1`
+- Version: `demo-slice-v2`
 - Scope: bounded ESP32-S3-to-Chrome development demonstration
-- Tracking issue: [#118](https://github.com/hallucination-studio/whisper/issues/118)
+- Tracking issue: [#136](https://github.com/hallucination-studio/whisper/issues/136)
 
 This specification is the first-applicable normative owner for the bounded
 Demo Slice:
@@ -26,6 +26,18 @@ work and blockers remain in GitHub Issues.
 
 The key words MUST, MUST NOT, SHOULD, and MAY are normative.
 
+## Changes from v1
+
+Version 2 replaces the Capture Session compatibility identity
+`algorithm_version` with the maturity-neutral exact value
+`native-coordinate-ingest-v1`. New Capture Sessions write only this value and
+there is no alternate accepted spelling. Existing Capture Sessions retain
+their stored identity and are not rewritten or reinterpreted. This changes no
+Store table, constraint, or connection invariant, so Store `user_version`
+remains 1 and no migration framework is introduced. The fixed executed-result
+classification `demo-smoke` and `DemoSmokeReceipt` name evidence scope and are
+unchanged.
+
 ## Imported authorities
 
 The Demo Slice imports the following contracts without changing their bytes or
@@ -42,7 +54,7 @@ domain meaning:
 
 Where this document gives Demo-specific schema, Capture Session, ingest,
 visibility, or browser-state rules, those rules are first-applicable for
-`demo-slice-v1`. They do not amend the imported Managed-store lifecycle or the
+`demo-slice-v2`. They do not amend the imported Managed-store lifecycle or the
 contract for a Semantic Session.
 
 ## Scope and deferrals
@@ -338,7 +350,7 @@ advance the Store watermark and an empty Capture Session is not query-visible.
 `started_utc_ns` is the checked nonnegative nanosecond count since the Unix
 epoch. `decoder_version` is exactly `native-frame-v1`, `conditioning_version`
 is the imported ReplayConfig conditioning version, and `algorithm_version` is
-exactly `demo-native-coordinate-v1`. The latter two are API compatibility and
+exactly `native-coordinate-ingest-v1`. The latter two are API compatibility and
 input-identity fields; they do not claim that conditioning or a semantic
 algorithm ran.
 

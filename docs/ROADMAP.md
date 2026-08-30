@@ -37,7 +37,7 @@ and provenance lives in the [references index](references/README.md).
 
 ### Direction
 
-After the bounded [Demo Slice v1](specs/demo-slice-v1.md) proves physical
+After the bounded [Demo Slice v2](specs/demo-slice-v2.md) proves physical
 ESP32-S3 capture through committed native-coordinate CSI and an unchanged
 Chrome page, resume the broader Semantic Program as a distinct authority and
 delivery graph. That Program may implement Semantic Sessions, Timeline,
@@ -50,7 +50,7 @@ target `Program 1`; the Semantic Program is its current deferred delivery scope.
 
 The accepted persistence, temporal/world, API/UI, evaluation, and
 development-E2E v1 documents preserve that future target. Their applicability
-notes and Demo Slice v1 define the exact shared subset operative for the
+notes and Demo Slice v2 define the exact shared subset operative for the
 bounded Demo. A `demo-smoke` result cannot promote or satisfy the deferred
 Store, session, transaction, semantic, or evidence contracts.
 

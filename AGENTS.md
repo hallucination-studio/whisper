@@ -11,6 +11,7 @@ This file governs the repository. It adapts Microsoft's [Pragmatic Rust Guidelin
 - All code must be sound, including private code behind safe APIs. Avoid `unsafe`; never use it to evade ownership, lifetimes, `Send`, or other type-system requirements (M-UNSOUND, M-UNSAFE).
 - Return `Result` for expected failures. Panic only for programming errors or broken invariants, with an actionable message (M-PANIC-IS-STOP, M-PANIC-ON-BUG, M-PANIC-MESSAGE).
 - Give non-obvious production constants descriptive names and document their unit, source, and non-obvious change impact (M-DOCUMENTED-MAGIC).
+- Name production source, test source, and internal paths with canonical domain terminology. Delivery-maturity labels belong only to roadmap, issue, specification, and evidence scopes.
 - Do not add design diaries, agent self-reports, or guideline-compliance tables to user-facing documentation (M-NO-META-DESIGN-DOCUMENTATION).
 - Repository requirements may override advisory guidance, but never soundness. If a requirement appears to need an unsound safe API, stop and report the conflict.
 

@@ -5,7 +5,7 @@ Status: Accepted
 Scope: this decision applies to the deferred Semantic Session Store. The Demo
 also selects SQLite as its sole authority, but its smaller schema and atomic
 ingest decision are owned by [ADR 0017](0017-atomic-capture-ingest.md) and
-[Demo Slice v1](../specs/demo-slice-v1.md).
+[Demo Slice v2](../specs/demo-slice-v2.md).
 
 ## Context
 

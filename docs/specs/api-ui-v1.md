@@ -15,7 +15,7 @@ current receipts and maturity are recorded in
 
 Applicability: the complete route set, semantic query sources, command path,
 disconnect/recovery behavior, and full schema-validation matrix belong to the
-deferred Semantic Program. [Demo Slice v1](demo-slice-v1.md) is first-applicable
+deferred Semantic Program. [Demo Slice v2](demo-slice-v2.md) is first-applicable
 for its bounded topology/signals/live subset and imports the named JSON
 definitions without redefining their wire shapes.
 

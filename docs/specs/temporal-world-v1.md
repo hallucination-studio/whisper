@@ -6,7 +6,7 @@ Applicability: Timeline, conditioning, baselines, Engine, World, semantic
 recovery, and semantic replay belong to the deferred Semantic Program. The
 bounded Demo imports only the Capture Profile identity, native-coordinate
 `CsiObservation` value, and standalone CBOR root, as routed by
-[Demo Slice v1](demo-slice-v1.md); deriving or committing those values does not
+[Demo Slice v2](demo-slice-v2.md); deriving or committing those values does not
 claim that any other contract in this document ran.
 
 This specification is the sole normative owner of Whisper v1 Capture Profile

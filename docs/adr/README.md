@@ -18,3 +18,4 @@ the linked specification owns operative behavior.
 | Why does every Demo `serve` create another non-semantic Capture Session? | [ADR 0016](0016-new-capture-session-per-serve.md) |
 | Why does capture ingest commit replay, packet, optional CSI, cursor, and watermark together? | [ADR 0017](0017-atomic-capture-ingest.md) |
 | Why does an independent thread own Host cleanup and lease release? | [ADR 0018](0018-independent-host-supervisor.md) |
+| Why must production compatibility identities use domain rather than delivery-maturity terminology? | [ADR 0019](0019-maturity-neutral-compatibility-identities.md) |

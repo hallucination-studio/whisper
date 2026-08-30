@@ -13,4 +13,4 @@ decoding produces only a pure candidate, and one `BEGIN IMMEDIATE` atomically
 commits replay admission, exact packet, optional capability and CSI, Capture
 Session cursor, and one Store watermark advance. Only that committed watermark
 may be published. Exact effects and rejects are owned by the
-[Demo Slice v1 specification](../specs/demo-slice-v1.md).
+[Demo Slice v2 specification](../specs/demo-slice-v2.md).
