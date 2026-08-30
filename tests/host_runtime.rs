@@ -341,9 +341,31 @@ async fn runtime_serves_read_only_shell_topology_and_exact_live_upgrade_failure(
             .await;
     let shell = String::from_utf8(shell).expect("UTF-8 shell response");
     assert!(shell.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(shell.contains("<h1>Whisper Signals</h1>"));
+    assert!(shell.contains("Whisper Signals"));
+    assert!(shell.contains("data-testid=\"connection-state\">POLLING"));
+    assert!(shell.contains("data-max-time-buckets=\"512\""));
     assert!(!shell.contains("<button"));
     assert!(!shell.contains("<form"));
+
+    let styles = http_request(
+        address,
+        "GET /assets/app.css HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let styles = String::from_utf8(styles).expect("UTF-8 stylesheet response");
+    assert!(styles.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(styles.contains("content-type: text/css; charset=utf-8"));
+    assert!(styles.contains(".signal-grid"));
+
+    let script = http_request(
+        address,
+        "GET /assets/app.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let script = String::from_utf8(script).expect("UTF-8 script response");
+    assert!(script.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(script.contains("content-type: text/javascript; charset=utf-8"));
+    assert!(script.contains("POLL_INTERVAL_MS = 250"));
 
     let topology = http_request(
         address,
