@@ -35,7 +35,7 @@ fn feature_cli_runs_inherited_handoff_without_disclosing_fixture_material() {
             "sensor-a",
             "python3",
             "-c",
-            "import hashlib,os,sys; data=sys.stdin.buffer.read(); ok=len(data)==32 and hashlib.sha256(data).hexdigest()==sys.argv[1] and os.environ.get('WHISPER_FIXTURE_SENSOR_ID')=='sensor-a' and os.environ.get('WHISPER_FIXTURE_DEVICE_ID')=='1' and os.environ.get('WHISPER_FIXTURE_KEY_EPOCH')=='1'; print('FIXTURE_PIPE_OK' if ok else 'FIXTURE_PIPE_FAIL'); raise SystemExit(0 if ok else 1)",
+            "import hashlib,os,sys; data=sys.stdin.buffer.read(); ok=len(data)==32 and hashlib.sha256(data).hexdigest()==sys.argv[1] and os.environ.get('WHISPER_FIXTURE_SENSOR_ID')=='sensor-a' and os.environ.get('WHISPER_FIXTURE_DEVICE_ID')=='1' and os.environ.get('WHISPER_FIXTURE_KEY_EPOCH')=='1' and os.environ.get('WHISPER_FIXTURE_FIRMWARE_BUILD_DIGEST')=='01'*32 and os.environ.get('WHISPER_FIXTURE_CAPABILITY_DIGEST')=='02'*32 and os.environ.get('WHISPER_FIXTURE_CAPTURE_IP')=='127.0.0.1' and os.environ.get('WHISPER_FIXTURE_CAPTURE_PORT')=='9000'; print('FIXTURE_PIPE_OK' if ok else 'FIXTURE_PIPE_FAIL'); raise SystemExit(0 if ok else 1)",
             "c2def135281b73b4040f7582db5379e74719224385ae20feec3dfea0fd6234f5",
         ])
         .output()

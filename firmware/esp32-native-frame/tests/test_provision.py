@@ -91,6 +91,21 @@ class ProvisionTest(unittest.TestCase):
         self.digest_patch.stop()
         self.temporary.cleanup()
 
+    def test_helper_commands_cannot_read_inherited_standard_input(self):
+        run = mock.Mock(return_value=subprocess.CompletedProcess(
+            ["tool"], 0, "complete\n"))
+
+        self.assertEqual(provision.checked(run, ["tool"]), "complete\n")
+
+        run.assert_called_once()
+        self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_capability_digest_matches_the_native_frame_descriptor_vector(self):
+        self.assertEqual(
+            provision.capability_digest(bytes([1]) * 32, bytes([2]) * 32).hex(),
+            "e1b35c57ed78ff9a7c0ec3784a727ec7a977f59f97c3ec1ab054b773d60841f8",
+        )
+
     def test_inherited_key_accepts_partial_reads_only_after_exact_eof(self):
         stream = PartialStream(bytes(range(32)), [1, 2, 3, 5, 8, 13])
 

@@ -57,7 +57,12 @@ impl From<FixtureErrorKind> for FixtureError {
     }
 }
 
-/// Runs a child provisioner with one validated fixture key on its inherited input stream.
+/// Runs a child provisioner with validated fixture facts and one inherited-stream key.
+///
+/// The child receives exactly 32 key bytes on standard input. Its environment
+/// receives the non-secret Sensor, Device, key-epoch, firmware, capability,
+/// and capture facts selected from `config`; raw key bytes never enter the
+/// arguments or environment.
 pub fn run(
     config: &Config,
     sensor_id: &str,
@@ -71,6 +76,9 @@ pub fn run(
         .ok_or_else(|| FixtureErrorKind::SensorNotFound { sensor_id: sensor_id.to_owned() })?;
     let device = sensor.device_id();
     let key_epoch = sensor.key_epoch();
+    let firmware_build_digest = encode_digest(sensor.firmware_build_digest());
+    let capability_digest = encode_digest(sensor.capability_digest());
+    let capture = config.capture().bind();
     let derived = derive_public_development_fixture_key(sensor_id.as_str(), key_epoch.get())
         .map_err(FixtureErrorKind::Derivation)?;
     let store = FixtureStore::materialize(
@@ -86,7 +94,11 @@ pub fn run(
         command
             .env("WHISPER_FIXTURE_SENSOR_ID", sensor_id.as_str())
             .env("WHISPER_FIXTURE_DEVICE_ID", device.to_string())
-            .env("WHISPER_FIXTURE_KEY_EPOCH", key_epoch.to_string());
+            .env("WHISPER_FIXTURE_KEY_EPOCH", key_epoch.to_string())
+            .env("WHISPER_FIXTURE_FIRMWARE_BUILD_DIGEST", firmware_build_digest)
+            .env("WHISPER_FIXTURE_CAPABILITY_DIGEST", capability_digest)
+            .env("WHISPER_FIXTURE_CAPTURE_IP", capture.ip().to_string())
+            .env("WHISPER_FIXTURE_CAPTURE_PORT", capture.port().to_string());
         run_with_inherited_key(command, key)
     })();
     let cleanup = store.remove();
@@ -95,6 +107,10 @@ pub fn run(
         (Ok(_), Err(source)) => Err(FixtureErrorKind::Cleanup(source).into()),
         (Ok(status), Ok(())) => Ok(status),
     }
+}
+
+fn encode_digest(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn run_with_inherited_key(
@@ -275,5 +291,18 @@ mod tests {
             !diagnostic
                 .contains("65b0e5101c8f9f0c9c5ee7a77b959981e22ff95d001c98726f661827dd61de6f")
         );
+    }
+
+    #[test]
+    fn fixture_run_removes_its_store_after_child_failure() {
+        let root = fixture_root();
+        let config = config_with_secret_root(&root);
+        let mut command = Command::new("python3");
+        command.args(["-c", "import sys; sys.stdin.buffer.read(); raise SystemExit(17)"]);
+
+        let status = run(&config, "sensor-a", &mut command).expect("run failing provisioner");
+
+        assert_eq!(status.code(), Some(17));
+        assert!(!root.exists(), "child failure must remove the secret root");
     }
 }

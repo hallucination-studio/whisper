@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import struct
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,13 @@ PROVISIONING_SCHEMA = 2
 # AES-256 key bytes plus one sentinel byte used to prove immediate EOF.
 INHERITED_KEY_MAX_BYTES = 33
 AES_256_KEY_BYTES = 32
+# These bytes and limits encode the capability descriptor specified by the
+# "Capability descriptor" table in docs/specs/native-frame-v1.md. Any change
+# must be coordinated with firmware emission and every pinned Config digest.
+CAPABILITY_DESCRIPTOR_PREFIX = bytes([1, 1, 1, 1, 1, 1, 1, 32, 0x07])
+MAXIMUM_RAW_CSI_BYTES = 612
+MAXIMUM_PLAINTEXT_BYTES = 705
+DATAGRAM_BUDGET_BYTES = 1200
 
 # Extracted from espressif/idf@sha256:f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb.
 GENERATOR_SOURCE_SHA256 = "5adcd0e787ea41b8c3a1d42bdeb3dcc333e2d63949ee0778ba10c6ba901ad80e"
@@ -87,6 +95,22 @@ def bounded_int(name, value, low, high):
     if not low <= number <= high:
         raise ValueError(f"{name} must be in {low}..{high}")
     return number
+
+
+def capability_digest(firmware_build_digest, wifi_abi_digest):
+    """Return the native-frame capability digest for exact build identities."""
+    if len(firmware_build_digest) != 32 or len(wifi_abi_digest) != 32:
+        raise ValueError("capability build identities must contain exactly 32 bytes")
+    descriptor = bytearray(CAPABILITY_DESCRIPTOR_PREFIX)
+    descriptor.extend(struct.pack(
+        "<HHH",
+        MAXIMUM_RAW_CSI_BYTES,
+        MAXIMUM_PLAINTEXT_BYTES,
+        DATAGRAM_BUDGET_BYTES,
+    ))
+    descriptor.extend(firmware_build_digest)
+    descriptor.extend(wifi_abi_digest)
+    return hashlib.sha256(descriptor).digest()
 
 
 def validate(args, password):
@@ -185,7 +209,13 @@ def command_prefix(python, tool, module):
 
 
 def checked(run, argv):
-    result = run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    result = run(
+        argv,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
     if result.returncode != 0:
         raise RuntimeError(f"command failed: {' '.join(argv[:2])}\n{result.stdout.strip()}")
     return result.stdout

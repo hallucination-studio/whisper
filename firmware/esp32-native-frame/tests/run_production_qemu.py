@@ -97,9 +97,7 @@ def main():
     header_digest = bytes(int(value, 16) for value in re.findall(r"0x([0-9a-f]{2})", generated_header))
     if abi_digest.hex() != facts["idf_wifi_abi_digest"] or header_digest != abi_digest:
         return 1
-    descriptor = bytes([1, 1, 1, 1, 1, 1, 1, 32, 0x07])
-    descriptor += struct.pack("<HHH", 612, 705, 1200) + build_digest + abi_digest
-    capability_digest = hashlib.sha256(descriptor).hexdigest()
+    capability_digest = provision.capability_digest(build_digest, abi_digest).hex()
 
     with tempfile.TemporaryDirectory(prefix="native-frame-qemu-") as temporary:
         temporary = Path(temporary)
