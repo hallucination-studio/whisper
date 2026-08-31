@@ -77,6 +77,11 @@ class ProvisionWifiTests(unittest.TestCase):
         self.assertEqual(arguments.collector_port, "9000")
         self.assertEqual(arguments.capability_digest, environment[
             "WHISPER_FIXTURE_CAPABILITY_DIGEST"])
+        self.assertEqual(
+            Path(arguments.nvs_tool),
+            provision_wifi.PROVISION_TOOLS_DIRECTORY / "nvs-partition-tool" / "nvs_tool.py",
+        )
+        self.assertIsNone(arguments.generator_source)
         self.assertTrue(arguments.key_stdin)
         self.assertIsNone(arguments.key_output)
         self.assertIsNone(arguments.receipt_output)

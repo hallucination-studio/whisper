@@ -20,7 +20,6 @@ shasum -a 256 firmware/esp32-native-frame/sdkconfig.defaults \
   firmware/esp32-native-frame/partitions.csv
 ```
 
-Set `IDF_IMAGE` to the immutable ESP-IDF container identity in the reference.
 Set `PORT` only after identifying the candidate serial device. Keep raw AES
 keys, Wi-Fi credentials, secret-bearing provisioning CSV or binary files, and
 other raw secret artifacts outside the repository. Retain sanitized immutable
@@ -29,14 +28,16 @@ described under "Receipts".
 
 ## Build the production image
 
-From the repository root:
+From the repository root, use the repository Makefile. It pins the official
+Espressif container by immutable digest, builds the application, builds the
+development-fixture-enabled Host, exports the official ESP-IDF NVS inspection
+tools, and prepares a Host Python environment containing Espressif's pinned
+`esptool` and NVS generator releases. It then combines the fixed
+`development.template.toml` identity with the generated application and
+capability digests in `build/development.toml`:
 
 ```sh
-docker run --rm \
-  -v "$PWD:/project" \
-  -w /project/firmware/esp32-native-frame \
-  "$IDF_IMAGE" \
-  bash -lc 'idf.py set-target esp32s3 && idf.py build'
+make esp32-native-frame
 ```
 
 Retain the complete command output, container digest, `build/flasher_args.json`,
@@ -117,15 +118,14 @@ Record the exact expanded commands, serial port, baud, probe outputs,
 
 ## Fixed development Wi-Fi provisioning
 
-Use the zero-argument command only after the application image has been built
-and flashed, and after the development-fixture-enabled release Host executable
-and pinned Python/ESP-IDF provisioning tools are available locally:
+Use the zero-argument command only after `make esp32-native-frame` has completed
+and its application image has been flashed:
 
 ```sh
 firmware/esp32-native-frame/provision-wifi.sh
 ```
 
-The command uses `firmware/esp32-native-frame/development.toml` and its sole
+The command uses the generated `build/development.toml` and its sole
 `sensor-a` entry. It does not accept a Config path, Sensor, identity, epoch,
 digest, port, serial path, collector address, or tool path. It discovers the
 Mac Wi-Fi interface, collector IPv4 address, and sole supported serial
@@ -141,9 +141,11 @@ complete schema-2 NVS, writes offset `0x11000`, and runs `verify-flash`.
 Successful verification prints exactly `Wi-Fi provisioning complete.`.
 Failures are redacted and fail closed.
 
-This command does not build the Host or firmware, flash the application,
-install tools, create a virtual environment, pull a container image, manage a
-cache, or retain a key, credential, generated NVS, or application readback.
+The command uses only the fixed tools prepared under the firmware build
+directory. It does not read `IDF_PATH` or accept any tool path. It does not
+build the Host or firmware, flash the application, install tools, create a
+virtual environment, pull a container image, manage a cache, or retain a key,
+credential, generated NVS, or application readback.
 The fixed `key_epoch = 1` is disposable: after the Sensor has transmitted under
 that epoch, update the sole Config to a fresh epoch before provisioning again.
 The command never creates or persists a second epoch counter.

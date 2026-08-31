@@ -14,6 +14,7 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parents[3]
 SCRIPT = PROJECT / "firmware" / "esp32-native-frame" / "provision-wifi.sh"
+MAKEFILE = PROJECT / "Makefile"
 
 
 class ProvisionWifiShellTests(unittest.TestCase):
@@ -27,9 +28,20 @@ class ProvisionWifiShellTests(unittest.TestCase):
         firmware.mkdir(parents=True)
         staged = firmware / SCRIPT.name
         shutil.copy2(SCRIPT, staged)
-        (firmware / "development.toml").write_text("fixed development config\n", encoding="utf-8")
+        (firmware / "build" / "development.toml").parent.mkdir(parents=True, exist_ok=True)
+        (firmware / "build" / "development.toml").write_text(
+            "fixed development config\n", encoding="utf-8")
         shutil.copy2(SCRIPT.parent / "provision_wifi.py", firmware / "provision_wifi.py")
         shutil.copy2(SCRIPT.parent / "provision.py", firmware / "provision.py")
+        provision_python = firmware / "build" / "provision-tools" / "venv" / "bin" / "python"
+        self.write_executable(provision_python, """
+            #!/usr/bin/env bash
+            exit 0
+        """)
+        nvs_tools = firmware / "build" / "provision-tools" / "nvs-partition-tool"
+        for name in ("nvs_tool.py", "nvs_check.py", "nvs_logger.py", "nvs_parser.py"):
+            (nvs_tools / name).parent.mkdir(parents=True, exist_ok=True)
+            (nvs_tools / name).write_text(f"# official {name}\n", encoding="utf-8")
         helper = root / "target" / "release" / "whisper"
         self.write_executable(helper, f"""
             #!/usr/bin/env python3
@@ -97,8 +109,10 @@ class ProvisionWifiShellTests(unittest.TestCase):
             checks = {
                 "fixed_invocation": (
                     sys.argv[1] == "development-fixture"
-                    and pathlib.Path(sys.argv[2]).name == "development.toml"
-                    and sys.argv[3:5] == ["sensor-a", "python3"]
+                    and pathlib.Path(sys.argv[2]).parts[-2:] == ("build", "development.toml")
+                    and sys.argv[3] == "sensor-a"
+                    and pathlib.Path(sys.argv[4]).parts[-5:]
+                    == ("build", "provision-tools", "venv", "bin", "python")
                 )
             }
             environment = {
@@ -177,9 +191,11 @@ class ProvisionWifiShellTests(unittest.TestCase):
             canonical_root = root.resolve()
             self.assertEqual(json.loads(record.read_text(encoding="utf-8")), [
                 "development-fixture",
-                str(canonical_root / "firmware" / "esp32-native-frame" / "development.toml"),
+                str(canonical_root / "firmware" / "esp32-native-frame" / "build"
+                    / "development.toml"),
                 "sensor-a",
-                "python3",
+                str(canonical_root / "firmware" / "esp32-native-frame" / "build"
+                    / "provision-tools" / "venv" / "bin" / "python"),
                 str(canonical_root / "firmware" / "esp32-native-frame" / "provision_wifi.py"),
             ])
 
@@ -264,6 +280,25 @@ class ProvisionWifiShellTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertEqual(result.stdout, "Wi-Fi provisioning complete.\n")
             self.assertFalse(marker.exists())
+
+    def test_public_entrypoint_uses_only_pinned_official_build_tools(self):
+        shell = SCRIPT.read_text(encoding="utf-8")
+        makefile = MAKEFILE.read_text(encoding="utf-8")
+
+        self.assertNotIn("IDF_PATH", shell)
+        self.assertNotIn("/private/tmp", shell)
+        self.assertIn('$SCRIPT_DIRECTORY/build/provision-tools', shell)
+        self.assertIn('$PROVISION_TOOLS_DIRECTORY/venv/bin/python', shell)
+        self.assertNotIn("IDF_PATH", makefile)
+        self.assertIn(
+            "espressif/idf@sha256:"
+            "f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb",
+            makefile,
+        )
+        self.assertIn("esptool==5.3.1", makefile)
+        self.assertIn("esp-idf-nvs-partition-gen==0.1.6", makefile)
+        self.assertIn("/opt/esp/idf/components/nvs_flash/nvs_partition_tool", makefile)
+        self.assertIn("prepare_development_config.py", makefile)
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,8 +47,10 @@ fn valid_s3_config_has_stable_digest_and_exact_routes() {
 
 #[test]
 fn fixed_development_config_has_one_exact_provisioning_identity() {
-    let path =
-        format!("{}/firmware/esp32-native-frame/development.toml", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/firmware/esp32-native-frame/development.template.toml",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let source = std::fs::read_to_string(path).expect("fixed development config");
     let config = parse_config(&source).expect("valid fixed development config");
 

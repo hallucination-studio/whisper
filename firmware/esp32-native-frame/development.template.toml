@@ -80,8 +80,8 @@ hardware_kind = "esp32-s3"
 device_id = 1
 key_epoch = 1
 expected_peer_ip = "192.0.2.10"
-firmware_build_digest = "8acecd63a2274e0a3a8ac20e45cfea06c3ec39a4bdb7a817ba571a489e8836f6"
-capability_digest = "51153daa77d8a6dd7aaf8cde16245f149465f9a22af41253a38a496b1a739e35"
+firmware_build_digest = "0000000000000000000000000000000000000000000000000000000000000000"
+capability_digest = "0000000000000000000000000000000000000000000000000000000000000000"
 maximum_raw_csi_bytes = 612
 maximum_plaintext_bytes = 705
 

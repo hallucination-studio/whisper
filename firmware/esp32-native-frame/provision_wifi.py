@@ -21,6 +21,8 @@ import provision
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 BUILD_DIRECTORY = SCRIPT_DIRECTORY / "build"
+PROVISION_TOOLS_DIRECTORY = BUILD_DIRECTORY / "provision-tools"
+NVS_TOOL = PROVISION_TOOLS_DIRECTORY / "nvs-partition-tool" / "nvs_tool.py"
 SERIAL_PATTERNS = ("cu.usbserial-*", "cu.usbmodem*")
 FIXTURE_FACTS = (
     "WHISPER_FIXTURE_SENSOR_ID",
@@ -354,6 +356,8 @@ def execute(environment=os.environ, key_stream=None):
         facts["WHISPER_FIXTURE_CAPTURE_PORT"],
         "--capability-digest",
         facts["WHISPER_FIXTURE_CAPABILITY_DIGEST"],
+        "--nvs-tool",
+        str(NVS_TOOL),
         "--key-stdin",
     ])
     inherited = key_stream if key_stream is not None else sys.stdin.buffer

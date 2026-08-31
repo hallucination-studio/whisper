@@ -309,10 +309,7 @@ def provision(args, password, run=subprocess.run, random_bytes=secrets.token_byt
             generator_source = Path(located.strip())
         nvs_tool = args.nvs_tool
         if not nvs_tool:
-            idf_path = os.environ.get("IDF_PATH")
-            if not idf_path:
-                raise RuntimeError("--nvs-tool or IDF_PATH is required")
-            nvs_tool = str(Path(idf_path) / "components/nvs_flash/nvs_partition_tool/nvs_tool.py")
+            raise RuntimeError("--nvs-tool is required")
 
         with tempfile.TemporaryDirectory(prefix="whisper-provision-") as temporary:
             directory = Path(temporary)
