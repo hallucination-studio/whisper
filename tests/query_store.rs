@@ -357,16 +357,16 @@ fn query_store_clones_retain_the_lifecycle_lease_until_the_reader_closes() {
 }
 
 #[test]
-fn topology_orders_visible_sessions_and_profiles_across_dynamic_links() {
+fn topology_orders_profiles_across_dynamic_links_in_one_capture_session() {
     let fixture = QueryFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
     let first_capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let second_capability = capability_body([0x03; 32], [0x44; 32], 2048);
 
-    let mut first = serve_capture(&fixture.config).expect("start first Capture runtime");
-    let first_session = first.session_id().to_owned();
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
+    let session = run.session_id().to_owned();
     commit_one_observation(
-        &mut first,
+        &mut run,
         &[0x11; 32],
         1,
         "192.0.2.10:5000",
@@ -374,12 +374,8 @@ fn topology_orders_visible_sessions_and_profiles_across_dynamic_links() {
         [2, 0, 0, 0, 0, 10],
         1,
     );
-    first.shutdown().expect("stop first Capture runtime");
-
-    let mut second = serve_capture(&fixture.config).expect("start second Capture runtime");
-    let second_session = second.session_id().to_owned();
     commit_one_observation(
-        &mut second,
+        &mut run,
         &[0x22; 32],
         2,
         "192.0.2.11:5000",
@@ -387,14 +383,12 @@ fn topology_orders_visible_sessions_and_profiles_across_dynamic_links() {
         [2, 0, 0, 0, 0, 11],
         6,
     );
-    let store = query_store(&second);
-    second.shutdown().expect("stop second Capture runtime");
+    let store = query_store(&run);
+    run.shutdown().expect("stop Capture runtime");
 
     let actual = serde_json::to_value(store.topology().expect("read topology snapshot"))
         .expect("serialize topology DTO");
-    let mut expected_sessions = vec![first_session, second_session];
-    expected_sessions.sort();
-    assert_eq!(actual["data"]["sessions"], json!(expected_sessions));
+    assert_eq!(actual["data"]["sessions"], json!([session]));
     assert_eq!(actual["receipt"]["projection_commit"]["sequence"], "4");
     let links = actual["data"]["links"].as_array().expect("topology links");
     assert_eq!(
@@ -1034,20 +1028,20 @@ fn queries_fail_closed_on_noncanonical_manifest_and_projection_envelope_mismatch
         .expect("restore projection decoder");
     connection
         .execute(
-            "UPDATE packet_records SET disposition = 'health_committed'
+            "UPDATE projection_commits SET kind = 'decode_rejected'
              WHERE record_seq = (SELECT record_seq FROM csi_observations)",
             [],
         )
-        .expect("corrupt packet disposition");
+        .expect("corrupt projection kind");
     assert!(store.signals(&query, limits).is_err());
 
     connection
         .execute(
-            "UPDATE packet_records SET disposition = 'csi_committed'
+            "UPDATE projection_commits SET kind = 'semantic'
              WHERE record_seq = (SELECT record_seq FROM csi_observations)",
             [],
         )
-        .expect("restore packet disposition");
+        .expect("restore projection kind");
     let observation: Vec<u8> = connection
         .query_row("SELECT observation_cbor FROM csi_observations", [], |row| row.get(0))
         .expect("read observation CBOR");

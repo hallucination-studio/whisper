@@ -1,5 +1,132 @@
 import { expect, test } from '@playwright/test';
-import { live, profiles, sessions, signalsFor, storeId, topology } from './responses.mjs';
+import {
+  live,
+  profiles,
+  relationshipLatestFor,
+  relationshipSubjects,
+  semanticSessions,
+  sessions,
+  signalsFor,
+  storeId,
+  topology,
+} from './responses.mjs';
+
+test('switches between Capture Session signals and Semantic Session relationship sensing', async ({ page }) => {
+  const relationshipRequests = [];
+  await page.route('**/api/topology', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(topology) }),
+  );
+  await page.route('**/api/signals?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(signalsFor(route.request().url())),
+  }));
+  await page.route('**/api/relationships/latest', (route) => {
+    relationshipRequests.push(route.request().url());
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(relationshipSubjects),
+    });
+  });
+  await page.route('**/api/relationships/latest?**', (route) => {
+    relationshipRequests.push(route.request().url());
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(relationshipLatestFor(route.request().url())),
+    });
+  });
+  await page.routeWebSocket('**/api/live', (socket) => socket.send(JSON.stringify(live)));
+
+  await page.goto('/');
+  await expect(page.getByRole('radio', { name: 'Signal Lab' })).toBeChecked();
+  await expect(page.getByLabel('Capture Session')).toBeVisible();
+  await expect(page.getByTestId('tile-heading')).toBeVisible();
+
+  await page.getByRole('radio', { name: 'Sensing' }).check();
+  await expect(page.getByLabel('Capture Session')).toBeHidden();
+  await expect(page.getByLabel('Semantic Session')).toBeVisible();
+  await page.getByLabel('Semantic Session').selectOption(semanticSessions[1]);
+  await page.getByLabel('Sensing Profile').selectOption(profiles[2]);
+
+  await expect.poll(() => relationshipRequests.some((request) => {
+    const query = new URL(request).searchParams;
+    return query.get('session') === semanticSessions[1]
+      && query.get('link') === 'link-b'
+      && query.get('profile') === profiles[2];
+  })).toBe(true);
+  await expect(page.getByTestId('relationship-state')).toHaveText('Unknown(BaselineLearning)');
+  await expect(page.getByTestId('relationship-result-time')).toHaveText('1000000000 ns');
+  await expect(page.getByTestId('tile-heading')).toBeHidden();
+  await expect(page.locator('button')).toHaveCount(0);
+});
+
+test('rejects a relationship response outside the closed HTTP schema', async ({ page }) => {
+  await page.route('**/api/topology', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(topology) }),
+  );
+  await page.route('**/api/signals?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(signalsFor(route.request().url())),
+  }));
+  await page.route('**/api/relationships/latest', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(relationshipSubjects),
+  }));
+  await page.route('**/api/relationships/latest?**', (route) => {
+    const response = relationshipLatestFor(route.request().url());
+    response.data.command = 'begin_learning';
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
+  });
+  await page.routeWebSocket('**/api/live', (socket) => socket.send(JSON.stringify(live)));
+
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'Sensing' }).check();
+  await expect(page.getByTestId('connection-state')).toHaveText('PROTOCOL ERROR');
+  await expect(page.getByTestId('relationship-state')).toBeHidden();
+  await expect(page.locator('button')).toHaveCount(0);
+});
+
+test('keeps Sensing POLLING until every relationship receipt reaches the WebSocket watermark', async ({ page }) => {
+  let sequence = '5';
+  const currentTopology = structuredClone(topology);
+  currentTopology.receipt.projection_commit.sequence = '6';
+  await page.route('**/api/topology', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify(currentTopology),
+  }));
+  await page.route('**/api/signals?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(signalsFor(route.request().url(), storeId, '6')),
+  }));
+  await page.route('**/api/relationships/latest', (route) => {
+    const response = structuredClone(relationshipSubjects);
+    response.receipt.projection_commit.sequence = sequence;
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
+  });
+  await page.route('**/api/relationships/latest?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(relationshipLatestFor(route.request().url(), storeId, sequence)),
+  }));
+  await page.routeWebSocket('**/api/live', (socket) => socket.send(JSON.stringify({
+    ...live,
+    projection_commit: { store_id: storeId, sequence: '6' },
+  })));
+
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'Sensing' }).check();
+  await expect(page.getByTestId('relationship-state')).toHaveText('Unknown(BaselineLearning)');
+  await expect(page.getByTestId('connection-state')).toHaveText('POLLING');
+  await page.waitForTimeout(300);
+  await expect(page.getByTestId('connection-state')).toHaveText('POLLING');
+
+  sequence = '6';
+  await expect(page.getByTestId('connection-state')).toHaveText('LIVE');
+});
 
 test('selects and renders a non-first session, Sensor, Link, and Profile', async ({ page }) => {
   const signalRequests = [];
@@ -23,8 +150,8 @@ test('selects and renders a non-first session, Sensor, Link, and Profile', async
 
   await page.getByLabel('Capture Session').selectOption(sessions[1]);
   await page.getByLabel('Sensor').selectOption('sensor-b');
-  await page.getByLabel('Link').selectOption('link-b');
-  await page.getByLabel('Profile').selectOption(profiles[2]);
+  await page.locator('#link-select').selectOption('link-b');
+  await page.locator('#profile-select').selectOption(profiles[2]);
 
   await expect.poll(() => signalRequests.some((request) => {
     const query = new URL(request).searchParams;

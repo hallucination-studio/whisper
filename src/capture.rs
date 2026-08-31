@@ -88,26 +88,6 @@ pub enum PacketDisposition {
     CsiCommitted,
 }
 
-impl PacketDisposition {
-    pub(crate) const fn as_store_text(self) -> &'static str {
-        match self {
-            Self::UnknownKind => "unknown_kind",
-            Self::MalformedKnownBody => "malformed_known_body",
-            Self::BuildMismatch => "build_mismatch",
-            Self::CapabilityPinMismatch => "capability_pin_mismatch",
-            Self::CapabilityCommitted => "capability_committed",
-            Self::HealthCommitted => "health_committed",
-            Self::CapabilityMismatch => "capability_mismatch",
-            Self::CapabilityUnavailable => "capability_unavailable",
-            Self::SourceMismatch => "source_mismatch",
-            Self::RadioMismatch => "radio_mismatch",
-            Self::BodyBudgetMismatch => "body_budget_mismatch",
-            Self::DecodedDomainRejected => "decoded_domain_rejected",
-            Self::CsiCommitted => "csi_committed",
-        }
-    }
-}
-
 /// Monotonic packet position within one Capture Session.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize)]
 pub struct CaptureRecordSequence(u64);

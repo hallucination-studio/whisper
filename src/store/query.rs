@@ -168,7 +168,6 @@ struct PinnedReader {
     database_path: PathBuf,
     file_identity: Identity,
     store_id: [u8; 32],
-    replay_digest: [u8; 32],
 }
 
 impl Drop for PinnedReader {
@@ -192,7 +191,7 @@ impl QueryStore {
         let (database_path, file_identity) =
             validate_existing_for_reader(database_path).map_err(StoreError::from)?;
         let connection = open_query_reader(&database_path)?;
-        let (store_id, replay_digest) = read_store_identity(&connection)?;
+        let store_id = read_store_identity(&connection)?;
         let interrupt = Arc::new(connection.get_interrupt_handle());
         Ok(Self {
             inner: Arc::new(Mutex::new(PinnedReader {
@@ -201,7 +200,6 @@ impl QueryStore {
                 database_path,
                 file_identity,
                 store_id,
-                replay_digest,
             })),
             interrupt,
             #[cfg(feature = "ingest-test-hooks")]
@@ -296,13 +294,59 @@ impl QueryStore {
         let mut reader = self.reader()?;
         validate_pinned_path(&reader)?;
         let store_id = reader.store_id;
-        let replay_digest = reader.replay_digest;
         let connection = reader
             .connection
             .as_mut()
             .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let response = signals_snapshot(&transaction, query, limits, store_id, replay_digest)?;
+        let response = signals_snapshot(&transaction, query, limits, store_id)?;
+        transaction.commit()?;
+        validate_pinned_path(&reader)?;
+        Ok(response)
+    }
+
+    /// Discovers committed Semantic Session, Link, and Profile relationship subjects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without a partial DTO when committed projection state is corrupt.
+    pub fn relationship_subjects(&self) -> Result<RelationshipSubjectsOk, QueryError> {
+        #[cfg(feature = "ingest-test-hooks")]
+        self.wait_for_test_gate()?;
+        let mut reader = self.reader()?;
+        validate_pinned_path(&reader)?;
+        let store_id = reader.store_id;
+        let connection = reader
+            .connection
+            .as_mut()
+            .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let response = relationship_subjects_snapshot(&transaction, store_id)?;
+        transaction.commit()?;
+        validate_pinned_path(&reader)?;
+        Ok(response)
+    }
+
+    /// Reads the latest committed relationship for one exact Semantic Session subject.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without a partial DTO when committed projection state is corrupt.
+    pub fn relationship_latest(
+        &self,
+        selection: &RelationshipSelection,
+    ) -> Result<RelationshipLatestResponse, QueryError> {
+        #[cfg(feature = "ingest-test-hooks")]
+        self.wait_for_test_gate()?;
+        let mut reader = self.reader()?;
+        validate_pinned_path(&reader)?;
+        let store_id = reader.store_id;
+        let connection = reader
+            .connection
+            .as_mut()
+            .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let response = relationship_latest_snapshot(&transaction, selection, store_id)?;
         transaction.commit()?;
         validate_pinned_path(&reader)?;
         Ok(response)
@@ -354,30 +398,16 @@ fn validate_pinned_path(reader: &PinnedReader) -> Result<(), QueryError> {
     Ok(())
 }
 
-fn read_store_identity(
-    connection: &rusqlite::Connection,
-) -> Result<([u8; 32], [u8; 32]), QueryError> {
-    let (store_id, replay, replay_digest): (Vec<u8>, Vec<u8>, Vec<u8>) = connection
-        .query_row(
-            "SELECT store_id, replay_config_cbor, replay_config_digest
-             FROM store_state WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+fn read_store_identity(connection: &rusqlite::Connection) -> Result<[u8; 32], QueryError> {
+    let store_id: Vec<u8> = connection
+        .query_row("SELECT store_id FROM store_state WHERE singleton = 1", [], |row| row.get(0))
         .optional()?
         .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
     let store_id = store_id
         .as_slice()
         .try_into()
         .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
-    let replay_digest: [u8; 32] = replay_digest
-        .as_slice()
-        .try_into()
-        .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
-    if <[u8; 32]>::from(Sha256::digest(&replay)) != replay_digest {
-        return Err(QueryError::new(QueryErrorKind::Incompatible));
-    }
-    Ok((store_id, replay_digest))
+    Ok(store_id)
 }
 
 /// A half-open session-time range used by one signal query.
@@ -452,6 +482,27 @@ pub struct SignalSelection {
     session: SessionId,
     sensor: SensorId,
     link: RadioLinkId,
+}
+
+/// Validated Semantic Session, Link, and Profile relationship selectors.
+#[derive(Clone, Debug)]
+pub struct RelationshipSelection {
+    session: SessionId,
+    link: RadioLinkId,
+    profile: crate::domain::csi::CaptureProfileId,
+}
+
+impl RelationshipSelection {
+    /// Validates one exact relationship subject selection.
+    pub fn try_new(session: &str, link: &str, profile: &str) -> Result<Self, QueryError> {
+        let session = SessionId::new(session).map_err(|_| {
+            QueryError::new(QueryErrorKind::InvalidRequest("invalid Semantic Session"))
+        })?;
+        let link = RadioLinkId::new(link)
+            .map_err(|_| QueryError::new(QueryErrorKind::InvalidRequest("invalid Link")))?;
+        let profile = crate::domain::csi::CaptureProfileId::from_bytes(decode_hex_32(profile)?);
+        Ok(Self { session, link, profile })
+    }
 }
 
 impl SignalSelection {
@@ -573,12 +624,7 @@ impl SignalsResponse {
     pub(crate) const fn http_status(&self) -> u16 {
         match self {
             Self::Ok(_) | Self::Empty(_) => 200,
-            Self::Error(error) => match &error.error {
-                ApiError::Invalid(_) => 400,
-                ApiError::Range(_) => 416,
-                ApiError::Phase(_) => 422,
-                ApiError::Projection(_) => 500,
-            },
+            Self::Error(error) => error.http_status(),
         }
     }
 }
@@ -664,6 +710,112 @@ struct ViewReceipt {
     algorithm_version: String,
 }
 
+/// Canonical committed relationship-subject discovery response.
+#[derive(Clone, Debug, Serialize)]
+pub struct RelationshipSubjectsOk {
+    http_schema_version: u8,
+    kind: &'static str,
+    resource: &'static str,
+    data: RelationshipSubjectsData,
+    receipt: StoreViewReceipt,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RelationshipSubjectsData {
+    subjects: Vec<RelationshipSubject>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RelationshipSubject {
+    session_id: String,
+    link: String,
+    profile: String,
+}
+
+/// One canonical selected relationship result, empty result, or typed error.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum RelationshipLatestResponse {
+    /// A committed latest relationship exists for the selected subject.
+    Ok(RelationshipLatestOk),
+    /// The selected committed subject has not produced a relationship window.
+    Empty(RelationshipLatestEmpty),
+    /// The selection could not produce a relationship response.
+    Error(ErrorEnvelope),
+}
+
+impl RelationshipLatestResponse {
+    pub(crate) const fn http_status(&self) -> u16 {
+        match self {
+            Self::Ok(_) | Self::Empty(_) => 200,
+            Self::Error(error) => error.http_status(),
+        }
+    }
+}
+
+/// Canonical committed latest-relationship response.
+#[derive(Clone, Debug, Serialize)]
+pub struct RelationshipLatestOk {
+    http_schema_version: u8,
+    kind: &'static str,
+    resource: &'static str,
+    data: RelationshipLatestData,
+    receipt: ViewReceipt,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RelationshipLatestData {
+    session_id: String,
+    link: String,
+    profile: String,
+    knowledge: RelationshipKnowledge,
+    result_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    most_recent_change: Option<RelationshipChange>,
+    creator_commit: ProjectionWatermark,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RelationshipChange {
+    previous: RelationshipKnowledge,
+    current: RelationshipKnowledge,
+    changed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RelationshipKnowledge {
+    Stable,
+    Changing,
+    Unknown { reason: RelationshipUnknownReason },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RelationshipUnknownReason {
+    BaselineMissing,
+    BaselineLearning,
+    InsufficientCoverage,
+    LowQuality,
+    AmbiguousEvidence,
+    TimeUncertain,
+    MissingData,
+    ProfileMismatch,
+    Stale,
+    Frozen,
+    Inactive,
+    NonFinite,
+}
+
+/// Canonical empty latest-relationship response for a committed subject.
+#[derive(Clone, Debug, Serialize)]
+pub struct RelationshipLatestEmpty {
+    http_schema_version: u8,
+    kind: &'static str,
+    resource: &'static str,
+    receipt: ViewReceipt,
+}
+
 /// Canonical visible-session empty response imported from API/UI v1.
 #[derive(Clone, Debug, Serialize)]
 pub struct EmptyEnvelope {
@@ -707,6 +859,29 @@ impl ErrorEnvelope {
             }),
         }
     }
+
+    /// Creates the canonical bounded-command queue exhaustion envelope.
+    #[must_use]
+    pub fn command_queue_full() -> Self {
+        Self {
+            http_schema_version: 1,
+            kind: "error",
+            error: ApiError::CommandQueue(CommandQueueFullError {
+                code: "command_queue_full",
+                message: "relationship command queue is full".to_owned(),
+            }),
+        }
+    }
+
+    const fn http_status(&self) -> u16 {
+        match &self.error {
+            ApiError::Invalid(_) => 400,
+            ApiError::Range(_) => 416,
+            ApiError::Phase(_) => 422,
+            ApiError::Projection(_) => 500,
+            ApiError::CommandQueue(_) => 503,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -716,6 +891,7 @@ enum ApiError {
     Range(RangeUnavailableError),
     Phase(PhaseOverBudgetError),
     Projection(ProjectionFailedError),
+    CommandQueue(CommandQueueFullError),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -739,6 +915,12 @@ struct PhaseOverBudgetError {
 
 #[derive(Clone, Debug, Serialize)]
 struct ProjectionFailedError {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CommandQueueFullError {
     code: &'static str,
     message: String,
 }
@@ -886,9 +1068,10 @@ struct TileRows {
 
 struct ObservationAuthority<'a> {
     query: &'a SignalQuery,
+    semantic_session: &'a str,
     record_sequence: u64,
     profile: [u8; 32],
-    replay_digest: [u8; 32],
+    config_digest: [u8; 32],
     decoder: &'a str,
     conditioning: &'a str,
     session_time: u64,
@@ -975,27 +1158,268 @@ struct StoredLink {
     receiver: String,
 }
 
-fn signals_snapshot(
+fn relationship_subjects_snapshot(
     transaction: &Transaction<'_>,
-    query: &SignalQuery,
-    limits: QueryLimits,
     expected_store_id: [u8; 32],
-    expected_replay_digest: [u8; 32],
-) -> Result<SignalsResponse, QueryError> {
-    if query.max_time_buckets > limits.max_time_buckets {
-        return Ok(invalid_request("max_time_buckets exceeds the configured limit"));
+) -> Result<RelationshipSubjectsOk, QueryError> {
+    let (store_id, watermark) = store_projection_snapshot(transaction, expected_store_id)?;
+    let rows = transaction
+        .prepare(
+            "SELECT session_id, link_id, profile_id FROM (
+                 SELECT baseline.source_session_id AS session_id,
+                        baseline.link_id AS link_id, baseline.profile_id AS profile_id
+                 FROM baseline_states AS baseline
+                 JOIN visible_sessions AS visible
+                   ON visible.session_id = baseline.source_session_id
+                 WHERE baseline.source_record_seq <= visible.processed_through_record_seq
+                 UNION
+                 SELECT relationship.session_id AS session_id,
+                        relationship.link_id AS link_id,
+                        relationship.profile_id AS profile_id
+                 FROM relationship_latest AS relationship
+                 JOIN visible_sessions AS visible USING (session_id)
+                 WHERE relationship.source_record_seq <= visible.processed_through_record_seq
+                   AND relationship.creator_commit_seq <= visible.projection_commit_seq
+             )
+             ORDER BY session_id, link_id, profile_id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut subjects = Vec::with_capacity(rows.len());
+    let mut previous: Option<(Vec<u8>, Vec<u8>, [u8; 32])> = None;
+    for (session, link, profile) in rows {
+        SessionId::new(session.as_str())
+            .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
+        RadioLinkId::new(link.as_str())
+            .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
+        let profile: [u8; 32] = profile
+            .as_slice()
+            .try_into()
+            .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
+        let identity = (session.as_bytes().to_vec(), link.as_bytes().to_vec(), profile);
+        if previous.as_ref().is_some_and(|previous| previous >= &identity) {
+            return Err(QueryError::new(QueryErrorKind::Incompatible));
+        }
+        previous = Some(identity);
+        subjects.push(RelationshipSubject {
+            session_id: session,
+            link,
+            profile: hex::encode(&profile),
+        });
     }
-    let (store_id, watermark, store_replay, store_replay_digest): (
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-    ) = transaction
+    if watermark == 0 && !subjects.is_empty() {
+        return Err(QueryError::new(QueryErrorKind::Incompatible));
+    }
+    Ok(RelationshipSubjectsOk {
+        http_schema_version: 1,
+        kind: "ok",
+        resource: "relationship_subjects",
+        data: RelationshipSubjectsData { subjects },
+        receipt: StoreViewReceipt {
+            projection_commit: ProjectionWatermark {
+                store_id: hex::encode(&store_id),
+                sequence: watermark.to_string(),
+            },
+        },
+    })
+}
+
+fn relationship_latest_snapshot(
+    transaction: &Transaction<'_>,
+    selection: &RelationshipSelection,
+    expected_store_id: [u8; 32],
+) -> Result<RelationshipLatestResponse, QueryError> {
+    let (store_id, watermark) = store_projection_snapshot(transaction, expected_store_id)?;
+    let visible = transaction
         .query_row(
-            "SELECT store_id, projection_commit_seq, replay_config_cbor, replay_config_digest
-             FROM store_state WHERE singleton = 1",
+            "SELECT processed_through_record_seq, projection_commit_seq,
+                    decoder_version, conditioning_version, algorithm_version
+             FROM visible_sessions WHERE session_id = ?1",
+            [selection.session.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((cursor, session_projection, decoder, conditioning, algorithm)) = visible else {
+        return Ok(RelationshipLatestResponse::Error(range_unavailable_envelope(
+            "Semantic Session is not query-visible",
+        )));
+    };
+    let cursor = decode_u64(&cursor)?;
+    let session_projection = decode_u64(&session_projection)?;
+    if watermark == 0 || session_projection == 0 || session_projection > watermark {
+        return Err(QueryError::new(QueryErrorKind::Incompatible));
+    }
+    let receipt = ViewReceipt {
+        projection_commit: ProjectionWatermark {
+            store_id: hex::encode(&store_id),
+            sequence: watermark.to_string(),
+        },
+        session_id: selection.session.as_str().to_owned(),
+        first_record_seq: "0".to_owned(),
+        last_record_seq: cursor.to_string(),
+        decoder_version: decoder,
+        conditioning_version: conditioning,
+        algorithm_version: algorithm,
+    };
+    let discoverable = transaction
+        .query_row(
+            "SELECT 1 FROM (
+                 SELECT baseline.source_session_id AS session_id,
+                        baseline.link_id AS link_id, baseline.profile_id AS profile_id
+                 FROM baseline_states AS baseline
+                 JOIN visible_sessions AS visible
+                   ON visible.session_id = baseline.source_session_id
+                 WHERE baseline.source_record_seq <= visible.processed_through_record_seq
+                 UNION
+                 SELECT relationship.session_id AS session_id,
+                        relationship.link_id AS link_id,
+                        relationship.profile_id AS profile_id
+                 FROM relationship_latest AS relationship
+                 JOIN visible_sessions AS visible USING (session_id)
+                 WHERE relationship.source_record_seq <= visible.processed_through_record_seq
+                   AND relationship.creator_commit_seq <= visible.projection_commit_seq
+             )
+             WHERE session_id = ?1 AND link_id = ?2 AND profile_id = ?3",
+            params![
+                selection.session.as_str(),
+                selection.link.as_str(),
+                selection.profile.as_bytes(),
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !discoverable {
+        return Ok(RelationshipLatestResponse::Error(invalid_request_envelope(
+            "relationship subject is not discoverable",
+        )));
+    }
+
+    type RelationshipRow = (
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+    );
+    let row: Option<RelationshipRow> = transaction
+        .query_row(
+            "SELECT relationship.knowledge_cbor, relationship.result_time,
+                    relationship.change_previous_cbor, relationship.change_current_cbor,
+                    relationship.changed_at, relationship.source_record_seq,
+                    relationship.creator_commit_seq, projection.record_seq, projection.kind
+             FROM relationship_latest AS relationship
+             JOIN projection_commits AS projection
+               ON projection.session_id = relationship.session_id
+              AND projection.record_seq = relationship.source_record_seq
+              AND projection.commit_seq = relationship.creator_commit_seq
+             WHERE relationship.session_id = ?1 AND relationship.link_id = ?2
+               AND relationship.profile_id = ?3",
+            params![
+                selection.session.as_str(),
+                selection.link.as_str(),
+                selection.profile.as_bytes(),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        knowledge,
+        result_time,
+        change_previous,
+        change_current,
+        changed_at,
+        source_record,
+        creator_commit,
+        projection_record,
+        projection_kind,
+    )) = row
+    else {
+        return Ok(RelationshipLatestResponse::Empty(RelationshipLatestEmpty {
+            http_schema_version: 1,
+            kind: "empty",
+            resource: "relationship_latest",
+            receipt,
+        }));
+    };
+    let source_record = decode_u64(&source_record)?;
+    let projection_record = decode_u64(&projection_record)?;
+    let creator_commit = decode_u64(&creator_commit)?;
+    if source_record != projection_record
+        || source_record > cursor
+        || creator_commit == 0
+        || creator_commit > session_projection
+        || creator_commit > watermark
+        || projection_kind != "semantic"
+    {
+        return Err(QueryError::new(QueryErrorKind::Incompatible));
+    }
+    let knowledge = decode_relationship_knowledge(&knowledge)?;
+    let result_time = decode_u64(&result_time)?;
+    let most_recent_change = match (change_previous, change_current, changed_at) {
+        (None, None, None) => None,
+        (Some(previous), Some(current), Some(changed_at)) => Some(RelationshipChange {
+            previous: decode_relationship_knowledge(&previous)?,
+            current: decode_relationship_knowledge(&current)?,
+            changed_at: decode_u64(&changed_at)?.to_string(),
+        }),
+        _ => return Err(QueryError::new(QueryErrorKind::Incompatible)),
+    };
+    Ok(RelationshipLatestResponse::Ok(RelationshipLatestOk {
+        http_schema_version: 1,
+        kind: "ok",
+        resource: "relationship_latest",
+        data: RelationshipLatestData {
+            session_id: selection.session.as_str().to_owned(),
+            link: selection.link.as_str().to_owned(),
+            profile: hex::encode(&selection.profile.as_bytes()),
+            knowledge,
+            result_time: result_time.to_string(),
+            most_recent_change,
+            creator_commit: ProjectionWatermark {
+                store_id: hex::encode(&store_id),
+                sequence: creator_commit.to_string(),
+            },
+        },
+        receipt,
+    }))
+}
+
+fn store_projection_snapshot(
+    transaction: &Transaction<'_>,
+    expected_store_id: [u8; 32],
+) -> Result<([u8; 32], u64), QueryError> {
+    let (store_id, watermark): (Vec<u8>, Vec<u8>) = transaction
+        .query_row(
+            "SELECT store_id, projection_commit_seq FROM store_state WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
         .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
@@ -1006,52 +1430,84 @@ fn signals_snapshot(
     if store_id != expected_store_id {
         return Err(QueryError::new(QueryErrorKind::Incompatible));
     }
-    let store_replay_digest: [u8; 32] = store_replay_digest
-        .as_slice()
-        .try_into()
-        .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
-    if store_replay_digest != expected_replay_digest
-        || <[u8; 32]>::from(Sha256::digest(&store_replay)) != store_replay_digest
+    Ok((store_id, decode_u64(&watermark)?))
+}
+
+fn decode_relationship_knowledge(bytes: &[u8]) -> Result<RelationshipKnowledge, QueryError> {
+    let mut cursor = Cursor::new(bytes);
+    let knowledge: RelationshipKnowledge =
+        from_reader(&mut cursor).map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
+    if cursor.position()
+        != u64::try_from(bytes.len()).map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?
     {
         return Err(QueryError::new(QueryErrorKind::Incompatible));
     }
-    let watermark = decode_u64(&watermark)?;
+    let mut canonical = Vec::new();
+    into_writer(&knowledge, &mut canonical)
+        .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
+    if canonical != bytes {
+        return Err(QueryError::new(QueryErrorKind::Incompatible));
+    }
+    Ok(knowledge)
+}
+
+fn signals_snapshot(
+    transaction: &Transaction<'_>,
+    query: &SignalQuery,
+    limits: QueryLimits,
+    expected_store_id: [u8; 32],
+) -> Result<SignalsResponse, QueryError> {
+    if query.max_time_buckets > limits.max_time_buckets {
+        return Ok(invalid_request("max_time_buckets exceeds the configured limit"));
+    }
+    let (store_id, watermark) = store_projection_snapshot(transaction, expected_store_id)?;
     let session = transaction
         .query_row(
-            "SELECT committed_through_record_seq, replay_config_digest, decoder_version,
-                    conditioning_version, algorithm_version, projection_commit_seq
-             FROM capture_sessions WHERE session_id = ?1
-               AND projection_commit_seq IS NOT NULL",
+            "SELECT capture.capture_record_seq, capture.session_id, visible.config_digest,
+                    capture_session.decoder_version, capture_session.conditioning_version,
+                    capture_session.algorithm_version, visible.projection_commit_seq
+             FROM visible_capture_records AS capture
+             JOIN capture_sessions AS capture_session USING (capture_session_id)
+             JOIN visible_sessions AS visible ON visible.session_id = capture.session_id
+             WHERE capture.capture_session_id = ?1
+             ORDER BY capture.capture_record_seq DESC LIMIT 1",
             [query.session.as_str()],
             |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((cursor, replay_digest, decoder, conditioning, algorithm, session_projection)) =
-        session
+    let Some((
+        cursor,
+        semantic_session,
+        config_digest,
+        decoder,
+        conditioning,
+        algorithm,
+        session_projection,
+    )) = session
     else {
         return Ok(range_unavailable("Capture Session is not query-visible"));
     };
+    SessionId::new(semantic_session.as_str())
+        .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
     let cursor = decode_u64(&cursor)?;
     let session_projection = decode_u64(&session_projection)?;
     if watermark == 0 || session_projection == 0 || session_projection > watermark {
         return Err(QueryError::new(QueryErrorKind::Incompatible));
     }
-    let replay_digest: [u8; 32] = replay_digest
+    let config_digest: [u8; 32] = config_digest
         .as_slice()
         .try_into()
         .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
-    if replay_digest != store_replay_digest {
-        return Err(QueryError::new(QueryErrorKind::Incompatible));
-    }
     let receipt = ViewReceipt {
         projection_commit: ProjectionWatermark {
             store_id: hex::encode(&store_id),
@@ -1070,19 +1526,25 @@ fn signals_snapshot(
 
     let rows = transaction
         .prepare(
-            "SELECT observation.session_time_ns, observation.record_seq,
+            "SELECT capture.capture_session_time, observation.record_seq,
                     observation.profile_id, observation.observation_cbor,
                     observation.decoder_version, observation.conditioning_version,
-                    observation.replay_config_digest, packet.session_time_ns,
-                    packet.device_id, packet.boot_generation, packet.disposition
-             FROM csi_observations AS observation
-             JOIN packet_records AS packet USING(session_id, record_seq)
-             WHERE observation.session_id = ?1
+                    observation.config_digest, observation.session_time,
+                    capture.session_id, capture.capture_record_seq, projection.kind
+             FROM visible_capture_records AS capture
+             JOIN csi_observations AS observation
+               ON observation.session_id = capture.session_id
+              AND observation.record_seq = capture.record_seq
+             JOIN projection_commits AS projection
+               ON projection.session_id = capture.session_id
+              AND projection.record_seq = capture.record_seq
+             WHERE capture.capture_session_id = ?1
                AND observation.sensor_id = ?2 AND observation.link_id = ?3
-               AND observation.record_seq <= ?4
-               AND observation.session_time_ns >= ?5 AND observation.session_time_ns < ?6
-             ORDER BY observation.profile_id, packet.device_id, packet.boot_generation,
-                      observation.session_time_ns, observation.record_seq",
+               AND capture.capture_record_seq <= ?4
+               AND capture.capture_session_time >= ?5
+               AND capture.capture_session_time < ?6
+             ORDER BY observation.profile_id, capture.capture_session_time,
+                      capture.capture_record_seq",
         )?
         .query_map(
             params![
@@ -1103,7 +1565,7 @@ fn signals_snapshot(
                     row.get::<_, String>(5)?,
                     row.get::<_, Vec<u8>>(6)?,
                     row.get::<_, Vec<u8>>(7)?,
-                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, String>(8)?,
                     row.get::<_, Vec<u8>>(9)?,
                     row.get::<_, String>(10)?,
                 ))
@@ -1115,22 +1577,23 @@ fn signals_snapshot(
     }
     let mut groups: BTreeMap<TileKey, TileRows> = BTreeMap::new();
     for (
-        time,
+        capture_time,
         record,
         profile,
         observation_bytes,
         row_decoder,
         row_conditioning,
-        row_replay_digest,
-        packet_time,
-        device,
-        boot,
-        disposition,
+        row_config_digest,
+        observation_time,
+        row_semantic_session,
+        capture_record,
+        projection_kind,
     ) in rows
     {
-        let session_time = decode_u64(&time)?;
-        let packet_time = decode_u64(&packet_time)?;
+        let capture_time = decode_u64(&capture_time)?;
+        let observation_time = decode_u64(&observation_time)?;
         let record_sequence = decode_u64(&record)?;
+        let capture_record = decode_u64(&capture_record)?;
         let profile: [u8; 32] = profile
             .as_slice()
             .try_into()
@@ -1138,14 +1601,12 @@ fn signals_snapshot(
         if query.profile.is_some_and(|selected| selected != profile) {
             continue;
         }
-        let device_id = decode_u64(&device)?;
-        let boot_generation = decode_u32(&boot)?;
-        if boot_generation == 0
-            || packet_time != session_time
+        if capture_record > cursor
+            || row_semantic_session != semantic_session
+            || projection_kind != "semantic"
             || row_decoder != decoder
             || row_conditioning != conditioning
-            || row_replay_digest.as_slice() != replay_digest
-            || disposition != "csi_committed"
+            || row_config_digest.as_slice() != config_digest
         {
             return Err(QueryError::new(QueryErrorKind::Incompatible));
         }
@@ -1164,16 +1625,19 @@ fn signals_snapshot(
         if canonical_observation != observation_bytes {
             return Err(QueryError::new(QueryErrorKind::Incompatible));
         }
+        let device_id = observation.observation.device_epoch.device;
+        let boot_generation = observation.observation.device_epoch.boot_generation;
         validate_observation(
             &observation,
             ObservationAuthority {
                 query,
+                semantic_session: &semantic_session,
                 record_sequence,
                 profile,
-                replay_digest,
+                config_digest,
                 decoder: &decoder,
                 conditioning: &conditioning,
-                session_time,
+                session_time: observation_time,
                 device_id,
                 boot_generation,
             },
@@ -1202,7 +1666,7 @@ fn signals_snapshot(
         {
             return Err(QueryError::new(QueryErrorKind::Incompatible));
         }
-        group.rows.push(SignalRow { session_time, observation });
+        group.rows.push(SignalRow { session_time: capture_time, observation });
     }
     if groups.is_empty() {
         return Ok(empty_signals(receipt));
@@ -1289,9 +1753,9 @@ fn validate_observation(
 ) -> Result<(), QueryError> {
     let observation = &root.observation;
     if root.schema_version != 1
-        || root.config_digest.as_slice() != authority.replay_digest
+        || root.config_digest.as_slice() != authority.config_digest
         || root.conditioning_version != authority.conditioning
-        || observation.input.session != authority.query.session.as_str()
+        || observation.input.session != authority.semantic_session
         || observation.input.record_seq != authority.record_sequence
         || observation.input.decoder_version != authority.decoder
         || observation.sensor != authority.query.sensor.as_str()
@@ -1450,25 +1914,33 @@ fn empty_signals(receipt: ViewReceipt) -> SignalsResponse {
 }
 
 fn invalid_request(message: &str) -> SignalsResponse {
-    SignalsResponse::Error(ErrorEnvelope {
+    SignalsResponse::Error(invalid_request_envelope(message))
+}
+
+fn invalid_request_envelope(message: &str) -> ErrorEnvelope {
+    ErrorEnvelope {
         http_schema_version: 1,
         kind: "error",
         error: ApiError::Invalid(InvalidRequestError {
             code: "invalid_request",
             message: message.to_owned(),
         }),
-    })
+    }
 }
 
 fn range_unavailable(message: &str) -> SignalsResponse {
-    SignalsResponse::Error(ErrorEnvelope {
+    SignalsResponse::Error(range_unavailable_envelope(message))
+}
+
+fn range_unavailable_envelope(message: &str) -> ErrorEnvelope {
+    ErrorEnvelope {
         http_schema_version: 1,
         kind: "error",
         error: ApiError::Range(RangeUnavailableError {
             code: "range_unavailable",
             message: message.to_owned(),
         }),
-    })
+    }
 }
 
 fn phase_over_budget(limit: NonZeroU64) -> SignalsResponse {
@@ -1672,8 +2144,8 @@ fn topology_snapshot(
 
     let sessions = transaction
         .prepare(
-            "SELECT session_id FROM capture_sessions
-             WHERE projection_commit_seq IS NOT NULL ORDER BY session_id",
+            "SELECT DISTINCT capture_session_id FROM visible_capture_records
+             ORDER BY capture_session_id",
         )?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1689,10 +2161,10 @@ fn topology_snapshot(
             .prepare(
                 "SELECT DISTINCT lower(hex(observation.profile_id))
                  FROM csi_observations AS observation
-                 JOIN capture_sessions AS session USING(session_id)
+                 JOIN visible_capture_records AS capture
+                   ON capture.session_id = observation.session_id
+                  AND capture.record_seq = observation.record_seq
                  WHERE observation.sensor_id = ?1 AND observation.link_id = ?2
-                   AND session.projection_commit_seq IS NOT NULL
-                   AND observation.record_seq <= session.committed_through_record_seq
                  ORDER BY observation.profile_id",
             )?
             .query_map(params![&link.receiver, &link.id], |row| row.get::<_, String>(0))?
@@ -1784,12 +2256,6 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_bytes(bytes)
-}
-
-fn decode_u32(bytes: &[u8]) -> Result<u32, QueryError> {
-    let bytes: [u8; 4] =
-        bytes.try_into().map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
-    Ok(u32::from_be_bytes(bytes))
 }
 
 fn decode_hex_32(value: &str) -> Result<[u8; 32], QueryError> {

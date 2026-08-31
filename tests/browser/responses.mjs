@@ -4,6 +4,10 @@ export const sessions = [
   'capture-00000000000000000000000000000001',
   'capture-00000000000000000000000000000002',
 ];
+export const semanticSessions = [
+  'session-00000000000000000000000000000001',
+  'session-00000000000000000000000000000002',
+];
 
 export const topology = {
   http_schema_version: 1,
@@ -43,6 +47,46 @@ export const live = {
   projection_commit: { store_id: storeId, sequence: '5' },
   payload: { kind: 'projection_watermark' },
 };
+
+export const relationshipSubjects = {
+  http_schema_version: 1,
+  kind: 'ok',
+  resource: 'relationship_subjects',
+  data: {
+    subjects: [
+      { session_id: semanticSessions[0], link: 'link-a', profile: profiles[0] },
+      { session_id: semanticSessions[1], link: 'link-b', profile: profiles[1] },
+      { session_id: semanticSessions[1], link: 'link-b', profile: profiles[2] },
+    ],
+  },
+  receipt: { projection_commit: { store_id: storeId, sequence: '5' } },
+};
+
+export function relationshipLatestFor(url, responseStoreId = storeId, sequence = '5') {
+  const query = new URL(url).searchParams;
+  return {
+    http_schema_version: 1,
+    kind: 'ok',
+    resource: 'relationship_latest',
+    data: {
+      session_id: query.get('session'),
+      link: query.get('link'),
+      profile: query.get('profile'),
+      knowledge: { kind: 'unknown', reason: 'baseline_learning' },
+      result_time: '1000000000',
+      creator_commit: { store_id: responseStoreId, sequence },
+    },
+    receipt: {
+      projection_commit: { store_id: responseStoreId, sequence },
+      session_id: query.get('session'),
+      first_record_seq: '0',
+      last_record_seq: '4',
+      decoder_version: 'native-frame-v1',
+      conditioning_version: 'amplitude-v1',
+      algorithm_version: 'baseline-v1',
+    },
+  };
+}
 
 export function signalsFor(url, responseStoreId = storeId, sequence = '5') {
   const query = new URL(url).searchParams;

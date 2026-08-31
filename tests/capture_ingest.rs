@@ -21,8 +21,8 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use whisper::parse_config;
 use whisper::test_support::{
-    CaptureRecordSequence, CapturedDatagram, CommitError, CommitOutcome, PacketDisposition,
-    ProjectionSequence, SubmitError, serve_capture,
+    CaptureRecordSequence, CapturedDatagram, CommitOutcome, PacketDisposition, ProjectionSequence,
+    SubmitError, serve_capture,
 };
 
 const HEADER_BYTES: usize = 32;
@@ -291,19 +291,18 @@ fn authenticated_unknown_kind_commits_one_packet_cursor_and_watermark() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let packet: (Vec<u8>, Vec<u8>, String) = connection
+    let packet: (Vec<u8>, Vec<u8>) = connection
         .query_row(
-            "SELECT record_seq, session_time_ns, disposition FROM packet_records",
+            "SELECT capture_record_seq, capture_session_time FROM packet_capture_membership",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("read packet");
     assert_eq!(packet.0, 0_u64.to_be_bytes());
     assert_eq!(packet.1.len(), 8);
-    assert_eq!(packet.2, "unknown_kind");
     let (cursor, watermark): (Vec<u8>, Vec<u8>) = connection
         .query_row(
-            "SELECT committed_through_record_seq,
+            "SELECT durable_tail_record_seq,
                     (SELECT projection_commit_seq FROM store_state)
              FROM capture_sessions",
             [],
@@ -347,7 +346,7 @@ fn replay_rejection_has_no_packet_cursor_or_watermark_effect() {
     let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, cursor, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
-            "SELECT (SELECT count(*) FROM packet_records), committed_through_record_seq,
+            "SELECT (SELECT count(*) FROM packet_capture_membership), durable_tail_record_seq,
                     (SELECT projection_commit_seq FROM store_state)
              FROM capture_sessions",
             [],
@@ -380,22 +379,22 @@ fn malformed_known_body_commits_before_capability_resolution() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let (disposition, capabilities, observations): (String, u64, u64) = connection
+    let (packets, observations, projection_kind): (u64, u64, String) = connection
         .query_row(
-            "SELECT disposition, (SELECT count(*) FROM capability_epochs),
-                    (SELECT count(*) FROM csi_observations)
-             FROM packet_records",
+            "SELECT (SELECT count(*) FROM packet_capture_membership),
+                    (SELECT count(*) FROM csi_observations), kind
+             FROM projection_commits",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read malformed packet effects");
-    assert_eq!(disposition, "malformed_known_body");
-    assert_eq!(capabilities, 0);
+    assert_eq!(packets, 1);
     assert_eq!(observations, 0);
+    assert_eq!(projection_kind, "decode_rejected");
 }
 
 #[test]
-fn first_conforming_capability_commits_exact_epoch_row() {
+fn first_conforming_capability_commits_one_packet_projection() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
     let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
@@ -416,16 +415,19 @@ fn first_conforming_capability_commits_exact_epoch_row() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let (digest, descriptor, first_record): (Vec<u8>, Vec<u8>, Vec<u8>) = connection
+    let (capture_record, body_bytes, projection_kind): (Vec<u8>, u64, String) = connection
         .query_row(
-            "SELECT capability_digest, descriptor_bytes, first_record_seq FROM capability_epochs",
+            "SELECT membership.capture_record_seq, length(record.body_cbor), projection.kind
+             FROM packet_capture_membership AS membership
+             JOIN session_records AS record USING (session_id, record_seq)
+             JOIN projection_commits AS projection USING (session_id, record_seq)",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .expect("read committed capability");
-    assert_eq!(digest, body[..32]);
-    assert_eq!(descriptor, body[34..]);
-    assert_eq!(first_record, 0_u64.to_be_bytes());
+        .expect("read committed capability packet");
+    assert_eq!(capture_record, 0_u64.to_be_bytes());
+    assert!(body_bytes > 0);
+    assert_eq!(projection_kind, "semantic");
 }
 
 #[test]
@@ -468,10 +470,15 @@ fn capability_pin_precedence_checks_build_before_digest() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let capabilities: u64 = connection
-        .query_row("SELECT count(*) FROM capability_epochs", [], |row| row.get(0))
-        .expect("read capability count");
-    assert_eq!(capabilities, 0);
+    let (packets, observations): (u64, u64) = connection
+        .query_row(
+            "SELECT (SELECT count(*) FROM packet_capture_membership),
+                    (SELECT count(*) FROM csi_observations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read mismatch effects");
+    assert_eq!((packets, observations), (2, 0));
 }
 
 #[test]
@@ -499,20 +506,19 @@ fn capability_descriptor_budget_above_route_is_rejected_before_epoch_commit() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let (disposition, capabilities): (String, u64) = connection
+    let (packets, observations): (u64, u64) = connection
         .query_row(
-            "SELECT disposition, (SELECT count(*) FROM capability_epochs)
-             FROM packet_records",
+            "SELECT (SELECT count(*) FROM packet_capture_membership),
+                    (SELECT count(*) FROM csi_observations)",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("read over-budget capability effects");
-    assert_eq!(disposition, "capability_pin_mismatch");
-    assert_eq!(capabilities, 0);
+    assert_eq!((packets, observations), (1, 0));
 }
 
 #[test]
-fn repeated_equal_capability_validates_one_durable_epoch_row() {
+fn repeated_equal_capability_commits_two_packet_projections() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
     let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
@@ -538,17 +544,16 @@ fn repeated_equal_capability_validates_one_durable_epoch_row() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let (packets, capabilities, first_record, watermark): (u64, u64, Vec<u8>, Vec<u8>) = connection
+    let (packets, projections, watermark): (u64, u64, Vec<u8>) = connection
         .query_row(
-            "SELECT (SELECT count(*) FROM packet_records), count(*), first_record_seq,
-                    (SELECT projection_commit_seq FROM store_state)
-             FROM capability_epochs",
+            "SELECT (SELECT count(*) FROM packet_capture_membership),
+                    (SELECT count(*) FROM projection_commits), projection_commit_seq
+             FROM store_state",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read repeated capability effects");
-    assert_eq!((packets, capabilities), (2, 1));
-    assert_eq!(first_record, 0_u64.to_be_bytes());
+    assert_eq!((packets, projections), (2, 2));
     assert_eq!(watermark, 2_u64.to_be_bytes());
 }
 
@@ -574,17 +579,15 @@ fn conforming_health_commits_without_capability_or_observation_rows() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let (disposition, capabilities, observations): (String, u64, u64) = connection
+    let (packets, observations): (u64, u64) = connection
         .query_row(
-            "SELECT disposition, (SELECT count(*) FROM capability_epochs),
-                    (SELECT count(*) FROM csi_observations)
-             FROM packet_records",
+            "SELECT (SELECT count(*) FROM packet_capture_membership),
+                    (SELECT count(*) FROM csi_observations)",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("read health effects");
-    assert_eq!(disposition, "health_committed");
-    assert_eq!((capabilities, observations), (0, 0));
+    assert_eq!((packets, observations), (1, 0));
 }
 
 #[test]
@@ -609,16 +612,16 @@ fn csi_unavailable_precedes_source_and_radio_mismatches() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let (disposition, observations, watermark): (String, u64, Vec<u8>) = connection
+    let (packets, observations, watermark): (u64, u64, Vec<u8>) = connection
         .query_row(
-            "SELECT disposition, (SELECT count(*) FROM csi_observations),
-                    (SELECT projection_commit_seq FROM store_state)
-             FROM packet_records",
+            "SELECT (SELECT count(*) FROM packet_capture_membership),
+                    (SELECT count(*) FROM csi_observations), projection_commit_seq
+             FROM store_state",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read unavailable CSI effects");
-    assert_eq!(disposition, "capability_unavailable");
+    assert_eq!(packets, 1);
     assert_eq!(observations, 0);
     assert_eq!(watermark, 1_u64.to_be_bytes());
 }
@@ -668,7 +671,7 @@ fn conforming_csi_commits_native_coordinate_observation() {
         String,
     ) = connection
         .query_row(
-            "SELECT session_time_ns, sensor_id, link_id, profile_id, observation_cbor,
+            "SELECT session_time, sensor_id, link_id, profile_id, observation_cbor,
                     decoder_version
              FROM csi_observations",
             [],
@@ -741,81 +744,16 @@ fn csi_mismatch_precedence_runs_through_body_budget() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let dispositions = connection
-        .prepare("SELECT disposition FROM packet_records ORDER BY record_seq")
-        .expect("prepare disposition query")
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("query dispositions")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read dispositions");
-    assert_eq!(
-        dispositions,
-        ["capability_committed", "capability_mismatch", "source_mismatch", "radio_mismatch",]
-    );
-    let observations: u64 = connection
-        .query_row("SELECT count(*) FROM csi_observations", [], |row| row.get(0))
-        .expect("read observation count");
-    assert_eq!(observations, 0);
-}
-
-#[test]
-fn csi_detects_durable_capability_build_mismatch_before_candidate_digest() {
-    let fixture = CaptureFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
-    let first_receive = Instant::now();
-    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
-    let capability_datagram = CapturedDatagram::new(
-        "192.0.2.10:5000".parse().expect("peer"),
-        first_receive,
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        seal_raw(1, 1, 1, &capability),
-    );
-    let _ = run
-        .try_submit(capability_datagram)
-        .expect("submit capability")
-        .wait()
-        .expect("commit capability");
-
-    let mut mismatched_descriptor = capability[34..].to_vec();
-    mismatched_descriptor[15] = 0x09;
-    let mismatched_digest: [u8; 32] = Sha256::digest(&mismatched_descriptor).into();
-    Connection::open(&fixture.database)
-        .expect("open Store for private corruption fixture")
-        .execute(
-            "UPDATE capability_epochs SET capability_digest = ?1, descriptor_bytes = ?2",
-            rusqlite::params![mismatched_digest, mismatched_descriptor],
-        )
-        .expect("install internally consistent mismatched capability row");
-    let csi_datagram = CapturedDatagram::new(
-        "192.0.2.10:5000".parse().expect("peer"),
-        first_receive + Duration::from_nanos(1),
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        seal_raw(2, 1, 2, &csi_body(&mismatched_digest, [2, 0, 0, 0, 0, 99], 6)),
-    );
-
-    let CommitOutcome::Committed(receipt) = run
-        .try_submit(csi_datagram)
-        .expect("submit CSI")
-        .wait()
-        .expect("commit build mismatch packet")
-    else {
-        panic!("increasing sequence cannot be a replay")
-    };
-    assert_eq!(receipt.disposition(), PacketDisposition::BuildMismatch);
-    run.shutdown().expect("stop Capture runtime");
-
-    let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let (disposition, observations): (String, u64) = connection
+    let (packets, projections, observations): (u64, u64, u64) = connection
         .query_row(
-            "SELECT disposition, (SELECT count(*) FROM csi_observations)
-             FROM packet_records WHERE record_seq = ?1",
-            [1_u64.to_be_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT (SELECT count(*) FROM packet_capture_membership),
+                    (SELECT count(*) FROM projection_commits),
+                    (SELECT count(*) FROM csi_observations)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .expect("read build mismatch effects");
-    assert_eq!(disposition, "build_mismatch");
-    assert_eq!(observations, 0);
+        .expect("read mismatch effects");
+    assert_eq!((packets, projections, observations), (4, 4, 0));
 }
 
 #[test]
@@ -900,15 +838,15 @@ fn decoded_domain_rejection_commits_packet_without_observation() {
     run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open committed Store");
-    let (disposition, observations): (String, u64) = connection
+    let (projection_kind, observations): (String, u64) = connection
         .query_row(
-            "SELECT disposition, (SELECT count(*) FROM csi_observations)
-             FROM packet_records WHERE record_seq = ?1",
+            "SELECT kind, (SELECT count(*) FROM csi_observations)
+             FROM projection_commits WHERE record_seq = ?1",
             [1_u64.to_be_bytes()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("read decoded-domain effects");
-    assert_eq!(disposition, "decoded_domain_rejected");
+    assert_eq!(projection_kind, "decode_rejected");
     assert_eq!(observations, 0);
 }
 
@@ -952,77 +890,7 @@ fn csi_body_budget_precedes_decoded_domain_rejection() {
 }
 
 #[test]
-fn capability_conflict_rolls_back_complete_write_set_and_stops_writer() {
-    let fixture = CaptureFixture::new();
-    whisper::init_admission(&fixture.config).expect("initialize Store");
-    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
-    let first_receive = Instant::now();
-    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
-    let first = CapturedDatagram::new(
-        "192.0.2.10:5000".parse().expect("peer"),
-        first_receive,
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        seal_raw(1, 1, 1, &capability),
-    );
-    let _ = run.try_submit(first).expect("submit capability").wait().expect("commit capability");
-
-    let mut conflicting_descriptor = capability[34..].to_vec();
-    conflicting_descriptor[47] ^= 0xff;
-    let conflicting_digest: [u8; 32] = Sha256::digest(&conflicting_descriptor).into();
-    Connection::open(&fixture.database)
-        .expect("open Store for private conflict fixture")
-        .execute(
-            "UPDATE capability_epochs SET capability_digest = ?1, descriptor_bytes = ?2",
-            rusqlite::params![conflicting_digest, conflicting_descriptor],
-        )
-        .expect("install conflicting capability row");
-    let conflict = CapturedDatagram::new(
-        "192.0.2.10:5000".parse().expect("peer"),
-        first_receive + Duration::from_nanos(1),
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        seal_raw(1, 1, 2, &capability),
-    );
-    let commit_error: CommitError = run
-        .try_submit(conflict)
-        .expect("queue conflict")
-        .wait()
-        .expect_err("capability conflict must stop the writer");
-    assert!(!commit_error.is_writer_stopped());
-    fs::remove_file(fixture.root.join("secrets/device-1/key-1.bin"))
-        .expect("remove key after fatal writer failure");
-    let after_fatal = CapturedDatagram::new(
-        "192.0.2.10:5000".parse().expect("peer"),
-        first_receive + Duration::from_nanos(2),
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        seal_raw(0x7f, 1, 3, &[0xa5]),
-    );
-    let submit_error: SubmitError =
-        run.try_submit(after_fatal).expect_err("stopped writer must reject later input");
-    assert!(submit_error.is_writer_stopped());
-    run.shutdown().expect("join stopped writer");
-
-    let connection = Connection::open(&fixture.database).expect("open rolled-back Store");
-    let (packets, maximum_sequence, cursor, watermark): (u64, Vec<u8>, Vec<u8>, Vec<u8>) =
-        connection
-            .query_row(
-                "SELECT (SELECT count(*) FROM packet_records),
-                        (SELECT maximum_message_sequence FROM admission_epochs
-                         WHERE device_id = ?1 AND key_epoch = ?2),
-                        committed_through_record_seq,
-                        (SELECT projection_commit_seq FROM store_state)
-                 FROM capture_sessions",
-                rusqlite::params![1_u64.to_be_bytes(), 1_u16.to_be_bytes()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("read rollback effects");
-    assert_eq!(packets, 1);
-    assert_eq!(maximum_sequence, 1_u64.to_be_bytes());
-    assert_eq!(cursor, 0_u64.to_be_bytes());
-    assert_eq!(watermark, 1_u64.to_be_bytes());
-}
-
-#[test]
-fn record_and_watermark_overflow_fail_closed_before_publication() {
+fn overflow_failures_preserve_the_transaction_a_visibility_boundary() {
     for overflow in ["record", "watermark"] {
         let fixture = CaptureFixture::new();
         whisper::init_admission(&fixture.config).expect("initialize Store");
@@ -1033,13 +901,8 @@ fn record_and_watermark_overflow_fail_closed_before_publication() {
                 connection
                     .execute(
                         "UPDATE capture_sessions
-                         SET committed_through_record_seq = ?1, last_session_time_ns = ?2,
-                             projection_commit_seq = ?3",
-                        rusqlite::params![
-                            u64::MAX.to_be_bytes(),
-                            0_u64.to_be_bytes(),
-                            0_u64.to_be_bytes(),
-                        ],
+                         SET durable_tail_record_seq = ?1, last_session_time = ?2",
+                        rusqlite::params![u64::MAX.to_be_bytes(), 0_u64.to_be_bytes(),],
                     )
                     .expect("install maximum record cursor");
             }
@@ -1064,56 +927,41 @@ fn record_and_watermark_overflow_fail_closed_before_publication() {
         run.shutdown().expect("join stopped writer");
 
         let connection = Connection::open(&fixture.database).expect("open failed Store");
-        let (packets, replay_boot): (u64, Option<Vec<u8>>) = connection
+        let (packets, visible_packets, replay_boot, watermark): (
+            u64,
+            u64,
+            Option<Vec<u8>>,
+            Vec<u8>,
+        ) = connection
             .query_row(
-                "SELECT (SELECT count(*) FROM packet_records), highest_boot_generation
+                "SELECT (SELECT count(*) FROM packet_capture_membership),
+                        (SELECT count(*) FROM visible_capture_records),
+                        highest_boot_generation,
+                        (SELECT projection_commit_seq FROM store_state)
                  FROM admission_epochs WHERE device_id = ?1 AND key_epoch = ?2",
                 rusqlite::params![1_u64.to_be_bytes(), 1_u16.to_be_bytes()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("read overflow rollback");
-        assert_eq!(packets, 0, "{overflow} overflow inserted a packet");
-        assert_eq!(replay_boot, None, "{overflow} overflow advanced replay");
+        assert_eq!(visible_packets, 0, "{overflow} overflow published a packet");
+        match overflow {
+            "record" => {
+                assert_eq!(packets, 0, "record overflow inserted a transaction-A packet");
+                assert_eq!(replay_boot, None, "record overflow advanced replay");
+                assert_eq!(watermark, 0_u64.to_be_bytes());
+            }
+            "watermark" => {
+                assert_eq!(packets, 1, "watermark overflow lost the transaction-A packet");
+                assert_eq!(replay_boot, Some(1_u32.to_be_bytes().to_vec()));
+                assert_eq!(watermark, u64::MAX.to_be_bytes());
+            }
+            _ => unreachable!("fixed overflow fixture"),
+        }
     }
 }
 
 #[test]
-fn nonmonotonic_session_time_and_corrupt_replay_bitmap_fail_closed() {
-    let time_fixture = CaptureFixture::new();
-    whisper::init_admission(&time_fixture.config).expect("initialize time Store");
-    let mut time_run = serve_capture(&time_fixture.config).expect("start time Capture runtime");
-    let first_receive = Instant::now();
-    let first = CapturedDatagram::new(
-        "192.0.2.10:5000".parse().expect("peer"),
-        first_receive,
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        seal_raw(0x7f, 1, 1, &[0xa5]),
-    );
-    let _ = time_run.try_submit(first).expect("submit first").wait().expect("commit first");
-    Connection::open(&time_fixture.database)
-        .expect("open time corruption fixture")
-        .execute("UPDATE capture_sessions SET last_session_time_ns = ?1", [u64::MAX.to_be_bytes()])
-        .expect("install reversed session time");
-    let second = CapturedDatagram::new(
-        "192.0.2.10:5000".parse().expect("peer"),
-        first_receive + Duration::from_nanos(1),
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        seal_raw(0x7f, 1, 2, &[0xa5]),
-    );
-    assert!(time_run.try_submit(second).expect("queue reversed time").wait().is_err());
-    time_run.shutdown().expect("join stopped time writer");
-    let connection = Connection::open(&time_fixture.database).expect("open time Store");
-    let (packets, maximum_sequence): (u64, Vec<u8>) = connection
-        .query_row(
-            "SELECT (SELECT count(*) FROM packet_records), maximum_message_sequence
-             FROM admission_epochs WHERE device_id = ?1 AND key_epoch = ?2",
-            rusqlite::params![1_u64.to_be_bytes(), 1_u16.to_be_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("read time rollback");
-    assert_eq!(packets, 1);
-    assert_eq!(maximum_sequence, 1_u64.to_be_bytes());
-
+fn corrupt_replay_bitmap_fails_closed() {
     let replay_fixture = CaptureFixture::new();
     whisper::init_admission(&replay_fixture.config).expect("initialize replay Store");
     let mut replay_run =
@@ -1143,20 +991,20 @@ fn nonmonotonic_session_time_and_corrupt_replay_bitmap_fail_closed() {
     replay_run.shutdown().expect("join stopped replay writer");
     let packets: u64 = Connection::open(&replay_fixture.database)
         .expect("open replay Store")
-        .query_row("SELECT count(*) FROM packet_records", [], |row| row.get(0))
+        .query_row("SELECT count(*) FROM packet_capture_membership", [], |row| row.get(0))
         .expect("read replay packet count");
     assert_eq!(packets, 0);
 }
 
 #[test]
-fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
+fn multiple_routes_epochs_and_observations_remain_dynamic() {
     let fixture = CaptureFixture::new();
     whisper::init_admission(&fixture.config).expect("initialize Store");
     let first_capability = capability_body([0x01; 32], [0x22; 32], 1024);
     let second_capability = capability_body([0x03; 32], [0x44; 32], 2048);
-    let mut first_run = serve_capture(&fixture.config).expect("start first Capture runtime");
+    let mut run = serve_capture(&fixture.config).expect("start Capture runtime");
     let first_receive = Instant::now();
-    let first_run_packets = [
+    let packets = [
         ("192.0.2.10:5000", seal_raw_for(&[0x11; 32], 1, 1, 1, 1, &first_capability)),
         ("192.0.2.11:5000", seal_raw_for(&[0x22; 32], 2, 1, 1, 1, &second_capability)),
         (
@@ -1181,25 +1029,6 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
                 &csi_body(&second_capability[..32], [2, 0, 0, 0, 0, 11], 6),
             ),
         ),
-    ];
-    for (offset, (peer, bytes)) in first_run_packets.into_iter().enumerate() {
-        let datagram = CapturedDatagram::new(
-            peer.parse().expect("peer"),
-            first_receive + Duration::from_nanos(offset as u64),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-            bytes,
-        );
-        let _ = first_run
-            .try_submit(datagram)
-            .expect("submit first-run packet")
-            .wait()
-            .expect("commit first-run packet");
-    }
-    first_run.shutdown().expect("stop first Capture runtime");
-
-    let mut second_run = serve_capture(&fixture.config).expect("start second Capture runtime");
-    let second_receive = Instant::now();
-    let second_run_packets = [
         (
             "192.0.2.10:5000",
             seal_raw_for(
@@ -1224,26 +1053,22 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
             ),
         ),
     ];
-    for (offset, (peer, bytes)) in second_run_packets.into_iter().enumerate() {
+    for (offset, (peer, bytes)) in packets.into_iter().enumerate() {
         let datagram = CapturedDatagram::new(
             peer.parse().expect("peer"),
-            second_receive + Duration::from_nanos(offset as u64),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+            first_receive + Duration::from_nanos(offset as u64),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
             bytes,
         );
-        let _ = second_run
-            .try_submit(datagram)
-            .expect("submit second-run packet")
-            .wait()
-            .expect("commit second-run packet");
+        let _ = run.try_submit(datagram).expect("submit packet").wait().expect("commit packet");
     }
-    second_run.shutdown().expect("stop second Capture runtime");
+    run.shutdown().expect("stop Capture runtime");
 
     let connection = Connection::open(&fixture.database).expect("open dynamic Store");
     let counts: (u64, u64, u64, u64, u64, u64) = connection
         .query_row(
             "SELECT (SELECT count(*) FROM capture_sessions),
-                    (SELECT count(*) FROM capability_epochs),
+                    (SELECT count(*) FROM admission_epochs),
                     (SELECT count(*) FROM csi_observations),
                     (SELECT count(DISTINCT sensor_id) FROM csi_observations),
                     (SELECT count(DISTINCT link_id) FROM csi_observations),
@@ -1254,11 +1079,11 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
             },
         )
         .expect("read dynamic counts");
-    assert_eq!(counts, (2, 3, 4, 2, 2, 2));
+    assert_eq!(counts, (1, 2, 4, 2, 2, 2));
     let epochs: Vec<(Vec<u8>, Vec<u8>)> = connection
         .prepare(
-            "SELECT device_id, boot_generation FROM capability_epochs
-             ORDER BY device_id, boot_generation",
+            "SELECT device_id, highest_boot_generation FROM admission_epochs
+             ORDER BY device_id",
         )
         .expect("prepare epoch query")
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -1269,7 +1094,6 @@ fn multiple_routes_sessions_epochs_and_observations_remain_dynamic() {
         epochs,
         [
             (1_u64.to_be_bytes().to_vec(), 1_u32.to_be_bytes().to_vec()),
-            (2_u64.to_be_bytes().to_vec(), 1_u32.to_be_bytes().to_vec()),
             (2_u64.to_be_bytes().to_vec(), 2_u32.to_be_bytes().to_vec()),
         ]
     );
@@ -1312,7 +1136,7 @@ fn pre_transaction_route_byte_and_auth_rejects_have_no_store_effect() {
     let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, cursor, watermark, replay_boot): RejectedStoreEffects = connection
         .query_row(
-            "SELECT (SELECT count(*) FROM packet_records), committed_through_record_seq,
+            "SELECT (SELECT count(*) FROM packet_capture_membership), durable_tail_record_seq,
                     (SELECT projection_commit_seq FROM store_state),
                     (SELECT highest_boot_generation FROM admission_epochs
                      WHERE device_id = ?1 AND key_epoch = ?2)
@@ -1355,7 +1179,7 @@ fn authenticated_rate_reject_does_not_advance_replay_or_session() {
     let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, maximum_sequence, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
-            "SELECT (SELECT count(*) FROM packet_records), maximum_message_sequence,
+            "SELECT (SELECT count(*) FROM packet_capture_membership), maximum_message_sequence,
                     (SELECT projection_commit_seq FROM store_state)
              FROM admission_epochs WHERE device_id = ?1 AND key_epoch = ?2",
             rusqlite::params![1_u64.to_be_bytes(), 1_u16.to_be_bytes()],
@@ -1395,7 +1219,7 @@ fn authenticated_byte_rate_reject_does_not_advance_replay_or_session() {
     let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, maximum_sequence, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
-            "SELECT (SELECT count(*) FROM packet_records), maximum_message_sequence,
+            "SELECT (SELECT count(*) FROM packet_capture_membership), maximum_message_sequence,
                     (SELECT projection_commit_seq FROM store_state)
              FROM admission_epochs WHERE device_id = ?1 AND key_epoch = ?2",
             rusqlite::params![1_u64.to_be_bytes(), 1_u16.to_be_bytes()],
@@ -1433,7 +1257,7 @@ fn out_of_order_receive_time_is_rejected_before_store_admission() {
     let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, maximum_sequence, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
-            "SELECT (SELECT count(*) FROM packet_records), maximum_message_sequence,
+            "SELECT (SELECT count(*) FROM packet_capture_membership), maximum_message_sequence,
                     (SELECT projection_commit_seq FROM store_state)
              FROM admission_epochs WHERE device_id = ?1 AND key_epoch = ?2",
             rusqlite::params![1_u64.to_be_bytes(), 1_u16.to_be_bytes()],
@@ -1466,7 +1290,7 @@ fn session_time_conversion_overflow_is_rejected_without_store_effect() {
     let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, cursor, watermark, replay_boot): RejectedStoreEffects = connection
         .query_row(
-            "SELECT (SELECT count(*) FROM packet_records), committed_through_record_seq,
+            "SELECT (SELECT count(*) FROM packet_capture_membership), durable_tail_record_seq,
                     (SELECT projection_commit_seq FROM store_state),
                     (SELECT highest_boot_generation FROM admission_epochs
                      WHERE device_id = ?1 AND key_epoch = ?2)
@@ -1513,7 +1337,7 @@ fn full_writer_queue_drops_candidate_without_store_effect_and_counts_it() {
     let connection = Connection::open(&fixture.database).expect("open committed Store");
     let (packets, maximum_sequence, watermark): (u64, Vec<u8>, Vec<u8>) = connection
         .query_row(
-            "SELECT (SELECT count(*) FROM packet_records), maximum_message_sequence,
+            "SELECT (SELECT count(*) FROM packet_capture_membership), maximum_message_sequence,
                     (SELECT projection_commit_seq FROM store_state)
              FROM admission_epochs WHERE device_id = ?1 AND key_epoch = ?2",
             rusqlite::params![1_u64.to_be_bytes(), 1_u16.to_be_bytes()],

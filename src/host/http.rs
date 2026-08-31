@@ -8,14 +8,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use axum::Json;
 use axum::Router;
-use axum::extract::{Query, Request, State, rejection::QueryRejection};
+use axum::extract::{Json, OriginalUri, Query, Request, State, rejection::QueryRejection};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{MethodFilter, on};
 use axum::serve::Listener;
 use serde::Deserialize;
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -24,8 +24,8 @@ use super::{RuntimeControl, RuntimeError, RuntimeErrorKind, SocketOperation, Soc
 use crate::ProjectionCommit;
 use crate::domain::time::SessionTime;
 use crate::store::{
-    ErrorEnvelope, Metric, QueryError, QueryLimits, QueryStore, SignalPath, SignalQuery,
-    SignalRange, SignalSelection,
+    ErrorEnvelope, Metric, QueryError, QueryLimits, QueryStore, RelationshipSelection, SignalPath,
+    SignalQuery, SignalRange, SignalSelection,
 };
 
 /// Maximum digits in the canonical decimal representation of a `u64`.
@@ -40,6 +40,7 @@ pub(super) struct HttpState {
     pub(super) query: QueryStore,
     pub(super) limits: QueryLimits,
     pub(super) live: broadcast::Sender<ProjectionCommit>,
+    pub(super) relationship_commands: crate::application::RelationshipCommandIngress,
     pub(super) control: RuntimeControl,
 }
 
@@ -227,10 +228,43 @@ struct SignalParameters {
     path: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelationshipParameters {
+    session: String,
+    link: String,
+    profile: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelationshipCommandRequest {
+    http_schema_version: u8,
+    target: RelationshipCommandTarget,
+    command: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RelationshipCommandTarget {
+    link: String,
+    profile: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RelationshipCommandAccepted {
+    http_schema_version: u8,
+    kind: &'static str,
+    resource: &'static str,
+    target: RelationshipCommandTarget,
+    correlation_id: String,
+}
+
 pub(super) fn router(
     query: QueryStore,
     limits: QueryLimits,
     live: broadcast::Sender<ProjectionCommit>,
+    relationship_commands: crate::application::RelationshipCommandIngress,
     control: RuntimeControl,
 ) -> Router {
     Router::new()
@@ -250,7 +284,74 @@ pub(super) fn router(
             on(MethodFilter::GET, super::websocket::handler)
                 .on(MethodFilter::HEAD, method_not_allowed),
         )
-        .with_state(HttpState { query, limits, live, control })
+        .route(
+            "/api/relationships/latest",
+            on(MethodFilter::GET, relationship_latest).on(MethodFilter::HEAD, method_not_allowed),
+        )
+        .route(
+            "/api/relationships/commands",
+            on(MethodFilter::POST, relationship_command).fallback(relationship_command_method),
+        )
+        .with_state(HttpState { query, limits, live, relationship_commands, control })
+}
+
+async fn relationship_command_method() -> Response {
+    invalid_request_response("invalid relationship command")
+}
+
+async fn relationship_command(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    body: Result<Json<RelationshipCommandRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if uri.query().is_some_and(|query| !query.is_empty()) {
+        return invalid_request_response("invalid relationship command");
+    }
+    let Ok(Json(request)) = body else {
+        return invalid_request_response("invalid relationship command");
+    };
+    if request.http_schema_version != 1 || request.command != "begin_learning" {
+        return invalid_request_response("invalid relationship command");
+    }
+    let Ok(link) = crate::domain::identity::RadioLinkId::new(request.target.link.as_str()) else {
+        return invalid_request_response("invalid relationship command");
+    };
+    let Ok(profile) = decode_profile(&request.target.profile) else {
+        return invalid_request_response("invalid relationship command");
+    };
+    match state.relationship_commands.try_begin_learning(link, profile) {
+        Ok(correlation_id) => (
+            StatusCode::ACCEPTED,
+            Json(RelationshipCommandAccepted {
+                http_schema_version: 1,
+                kind: "accepted",
+                resource: "relationship_command",
+                target: request.target,
+                correlation_id,
+            }),
+        )
+            .into_response(),
+        Err(crate::application::RelationshipCommandAdmissionError::QueueFull) => {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorEnvelope::command_queue_full()))
+                .into_response()
+        }
+        Err(_) => invalid_request_response("invalid relationship command"),
+    }
+}
+
+fn decode_profile(value: &str) -> Result<crate::domain::csi::CaptureProfileId, ()> {
+    if value.len() != 64
+        || value.bytes().any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(());
+    }
+    let mut decoded = [0_u8; 32];
+    for (target, pair) in decoded.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let high = char::from(pair[0]).to_digit(16).ok_or(())?;
+        let low = char::from(pair[1]).to_digit(16).ok_or(())?;
+        *target = u8::try_from((high << 4) | low).map_err(|_| ())?;
+    }
+    Ok(crate::domain::csi::CaptureProfileId::from_bytes(decoded))
 }
 
 pub(super) fn bind_socket(address: SocketAddr) -> Result<TcpListener, RuntimeError> {
@@ -316,6 +417,45 @@ async fn signals(
             (status, Json(response)).into_response()
         }
         Err(()) => projection_failure_response(),
+    }
+}
+
+async fn relationship_latest(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    parameters: Result<Query<RelationshipParameters>, QueryRejection>,
+    request: Request,
+) -> Response {
+    if request_has_body(&request) {
+        return invalid_request_response("invalid relationship query");
+    }
+    let control = state.control.clone();
+    match uri.query() {
+        None => match run_query(&control, move || state.query.relationship_subjects()).await {
+            Ok(response) => Json(response).into_response(),
+            Err(()) => projection_failure_response(),
+        },
+        Some("") => invalid_request_response("invalid relationship query"),
+        Some(_) => {
+            let Ok(Query(parameters)) = parameters else {
+                return invalid_request_response("invalid relationship query");
+            };
+            let Ok(selection) = RelationshipSelection::try_new(
+                &parameters.session,
+                &parameters.link,
+                &parameters.profile,
+            ) else {
+                return invalid_request_response("invalid relationship query");
+            };
+            match run_query(&control, move || state.query.relationship_latest(&selection)).await {
+                Ok(response) => {
+                    let status = StatusCode::from_u16(response.http_status())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    (status, Json(response)).into_response()
+                }
+                Err(()) => projection_failure_response(),
+            }
+        }
     }
 }
 

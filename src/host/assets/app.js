@@ -5,6 +5,11 @@
   const POLL_INTERVAL_MS = 250;
   const RECONNECT_INTERVAL_MS = 500;
   const METRICS = new Set(['i', 'q', 'amplitude', 'phase']);
+  const RELATIONSHIP_UNKNOWN_REASONS = new Set([
+    'baseline_missing', 'baseline_learning', 'insufficient_coverage', 'low_quality',
+    'ambiguous_evidence', 'time_uncertain', 'missing_data', 'profile_mismatch',
+    'stale', 'frozen', 'inactive', 'non_finite',
+  ]);
   const HEX64 = /^[0-9a-f]{64}$/;
   const U64 = /^(0|[1-9][0-9]*)$/;
   const IDENTIFIER_CONTENT = /[^\p{White_Space}]/u;
@@ -27,11 +32,32 @@
     from: document.querySelector('#from-input'),
     to: document.querySelector('#to-input'),
     path: document.querySelector('#path-select'),
+    modeControls: [...document.querySelectorAll('input[name="view-mode"]')],
+    contextLabel: document.querySelector('#context-label'),
+    contextHeading: document.querySelector('#context-heading'),
+    contextCopy: document.querySelector('#context-copy'),
+    captureControls: document.querySelector('#capture-controls'),
+    sensingControls: document.querySelector('#sensing-controls'),
+    signalPanel: document.querySelector('#signal-panel'),
+    relationshipPanel: document.querySelector('#relationship-panel'),
+    relationshipMessage: document.querySelector('#relationship-message'),
+    relationshipView: document.querySelector('#relationship-view'),
+    relationshipSession: document.querySelector('#relationship-session-select'),
+    relationshipLink: document.querySelector('#relationship-link-select'),
+    relationshipProfile: document.querySelector('#relationship-profile-select'),
+    relationshipState: document.querySelector('#relationship-state'),
+    relationshipResultTime: document.querySelector('#relationship-result-time'),
+    relationshipChange: document.querySelector('#relationship-change'),
+    relationshipChangeState: document.querySelector('#relationship-change-state'),
+    relationshipChangeTime: document.querySelector('#relationship-change-time'),
   };
   const maxTimeBuckets = document.documentElement.dataset.maxTimeBuckets;
   const state = {
     topology: null,
     signals: null,
+    relationshipSubjects: null,
+    relationshipLatest: null,
+    viewMode: 'signal',
     storeId: null,
     pendingWatermark: null,
     latestWatermark: null,
@@ -359,6 +385,49 @@
       && viewReceipt(value.receipt);
   }
   function signalsResponse(value) { return signalsBody(value) || emptySignalsBody(value); }
+  function compareRelationshipSubject(left, right) {
+    return compareBytes(left.session_id, right.session_id)
+      || compareBytes(left.link, right.link)
+      || compareBytes(left.profile, right.profile);
+  }
+  function relationshipSubjectsBody(value) {
+    return exact(value, ['http_schema_version', 'kind', 'resource', 'data', 'receipt'])
+      && smallInteger(value.http_schema_version, 1, 1) && value.kind === 'ok'
+      && value.resource === 'relationship_subjects'
+      && exact(value.data, ['subjects']) && Array.isArray(value.data.subjects)
+      && value.data.subjects.every((subject) => exact(subject, ['session_id', 'link', 'profile'])
+        && textId(subject.session_id) && textId(subject.link) && hex64(subject.profile))
+      && strictlyOrdered(value.data.subjects, (subject) => subject, compareRelationshipSubject)
+      && storeReceipt(value.receipt)
+      && (value.receipt.projection_commit.sequence !== '0' || value.data.subjects.length === 0);
+  }
+  function relationshipKnowledge(value) {
+    if (!object(value)) return false;
+    if (value.kind === 'stable' || value.kind === 'changing') return exact(value, ['kind']);
+    return value.kind === 'unknown' && exact(value, ['kind', 'reason'])
+      && RELATIONSHIP_UNKNOWN_REASONS.has(value.reason);
+  }
+  function relationshipChange(value) {
+    return exact(value, ['previous', 'current', 'changed_at'])
+      && relationshipKnowledge(value.previous) && relationshipKnowledge(value.current)
+      && u64(value.changed_at);
+  }
+  function relationshipLatestBody(value) {
+    if (!exact(value, ['http_schema_version', 'kind', 'resource', 'receipt'], ['data'])
+      || !smallInteger(value.http_schema_version, 1, 1)
+      || value.resource !== 'relationship_latest' || !viewReceipt(value.receipt)) return false;
+    if (value.kind === 'empty') return !Object.hasOwn(value, 'data');
+    if (value.kind !== 'ok' || !exact(value.data, [
+      'session_id', 'link', 'profile', 'knowledge', 'result_time', 'creator_commit',
+    ], ['most_recent_change'])) return false;
+    const data = value.data;
+    return textId(data.session_id) && textId(data.link) && hex64(data.profile)
+      && relationshipKnowledge(data.knowledge) && u64(data.result_time)
+      && watermark(data.creator_commit, true)
+      && data.creator_commit.store_id === value.receipt.projection_commit.store_id
+      && BigInt(data.creator_commit.sequence) <= BigInt(value.receipt.projection_commit.sequence)
+      && (!Object.hasOwn(data, 'most_recent_change') || relationshipChange(data.most_recent_change));
+  }
   function errorEnvelope(value, status, allowedCodes) {
     if (!exact(value, ['http_schema_version', 'kind', 'error'])
       || !smallInteger(value.http_schema_version, 1, 1) || value.kind !== 'error' || !object(value.error)) return false;
@@ -468,6 +537,49 @@
     syncSelect(dom.profile, selection.profileEntries, selection.profile);
     if (resetPath) syncSelect(dom.path, [{ label: 'All applicable paths', value: '' }], '');
   }
+  function currentRelationshipSelection() {
+    return {
+      session: dom.relationshipSession.value,
+      link: dom.relationshipLink.value,
+      profile: dom.relationshipProfile.value,
+    };
+  }
+  function proposeRelationshipSelections(subjects, preferred) {
+    const sessionEntries = [...new Set(subjects.data.subjects.map((subject) => subject.session_id))]
+      .map((value) => ({ label: value, value }));
+    const session = preferredValue(sessionEntries, preferred.session);
+    const sessionSubjects = subjects.data.subjects.filter((subject) => subject.session_id === session);
+    const linkEntries = [...new Set(sessionSubjects.map((subject) => subject.link))]
+      .map((value) => ({ label: value, value }));
+    const link = preferredValue(linkEntries, preferred.link);
+    const profileEntries = sessionSubjects.filter((subject) => subject.link === link)
+      .map((subject) => ({ label: subject.profile, value: subject.profile }));
+    const profile = preferredValue(profileEntries, preferred.profile);
+    return { sessionEntries, linkEntries, profileEntries, session, link, profile };
+  }
+  function applyRelationshipSelections(selection) {
+    syncSelect(dom.relationshipSession, selection.sessionEntries, selection.session);
+    syncSelect(dom.relationshipLink, selection.linkEntries, selection.link);
+    syncSelect(dom.relationshipProfile, selection.profileEntries, selection.profile);
+  }
+  function relationshipSelectionComplete(selection) {
+    return selection.session && selection.link && selection.profile;
+  }
+  function relationshipRequest(selection) {
+    const query = new URLSearchParams({
+      session: selection.session,
+      link: selection.link,
+      profile: selection.profile,
+    });
+    return { ...selection, url: `/api/relationships/latest?${query}` };
+  }
+  function relationshipMatchesRequest(latest, request) {
+    if (latest.receipt.session_id !== request.session) return false;
+    if (latest.kind === 'empty') return true;
+    return latest.data.session_id === request.session
+      && latest.data.link === request.link
+      && latest.data.profile === request.profile;
+  }
   function unmountSignals(message) {
     state.signals = null;
     dom.view.replaceChildren();
@@ -547,6 +659,9 @@
     dom.detail.textContent = detail;
   }
   function setStale(stale) { state.stale = stale; dom.stale.hidden = !stale; }
+  function hasRetainedResult() {
+    return state.viewMode === 'signal' ? state.signals !== null : state.relationshipLatest !== null;
+  }
   function ensurePolling() {
     if (state.pollTimer === null) state.pollTimer = window.setInterval(refresh, POLL_INTERVAL_MS);
   }
@@ -560,6 +675,8 @@
     state.storeId = nextStore;
     state.topology = null;
     state.signals = null;
+    state.relationshipSubjects = null;
+    state.relationshipLatest = null;
     state.pendingWatermark = null;
     state.latestWatermark = null;
     dom.deployment.textContent = 'Not read';
@@ -571,6 +688,12 @@
     dom.message.hidden = false;
     dom.message.textContent = 'Store identity changed. Reading a complete context…';
     dom.session.replaceChildren(); dom.sensor.replaceChildren(); dom.link.replaceChildren(); dom.profile.replaceChildren();
+    dom.relationshipSession.replaceChildren();
+    dom.relationshipLink.replaceChildren();
+    dom.relationshipProfile.replaceChildren();
+    dom.relationshipView.hidden = true;
+    dom.relationshipMessage.hidden = false;
+    dom.relationshipMessage.textContent = 'Store identity changed. Reading a complete context…';
     syncSelect(dom.path, [{ label: 'All applicable paths', value: '' }], '');
   }
   function pathLabel(value) {
@@ -641,6 +764,39 @@
     const entries = [{ label: 'All applicable paths', value: '' }, ...[...values].map(([value, label]) => ({ value, label }))];
     syncSelect(dom.path, entries, dom.path.value);
   }
+  function titleCaseToken(value) {
+    return value.split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join('');
+  }
+  function knowledgeLabel(knowledge) {
+    if (knowledge.kind === 'unknown') return `Unknown(${titleCaseToken(knowledge.reason)})`;
+    return titleCaseToken(knowledge.kind);
+  }
+  function mountRelationship(topology, subjects, latest) {
+    state.topology = topology;
+    state.relationshipSubjects = subjects;
+    state.relationshipLatest = latest;
+    dom.deployment.textContent = topology.data.deployment;
+    dom.store.textContent = topology.receipt.projection_commit.store_id;
+    dom.store.title = topology.receipt.projection_commit.store_id;
+    dom.watermark.textContent = topology.receipt.projection_commit.sequence;
+    if (latest.kind === 'ok') {
+      dom.relationshipState.textContent = knowledgeLabel(latest.data.knowledge);
+      dom.relationshipResultTime.textContent = `${latest.data.result_time} ns`;
+      const change = latest.data.most_recent_change;
+      dom.relationshipChange.hidden = change === undefined;
+      if (change !== undefined) {
+        dom.relationshipChangeState.textContent = `${knowledgeLabel(change.previous)} → ${knowledgeLabel(change.current)}`;
+        dom.relationshipChangeTime.textContent = `${change.changed_at} ns`;
+      }
+      dom.relationshipMessage.hidden = true;
+      dom.relationshipView.hidden = false;
+    } else {
+      dom.relationshipView.hidden = true;
+      dom.relationshipMessage.hidden = false;
+      dom.relationshipMessage.textContent = 'No committed relationship window is available for this subject.';
+    }
+    setStale(false);
+  }
   function mount(topology, signals) {
     state.topology = topology; state.signals = signals;
     dom.deployment.textContent = topology.data.deployment;
@@ -659,13 +815,13 @@
     }
     setStale(false);
   }
-  function qualifies(topology, signals, target) {
-    if (!state.websocketReady || !target || !signals) return false;
-    const topologyCommit = topology.receipt.projection_commit;
-    const signalsCommit = signals.receipt.projection_commit;
-    return topologyCommit.store_id === target.store_id && signalsCommit.store_id === target.store_id
-      && BigInt(topologyCommit.sequence) >= BigInt(target.sequence)
-      && BigInt(signalsCommit.sequence) >= BigInt(target.sequence);
+  function qualifies(resources, target) {
+    if (!state.websocketReady || !target || resources.some((resource) => !resource)) return false;
+    return resources.every((resource) => {
+      const commit = resource.receipt.projection_commit;
+      return commit.store_id === target.store_id
+        && BigInt(commit.sequence) >= BigInt(target.sequence);
+    });
   }
   async function refresh() {
     if (state.polling) { state.refreshRequested = true; return; }
@@ -682,48 +838,105 @@
         state.readToken = token;
       }
       state.storeId = incomingStore;
-      const previousSelection = currentSelection();
-      const proposedSelection = proposeSelections(topology, previousSelection);
-      const selectionChanged = !sameSelection(previousSelection, proposedSelection);
-      if (!selectionComplete(proposedSelection)) {
-        applySelections(proposedSelection, true);
-        state.topology = topology;
-        state.signals = null;
-        dom.deployment.textContent = topology.data.deployment;
-        dom.store.textContent = incomingStore;
-        dom.watermark.textContent = topology.receipt.projection_commit.sequence;
-        dom.message.hidden = false;
-        dom.message.textContent = 'No committed Capture Session and Profile are available.';
-        dom.view.replaceChildren();
-        syncSelect(dom.path, [{ label: 'All applicable paths', value: '' }], '');
-        setStale(false);
+      if (state.viewMode === 'signal') {
+        const previousSelection = currentSelection();
+        const proposedSelection = proposeSelections(topology, previousSelection);
+        const selectionChanged = !sameSelection(previousSelection, proposedSelection);
+        if (!selectionComplete(proposedSelection)) {
+          applySelections(proposedSelection, true);
+          state.topology = topology;
+          state.signals = null;
+          dom.deployment.textContent = topology.data.deployment;
+          dom.store.textContent = incomingStore;
+          dom.watermark.textContent = topology.receipt.projection_commit.sequence;
+          dom.message.hidden = false;
+          dom.message.textContent = 'No committed Capture Session and Profile are available.';
+          dom.view.replaceChildren();
+          syncSelect(dom.path, [{ label: 'All applicable paths', value: '' }], '');
+          setStale(false);
+          state.protocolError = false;
+          setMode('POLLING', 'Complete topology read · waiting for a selectable signals context');
+          ensurePolling();
+          return;
+        }
+        const request = signalRequest(proposedSelection, !selectionChanged);
+        const signals = await read(
+          request.url,
+          signalsResponse,
+          new Set(['invalid_request', 'range_unavailable', 'phase_over_budget', 'projection_failed']),
+        );
+        if (state.readToken !== token) return;
+        if (signals.receipt.projection_commit.store_id !== incomingStore) throw new ProtocolFailure('Store IDs do not match');
+        if (!signalsMatchRequest(signals, request)) throw new ProtocolFailure('signals selection does not match');
+        applySelections(proposedSelection, selectionChanged);
+        mount(topology, signals);
         state.protocolError = false;
-        setMode('POLLING', 'Complete topology read · waiting for a selectable signals context');
+        setMode('POLLING', 'Complete HTTP resources read · waiting for WebSocket synchronization');
         ensurePolling();
-        return;
-      }
-      const request = signalRequest(proposedSelection, !selectionChanged);
-      const signals = await read(
-        request.url,
-        signalsResponse,
-        new Set(['invalid_request', 'range_unavailable', 'phase_over_budget', 'projection_failed']),
-      );
-      if (state.readToken !== token) return;
-      if (signals.receipt.projection_commit.store_id !== incomingStore) throw new ProtocolFailure('Store IDs do not match');
-      if (!signalsMatchRequest(signals, request)) throw new ProtocolFailure('signals selection does not match');
-      applySelections(proposedSelection, selectionChanged);
-      mount(topology, signals);
-      state.protocolError = false;
-      setMode('POLLING', 'Complete HTTP resources read · waiting for WebSocket synchronization');
-      ensurePolling();
-      if (qualifies(topology, signals, state.pendingWatermark)) {
-        state.latestWatermark = state.pendingWatermark;
+        if (qualifies([topology, signals], state.pendingWatermark)) {
+          state.latestWatermark = state.pendingWatermark;
+          state.protocolError = false;
+          setMode('LIVE', 'WebSocket invalidation synchronized with complete Store reads');
+          stopPolling();
+        }
+      } else {
+        const subjects = await read(
+          '/api/relationships/latest',
+          relationshipSubjectsBody,
+          new Set(['projection_failed']),
+        );
+        if (state.readToken !== token) return;
+        if (subjects.receipt.projection_commit.store_id !== incomingStore) {
+          throw new ProtocolFailure('Store IDs do not match');
+        }
+        const previousSelection = currentRelationshipSelection();
+        const proposedSelection = proposeRelationshipSelections(subjects, previousSelection);
+        const selectionChanged = ['session', 'link', 'profile']
+          .some((key) => previousSelection[key] !== proposedSelection[key]);
+        applyRelationshipSelections(proposedSelection);
+        if (!relationshipSelectionComplete(proposedSelection)) {
+          state.topology = topology;
+          state.relationshipSubjects = subjects;
+          state.relationshipLatest = null;
+          dom.deployment.textContent = topology.data.deployment;
+          dom.store.textContent = incomingStore;
+          dom.watermark.textContent = topology.receipt.projection_commit.sequence;
+          dom.relationshipView.hidden = true;
+          dom.relationshipMessage.hidden = false;
+          dom.relationshipMessage.textContent = 'No committed relationship subjects are available.';
+          setStale(false);
+          state.protocolError = false;
+          setMode('POLLING', 'Complete subject read · waiting for a selectable relationship');
+          ensurePolling();
+          return;
+        }
+        const request = relationshipRequest(proposedSelection);
+        const latest = await read(
+          request.url,
+          relationshipLatestBody,
+          new Set(['invalid_request', 'range_unavailable', 'projection_failed']),
+        );
+        if (state.readToken !== token) return;
+        if (latest.receipt.projection_commit.store_id !== incomingStore) {
+          throw new ProtocolFailure('Store IDs do not match');
+        }
+        if (!relationshipMatchesRequest(latest, request)) {
+          throw new ProtocolFailure('relationship selection does not match');
+        }
+        if (selectionChanged) dom.relationshipView.hidden = true;
+        mountRelationship(topology, subjects, latest);
         state.protocolError = false;
-        setMode('LIVE', 'WebSocket invalidation synchronized with complete Store reads');
-        stopPolling();
+        setMode('POLLING', 'Complete relationship read · waiting for WebSocket synchronization');
+        ensurePolling();
+        if (qualifies([topology, subjects, latest], state.pendingWatermark)) {
+          state.latestWatermark = state.pendingWatermark;
+          state.protocolError = false;
+          setMode('LIVE', 'WebSocket invalidation synchronized with complete Store reads');
+          stopPolling();
+        }
       }
     } catch (error) {
-      setStale(state.signals !== null);
+      setStale(hasRetainedResult());
       if (error instanceof ProtocolFailure) {
         state.protocolError = true;
         setMode('PROTOCOL ERROR', 'A response failed canonical validation');
@@ -768,7 +981,7 @@
         state.protocolError = false;
         state.readToken = null;
         state.refreshRequested = true;
-        setStale(state.signals !== null);
+        setStale(hasRetainedResult());
         setMode('POLLING', 'Watermark received · reading complete HTTP resources');
         ensurePolling();
         refresh();
@@ -782,7 +995,7 @@
     socket.addEventListener('close', () => {
       state.websocketReady = false;
       if (!state.protocolError) setMode('POLLING', 'WebSocket closed · fixed 250 ms HTTP polling');
-      setStale(state.signals !== null);
+      setStale(hasRetainedResult());
       ensurePolling();
       if (state.reconnectTimer === null) {
         state.reconnectTimer = window.setTimeout(() => { state.reconnectTimer = null; connect(); }, RECONNECT_INTERVAL_MS);
@@ -798,10 +1011,60 @@
     ensurePolling();
     refresh();
   }
+  function relationshipSelectionChanged() {
+    state.readToken = null;
+    state.refreshRequested = true;
+    state.relationshipLatest = null;
+    dom.relationshipView.hidden = true;
+    dom.relationshipMessage.hidden = false;
+    dom.relationshipMessage.textContent = 'Selection changed. Reading a complete relationship resource…';
+    setStale(false);
+    setMode('POLLING', 'Selection changed · reading a complete relationship resource');
+    ensurePolling();
+    refresh();
+  }
+  function viewModeChanged(event) {
+    state.viewMode = event.target.value;
+    const sensing = state.viewMode === 'sensing';
+    dom.captureControls.hidden = sensing;
+    dom.sensingControls.hidden = !sensing;
+    dom.signalPanel.hidden = sensing;
+    dom.relationshipPanel.hidden = !sensing;
+    dom.contextLabel.textContent = sensing ? 'Sensing context' : 'Capture context';
+    dom.contextHeading.textContent = sensing ? 'Read the RF relationship' : 'Follow the committed path';
+    dom.contextCopy.textContent = sensing
+      ? 'Select one committed Semantic Session, Link, and Profile.'
+      : 'Select Store-backed identities. These controls only change the read view.';
+    state.readToken = null;
+    state.refreshRequested = true;
+    setStale(false);
+    if (sensing) {
+      state.relationshipLatest = null;
+      dom.relationshipView.hidden = true;
+      dom.relationshipMessage.hidden = false;
+      dom.relationshipMessage.textContent = 'Reading relationship subjects…';
+    } else {
+      unmountSignals('Reading topology…');
+    }
+    setMode('POLLING', 'View changed · reading complete Store resources');
+    ensurePolling();
+    refresh();
+  }
   dom.session.addEventListener('change', selectionChanged);
   dom.sensor.addEventListener('change', () => { dom.link.value = ''; dom.profile.value = ''; selectionChanged(); });
   dom.link.addEventListener('change', () => { dom.profile.value = ''; selectionChanged(); });
   for (const control of [dom.profile, dom.metric, dom.from, dom.to, dom.path]) control.addEventListener('change', selectionChanged);
+  dom.relationshipSession.addEventListener('change', () => {
+    dom.relationshipLink.value = '';
+    dom.relationshipProfile.value = '';
+    relationshipSelectionChanged();
+  });
+  dom.relationshipLink.addEventListener('change', () => {
+    dom.relationshipProfile.value = '';
+    relationshipSelectionChanged();
+  });
+  dom.relationshipProfile.addEventListener('change', relationshipSelectionChanged);
+  for (const control of dom.modeControls) control.addEventListener('change', viewModeChanged);
   setMode('POLLING', 'Waiting for complete Store reads');
   ensurePolling();
   connect();

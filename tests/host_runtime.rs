@@ -22,8 +22,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 #[cfg(feature = "ingest-test-hooks")]
 use whisper::test_support::{
-    release_writer, start_host_with_panicked_writer, start_host_with_query_held,
-    start_host_with_teardown_held, start_host_with_writer_held,
+    advance_host_clock, host_query_store, release_writer, start_host_with_manual_clock,
+    start_host_with_panicked_writer, start_host_with_query_held,
+    start_host_with_relationship_transaction_a_failure,
+    start_host_with_relationship_transaction_b_failure, start_host_with_teardown_held,
+    start_host_with_writer_held,
 };
 use whisper::{HostRuntime, RuntimeFailure, SocketOperation, SocketRole, parse_config};
 
@@ -187,6 +190,63 @@ async fn http_request(address: std::net::SocketAddr, request: &str) -> Vec<u8> {
 fn response_json(response: &[u8]) -> serde_json::Value {
     let separator = response.windows(4).position(|window| window == b"\r\n\r\n").expect("headers");
     serde_json::from_slice(&response[separator + 4..]).expect("JSON response")
+}
+
+fn relationship_command_request(link: &str, profile: &str) -> String {
+    let body = format!(
+        r#"{{"http_schema_version":1,"target":{{"link":"{link}","profile":"{profile}"}},"command":"begin_learning"}}"#
+    );
+    format!(
+        "POST /api/relationships/commands HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+async fn wait_for_projection(address: std::net::SocketAddr, expected: u64) {
+    let expected = expected.to_string();
+    for _ in 0..100 {
+        let body = response_json(
+            &http_request(
+                address,
+                "GET /api/topology HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        if body["receipt"]["projection_commit"]["sequence"] == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("projection {expected} did not become query-visible");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+async fn latest_relationship(address: std::net::SocketAddr, profile: &str) -> serde_json::Value {
+    for _ in 0..100 {
+        let subjects = response_json(
+            &http_request(
+                address,
+                "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        if let Some(session) = subjects["data"]["subjects"]
+            .as_array()
+            .and_then(|subjects| subjects.first())
+            .and_then(|subject| subject["session_id"].as_str())
+        {
+            let request = format!(
+                "GET /api/relationships/latest?session={session}&link=link-a&profile={profile} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            let latest = response_json(&http_request(address, &request).await);
+            if latest["kind"] == "ok" {
+                return latest;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("relationship did not become query-visible");
 }
 
 fn spawn_serve_cli(
@@ -450,6 +510,465 @@ async fn runtime_serves_read_only_shell_topology_and_exact_live_upgrade_failure(
     runtime.shutdown().await.expect("stop Host runtime");
 }
 
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn relationship_command_ingress_accepts_only_the_closed_begin_learning_request() {
+    let fixture = RuntimeFixture::new();
+    let runtime = start_host_with_manual_clock(&fixture.config).await.expect("start Host runtime");
+    let address = runtime.http_address();
+    let profile = "11".repeat(32);
+    let request = relationship_command_request("link-a", &profile);
+    let accepted = http_request(address, &request).await;
+    assert!(accepted.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    let accepted = response_json(&accepted);
+    assert_eq!(
+        accepted,
+        serde_json::json!({
+            "http_schema_version": 1,
+            "kind": "accepted",
+            "resource": "relationship_command",
+            "target": {"link": "link-a", "profile": profile},
+            "correlation_id": "relationship-command-1"
+        })
+    );
+
+    let invalid_body = r#"{"http_schema_version":1,"target":{"link":"link-a","profile":"1111111111111111111111111111111111111111111111111111111111111111"},"command":"begin_learning","unknown":true}"#;
+    let invalid_request = format!(
+        "POST /api/relationships/commands HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{invalid_body}",
+        invalid_body.len()
+    );
+    let invalid = http_request(address, &invalid_request).await;
+    assert!(invalid.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert_eq!(response_json(&invalid)["error"]["code"], "invalid_request");
+
+    for method in ["GET", "HEAD", "PUT"] {
+        let response = http_request(
+            address,
+            &format!(
+                "{method} /api/relationships/commands HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        if method != "HEAD" {
+            assert_eq!(response_json(&response)["error"]["code"], "invalid_request");
+        }
+    }
+
+    for invalid_read in [
+        "GET /api/relationships/latest? HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "GET /api/relationships/latest?session=x&link=link-a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "GET /api/relationships/latest?session=x&link=link-a&profile=1111111111111111111111111111111111111111111111111111111111111111&unknown=x HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "GET /api/relationships/latest?session=x&link=link-a&profile=AA HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+    ] {
+        let response = http_request(address, invalid_read).await;
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        assert_eq!(response_json(&response)["error"]["code"], "invalid_request");
+    }
+    let head = http_request(
+        address,
+        "HEAD /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(head.starts_with(b"HTTP/1.1 405 Method Not Allowed\r\n"));
+
+    let mut subjects = None;
+    for _ in 0..100 {
+        let response = http_request(
+            address,
+            "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        if response.starts_with(b"HTTP/1.1 200 OK\r\n") {
+            let body = response_json(&response);
+            if body["data"]["subjects"].as_array().is_some_and(|subjects| subjects.len() == 1) {
+                subjects = Some(body);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let subjects = subjects.expect("committed relationship subject did not become visible");
+    let semantic_session =
+        subjects["data"]["subjects"][0]["session_id"].as_str().expect("Semantic Session ID");
+    let store_id = subjects["receipt"]["projection_commit"]["store_id"].as_str().expect("Store ID");
+    assert_eq!(
+        subjects,
+        serde_json::json!({
+            "http_schema_version": 1,
+            "kind": "ok",
+            "resource": "relationship_subjects",
+            "data": {"subjects": [{
+                "session_id": semantic_session,
+                "link": "link-a",
+                "profile": profile
+            }]},
+            "receipt": {"projection_commit": {"store_id": store_id, "sequence": "1"}}
+        })
+    );
+
+    advance_host_clock(&runtime, Duration::from_millis(1_200));
+    wait_for_projection(address, 2).await;
+
+    let latest_request = format!(
+        "GET /api/relationships/latest?session={semantic_session}&link=link-a&profile={profile} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    );
+    let latest = http_request(address, &latest_request).await;
+    assert!(latest.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        response_json(&latest),
+        serde_json::json!({
+            "http_schema_version": 1,
+            "kind": "empty",
+            "resource": "relationship_latest",
+            "receipt": {
+                "projection_commit": {"store_id": store_id, "sequence": "2"},
+                "session_id": semantic_session,
+                "first_record_seq": "0",
+                "last_record_seq": "1",
+                "decoder_version": "native-frame-v1",
+                "conditioning_version": "amplitude-v1",
+                "algorithm_version": "baseline-v1"
+            }
+        })
+    );
+
+    runtime.shutdown().await.expect("stop Host runtime");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn repeated_begin_learning_is_rejected_without_reset_or_publication() {
+    let fixture = RuntimeFixture::new();
+    let runtime = HostRuntime::start(&fixture.config).await.expect("start Host runtime");
+    let query = host_query_store(&runtime);
+    let address = runtime.http_address();
+    let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/api/live"))
+        .await
+        .expect("connect runtime WebSocket");
+    websocket.next().await.expect("handshake message").expect("valid handshake message");
+    let request = relationship_command_request("link-a", &"11".repeat(32));
+    assert!(http_request(address, &request).await.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    let first = websocket
+        .next()
+        .await
+        .expect("first command invalidation")
+        .expect("valid first command invalidation");
+    let first: serde_json::Value =
+        serde_json::from_str(first.to_text().expect("text invalidation"))
+            .expect("invalidation JSON");
+    assert_eq!(first["projection_commit"]["sequence"], "1");
+
+    assert!(http_request(address, &request).await.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    tokio::time::timeout(Duration::from_secs(1), runtime.wait_for_stop())
+        .await
+        .expect("repeated command stop timeout");
+    if let Ok(Some(Ok(message))) =
+        tokio::time::timeout(Duration::from_millis(100), websocket.next()).await
+        && message.is_text()
+    {
+        panic!("repeated BeginLearning emitted an invalidation: {message:?}");
+    }
+    let subjects = serde_json::to_value(query.relationship_subjects().expect("query subjects"))
+        .expect("serialize subjects");
+    assert_eq!(subjects["data"]["subjects"].as_array().expect("subjects").len(), 1);
+    assert_eq!(subjects["receipt"]["projection_commit"]["sequence"], "1");
+    drop(query);
+    let error = runtime.shutdown().await.expect_err("repeated BeginLearning must stop the writer");
+    assert!(error.is_writer_failure());
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn physical_format_csi_before_learning_publishes_committed_baseline_missing() {
+    let fixture = RuntimeFixture::new();
+    let runtime = start_host_with_manual_clock(&fixture.config).await.expect("start Host runtime");
+    let address = runtime.http_address();
+    let capture = runtime.capture_address();
+    let destination =
+        std::net::SocketAddr::new("127.0.0.1".parse().expect("loopback"), capture.port());
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP sender");
+    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
+    sender.send_to(&seal_raw(1, 1, &capability), destination).await.expect("send capability");
+    wait_for_projection(address, 1).await;
+    for sequence in 1_u64..=4 {
+        advance_host_clock(&runtime, Duration::from_millis(200));
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&sequence.to_le_bytes());
+        sender
+            .send_to(&seal_raw(2, sequence + 1, &csi), destination)
+            .await
+            .expect("send learning CSI");
+        wait_for_projection(address, sequence + 1).await;
+    }
+    advance_host_clock(&runtime, Duration::from_millis(400));
+    let mut later_csi = csi_body(&capability[..32]);
+    later_csi[32..40].copy_from_slice(&5_u64.to_le_bytes());
+    sender.send_to(&seal_raw(2, 6, &later_csi), destination).await.expect("send later-window CSI");
+    wait_for_projection(address, 7).await;
+
+    let profile = "61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2";
+    let mut latest = None;
+    for _ in 0..150 {
+        let subjects = response_json(
+            &http_request(
+                address,
+                "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        if let Some(semantic_session) = subjects["data"]["subjects"]
+            .as_array()
+            .and_then(|subjects| subjects.first())
+            .and_then(|subject| subject["session_id"].as_str())
+        {
+            let request = format!(
+                "GET /api/relationships/latest?session={semantic_session}&link=link-a&profile={profile} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            let body = response_json(&http_request(address, &request).await);
+            if body["kind"] == "ok" {
+                latest = Some(body);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let latest = latest.expect("BaselineMissing relationship did not become query-visible");
+    assert_eq!(
+        latest["data"]["knowledge"],
+        serde_json::json!({"kind": "unknown", "reason": "baseline_missing"})
+    );
+    assert_eq!(latest["data"]["result_time"], "1000000000");
+    assert_eq!(latest["data"]["creator_commit"], latest["receipt"]["projection_commit"]);
+
+    runtime.shutdown().await.expect("stop Host runtime");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn knowledge_change_is_recorded_once_and_preserved_across_equal_results() {
+    let fixture = RuntimeFixture::new();
+    let runtime = start_host_with_manual_clock(&fixture.config).await.expect("start Host runtime");
+    let address = runtime.http_address();
+    let capture = runtime.capture_address();
+    let destination =
+        std::net::SocketAddr::new("127.0.0.1".parse().expect("loopback"), capture.port());
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP sender");
+    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
+    let profile = "61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2";
+
+    sender.send_to(&seal_raw(1, 1, &capability), destination).await.expect("send capability");
+    wait_for_projection(address, 1).await;
+    for capture_sequence in 1_u64..=4 {
+        advance_host_clock(&runtime, Duration::from_millis(200));
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+        sender
+            .send_to(&seal_raw(2, capture_sequence + 1, &csi), destination)
+            .await
+            .expect("send pre-learning CSI");
+        wait_for_projection(address, capture_sequence + 1).await;
+    }
+    advance_host_clock(&runtime, Duration::from_millis(400));
+    let mut csi = csi_body(&capability[..32]);
+    csi[32..40].copy_from_slice(&5_u64.to_le_bytes());
+    sender.send_to(&seal_raw(2, 6, &csi), destination).await.expect("close missing window");
+    wait_for_projection(address, 7).await;
+    let missing = latest_relationship(address, profile).await;
+    assert_eq!(
+        missing["data"]["knowledge"],
+        serde_json::json!({"kind": "unknown", "reason": "baseline_missing"})
+    );
+    assert!(missing["data"].get("most_recent_change").is_none());
+
+    let accepted = http_request(address, &relationship_command_request("link-a", profile)).await;
+    assert!(accepted.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    wait_for_projection(address, 8).await;
+    for (capture_sequence, message_sequence) in [(6_u64, 7_u64), (7, 8), (8, 9)] {
+        advance_host_clock(&runtime, Duration::from_millis(200));
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+        if capture_sequence == 7 {
+            csi[68] = 4;
+        }
+        sender
+            .send_to(&seal_raw(2, message_sequence, &csi), destination)
+            .await
+            .expect("send learning CSI");
+        wait_for_projection(address, message_sequence + 2).await;
+    }
+    advance_host_clock(&runtime, Duration::from_millis(400));
+    let mut csi = csi_body(&capability[..32]);
+    csi[32..40].copy_from_slice(&9_u64.to_le_bytes());
+    sender.send_to(&seal_raw(2, 10, &csi), destination).await.expect("close changed window");
+    wait_for_projection(address, 13).await;
+    let changed = latest_relationship(address, profile).await;
+    assert_eq!(
+        changed["data"]["knowledge"],
+        serde_json::json!({"kind": "unknown", "reason": "baseline_learning"})
+    );
+    assert_eq!(
+        changed["data"]["most_recent_change"],
+        serde_json::json!({
+            "previous": {"kind": "unknown", "reason": "baseline_missing"},
+            "current": {"kind": "unknown", "reason": "baseline_learning"},
+            "changed_at": "2000000000"
+        })
+    );
+
+    for (capture_sequence, message_sequence) in [(10_u64, 11_u64), (11, 12), (12, 13)] {
+        advance_host_clock(&runtime, Duration::from_millis(200));
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+        sender
+            .send_to(&seal_raw(2, message_sequence, &csi), destination)
+            .await
+            .expect("send equal-result CSI");
+        wait_for_projection(address, message_sequence + 3).await;
+    }
+    advance_host_clock(&runtime, Duration::from_millis(400));
+    let mut csi = csi_body(&capability[..32]);
+    csi[32..40].copy_from_slice(&13_u64.to_le_bytes());
+    sender.send_to(&seal_raw(2, 14, &csi), destination).await.expect("close equal window");
+    wait_for_projection(address, 18).await;
+    let equal = latest_relationship(address, profile).await;
+    assert_eq!(equal["data"]["result_time"], "3000000000");
+    assert_eq!(equal["data"]["most_recent_change"], changed["data"]["most_recent_change"]);
+
+    runtime.shutdown().await.expect("stop Host runtime");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn begin_learning_and_physical_format_csi_publish_committed_baseline_learning() {
+    let fixture = RuntimeFixture::new();
+    let runtime = start_host_with_manual_clock(&fixture.config).await.expect("start Host runtime");
+    let address = runtime.http_address();
+    let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/api/live"))
+        .await
+        .expect("connect runtime WebSocket");
+    let handshake = tokio::time::timeout(Duration::from_secs(1), websocket.next())
+        .await
+        .expect("handshake timeout")
+        .expect("handshake message")
+        .expect("valid handshake message");
+    let handshake: serde_json::Value =
+        serde_json::from_str(handshake.to_text().expect("text handshake")).expect("handshake JSON");
+    assert_eq!(handshake["projection_commit"]["sequence"], "0");
+
+    let profile = "61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2";
+    let request = relationship_command_request("link-a", profile);
+    let accepted = http_request(address, &request).await;
+    assert!(accepted.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    let command_commit = tokio::time::timeout(Duration::from_secs(1), websocket.next())
+        .await
+        .expect("command invalidation timeout")
+        .expect("command invalidation")
+        .expect("valid command invalidation");
+    let command_commit: serde_json::Value =
+        serde_json::from_str(command_commit.to_text().expect("text command invalidation"))
+            .expect("command invalidation JSON");
+    assert_eq!(command_commit["projection_commit"]["sequence"], "1");
+    assert_eq!(command_commit["payload"], serde_json::json!({"kind": "projection_watermark"}));
+
+    let capture = runtime.capture_address();
+    let destination =
+        std::net::SocketAddr::new("127.0.0.1".parse().expect("loopback"), capture.port());
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP sender");
+    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
+    sender.send_to(&seal_raw(1, 1, &capability), destination).await.expect("send capability");
+    wait_for_projection(address, 2).await;
+    for sequence in 1_u64..=4 {
+        advance_host_clock(&runtime, Duration::from_millis(200));
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&sequence.to_le_bytes());
+        sender
+            .send_to(&seal_raw(2, sequence + 1, &csi), destination)
+            .await
+            .expect("send learning CSI");
+        wait_for_projection(address, sequence + 2).await;
+    }
+    advance_host_clock(&runtime, Duration::from_millis(400));
+    let mut later_csi = csi_body(&capability[..32]);
+    later_csi[32..40].copy_from_slice(&5_u64.to_le_bytes());
+    sender.send_to(&seal_raw(2, 6, &later_csi), destination).await.expect("send later-window CSI");
+    wait_for_projection(address, 8).await;
+
+    let mut latest = None;
+    for _ in 0..150 {
+        let subjects = response_json(
+            &http_request(
+                address,
+                "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        if let Some(semantic_session) = subjects["data"]["subjects"][0]["session_id"].as_str() {
+            let request = format!(
+                "GET /api/relationships/latest?session={semantic_session}&link=link-a&profile={profile} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            let response = http_request(address, &request).await;
+            let body = response_json(&response);
+            if body["kind"] == "ok" {
+                latest = Some(body);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let latest = latest.expect("BaselineLearning relationship did not become query-visible");
+    let semantic_session = latest["data"]["session_id"].as_str().expect("Semantic Session ID");
+    let store_id = latest["receipt"]["projection_commit"]["store_id"].as_str().expect("Store ID");
+    assert_eq!(
+        latest,
+        serde_json::json!({
+            "http_schema_version": 1,
+            "kind": "ok",
+            "resource": "relationship_latest",
+            "data": {
+                "session_id": semantic_session,
+                "link": "link-a",
+                "profile": profile,
+                "knowledge": {"kind": "unknown", "reason": "baseline_learning"},
+                "result_time": "1000000000",
+                "creator_commit": {"store_id": store_id, "sequence": "8"}
+            },
+            "receipt": {
+                "projection_commit": {"store_id": store_id, "sequence": "8"},
+                "session_id": semantic_session,
+                "first_record_seq": "0",
+                "last_record_seq": "7",
+                "decoder_version": "native-frame-v1",
+                "conditioning_version": "amplitude-v1",
+                "algorithm_version": "baseline-v1"
+            }
+        })
+    );
+
+    let mut watermarks = vec![command_commit];
+    while watermarks.len() < 8 {
+        let message = tokio::time::timeout(Duration::from_secs(1), websocket.next())
+            .await
+            .expect("relationship invalidation timeout")
+            .expect("relationship invalidation")
+            .expect("valid relationship invalidation");
+        watermarks.push(
+            serde_json::from_str(message.to_text().expect("text invalidation"))
+                .expect("invalidation JSON"),
+        );
+    }
+    for (index, watermark) in watermarks.iter().enumerate() {
+        assert_eq!(watermark["delivery_sequence"], (index + 1).to_string());
+        assert_eq!(watermark["projection_commit"]["sequence"], (index + 1).to_string());
+        assert_eq!(watermark["payload"], serde_json::json!({"kind": "projection_watermark"}));
+        assert_eq!(watermark["projection_commit"]["store_id"], store_id);
+    }
+
+    drop(websocket);
+    runtime.shutdown().await.expect("stop Host runtime");
+}
+
 #[tokio::test]
 async fn udp_capture_commits_and_becomes_visible_through_canonical_http_queries() {
     let fixture = RuntimeFixture::new();
@@ -554,54 +1073,71 @@ async fn websocket_handshake_and_postcommit_messages_are_ordered_invalidation_on
     runtime.shutdown().await.expect("stop Host runtime");
 }
 
+#[cfg(feature = "ingest-test-hooks")]
 #[tokio::test]
-async fn fatal_writer_failure_stops_capture_and_delivery_without_partial_commit() {
+async fn relationship_transaction_b_failure_stops_without_projection_or_invalidation() {
     let fixture = RuntimeFixture::new();
-    let runtime = HostRuntime::start(&fixture.config).await.expect("start Host runtime");
-    let capture = runtime.capture_address();
-    let destination =
-        std::net::SocketAddr::new("127.0.0.1".parse().expect("loopback"), capture.port());
-    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP sender");
-    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
-    sender.send_to(&seal_raw(1, 1, &capability), destination).await.expect("send capability");
-
-    let address = runtime.http_address();
-    let mut capability_committed = false;
-    for _ in 0..100 {
-        let body = response_json(
-            &http_request(
-                address,
-                "GET /api/topology HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            )
-            .await,
-        );
-        if body["receipt"]["projection_commit"]["sequence"] == "1" {
-            capability_committed = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(capability_committed, "capability did not commit before corruption");
-    Connection::open(&fixture.database)
-        .expect("open Store")
-        .execute("UPDATE capability_epochs SET descriptor_bytes = zeroblob(79)", [])
-        .expect("install capability conflict");
-    sender
-        .send_to(&seal_raw(1, 2, &capability), destination)
+    let runtime = start_host_with_relationship_transaction_b_failure(&fixture.config)
         .await
-        .expect("send conflicting capability");
+        .expect("start transaction-B-failing Host runtime");
+    let query = host_query_store(&runtime);
+    let address = runtime.http_address();
+    let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/api/live"))
+        .await
+        .expect("connect runtime WebSocket");
+    websocket.next().await.expect("handshake message").expect("valid handshake message");
+    let request = relationship_command_request("link-a", &"11".repeat(32));
+    assert!(http_request(address, &request).await.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
 
     tokio::time::timeout(std::time::Duration::from_secs(1), runtime.wait_for_stop())
         .await
         .expect("fatal runtime stop timeout");
+    if let Ok(Some(Ok(message))) =
+        tokio::time::timeout(Duration::from_millis(100), websocket.next()).await
+        && message.is_text()
+    {
+        panic!("failed transaction B emitted an invalidation: {message:?}");
+    }
+    let subjects = serde_json::to_value(query.relationship_subjects().expect("query subjects"))
+        .expect("serialize subjects");
+    assert_eq!(subjects["data"]["subjects"], serde_json::json!([]));
+    assert_eq!(subjects["receipt"]["projection_commit"]["sequence"], "0");
+    drop(query);
     let error = runtime.shutdown().await.expect_err("fatal writer failure must reach the caller");
     assert!(error.is_writer_failure());
+}
 
-    let packets: u64 = Connection::open(&fixture.database)
-        .expect("open stopped Store")
-        .query_row("SELECT count(*) FROM packet_records", [], |row| row.get(0))
-        .expect("count committed packets");
-    assert_eq!(packets, 1, "fatal packet transaction must roll back completely");
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn relationship_transaction_a_failure_has_no_projection_or_invalidation_effect() {
+    let fixture = RuntimeFixture::new();
+    let runtime = start_host_with_relationship_transaction_a_failure(&fixture.config)
+        .await
+        .expect("start transaction-A-failing Host runtime");
+    let query = host_query_store(&runtime);
+    let address = runtime.http_address();
+    let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/api/live"))
+        .await
+        .expect("connect runtime WebSocket");
+    websocket.next().await.expect("handshake message").expect("valid handshake message");
+    let request = relationship_command_request("link-a", &"11".repeat(32));
+    assert!(http_request(address, &request).await.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    tokio::time::timeout(Duration::from_secs(1), runtime.wait_for_stop())
+        .await
+        .expect("transaction-A failure stop timeout");
+    if let Ok(Some(Ok(message))) =
+        tokio::time::timeout(Duration::from_millis(100), websocket.next()).await
+        && message.is_text()
+    {
+        panic!("failed transaction A emitted an invalidation: {message:?}");
+    }
+    let subjects = serde_json::to_value(query.relationship_subjects().expect("query subjects"))
+        .expect("serialize subjects");
+    assert_eq!(subjects["data"]["subjects"], serde_json::json!([]));
+    assert_eq!(subjects["receipt"]["projection_commit"]["sequence"], "0");
+    drop(query);
+    let error = runtime.shutdown().await.expect_err("transaction-A failure must stop the writer");
+    assert!(error.is_writer_failure());
 }
 
 #[tokio::test]
@@ -609,6 +1145,12 @@ async fn runtime_routes_a_nonfirst_configured_sensor_without_singleton_shortcuts
     let fixture = RuntimeFixture::new();
     let runtime = HostRuntime::start(&fixture.config).await.expect("start Host runtime");
     let session = runtime.session_id().to_owned();
+    let address = runtime.http_address();
+    let profile = "61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2";
+    for link in ["link-a", "link-b"] {
+        let response = http_request(address, &relationship_command_request(link, profile)).await;
+        assert!(response.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    }
     let capture = runtime.capture_address();
     let destination =
         std::net::SocketAddr::new("127.0.0.1".parse().expect("loopback"), capture.port());
@@ -642,7 +1184,6 @@ async fn runtime_routes_a_nonfirst_configured_sensor_without_singleton_shortcuts
         .await
         .expect("send second CSI");
 
-    let address = runtime.http_address();
     let mut committed = false;
     for _ in 0..100 {
         let body = response_json(
@@ -652,7 +1193,7 @@ async fn runtime_routes_a_nonfirst_configured_sensor_without_singleton_shortcuts
             )
             .await,
         );
-        if body["receipt"]["projection_commit"]["sequence"] == "4" {
+        if body["receipt"]["projection_commit"]["sequence"] == "6" {
             committed = true;
             break;
         }
@@ -673,7 +1214,56 @@ async fn runtime_routes_a_nonfirst_configured_sensor_without_singleton_shortcuts
     assert_eq!(body["data"]["tiles"][0]["stream"]["key"]["sensor"], "sensor-b");
     assert_eq!(body["data"]["tiles"][0]["stream"]["device_epoch"]["device_id"], "2");
 
+    let subjects = response_json(
+        &http_request(
+            address,
+            "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await,
+    );
+    assert_eq!(
+        subjects["data"]["subjects"],
+        serde_json::json!([
+            {"session_id": subjects["data"]["subjects"][0]["session_id"], "link": "link-a", "profile": profile},
+            {"session_id": subjects["data"]["subjects"][0]["session_id"], "link": "link-b", "profile": profile}
+        ])
+    );
+
     runtime.shutdown().await.expect("stop Host runtime");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn relationship_command_queue_exhaustion_is_canonical_and_has_no_extra_store_effect() {
+    let fixture = RuntimeFixture::with_queue_capacity(1);
+    let mut runtime =
+        start_host_with_writer_held(&fixture.config).await.expect("start held Host runtime");
+    let address = runtime.http_address();
+    let profile = "11".repeat(32);
+    let request = relationship_command_request("link-a", &profile);
+
+    let accepted = http_request(address, &request).await;
+    assert!(accepted.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    let rejected = http_request(address, &request).await;
+    assert!(rejected.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    assert_eq!(response_json(&rejected)["error"]["code"], "command_queue_full");
+
+    release_writer(&mut runtime);
+    for _ in 0..100 {
+        let subjects = response_json(
+            &http_request(
+                address,
+                "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        if subjects["data"]["subjects"].as_array().is_some_and(|items| items.len() == 1) {
+            runtime.shutdown().await.expect("stop Host runtime");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the sole accepted relationship command did not commit");
 }
 
 #[cfg(feature = "ingest-test-hooks")]
@@ -704,7 +1294,7 @@ async fn runtime_queue_exhaustion_counts_the_drop_without_store_effect() {
     for _ in 0..100 {
         let packets: u64 = Connection::open(&fixture.database)
             .expect("open Store")
-            .query_row("SELECT count(*) FROM packet_records", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM packet_capture_membership", [], |row| row.get(0))
             .expect("count packets");
         if packets == 1 {
             committed = true;

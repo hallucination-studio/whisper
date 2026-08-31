@@ -24,37 +24,57 @@
     </dl>
   </header>
 
-  <main class="bench">
-    <aside class="topology-panel" aria-label="Capture context">
-      <div class="section-label">Capture context</div>
+  <main class="workspace">
+    <nav class="mode-switch" aria-label="View mode">
+      <label class="mode-option">
+        <input type="radio" name="view-mode" value="signal" checked>
+        <span>Signal Lab</span>
+      </label>
+      <label class="mode-option">
+        <input type="radio" name="view-mode" value="sensing">
+        <span>Sensing</span>
+      </label>
+    </nav>
+
+    <div class="bench">
+    <aside class="topology-panel" aria-label="Read context">
+      <div id="context-label" class="section-label">Capture context</div>
       <h1 id="context-heading">Follow the committed path</h1>
-      <p class="context-copy">Select Store-backed identities. These controls only change the read view.</p>
+      <p id="context-copy" class="context-copy">Select Store-backed identities. These controls only change the read view.</p>
 
       <div class="topology-trace" aria-hidden="true"></div>
-      <div class="selectors">
-        <label><span>Capture Session</span><select id="session-select"></select></label>
-        <label><span>Sensor</span><select id="sensor-select"></select></label>
-        <label><span>Link</span><select id="link-select"></select></label>
-        <label><span>Profile</span><select id="profile-select"></select></label>
+      <div id="capture-controls">
+        <div class="selectors">
+          <label><span>Capture Session</span><select id="session-select"></select></label>
+          <label><span>Sensor</span><select id="sensor-select"></select></label>
+          <label><span>Link</span><select id="link-select"></select></label>
+          <label><span>Profile</span><select id="profile-select"></select></label>
+        </div>
+
+        <div class="section-label read-label">Read shape</div>
+        <div class="selectors compact">
+          <label><span>Metric</span>
+            <select id="metric-select">
+              <option value="i">I</option><option value="q">Q</option>
+              <option value="amplitude">Amplitude</option><option value="phase">Phase</option>
+            </select>
+          </label>
+          <div class="range-fields">
+            <label><span>Interval from (ns)</span><input id="from-input" value="0" inputmode="numeric"></label>
+            <label><span>Interval to (ns)</span><input id="to-input" value="18446744073709551615" inputmode="numeric"></label>
+          </div>
+          <label><span>Path</span><select id="path-select"><option value="">All applicable paths</option></select></label>
+        </div>
       </div>
 
-      <div class="section-label read-label">Read shape</div>
-      <div class="selectors compact">
-        <label><span>Metric</span>
-          <select id="metric-select">
-            <option value="i">I</option><option value="q">Q</option>
-            <option value="amplitude">Amplitude</option><option value="phase">Phase</option>
-          </select>
-        </label>
-        <div class="range-fields">
-          <label><span>Interval from (ns)</span><input id="from-input" value="0" inputmode="numeric"></label>
-          <label><span>Interval to (ns)</span><input id="to-input" value="18446744073709551615" inputmode="numeric"></label>
-        </div>
-        <label><span>Path</span><select id="path-select"><option value="">All applicable paths</option></select></label>
+      <div id="sensing-controls" class="selectors" hidden>
+        <label><span>Semantic Session</span><select id="relationship-session-select"></select></label>
+        <label><span>Sensing Link</span><select id="relationship-link-select"></select></label>
+        <label><span>Sensing Profile</span><select id="relationship-profile-select"></select></label>
       </div>
     </aside>
 
-    <section class="signal-panel" aria-labelledby="signal-heading">
+    <section id="signal-panel" class="signal-panel" aria-labelledby="signal-heading">
       <div class="signal-heading-row">
         <div>
           <div class="section-label">Committed native coordinates</div>
@@ -65,6 +85,29 @@
       <div id="message" class="message" role="status">Reading topology…</div>
       <div id="signal-view" class="signal-view" aria-live="polite"></div>
     </section>
+    <section id="relationship-panel" class="signal-panel relationship-panel" aria-labelledby="relationship-heading" hidden>
+      <div class="signal-heading-row">
+        <div>
+          <div class="section-label">Committed RF relationship</div>
+          <h2 id="relationship-heading">Relationship knowledge</h2>
+        </div>
+      </div>
+      <div id="relationship-message" class="message" role="status">Reading relationship subjects…</div>
+      <div id="relationship-view" class="relationship-view" aria-live="polite" hidden>
+        <div class="relationship-state-block">
+          <div class="section-label">RF relationship state</div>
+          <output id="relationship-state" class="relationship-state" data-testid="relationship-state"></output>
+        </div>
+        <dl class="relationship-facts">
+          <div><dt>Result time</dt><dd id="relationship-result-time" data-testid="relationship-result-time"></dd></div>
+          <div id="relationship-change" hidden>
+            <dt>Most recent change</dt>
+            <dd><span id="relationship-change-state"></span><time id="relationship-change-time"></time></dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+    </div>
   </main>
 </body>
 </html>

@@ -533,7 +533,6 @@ pub struct QualityConfig {
     minimum_time_quality: TimeQualityConfig,
 }
 
-#[expect(dead_code, reason = "consumed by later estimator work package")]
 impl QualityConfig {
     pub(crate) const fn minimum_frames(&self) -> u32 {
         self.minimum_frames
@@ -1124,7 +1123,6 @@ impl Config {
 
     /// Returns window settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by later timeline work package")]
     pub(crate) const fn window(&self) -> &WindowConfig {
         self.replay.window()
     }
@@ -1137,7 +1135,6 @@ impl Config {
 
     /// Returns quality settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by later estimator work package")]
     pub(crate) const fn quality(&self) -> &QualityConfig {
         self.replay.quality()
     }

@@ -15,7 +15,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::store::QueryError;
 #[cfg(feature = "ingest-test-hooks")]
-use crate::store::QueryHold;
+use crate::store::{QueryHold, QueryStore};
 use crate::{Config, LifecycleError};
 
 mod capture;
@@ -286,6 +286,10 @@ pub struct HostRuntime {
     writer_hold: Arc<Mutex<Option<crate::application::WriterHold>>>,
     #[cfg(feature = "ingest-test-hooks")]
     query_hold: Arc<Mutex<Option<QueryHold>>>,
+    #[cfg(feature = "ingest-test-hooks")]
+    query: Option<QueryStore>,
+    #[cfg(feature = "ingest-test-hooks")]
+    manual_clock: Option<crate::application::ManualClockControl>,
 }
 
 /// Test-only gate that pauses final teardown on the independent supervisor.
@@ -461,12 +465,33 @@ impl HostRuntime {
     ///
     /// Returns the first writer, query, socket, task, or shutdown failure after all tasks join.
     pub async fn shutdown(self) -> Result<u64, RuntimeError> {
-        self.control.stop();
         #[cfg(feature = "ingest-test-hooks")]
-        self.writer_hold.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
-        let result = self.completion.wait().await;
-        let queue_drop_count = self.queue_drop_count();
+        let mut runtime = self;
+        #[cfg(not(feature = "ingest-test-hooks"))]
+        let runtime = self;
+        runtime.control.stop();
+        #[cfg(feature = "ingest-test-hooks")]
+        runtime.writer_hold.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        #[cfg(feature = "ingest-test-hooks")]
+        runtime.query.take();
+        let result = runtime.completion.wait().await;
+        let queue_drop_count = runtime.queue_drop_count();
         result.map(|()| queue_drop_count)
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    pub(crate) fn query_store_for_test(&self) -> QueryStore {
+        self.query.as_ref().expect("test Query Store is present").clone()
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    pub(crate) fn advance_clock_for_test(&self, elapsed: std::time::Duration) {
+        let advanced = self
+            .manual_clock
+            .as_ref()
+            .expect("manual clock is present for this test Host")
+            .advance(elapsed);
+        assert!(advanced, "manual clock advance exceeds its representable range");
     }
 }
 
@@ -475,6 +500,8 @@ impl Drop for HostRuntime {
         self.control.stop();
         #[cfg(feature = "ingest-test-hooks")]
         self.writer_hold.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        #[cfg(feature = "ingest-test-hooks")]
+        self.query.take();
     }
 }
 
@@ -488,6 +515,19 @@ pub(crate) async fn start_with_panicked_writer(
     config: &Config,
 ) -> Result<HostRuntime, RuntimeError> {
     supervisor::start_with_panicked_writer(config).await
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+pub(crate) async fn start_with_relationship_failure(
+    config: &Config,
+    stage: crate::store::RelationshipFailureStage,
+) -> Result<HostRuntime, RuntimeError> {
+    supervisor::start_with_relationship_failure(config, stage).await
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+pub(crate) async fn start_with_manual_clock(config: &Config) -> Result<HostRuntime, RuntimeError> {
+    supervisor::start_with_manual_clock(config).await
 }
 
 #[cfg(feature = "ingest-test-hooks")]

@@ -16,8 +16,9 @@ pub use crate::host::TeardownHold;
 #[doc(inline)]
 pub use crate::store::{
     EmptyEnvelope, ErrorEnvelope, Metric, QueryError, QueryHold, QueryLimits, QueryStore,
-    SignalPath, SignalQuery, SignalQueryBuilder, SignalRange, SignalSelection, SignalsOk,
-    SignalsResponse, TopologyOk,
+    RelationshipLatestResponse, RelationshipSelection, RelationshipSubjectsOk, SignalPath,
+    SignalQuery, SignalQueryBuilder, SignalRange, SignalSelection, SignalsOk, SignalsResponse,
+    TopologyOk,
 };
 use crate::{Config, HostRuntime, LifecycleError, RuntimeError};
 
@@ -273,6 +274,72 @@ pub fn release_writer(runtime: &mut HostRuntime) {
 /// Returns any normal Host startup failure or a writer-control failure.
 pub async fn start_host_with_panicked_writer(config: &Config) -> Result<HostRuntime, RuntimeError> {
     crate::host::start_with_panicked_writer(config).await
+}
+
+/// Starts a Host whose next relationship-command transaction A rolls back.
+///
+/// The failure is a one-shot non-default test control. The command still enters
+/// through the production HTTP and bounded-writer path.
+///
+/// # Errors
+///
+/// Returns any normal Host startup failure or a writer-control failure.
+pub async fn start_host_with_relationship_transaction_a_failure(
+    config: &Config,
+) -> Result<HostRuntime, RuntimeError> {
+    crate::host::start_with_relationship_failure(
+        config,
+        crate::store::RelationshipFailureStage::TransactionA,
+    )
+    .await
+}
+
+/// Starts a Host whose next relationship-command transaction B rolls back.
+///
+/// The failure is a one-shot non-default test control. The command still enters
+/// through the production HTTP and bounded-writer path.
+///
+/// # Errors
+///
+/// Returns any normal Host startup failure or a writer-control failure.
+pub async fn start_host_with_relationship_transaction_b_failure(
+    config: &Config,
+) -> Result<HostRuntime, RuntimeError> {
+    crate::host::start_with_relationship_failure(
+        config,
+        crate::store::RelationshipFailureStage::TransactionB,
+    )
+    .await
+}
+
+/// Starts a Host whose private runtime clock advances only through test control.
+///
+/// Encrypted packets and commands still enter through the production Host seams.
+///
+/// # Errors
+///
+/// Returns any normal Host startup failure.
+pub async fn start_host_with_manual_clock(config: &Config) -> Result<HostRuntime, RuntimeError> {
+    crate::host::start_with_manual_clock(config).await
+}
+
+/// Advances the private clock used by a manual-clock Host.
+///
+/// This wakes the ordinary single-writer scheduler so elapsed deadlines are
+/// observed without injecting a Timeline fact or other semantic work.
+///
+/// # Panics
+///
+/// Panics if `runtime` does not use a manual clock or the advance exceeds its
+/// representable range.
+pub fn advance_host_clock(runtime: &HostRuntime, elapsed: std::time::Duration) {
+    runtime.advance_clock_for_test(elapsed);
+}
+
+/// Returns the Host's ordinary committed read-side handle for behavior tests.
+#[must_use]
+pub fn host_query_store(runtime: &HostRuntime) -> QueryStore {
+    runtime.query_store_for_test()
 }
 
 /// Starts a Host whose pinned Store query waits for shutdown interruption.

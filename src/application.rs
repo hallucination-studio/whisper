@@ -10,21 +10,31 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+use std::sync::Weak;
 #[cfg(unix)]
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     mpsc::{self, Receiver, SyncSender},
 };
 #[cfg(unix)]
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::Config;
 use crate::config::RouteConfig;
 use crate::database::{Database, DatabaseError, EpochHandle, ReplayWindowIdentity};
+#[cfg(unix)]
+use crate::domain::csi::CaptureProfileId;
+#[cfg(unix)]
+use crate::domain::identity::RadioLinkId;
 use crate::domain::identity::{DeploymentId, DeviceId, KeyEpoch};
+#[cfg(unix)]
+use crate::domain::world::{BaselineCommand, TargetedBaselineCommand};
 use crate::key_material::{EpochKey, SecretStoreError, load_epoch_key};
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+use crate::store::RelationshipFailureStage;
 #[cfg(unix)]
 use crate::store::{AdmissionEpochSeed, CaptureSession, QueryError, QueryStore, Store, StoreError};
 #[cfg(unix)]
@@ -35,6 +45,126 @@ use sha2::{Digest, Sha256};
 
 const REPLAY_WINDOW_IDENTITY_DOMAIN: &[u8] = b"whisper.replay-window.identity";
 const REPLAY_WINDOW_IDENTITY_PREIMAGE_VERSION: u8 = 1;
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeClock {
+    source: RuntimeClockSource,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+enum RuntimeClockSource {
+    System,
+    #[cfg(feature = "ingest-test-hooks")]
+    Manual(Arc<ManualClockState>),
+}
+
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+#[derive(Debug)]
+struct ManualClockState {
+    monotonic_origin: Instant,
+    utc_origin: SystemTime,
+    elapsed_ns: AtomicU64,
+    writer: Mutex<Option<Weak<WriterInbox>>>,
+}
+
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+#[derive(Clone, Debug)]
+pub(crate) struct ManualClockControl {
+    state: Arc<ManualClockState>,
+}
+
+#[cfg(unix)]
+impl RuntimeClock {
+    pub(crate) const fn system() -> Self {
+        Self { source: RuntimeClockSource::System }
+    }
+
+    pub(crate) fn sample(&self) -> (Instant, SystemTime) {
+        match &self.source {
+            RuntimeClockSource::System => (Instant::now(), SystemTime::now()),
+            #[cfg(feature = "ingest-test-hooks")]
+            RuntimeClockSource::Manual(state) => {
+                let elapsed = Duration::from_nanos(state.elapsed_ns.load(AtomicOrdering::Acquire));
+                (
+                    state
+                        .monotonic_origin
+                        .checked_add(elapsed)
+                        .expect("manual clock advance validates the monotonic range"),
+                    state
+                        .utc_origin
+                        .checked_add(elapsed)
+                        .expect("manual clock advance validates the UTC range"),
+                )
+            }
+        }
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    pub(crate) fn manual() -> (Self, ManualClockControl) {
+        let state = Arc::new(ManualClockState {
+            monotonic_origin: Instant::now(),
+            utc_origin: SystemTime::now(),
+            elapsed_ns: AtomicU64::new(0),
+            writer: Mutex::new(None),
+        });
+        (
+            Self { source: RuntimeClockSource::Manual(Arc::clone(&state)) },
+            ManualClockControl { state },
+        )
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    fn attach_writer(&self, writer: &Arc<WriterInbox>) {
+        if let RuntimeClockSource::Manual(state) = &self.source {
+            *state.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(Arc::downgrade(writer));
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "ingest-test-hooks"))]
+impl ManualClockControl {
+    pub(crate) fn advance(&self, elapsed: Duration) -> bool {
+        let Ok(elapsed_ns) = u64::try_from(elapsed.as_nanos()) else {
+            return false;
+        };
+        let mut current = self.state.elapsed_ns.load(AtomicOrdering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(elapsed_ns) else {
+                return false;
+            };
+            let elapsed = Duration::from_nanos(next);
+            if self.state.monotonic_origin.checked_add(elapsed).is_none()
+                || self.state.utc_origin.checked_add(elapsed).is_none()
+            {
+                return false;
+            }
+            match self.state.elapsed_ns.compare_exchange_weak(
+                current,
+                next,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => {
+                    if let Some(writer) = self
+                        .state
+                        .writer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                    {
+                        writer.wake();
+                    }
+                    return true;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
 const NATIVE_FRAME_WIRE_VERSION: u8 = 1;
 // Fixed by the persistence-v1 managed-database path contract. Changing this splits
 // cross-process sidecar identity and requires a contract change.
@@ -375,10 +505,14 @@ pub(crate) struct CaptureRuntime {
     store_id: [u8; 32],
     session_id: String,
     monotonic_origin: Instant,
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    clock: RuntimeClock,
     #[cfg(unix)]
     config: Config,
     #[cfg(unix)]
     writer_inbox: Arc<WriterInbox>,
+    #[cfg(unix)]
+    relationship_commands: RelationshipCommandIngress,
     #[cfg(unix)]
     writer: Option<JoinHandle<()>>,
     #[cfg(unix)]
@@ -397,7 +531,12 @@ pub(crate) struct CaptureRuntime {
 
 impl CaptureRuntime {
     #[cfg(unix)]
-    fn new(store: Store, config: Config, capture: CaptureSession) -> Result<Self, HostError> {
+    fn new(
+        store: Store,
+        config: Config,
+        capture: CaptureSession,
+        clock: RuntimeClock,
+    ) -> Result<Self, HostError> {
         let store_id = capture.store_id();
         let session_id = capture.session_id().to_owned();
         let monotonic_origin = capture.monotonic_origin();
@@ -410,17 +549,28 @@ impl CaptureRuntime {
             Arc::clone(&writer_stopped),
             Arc::clone(&writer_panicked),
         ));
+        #[cfg(feature = "ingest-test-hooks")]
+        clock.attach_writer(&writer_inbox);
         let writer_inbox_for_thread = Arc::clone(&writer_inbox);
+        let writer_clock = clock.clone();
+        let relationship_commands = RelationshipCommandIngress {
+            writer_inbox: Arc::clone(&writer_inbox),
+            configured_links: config.registry().links().keys().cloned().collect(),
+            next_correlation: Arc::new(AtomicU64::new(0)),
+        };
         let writer = thread::Builder::new()
             .name("whisper-capture-writer".to_owned())
-            .spawn(move || writer_loop(capture, writer_inbox_for_thread))
+            .spawn(move || writer_loop(capture, writer_inbox_for_thread, writer_clock))
             .map_err(HostError::WriterSpawn)?;
         Ok(Self {
             store_id,
             session_id,
             monotonic_origin,
+            #[cfg(feature = "ingest-test-hooks")]
+            clock,
             config,
             writer_inbox,
+            relationship_commands,
             writer: Some(writer),
             writer_stopped,
             rate_windows: BTreeMap::new(),
@@ -447,7 +597,11 @@ impl CaptureRuntime {
 
     #[cfg(feature = "ingest-test-hooks")]
     pub(crate) fn elapsed(&self) -> Duration {
-        self.monotonic_origin.elapsed()
+        self.clock
+            .sample()
+            .0
+            .checked_duration_since(self.monotonic_origin)
+            .expect("runtime clock cannot precede its capture origin")
     }
 
     #[cfg(unix)]
@@ -504,7 +658,7 @@ impl CaptureRuntime {
             #[cfg(feature = "ingest-test-hooks")]
             reject_csi_domain: std::mem::take(&mut self.reject_next_csi_domain),
         };
-        match self.writer_inbox.try_push(pending) {
+        match self.writer_inbox.try_push(PendingWork::Candidate(pending)) {
             Ok(()) => Ok(CommitTicket { response: response_rx }),
             Err(PushError::Full) => {
                 self.queue_drop_count =
@@ -518,6 +672,11 @@ impl CaptureRuntime {
     pub(crate) fn observe_writer(&self, observer: WriterObserver) -> Result<(), HostError> {
         self.writer_inbox.observe(observer);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn relationship_commands(&self) -> RelationshipCommandIngress {
+        self.relationship_commands.clone()
     }
 
     #[cfg(unix)]
@@ -544,6 +703,21 @@ impl CaptureRuntime {
     #[cfg(all(unix, feature = "ingest-test-hooks"))]
     pub(crate) fn panic_writer_for_test(&self) -> Result<(), HostError> {
         self.writer_inbox.request_panic()
+    }
+
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    pub(crate) fn arm_relationship_failure(
+        &self,
+        stage: RelationshipFailureStage,
+    ) -> Result<(), HostError> {
+        let (response, received) = mpsc::sync_channel(1);
+        self.writer_inbox
+            .try_push(PendingWork::ArmRelationshipFailure { stage, response })
+            .map_err(|error| match error {
+                PushError::Full => HostError::WriterQueueFull,
+                PushError::Stopped => HostError::WriterStopped,
+            })?;
+        received.recv().map_err(|_| HostError::WriterStopped)
     }
 
     #[cfg(unix)]
@@ -604,6 +778,77 @@ struct PendingCandidate {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Debug)]
+pub(crate) struct RelationshipCommandIngress {
+    writer_inbox: Arc<WriterInbox>,
+    configured_links: BTreeSet<RadioLinkId>,
+    next_correlation: Arc<AtomicU64>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RelationshipCommandAdmissionError {
+    InvalidTarget,
+    QueueFull,
+    WriterStopped,
+    CorrelationOverflow,
+}
+
+#[cfg(unix)]
+impl RelationshipCommandIngress {
+    pub(crate) fn try_begin_learning(
+        &self,
+        link: RadioLinkId,
+        profile: CaptureProfileId,
+    ) -> Result<String, RelationshipCommandAdmissionError> {
+        if !self.configured_links.contains(&link) {
+            return Err(RelationshipCommandAdmissionError::InvalidTarget);
+        }
+        let correlation = self
+            .next_correlation
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| RelationshipCommandAdmissionError::CorrelationOverflow)?
+            .checked_add(1)
+            .ok_or(RelationshipCommandAdmissionError::CorrelationOverflow)?;
+        let command = TargetedBaselineCommand::new(
+            crate::domain::identity::LinkProfileKey::new(link, profile),
+            BaselineCommand::BeginLearning,
+        );
+        self.writer_inbox.try_push(PendingWork::RelationshipCommand(command)).map_err(|error| {
+            match error {
+                PushError::Full => RelationshipCommandAdmissionError::QueueFull,
+                PushError::Stopped => RelationshipCommandAdmissionError::WriterStopped,
+            }
+        })?;
+        Ok(format!("relationship-command-{correlation}"))
+    }
+}
+
+#[cfg(unix)]
+enum PendingWork {
+    Candidate(PendingCandidate),
+    RelationshipCommand(TargetedBaselineCommand),
+    #[cfg(feature = "ingest-test-hooks")]
+    ArmRelationshipFailure {
+        stage: RelationshipFailureStage,
+        response: SyncSender<()>,
+    },
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the writer handoff moves one queued item and avoids a heap allocation per input"
+)]
+enum WriterAction {
+    Work(PendingWork),
+    TimelineAdvance,
+    Closed,
+}
+
+#[cfg(unix)]
 enum PushError {
     Full,
     Stopped,
@@ -631,7 +876,7 @@ impl std::fmt::Debug for WriterInbox {
 #[cfg(unix)]
 #[derive(Default)]
 struct WriterInboxState {
-    candidates: VecDeque<PendingCandidate>,
+    work: VecDeque<PendingWork>,
     observer: Option<WriterObserver>,
     closed: bool,
     #[cfg(feature = "ingest-test-hooks")]
@@ -654,7 +899,7 @@ impl WriterInbox {
         }
     }
 
-    fn try_push(&self, candidate: PendingCandidate) -> Result<(), PushError> {
+    fn try_push(&self, work: PendingWork) -> Result<(), PushError> {
         if self.stopped.load(AtomicOrdering::Acquire) {
             return Err(PushError::Stopped);
         }
@@ -662,16 +907,21 @@ impl WriterInbox {
         if state.closed {
             return Err(PushError::Stopped);
         }
-        if state.candidates.len() >= self.capacity {
+        if state.work.len() >= self.capacity {
             return Err(PushError::Full);
         }
-        state.candidates.push_back(candidate);
+        state.work.push_back(work);
         drop(state);
         self.changed.notify_one();
         Ok(())
     }
 
-    fn next(&self) -> Option<PendingCandidate> {
+    #[cfg(feature = "ingest-test-hooks")]
+    fn wake(&self) {
+        self.changed.notify_all();
+    }
+
+    fn next(&self, timeline_deadline: Option<Instant>, clock: &RuntimeClock) -> WriterAction {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
             #[cfg(feature = "ingest-test-hooks")]
@@ -689,13 +939,24 @@ impl WriterInbox {
                 state.held = false;
                 continue;
             }
-            if let Some(candidate) = state.candidates.pop_front() {
-                return Some(candidate);
-            }
             if state.closed {
-                return None;
+                return state.work.pop_front().map_or(WriterAction::Closed, WriterAction::Work);
             }
-            state = self.changed.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+            if timeline_deadline.is_some_and(|deadline| clock.sample().0 >= deadline) {
+                return WriterAction::TimelineAdvance;
+            }
+            if let Some(work) = state.work.pop_front() {
+                return WriterAction::Work(work);
+            }
+            state = if let Some(deadline) = timeline_deadline {
+                let timeout = deadline.saturating_duration_since(clock.sample().0);
+                self.changed
+                    .wait_timeout(state, timeout)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0
+            } else {
+                self.changed.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner())
+            };
         }
     }
 
@@ -791,43 +1052,72 @@ impl Drop for WriterHold {
 }
 
 #[cfg(unix)]
-fn writer_loop(mut capture: CaptureSession, inbox: Arc<WriterInbox>) {
+fn writer_loop(mut capture: CaptureSession, inbox: Arc<WriterInbox>, clock: RuntimeClock) {
     let _stopped = WriterStoppedGuard(Arc::clone(&inbox));
-    while let Some(PendingCandidate {
-        candidate,
-        response,
-        #[cfg(feature = "ingest-test-hooks")]
-        reject_csi_domain,
-    }) = inbox.next()
-    {
-        let outcome = {
-            #[cfg(feature = "ingest-test-hooks")]
-            {
-                if reject_csi_domain {
-                    capture.commit_with_domain_rejection(candidate)
-                } else {
-                    capture.commit(candidate)
+    loop {
+        match inbox.next(capture.next_timeline_deadline(), &clock) {
+            WriterAction::Closed => break,
+            WriterAction::TimelineAdvance => match capture.commit_timeline_advance() {
+                Ok(projection) => inbox.notify(WriterEvent::Committed(projection)),
+                Err(error) => {
+                    inbox.stopped.store(true, AtomicOrdering::Release);
+                    inbox.notify(WriterEvent::Fatal(Arc::new(HostError::Store(error))));
+                    break;
                 }
-            }
-            #[cfg(not(feature = "ingest-test-hooks"))]
-            {
-                capture.commit(candidate)
-            }
-        };
-        match outcome {
-            Ok(outcome) => {
-                let _ = response.send(Ok(outcome));
-                if let CommitOutcome::Committed(receipt) = outcome {
-                    inbox.notify(WriterEvent::Committed(receipt.projection_sequence()));
+            },
+            WriterAction::Work(work) => match work {
+                PendingWork::Candidate(PendingCandidate {
+                    candidate,
+                    response,
+                    #[cfg(feature = "ingest-test-hooks")]
+                    reject_csi_domain,
+                }) => {
+                    let outcome = {
+                        #[cfg(feature = "ingest-test-hooks")]
+                        {
+                            if reject_csi_domain {
+                                capture.commit_with_domain_rejection(candidate)
+                            } else {
+                                capture.commit(candidate)
+                            }
+                        }
+                        #[cfg(not(feature = "ingest-test-hooks"))]
+                        {
+                            capture.commit(candidate)
+                        }
+                    };
+                    match outcome {
+                        Ok(outcome) => {
+                            let _ = response.send(Ok(outcome));
+                            if let CommitOutcome::Committed(receipt) = outcome {
+                                inbox.notify(WriterEvent::Committed(receipt.projection_sequence()));
+                            }
+                        }
+                        Err(error) => {
+                            inbox.stopped.store(true, AtomicOrdering::Release);
+                            let error = Arc::new(HostError::Store(error));
+                            let _ = response.send(Err(Arc::clone(&error)));
+                            inbox.notify(WriterEvent::Fatal(error));
+                            break;
+                        }
+                    }
                 }
-            }
-            Err(error) => {
-                inbox.stopped.store(true, AtomicOrdering::Release);
-                let error = Arc::new(HostError::Store(error));
-                let _ = response.send(Err(Arc::clone(&error)));
-                inbox.notify(WriterEvent::Fatal(error));
-                break;
-            }
+                PendingWork::RelationshipCommand(command) => {
+                    match capture.commit_relationship_command(command, clock.sample()) {
+                        Ok(projection) => inbox.notify(WriterEvent::Committed(projection)),
+                        Err(error) => {
+                            inbox.stopped.store(true, AtomicOrdering::Release);
+                            inbox.notify(WriterEvent::Fatal(Arc::new(HostError::Store(error))));
+                            break;
+                        }
+                    }
+                }
+                #[cfg(feature = "ingest-test-hooks")]
+                PendingWork::ArmRelationshipFailure { stage, response } => {
+                    capture.arm_relationship_failure(stage);
+                    let _ = response.send(());
+                }
+            },
         }
     }
 }
@@ -951,10 +1241,18 @@ pub(crate) fn init_admission(_config: &Config) -> Result<(), HostError> {
 
 #[cfg(unix)]
 pub(crate) fn serve(config: &Config) -> Result<CaptureRuntime, HostError> {
+    serve_with_clock(config, RuntimeClock::system())
+}
+
+#[cfg(unix)]
+pub(crate) fn serve_with_clock(
+    config: &Config,
+    clock: RuntimeClock,
+) -> Result<CaptureRuntime, HostError> {
     let store = Store::acquire_existing(config)?;
     let admissions = admission_seeds(config)?;
-    let capture = store.create_capture_session(config, admissions)?;
-    CaptureRuntime::new(store, config.clone(), capture)
+    let capture = store.create_capture_session(config, admissions, clock.sample())?;
+    CaptureRuntime::new(store, config.clone(), capture, clock)
 }
 
 #[cfg(not(unix))]

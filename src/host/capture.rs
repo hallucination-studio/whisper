@@ -1,34 +1,17 @@
 //! Board-facing UDP receipt and postcommit writer-event delivery.
 
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Instant, SystemTime};
-
-use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, watch};
 
 use super::{RuntimeError, RuntimeErrorKind, SocketOperation, SocketRole};
-use crate::application::CaptureRuntime;
+use crate::application::{CaptureRuntime, RuntimeClock};
 use crate::{CapturedDatagram, ProjectionCommit};
-
-#[derive(Clone, Copy)]
-pub(super) struct ReceiveClock {
-    now: fn() -> (Instant, SystemTime),
-}
-
-impl ReceiveClock {
-    pub(super) const fn system() -> Self {
-        Self { now: system_receive_time }
-    }
-
-    fn sample(self) -> (Instant, SystemTime) {
-        (self.now)()
-    }
-}
 
 pub(super) fn bind_socket(
     address: SocketAddr,
@@ -59,7 +42,7 @@ pub(super) async fn run(
     maximum_datagram_bytes: usize,
     mut shutdown: watch::Receiver<bool>,
     queue_drop_count: Arc<AtomicU64>,
-    receive_clock: ReceiveClock,
+    clock: RuntimeClock,
 ) -> Result<(), RuntimeError> {
     let receive_capacity = maximum_datagram_bytes
         .checked_add(1)
@@ -87,7 +70,7 @@ pub(super) async fn run(
                 if length > maximum_datagram_bytes {
                     continue;
                 }
-                let (received_monotonic, received_utc) = receive_clock.sample();
+                let (received_monotonic, received_utc) = clock.sample();
                 let datagram = CapturedDatagram::new(
                     peer,
                     received_monotonic,
@@ -166,8 +149,4 @@ pub(super) async fn deliver_writer_events(
             }
         }
     }
-}
-
-fn system_receive_time() -> (Instant, SystemTime) {
-    (Instant::now(), SystemTime::now())
 }

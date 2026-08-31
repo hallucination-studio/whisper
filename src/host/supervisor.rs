@@ -12,14 +12,18 @@ use tokio::task::JoinHandle;
 
 #[cfg(feature = "ingest-test-hooks")]
 use super::TeardownHold;
-use super::capture::ReceiveClock;
 use super::http::ConnectionRegistry;
 use super::{
     HostRuntime, RuntimeCompletion, RuntimeControl, RuntimeError, RuntimeErrorKind,
     SocketOperation, SocketRole, capture, http,
 };
 #[cfg(feature = "ingest-test-hooks")]
+use crate::application::ManualClockControl;
+use crate::application::RuntimeClock;
+#[cfg(feature = "ingest-test-hooks")]
 use crate::store::QueryHold;
+#[cfg(feature = "ingest-test-hooks")]
+use crate::store::RelationshipFailureStage;
 use crate::store::{QueryLimits, QueryStore};
 use crate::{Config, LifecycleError};
 
@@ -34,6 +38,8 @@ struct Startup {
     capture_address: SocketAddr,
     queue_drop_count: Arc<AtomicU64>,
     http_address: SocketAddr,
+    #[cfg(feature = "ingest-test-hooks")]
+    query: QueryStore,
 }
 
 #[derive(Default)]
@@ -44,6 +50,10 @@ struct SupervisorControls {
     hold_query: bool,
     #[cfg(feature = "ingest-test-hooks")]
     teardown_gate: Option<TeardownGate>,
+    #[cfg(feature = "ingest-test-hooks")]
+    relationship_failure: Option<RelationshipFailureStage>,
+    #[cfg(feature = "ingest-test-hooks")]
+    manual_clock: bool,
 }
 
 #[cfg(feature = "ingest-test-hooks")]
@@ -54,7 +64,7 @@ struct TeardownGate {
 
 struct Supervisor {
     config: Config,
-    receive_clock: ReceiveClock,
+    clock: RuntimeClock,
     controls: SupervisorControls,
     control: RuntimeControl,
     #[cfg(feature = "ingest-test-hooks")]
@@ -84,6 +94,24 @@ pub(super) async fn start_with_panicked_writer(
     config: &Config,
 ) -> Result<HostRuntime, RuntimeError> {
     start_inner(config, SupervisorControls { panic_writer: true, ..SupervisorControls::default() })
+        .await
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+pub(super) async fn start_with_relationship_failure(
+    config: &Config,
+    stage: RelationshipFailureStage,
+) -> Result<HostRuntime, RuntimeError> {
+    start_inner(
+        config,
+        SupervisorControls { relationship_failure: Some(stage), ..SupervisorControls::default() },
+    )
+    .await
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+pub(super) async fn start_with_manual_clock(config: &Config) -> Result<HostRuntime, RuntimeError> {
+    start_inner(config, SupervisorControls { manual_clock: true, ..SupervisorControls::default() })
         .await
 }
 
@@ -123,6 +151,16 @@ async fn start_inner(
     config: &Config,
     controls: SupervisorControls,
 ) -> Result<HostRuntime, RuntimeError> {
+    #[cfg(feature = "ingest-test-hooks")]
+    let (clock, manual_clock): (RuntimeClock, Option<ManualClockControl>) = if controls.manual_clock
+    {
+        let (clock, control) = RuntimeClock::manual();
+        (clock, Some(control))
+    } else {
+        (RuntimeClock::system(), None)
+    };
+    #[cfg(not(feature = "ingest-test-hooks"))]
+    let clock = RuntimeClock::system();
     let control = RuntimeControl::new();
     let completion = Arc::new(RuntimeCompletion::new());
     #[cfg(feature = "ingest-test-hooks")]
@@ -133,7 +171,7 @@ async fn start_inner(
     let launch = SupervisorLaunch {
         supervisor: Supervisor {
             config: config.clone(),
-            receive_clock: ReceiveClock::system(),
+            clock,
             controls,
             control: control.clone(),
             #[cfg(feature = "ingest-test-hooks")]
@@ -161,6 +199,10 @@ async fn start_inner(
         writer_hold,
         #[cfg(feature = "ingest-test-hooks")]
         query_hold,
+        #[cfg(feature = "ingest-test-hooks")]
+        query: Some(startup.query),
+        #[cfg(feature = "ingest-test-hooks")]
+        manual_clock,
     })
 }
 
@@ -237,7 +279,8 @@ impl Supervisor {
                 source,
             )
         })?;
-        let capture = crate::application::serve(&self.config).map_err(LifecycleError::host)?;
+        let capture = crate::application::serve_with_clock(&self.config, self.clock.clone())
+            .map_err(LifecycleError::host)?;
         #[cfg(feature = "ingest-test-hooks")]
         let mut capture = capture;
         let store_id = capture.store_id();
@@ -258,6 +301,7 @@ impl Supervisor {
                 writer_events_tx.send_replace(Some(event));
             }))
             .map_err(LifecycleError::host)?;
+        let relationship_commands = capture.relationship_commands();
         #[cfg(feature = "ingest-test-hooks")]
         if self.controls.hold_writer {
             *self.writer_hold.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -271,12 +315,22 @@ impl Supervisor {
         }
         #[cfg(not(feature = "ingest-test-hooks"))]
         let _ = self.controls.panic_writer;
+        #[cfg(feature = "ingest-test-hooks")]
+        if let Some(stage) = self.controls.relationship_failure {
+            capture.arm_relationship_failure(stage).map_err(LifecycleError::host)?;
+        }
 
         let capture_owner = Arc::new(Mutex::new(Some(capture)));
         let queue_drop_count = Arc::new(AtomicU64::new(0));
         let connections = ConnectionRegistry::default();
         let (live_tx, _) = broadcast::channel(live_capacity);
-        let app = http::router(query.clone(), limits, live_tx.clone(), self.control.clone());
+        let app = http::router(
+            query.clone(),
+            limits,
+            live_tx.clone(),
+            relationship_commands,
+            self.control.clone(),
+        );
         let http_listener = http::TrackedListener::new(
             http_listener,
             connections.clone(),
@@ -288,6 +342,8 @@ impl Supervisor {
             capture_address,
             queue_drop_count: Arc::clone(&queue_drop_count),
             http_address,
+            #[cfg(feature = "ingest-test-hooks")]
+            query: query.clone(),
         };
         let mut http_shutdown_rx = self.control.shutdown.subscribe();
         let task_control = self.control.clone();
@@ -339,7 +395,7 @@ impl Supervisor {
                     maximum_datagram_bytes,
                     task_control.shutdown.subscribe(),
                     queue_drop_count,
-                    self.receive_clock,
+                    self.clock.clone(),
                 ),
                 task_control.clone(),
             );

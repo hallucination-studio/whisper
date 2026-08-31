@@ -7,9 +7,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
 use rusqlite::Connection;
-use whisper::test_support::serve_capture;
+use whisper::test_support::{CapturedDatagram, serve_capture};
 use whisper::{Config, parse_config};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +111,28 @@ fn decode_hex(encoded: &str) -> Vec<u8> {
         .collect()
 }
 
+fn seal_unknown_packet(message_sequence: u64) -> Box<[u8]> {
+    const HEADER_BYTES: usize = 32;
+    let body = [0xa5];
+    let mut header = [0_u8; HEADER_BYTES];
+    header[0] = 1;
+    header[1] = 0x7f;
+    header[2..4].copy_from_slice(&(HEADER_BYTES as u16).to_le_bytes());
+    header[4..12].copy_from_slice(&1_u64.to_le_bytes());
+    header[12..14].copy_from_slice(&1_u16.to_le_bytes());
+    header[16..20].copy_from_slice(&1_u32.to_le_bytes());
+    header[20..28].copy_from_slice(&message_sequence.to_le_bytes());
+    header[28..30].copy_from_slice(&(body.len() as u16).to_le_bytes());
+    let mut nonce = [0_u8; 12];
+    nonce[..4].copy_from_slice(&1_u32.to_le_bytes());
+    nonce[4..].copy_from_slice(&message_sequence.to_le_bytes());
+    let ciphertext = Aes256Gcm::new_from_slice(&[0x11; 32])
+        .expect("test key")
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: &body, aad: &header })
+        .expect("seal test datagram");
+    header.into_iter().chain(ciphertext).collect::<Vec<_>>().into_boxed_slice()
+}
+
 #[test]
 fn init_admission_creates_the_closed_store_and_empty_epochs() {
     let fixture = StoreFixture::new();
@@ -137,7 +164,7 @@ fn init_admission_creates_the_closed_store_and_empty_epochs() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("user version");
     assert_eq!(application_id, 0x5753_5044);
-    assert_eq!(user_version, 1);
+    assert_eq!(user_version, 2);
 
     let objects = connection
         .prepare(
@@ -155,13 +182,27 @@ fn init_admission_creates_the_closed_store_and_empty_epochs() {
         objects,
         [
             "admission_epochs",
-            "capability_epochs",
+            "baseline_by_source",
+            "baseline_states",
+            "capture_record_identity",
             "capture_sessions",
+            "capture_sessions_started",
             "csi_by_link_time",
+            "csi_by_sensor_time",
             "csi_observations",
-            "packet_records",
-            "packet_records_time",
+            "one_active_session",
+            "one_commit_per_record",
+            "packet_capture_membership",
+            "projection_commits",
+            "relationship_latest",
+            "session_processing_state",
+            "session_records",
+            "session_records_time",
+            "sessions",
             "store_state",
+            "visible_capture_records",
+            "visible_records",
+            "visible_sessions",
         ]
     );
 
@@ -201,7 +242,7 @@ fn init_admission_creates_the_closed_store_and_empty_epochs() {
 }
 
 #[test]
-fn init_admission_persists_imported_canonical_receipts() {
+fn init_admission_persists_topology_and_admission_receipts() {
     const TOPOLOGY_HEX: &str = concat!(
         "a666736368656d61016a6465706c6f796d656e74636c6162667370616365738164726f6f6d",
         "6c7472616e736d697474657273826474782d616474782d626773656e736f727382a362696468",
@@ -231,26 +272,16 @@ fn init_admission_persists_imported_canonical_receipts() {
     );
 
     let connection = Connection::open(&fixture.database).expect("open initialized Store");
-    let (topology, topology_digest, replay, replay_digest): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) =
-        connection
-            .query_row(
-                "SELECT topology_manifest_cbor, topology_manifest_digest,
-                        replay_config_cbor, replay_config_digest
-                 FROM store_state WHERE singleton = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("read immutable Store receipts");
+    let (topology, topology_digest): (Vec<u8>, Vec<u8>) = connection
+        .query_row(
+            "SELECT topology_manifest_cbor, topology_manifest_digest
+             FROM store_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read immutable Store receipts");
     assert_eq!(topology, decode_hex(TOPOLOGY_HEX));
     assert_eq!(topology_digest, decode_hex(TOPOLOGY_DIGEST_HEX));
-    assert_eq!(
-        replay,
-        decode_hex(include_str!("fixtures/config/replay-config-canonical.hex").trim())
-    );
-    assert_eq!(
-        replay_digest,
-        decode_hex(include_str!("fixtures/config/replay-config-canonical.sha256").trim())
-    );
 
     let identities = connection
         .prepare(
@@ -296,23 +327,21 @@ fn serve_requires_an_existing_store_and_creates_one_empty_capture_session() {
     let connection = Connection::open(&fixture.database).expect("open served Store");
     let sessions = connection
         .prepare(
-            "SELECT session_id, length(started_utc_ns), replay_config_digest,
+            "SELECT capture_session_id, started_utc_ns,
                     decoder_version, conditioning_version, algorithm_version,
-                    committed_through_record_seq, last_session_time_ns, projection_commit_seq
+                    durable_tail_record_seq, last_session_time
              FROM capture_sessions",
         )
         .expect("prepare Capture Session query")
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, usize>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
                 row.get::<_, Option<Vec<u8>>>(6)?,
-                row.get::<_, Option<Vec<u8>>>(7)?,
-                row.get::<_, Option<Vec<u8>>>(8)?,
             ))
         })
         .expect("query Capture Sessions")
@@ -324,15 +353,11 @@ fn serve_requires_an_existing_store_and_creates_one_empty_capture_session() {
         assert_eq!(session.0.len(), "capture-".len() + 32);
         assert!(session.0.starts_with("capture-"));
         assert!(session.0["capture-".len()..].bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(session.1, 8);
-        assert_eq!(session.2.len(), 32);
-        assert_eq!(session.3, "native-frame-v1");
-        assert_eq!(session.4, "amplitude-v1");
-        assert_eq!(session.5, "native-coordinate-ingest-v1");
-        assert_eq!(
-            (session.6.as_ref(), session.7.as_ref(), session.8.as_ref()),
-            (None, None, None)
-        );
+        assert!(session.1 > 0);
+        assert_eq!(session.2, "native-frame-v1");
+        assert_eq!(session.3, "amplitude-v1");
+        assert_eq!(session.4, "native-coordinate-ingest-v1");
+        assert_eq!((session.5.as_ref(), session.6.as_ref()), (None, None));
     }
     let watermark: Vec<u8> = connection
         .query_row("SELECT projection_commit_seq FROM store_state", [], |row| row.get(0))
@@ -350,7 +375,8 @@ fn serve_returns_committed_session_authority_and_retains_the_lifecycle_lease() {
     let connection = Connection::open(&fixture.database).expect("open served Store");
     let (store_id, session_count): (Vec<u8>, u64) = connection
         .query_row(
-            "SELECT store_id, (SELECT count(*) FROM capture_sessions WHERE session_id = ?1)
+            "SELECT store_id,
+                    (SELECT count(*) FROM capture_sessions WHERE capture_session_id = ?1)
              FROM store_state WHERE singleton = 1",
             [session.session_id()],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -443,9 +469,9 @@ fn assert_serve_rejects_corruption(sql: &str) {
 fn serve_rejects_incompatible_identity_schema_and_state_without_mutation() {
     for sql in [
         "PRAGMA application_id = 0;",
-        "PRAGMA user_version = 2;",
+        "PRAGMA user_version = 1;",
         "CREATE TABLE unexpected(value INTEGER);",
-        "DROP INDEX packet_records_time;",
+        "DROP INDEX session_records_time;",
         "UPDATE store_state SET topology_manifest_digest = zeroblob(32);",
         "UPDATE admission_epochs SET replay_window_size = 63, seen_bitmap = zeroblob(8)
          WHERE device_id = X'0000000000000001';",
@@ -718,33 +744,19 @@ fn serve_preserves_an_advanced_store_watermark_and_starts_a_fresh_session() {
         .expect("run init-admission");
     assert!(initialized.status.success());
     let config = fixture.parsed_config();
-    let first_serve = serve_capture(&config).expect("serve initialized Store");
-    drop(first_serve);
-    let connection = Connection::open(&fixture.database).expect("open Store");
-    let first_session: String = connection
-        .query_row("SELECT session_id FROM capture_sessions", [], |row| row.get(0))
-        .expect("read first Capture Session");
-    connection
-        .execute(
-            "UPDATE capture_sessions
-             SET committed_through_record_seq = ?1, last_session_time_ns = ?2,
-                 projection_commit_seq = ?3
-             WHERE session_id = ?4",
-            rusqlite::params![
-                1_u64.to_be_bytes(),
-                10_u64.to_be_bytes(),
-                1_u64.to_be_bytes(),
-                first_session,
-            ],
-        )
-        .expect("make first Capture Session visible");
-    connection
-        .execute(
-            "UPDATE store_state SET projection_commit_seq = ?1",
-            rusqlite::params![1_u64.to_be_bytes()],
-        )
-        .expect("advance Store watermark");
-    connection.close().expect("close advanced Store");
+    let mut first_serve = serve_capture(&config).expect("serve initialized Store");
+    let datagram = CapturedDatagram::new(
+        "192.0.2.10:5000".parse().expect("peer"),
+        Instant::now(),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        seal_unknown_packet(1),
+    );
+    first_serve
+        .try_submit(datagram)
+        .expect("submit authenticated packet")
+        .wait()
+        .expect("commit authenticated packet");
+    first_serve.shutdown().expect("stop first Capture runtime");
 
     let second_serve = serve_capture(&config).expect("serve valid advanced Store state");
     drop(second_serve);

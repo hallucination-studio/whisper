@@ -228,10 +228,6 @@ pub(crate) struct TimelineConfig {
     maximum_encoded_timeline_state_bytes: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "constructed for the Timeline state codec integration slice")
-)]
 impl TimelineConfig {
     pub(crate) fn try_new(
         manifest: &SessionManifest,
@@ -723,6 +719,10 @@ impl Timeline {
         };
         timeline.encode_state()?;
         Ok(timeline)
+    }
+
+    pub(crate) fn state(&self) -> Result<TimelineState, TimelineError> {
+        self.encode_state()
     }
 
     #[cfg(test)]
