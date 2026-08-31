@@ -7,6 +7,8 @@ use std::path::Path;
 #[cfg(feature = "development-fixture")]
 use std::process::Command;
 use std::process::ExitCode;
+#[cfg(all(feature = "development-fixture", unix))]
+use tokio::signal::unix::{Signal, SignalKind};
 
 use whisper::{Config, ConfigError, parse_config};
 
@@ -170,6 +172,14 @@ fn development_fixture_command(args: Vec<OsString>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    #[cfg(unix)]
+    let _interrupt_guard = match FixtureInterruptGuard::install() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("development fixture signal handling failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
     let mut child = Command::new(program);
     child.args(child_args);
     match whisper::development_fixture::run(&config, sensor_id, &mut child) {
@@ -181,6 +191,24 @@ fn development_fixture_command(args: Vec<OsString>) -> ExitCode {
             eprintln!("development fixture failed: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(all(feature = "development-fixture", unix))]
+struct FixtureInterruptGuard {
+    _runtime: tokio::runtime::Runtime,
+    _interrupt: Signal,
+}
+
+#[cfg(all(feature = "development-fixture", unix))]
+impl FixtureInterruptGuard {
+    fn install() -> std::io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let guard = runtime.enter();
+        // Keep the Host alive until the interrupted child exits and the fixture store is removed.
+        let interrupt = tokio::signal::unix::signal(SignalKind::interrupt())?;
+        drop(guard);
+        Ok(Self { _runtime: runtime, _interrupt: interrupt })
     }
 }
 
