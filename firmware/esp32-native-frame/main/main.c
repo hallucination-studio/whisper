@@ -93,6 +93,8 @@ static void wifi_event(void *argument, esp_event_base_t base, int32_t id, void *
             xEventGroupSetBits(state->events, WIFI_READY_BIT);
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *event = data;
+        ESP_LOGE(TAG, "Wi-Fi station disconnected: reason=%u", (unsigned)event->reason);
         fail_runtime(state);
     }
 }
