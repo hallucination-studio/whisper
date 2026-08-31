@@ -109,12 +109,21 @@ different target.
 ## Flash and verify the application
 
 Read offset/image pairs and flash settings from the production build's
-`flasher_args.json`. Use those generated values for `write-flash`, then use the
-same offset/image pairs for `verify-flash`. Do not transcribe addresses from a
-document or another project.
+`flasher_args.json` and use those generated values for `write-flash`. Treat
+esptool's successful per-image write verification as the integrity result for
+the complete generated flash set. Do not transcribe addresses from a document
+or another project.
+
+When an independent post-write identity check is required, run `verify-flash`
+for the immutable application image. Do not require a post-boot byte comparison
+for runtime-owned mutable partitions. In particular, the boot process may
+legitimately update the initial OTA data, and provisioning replaces the NVS
+partition. A mismatch between those current partition bytes and their initial
+build artifacts is not an application-image verification failure.
 
 Record the exact expanded commands, serial port, baud, probe outputs,
-`flasher_args.json`, image digests, write result, and verification result.
+`flasher_args.json`, application-image digest, write result, and application
+verification result.
 
 ## Fixed development Wi-Fi provisioning
 
