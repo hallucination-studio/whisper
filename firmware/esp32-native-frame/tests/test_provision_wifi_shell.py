@@ -144,8 +144,6 @@ class ProvisionWifiShellTests(unittest.TestCase):
                                       side_effect=lambda _ssid: observed("password", password)), \
                     mock.patch.object(adapter, "validate_capture_route",
                                       side_effect=lambda *_values: calls.append("route")), \
-                    mock.patch.object(adapter, "validate_build_and_board",
-                                      side_effect=lambda *_values: calls.append("build-board")), \
                     mock.patch.object(adapter.getpass, "getpass", side_effect=hidden_prompt), \
                     mock.patch.object(adapter.provision, "provision", side_effect=capture):
                 adapter.execute(environment, io.BytesIO(bytes(range(32))))
@@ -283,10 +281,12 @@ class ProvisionWifiShellTests(unittest.TestCase):
 
     def test_public_entrypoint_uses_only_pinned_official_build_tools(self):
         shell = SCRIPT.read_text(encoding="utf-8")
+        adapter = (SCRIPT.parent / "provision_wifi.py").read_text(encoding="utf-8")
         makefile = MAKEFILE.read_text(encoding="utf-8")
 
         self.assertNotIn("IDF_PATH", shell)
         self.assertNotIn("/private/tmp", shell)
+        self.assertNotIn('"read-flash"', adapter)
         self.assertIn('$SCRIPT_DIRECTORY/build/provision-tools', shell)
         self.assertIn('$PROVISION_TOOLS_DIRECTORY/venv/bin/python', shell)
         self.assertNotIn("IDF_PATH", makefile)

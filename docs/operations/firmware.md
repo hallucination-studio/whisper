@@ -133,11 +133,10 @@ interface. It reads the current SSID and saved AirPort password when macOS
 makes them available, otherwise it asks only for each unavailable Wi-Fi value
 through a hidden prompt.
 
-Before writing NVS, the command validates the Config against the prebuilt
-application and capability facts and reads back the connected board's
-application bytes for an exact match. It then hands the validated fixture key
-to `provision.py`, which probes the ESP32-S3 and 8 MB flash, generates the
-complete schema-2 NVS, writes offset `0x11000`, and runs `verify-flash`.
+The command hands the fixed fixture key to `provision.py`, which probes the
+ESP32-S3 and 8 MB flash, generates a fresh complete schema-2 NVS, overwrites
+offset `0x11000`, and runs `verify-flash`. It does not compare or rewrite the
+application image; flash the intended application before running this command.
 Successful verification prints exactly `Wi-Fi provisioning complete.`.
 Failures are redacted and fail closed.
 
@@ -145,7 +144,7 @@ The command uses only the fixed tools prepared under the firmware build
 directory. It does not read `IDF_PATH` or accept any tool path. It does not
 build the Host or firmware, flash the application, install tools, create a
 virtual environment, pull a container image, manage a cache, or retain a key,
-credential, generated NVS, or application readback.
+credential, or generated NVS.
 The fixed `key_epoch = 1` is disposable: after the Sensor has transmitted under
 that epoch, update the sole Config to a fresh epoch before provisioning again.
 The command never creates or persists a second epoch counter.

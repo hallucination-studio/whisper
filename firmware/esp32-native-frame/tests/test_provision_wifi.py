@@ -7,9 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
-import subprocess
 import sys
-import tempfile
 import types
 import unittest
 from unittest import mock
@@ -57,7 +55,6 @@ class ProvisionWifiTests(unittest.TestCase):
                 mock.patch.object(provision_wifi, "resolve_collector_ip",
                                   return_value="192.0.2.44"), \
                 mock.patch.object(provision_wifi, "validate_capture_route"), \
-                mock.patch.object(provision_wifi, "validate_build_and_board"), \
                 mock.patch.object(provision_wifi.provision, "provision", side_effect=capture), \
                 mock.patch.object(provision_wifi.getpass, "getpass") as prompt:
             provision_wifi.execute(environment, key_stream)
@@ -98,7 +95,6 @@ class ProvisionWifiTests(unittest.TestCase):
                 mock.patch.object(provision_wifi, "resolve_collector_ip",
                                   return_value="192.0.2.44"), \
                 mock.patch.object(provision_wifi, "validate_capture_route"), \
-                mock.patch.object(provision_wifi, "validate_build_and_board"), \
                 mock.patch.object(provision_wifi.provision, "provision"), \
                 mock.patch.object(provision_wifi.getpass, "getpass",
                                   side_effect=lambda _prompt: next(prompts)) as prompt:
@@ -174,67 +170,6 @@ class ProvisionWifiTests(unittest.TestCase):
         with mock.patch.object(provision_wifi, "run_optional", return_value=None):
             self.assertIsNone(provision_wifi.resolve_current_ssid("en0"))
             self.assertIsNone(provision_wifi.resolve_keychain_password("Private Lab SSID"))
-
-    def test_build_and_board_validation_matches_config_and_removes_readback(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            build = Path(temporary)
-            image = b"prebuilt application bytes"
-            (build / "application.bin").write_bytes(image)
-            (build / "flasher_args.json").write_text(json.dumps({
-                "flash_settings": {"flash_size": "8MB"},
-                "app": {"offset": "0x20000", "file": "application.bin"},
-            }), encoding="utf-8")
-            (build / "capability-build-facts.json").write_text(json.dumps({
-                "schema": 1,
-                "domain": "esp-idf-wifi-csi-abi-v1",
-                "idf_wifi_abi_digest": "02" * 32,
-            }), encoding="utf-8")
-            readbacks = []
-            image_info_commands = []
-
-            def fake_run(arguments, **_kwargs):
-                arguments = [str(argument) for argument in arguments]
-                if "version" in arguments:
-                    output = "esptool v5.3.1\n"
-                elif "image-info" in arguments:
-                    image_info_commands.append(arguments)
-                    output = f"Validation hash: {'01' * 32} (valid)\n"
-                elif "read-flash" in arguments:
-                    readback = Path(arguments[-1])
-                    readbacks.append(readback)
-                    readback.write_bytes(image)
-                    output = "read complete\n"
-                else:
-                    self.fail(f"unexpected command: {arguments}")
-                return subprocess.CompletedProcess(arguments, 0, output)
-
-            provision_wifi.validate_build_and_board(
-                self.fixture_environment(), Path("/dev/cu.private"), build, run=fake_run)
-
-            self.assertTrue(readbacks)
-            self.assertTrue(all(not path.exists() for path in readbacks))
-            self.assertTrue(image_info_commands)
-            self.assertTrue(all("--version" not in command for command in image_info_commands))
-
-            for fact in (
-                "WHISPER_FIXTURE_FIRMWARE_BUILD_DIGEST",
-                "WHISPER_FIXTURE_CAPABILITY_DIGEST",
-            ):
-                mismatched = self.fixture_environment()
-                mismatched[fact] = "03" * 32
-                with self.subTest(fact=fact), self.assertRaises(provision_wifi.AdapterError):
-                    provision_wifi.validate_build_and_board(
-                        mismatched, Path("/dev/cu.private"), build, run=fake_run)
-
-            def wrong_board(arguments, **kwargs):
-                result = fake_run(arguments, **kwargs)
-                if "read-flash" in [str(argument) for argument in arguments]:
-                    Path(arguments[-1]).write_bytes(b"different application")
-                return result
-
-            with self.assertRaises(provision_wifi.AdapterError):
-                provision_wifi.validate_build_and_board(
-                    self.fixture_environment(), Path("/dev/cu.private"), build, run=wrong_board)
 
     def test_helper_subprocesses_cannot_read_inherited_key_stdin(self):
         read_descriptor, write_descriptor = os.pipe()

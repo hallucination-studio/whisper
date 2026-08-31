@@ -4,7 +4,6 @@
 from contextlib import redirect_stderr, redirect_stdout
 import fnmatch
 import getpass
-import hmac
 import ipaddress
 import json
 import os
@@ -14,7 +13,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 
 import provision
 
@@ -33,13 +31,8 @@ FIXTURE_FACTS = (
     "WHISPER_FIXTURE_CAPTURE_IP",
     "WHISPER_FIXTURE_CAPTURE_PORT",
 )
-CAPABILITY_DOMAIN = "esp-idf-wifi-csi-abi-v1"
 SYSTEM_PROFILER = "/usr/sbin/system_profiler"
 IOREG = "/usr/sbin/ioreg"
-# The build-generated flasher_args.json owns the actual application offset;
-# native-frame-v1.md fixes this deployment layout at 0x20000. A layout change
-# must update the partition contract and application readback validation.
-EXPECTED_APPLICATION_OFFSET = 0x20000
 
 
 class AdapterError(RuntimeError):
@@ -220,106 +213,8 @@ def validate_capture_route(configured_ip, collector_ip):
         raise AdapterError("configured capture route does not match Wi-Fi")
 
 
-def parse_digest(name, value):
-    """Parse one exact 32-byte hexadecimal digest."""
-    if re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
-        raise AdapterError(f"{name} is invalid")
-    return bytes.fromhex(value)
-
-
-def load_json(path):
-    """Load one required build JSON object."""
-    try:
-        with path.open(encoding="utf-8") as source:
-            value = json.load(source)
-    except (OSError, ValueError) as error:
-        raise AdapterError("prebuilt firmware facts are unavailable") from error
-    if not isinstance(value, dict):
-        raise AdapterError("prebuilt firmware facts are invalid")
-    return value
-
-
-def validate_build_and_board(environment, port, build_directory=BUILD_DIRECTORY, *,
-                             run=subprocess.run):
-    """Match the fixed Config, prebuilt application, and connected board bytes."""
-    configured_build = parse_digest(
-        "firmware build digest",
-        fixture_fact(environment, "WHISPER_FIXTURE_FIRMWARE_BUILD_DIGEST"),
-    )
-    configured_capability = parse_digest(
-        "capability digest",
-        fixture_fact(environment, "WHISPER_FIXTURE_CAPABILITY_DIGEST"),
-    )
-    build_directory = build_directory.resolve()
-    flasher = load_json(build_directory / "flasher_args.json")
-    facts = load_json(build_directory / "capability-build-facts.json")
-    try:
-        app = flasher["app"]
-        app_offset = int(app["offset"], 0)
-        app_path = (build_directory / app["file"]).resolve()
-        flash_size = flasher["flash_settings"]["flash_size"]
-        abi_schema = facts["schema"]
-        abi_domain = facts["domain"]
-        abi_digest = parse_digest("Wi-Fi ABI digest", facts["idf_wifi_abi_digest"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise AdapterError("prebuilt firmware facts are invalid") from error
-    if (
-        app_offset != EXPECTED_APPLICATION_OFFSET
-        or flash_size != "8MB"
-        or abi_schema != 1
-        or abi_domain != CAPABILITY_DOMAIN
-        or not app_path.is_relative_to(build_directory)
-        or not app_path.is_file()
-    ):
-        raise AdapterError("prebuilt firmware facts are invalid")
-    application = app_path.read_bytes()
-    if not application:
-        raise AdapterError("prebuilt application is empty")
-
-    esptool = [sys.executable, "-m", "esptool"]
-    version_output = checked(esptool + ["version"], run=run)
-    version = re.escape(provision.ESPTOOL_VERSION)
-    if re.fullmatch(rf"esptool(?:\.py)? v{version}(?:\r?\n{version})?\r?\n?", version_output) is None:
-        raise AdapterError("required esptool version is unavailable")
-    image_output = checked(
-        esptool + ["image-info", str(app_path)],
-        run=run,
-    )
-    match = re.search(r"Validation hash: ([0-9a-f]{64}) \(valid\)", image_output)
-    if match is None or not hmac.compare_digest(bytes.fromhex(match.group(1)), configured_build):
-        raise AdapterError("prebuilt application does not match fixed Config")
-    computed_capability = provision.capability_digest(configured_build, abi_digest)
-    if not hmac.compare_digest(computed_capability, configured_capability):
-        raise AdapterError("prebuilt capability does not match fixed Config")
-
-    with tempfile.TemporaryDirectory(prefix="whisper-application-readback-") as temporary:
-        readback = Path(temporary) / "application.bin"
-        checked(
-            esptool
-            + [
-                "--chip",
-                provision.CHIP,
-                "--port",
-                str(port),
-                "--baud",
-                str(provision.DEFAULT_BAUD),
-                "read-flash",
-                hex(app_offset),
-                str(len(application)),
-                str(readback),
-            ],
-            run=run,
-        )
-        try:
-            board_application = readback.read_bytes()
-        except OSError as error:
-            raise AdapterError("connected application readback failed") from error
-        if not hmac.compare_digest(board_application, application):
-            raise AdapterError("connected application does not match prebuilt image")
-
-
 def execute(environment=os.environ, key_stream=None):
-    """Provision one validated fixed development fixture using local network facts."""
+    """Refresh one fixed development fixture using local network facts."""
     require_commands("ifconfig")
     facts = {name: fixture_fact(environment, name) for name in FIXTURE_FACTS}
     if facts["WHISPER_FIXTURE_SENSOR_ID"] != "sensor-a":
@@ -328,7 +223,6 @@ def execute(environment=os.environ, key_stream=None):
     interface = resolve_wifi_interface()
     collector_ip = resolve_collector_ip(interface)
     validate_capture_route(facts["WHISPER_FIXTURE_CAPTURE_IP"], collector_ip)
-    validate_build_and_board(facts, port)
 
     ssid = resolve_current_ssid(interface)
     if ssid is None:
