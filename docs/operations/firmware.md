@@ -129,9 +129,9 @@ The command uses the generated `build/development.toml` and its sole
 `sensor-a` entry. It does not accept a Config path, Sensor, identity, epoch,
 digest, port, serial path, collector address, or tool path. It discovers the
 Mac Wi-Fi interface, collector IPv4 address, and sole supported serial
-interface. It reads the current SSID and saved AirPort password when macOS
-makes them available, otherwise it asks only for each unavailable Wi-Fi value
-through a hidden prompt.
+interface. It reads the current SSID when macOS makes it available, otherwise
+it asks for the SSID through a hidden prompt. It always asks for the Wi-Fi
+password through a hidden prompt and does not access macOS Keychain.
 
 The command hands the fixed fixture key to `provision.py`, which probes the
 ESP32-S3 and 8 MB flash, generates a fresh complete schema-2 NVS, overwrites

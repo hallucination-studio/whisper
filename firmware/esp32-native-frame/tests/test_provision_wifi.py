@@ -43,24 +43,27 @@ class ProvisionWifiTests(unittest.TestCase):
         def capture(arguments, password, **kwargs):
             captured.append((arguments, password, kwargs["key_stream"]))
 
-        with mock.patch.object(provision_wifi, "require_tty") as require_tty, \
+        with mock.patch.object(provision_wifi, "require_tty"), \
                 mock.patch.object(provision_wifi, "require_commands"), \
                 mock.patch.object(provision_wifi, "discover_serial_port",
                                   return_value=Path("/dev/cu.usbserial-private")), \
                 mock.patch.object(provision_wifi, "resolve_wifi_interface", return_value="en0"), \
                 mock.patch.object(provision_wifi, "resolve_current_ssid",
                                   return_value="Private Lab SSID"), \
-                mock.patch.object(provision_wifi, "resolve_keychain_password",
-                                  return_value="Private Password"), \
                 mock.patch.object(provision_wifi, "resolve_collector_ip",
                                   return_value="192.0.2.44"), \
                 mock.patch.object(provision_wifi, "validate_capture_route"), \
+                mock.patch.object(
+                    provision_wifi, "run_optional",
+                    side_effect=AssertionError("credential lookup must not run"),
+                ), \
                 mock.patch.object(provision_wifi.provision, "provision", side_effect=capture), \
-                mock.patch.object(provision_wifi.getpass, "getpass") as prompt:
+                mock.patch.object(
+                    provision_wifi.getpass, "getpass", return_value="Private Password",
+                ) as prompt:
             provision_wifi.execute(environment, key_stream)
 
-        prompt.assert_not_called()
-        require_tty.assert_not_called()
+        prompt.assert_called_once_with("Wi-Fi password: ")
         self.assertEqual(len(captured), 1)
         arguments, password, inherited = captured[0]
         self.assertIs(inherited, key_stream)
@@ -84,15 +87,14 @@ class ProvisionWifiTests(unittest.TestCase):
         self.assertIsNone(arguments.key_output)
         self.assertIsNone(arguments.receipt_output)
 
-    def test_execute_hidden_prompts_only_for_missing_wifi_values(self):
+    def test_execute_prompts_for_missing_ssid_and_always_for_password(self):
         prompts = iter(["Private Lab SSID", "Private Password"])
-        with mock.patch.object(provision_wifi, "require_tty") as require_tty, \
+        with mock.patch.object(provision_wifi, "require_tty"), \
                 mock.patch.object(provision_wifi, "require_commands"), \
                 mock.patch.object(provision_wifi, "discover_serial_port",
                                   return_value=Path("/dev/cu.usbserial-private")), \
                 mock.patch.object(provision_wifi, "resolve_wifi_interface", return_value="en0"), \
                 mock.patch.object(provision_wifi, "resolve_current_ssid", return_value=None), \
-                mock.patch.object(provision_wifi, "resolve_keychain_password", return_value=None), \
                 mock.patch.object(provision_wifi, "resolve_collector_ip",
                                   return_value="192.0.2.44"), \
                 mock.patch.object(provision_wifi, "validate_capture_route"), \
@@ -105,7 +107,28 @@ class ProvisionWifiTests(unittest.TestCase):
             mock.call("Wi-Fi SSID: "),
             mock.call("Wi-Fi password: "),
         ])
-        self.assertEqual(require_tty.call_count, 2)
+
+    def test_execute_requires_terminal_before_prompting(self):
+        with mock.patch.object(
+                provision_wifi, "require_tty",
+                side_effect=provision_wifi.AdapterError("interactive terminal required")), \
+                mock.patch.object(provision_wifi, "require_commands"), \
+                mock.patch.object(provision_wifi, "discover_serial_port",
+                                  return_value=Path("/dev/cu.usbserial-private")), \
+                mock.patch.object(provision_wifi, "resolve_wifi_interface", return_value="en0"), \
+                mock.patch.object(provision_wifi, "resolve_collector_ip",
+                                  return_value="192.0.2.44"), \
+                mock.patch.object(provision_wifi, "validate_capture_route"), \
+                mock.patch.object(provision_wifi, "resolve_current_ssid") as resolve_ssid, \
+                mock.patch.object(provision_wifi.getpass, "getpass") as prompt, \
+                mock.patch.object(provision_wifi.provision, "provision") as provision:
+            with self.assertRaisesRegex(
+                    provision_wifi.AdapterError, "interactive terminal required"):
+                provision_wifi.execute(self.fixture_environment(), io.BytesIO(bytes(32)))
+
+        resolve_ssid.assert_not_called()
+        prompt.assert_not_called()
+        provision.assert_not_called()
 
     def test_serial_discovery_requires_exactly_one_character_device(self):
         character = types.SimpleNamespace(
@@ -155,14 +178,12 @@ class ProvisionWifiTests(unittest.TestCase):
                     self.assertRaises(provision_wifi.AdapterError):
                 provision_wifi.resolve_collector_ip("en0")
 
-    def test_current_ssid_and_keychain_password_are_best_effort(self):
+    def test_current_ssid_is_best_effort(self):
         with mock.patch.object(
                 provision_wifi, "run_optional",
-                side_effect=["Current Wi-Fi Network: Private Lab SSID\n", "Private Password\n"]):
+                return_value="Current Wi-Fi Network: Private Lab SSID\n"):
             ssid = provision_wifi.resolve_current_ssid("en0")
-            password = provision_wifi.resolve_keychain_password(ssid)
         self.assertEqual(ssid, "Private Lab SSID")
-        self.assertEqual(password, "Private Password")
 
         ioreg = '    "IO80211SSID" = "Private Lab SSID"\n'
         with mock.patch.object(provision_wifi, "run_optional", side_effect=[None, ioreg]):
@@ -180,7 +201,6 @@ class ProvisionWifiTests(unittest.TestCase):
 
         with mock.patch.object(provision_wifi, "run_optional", return_value=None):
             self.assertIsNone(provision_wifi.resolve_current_ssid("en0"))
-            self.assertIsNone(provision_wifi.resolve_keychain_password("Private Lab SSID"))
 
     def test_helper_subprocesses_cannot_read_inherited_key_stdin(self):
         read_descriptor, write_descriptor = os.pipe()

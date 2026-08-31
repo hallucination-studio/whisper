@@ -32,6 +32,7 @@ FIXTURE_FACTS = (
     "WHISPER_FIXTURE_CAPTURE_PORT",
 )
 SYSTEM_PROFILER = "/usr/sbin/system_profiler"
+# macOS emits this sentinel when Wi-Fi identity access is redacted; prompt instead.
 MACOS_REDACTED_SSID = "<SSID Redacted>"
 IOREG = "/usr/sbin/ioreg"
 
@@ -163,7 +164,7 @@ def resolve_collector_ip(interface):
 
 def resolve_current_ssid(interface):
     """Return the associated SSID when macOS makes it available."""
-    def usable(value):
+    def is_visible_ssid(value):
         return bool(value) and value.casefold() != MACOS_REDACTED_SSID.casefold()
 
     output = run_optional(["networksetup", "-getairportnetwork", interface])
@@ -172,7 +173,7 @@ def resolve_current_ssid(interface):
         line = output.rstrip("\r\n")
         if line.startswith(prefix):
             ssid = line[len(prefix):]
-            if usable(ssid):
+            if is_visible_ssid(ssid):
                 return ssid
     output = run_optional([IOREG, "-l"])
     if output is None:
@@ -184,24 +185,10 @@ def resolve_current_ssid(interface):
             decoded = json.loads(value)
         except ValueError:
             continue
-        if isinstance(decoded, str) and usable(decoded):
+        if isinstance(decoded, str) and is_visible_ssid(decoded):
             values.append(decoded)
     values = list(dict.fromkeys(values))
     return values[0] if len(values) == 1 else None
-
-
-def resolve_keychain_password(ssid):
-    """Return the saved AirPort password when Keychain permits access."""
-    output = run_optional([
-        "security",
-        "find-generic-password",
-        "-D",
-        "AirPort network password",
-        "-a",
-        ssid,
-        "-w",
-    ])
-    return None if output is None else output.rstrip("\r\n")
 
 
 def validate_capture_route(configured_ip, collector_ip):
@@ -228,14 +215,11 @@ def execute(environment=os.environ, key_stream=None):
     collector_ip = resolve_collector_ip(interface)
     validate_capture_route(facts["WHISPER_FIXTURE_CAPTURE_IP"], collector_ip)
 
+    require_tty()
     ssid = resolve_current_ssid(interface)
     if ssid is None:
-        require_tty()
         ssid = getpass.getpass("Wi-Fi SSID: ")
-    password = resolve_keychain_password(ssid)
-    if password is None:
-        require_tty()
-        password = getpass.getpass("Wi-Fi password: ")
+    password = getpass.getpass("Wi-Fi password: ")
 
     arguments = provision.parser().parse_args([
         "--port",

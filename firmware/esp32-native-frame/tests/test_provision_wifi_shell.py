@@ -70,7 +70,6 @@ class ProvisionWifiShellTests(unittest.TestCase):
             mode = os.environ["PUBLIC_WIFI_MODE"]
             calls = []
             prompts = []
-            tty_checks = []
 
             def observed(name, value):
                 calls.append(name)
@@ -78,16 +77,10 @@ class ProvisionWifiShellTests(unittest.TestCase):
 
             def hidden_prompt(prompt):
                 prompts.append(prompt)
-                return {
-                    "missing-ssid": "Prompted SSID",
-                    "missing-password": "Prompted Password",
-                }[mode]
+                return "Prompted SSID" if prompt == "Wi-Fi SSID: " else "Prompted Password"
 
             def capture(arguments, password, *, key_stream):
                 expected_ssid = "Prompted SSID" if mode == "missing-ssid" else "Auto SSID"
-                expected_password = (
-                    "Prompted Password" if mode == "missing-password" else "Auto Password"
-                )
                 calls.append("provision")
                 checks.update({
                     "fixed_facts": (
@@ -101,7 +94,7 @@ class ProvisionWifiShellTests(unittest.TestCase):
                         and arguments.collector_ip == "192.0.2.44"
                     ),
                     "wifi_values": (
-                        arguments.ssid == expected_ssid and password == expected_password
+                        arguments.ssid == expected_ssid and password == "Prompted Password"
                     ),
                     "inherited_key": key_stream.read() == bytes(range(32)),
                 })
@@ -125,11 +118,9 @@ class ProvisionWifiShellTests(unittest.TestCase):
                 "WHISPER_FIXTURE_CAPTURE_PORT": "9000",
             }
             ssid = None if mode == "missing-ssid" else "Auto SSID"
-            password = None if mode == "missing-password" else "Auto Password"
             with mock.patch.object(adapter, "require_commands",
                                    side_effect=lambda *_names: calls.append("commands")), \
-                    mock.patch.object(adapter, "require_tty",
-                                      side_effect=lambda: tty_checks.append(True)), \
+                    mock.patch.object(adapter, "require_tty"), \
                     mock.patch.object(adapter, "discover_serial_port",
                                       side_effect=lambda: observed(
                                           "serial", pathlib.Path("/dev/cu.test"))), \
@@ -140,8 +131,10 @@ class ProvisionWifiShellTests(unittest.TestCase):
                                           "collector", "192.0.2.44")), \
                     mock.patch.object(adapter, "resolve_current_ssid",
                                       side_effect=lambda _interface: observed("ssid", ssid)), \
-                    mock.patch.object(adapter, "resolve_keychain_password",
-                                      side_effect=lambda _ssid: observed("password", password)), \
+                    mock.patch.object(
+                        adapter, "run_optional",
+                        side_effect=AssertionError("credential lookup must not run"),
+                    ), \
                     mock.patch.object(adapter, "validate_capture_route",
                                       side_effect=lambda *_values: calls.append("route")), \
                     mock.patch.object(adapter.getpass, "getpass", side_effect=hidden_prompt), \
@@ -151,9 +144,8 @@ class ProvisionWifiShellTests(unittest.TestCase):
             checks.update({
                 "automatic_discovery": all(
                     name in calls
-                    for name in ("serial", "interface", "collector", "ssid", "password")
+                    for name in ("serial", "interface", "collector", "ssid")
                 ),
-                "tty_checks": len(tty_checks),
                 "prompts": prompts,
                 "provision_called": calls.count("provision") == 1,
             })
@@ -228,13 +220,12 @@ class ProvisionWifiShellTests(unittest.TestCase):
             self.assertEqual(result.stdout, "Wi-Fi provisioning failed.\n")
             self.assertFalse(record.exists())
 
-    def test_public_command_runs_real_adapter_auto_and_single_fallback_paths(self):
+    def test_public_command_prompts_for_password_with_discovered_or_missing_ssid(self):
         cases = (
-            ("automatic", 0, []),
-            ("missing-ssid", 1, ["Wi-Fi SSID: "]),
-            ("missing-password", 1, ["Wi-Fi password: "]),
+            ("discovered-ssid", ["Wi-Fi password: "]),
+            ("missing-ssid", ["Wi-Fi SSID: ", "Wi-Fi password: "]),
         )
-        for mode, tty_checks, prompts in cases:
+        for mode, prompts in cases:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 script = self.staged_public_adapter_shell(Path(temporary))
 
@@ -254,7 +245,6 @@ class ProvisionWifiShellTests(unittest.TestCase):
                     "provision_called",
                 ):
                     self.assertTrue(checks[name], name)
-                self.assertEqual(checks["tty_checks"], tty_checks)
                 self.assertEqual(checks["prompts"], prompts)
 
     def test_public_shell_does_not_invoke_build_install_or_cache_tools(self):
