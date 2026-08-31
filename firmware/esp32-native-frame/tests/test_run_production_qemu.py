@@ -37,6 +37,7 @@ class ProductionQemuTest(unittest.TestCase):
             self.assertEqual(rows["aes_key"][3], bytes(range(32)).hex())
             self.assertEqual(rows["cap_digest"][3], "5a" * 32)
             self.assertEqual(rows["schema"][3], "2")
+            self.assertNotIn("wifi_country", rows)
             self.assertEqual(rows["device_id"][3], str(0x12))
             self.assertEqual(rows["key_epoch"][3], "7")
         self.assertFalse((SCRIPT.parent / "disposable-provision.csv").exists())

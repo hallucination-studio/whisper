@@ -290,6 +290,7 @@ class ProvisionWifiShellTests(unittest.TestCase):
         self.assertIn('$SCRIPT_DIRECTORY/build/provision-tools', shell)
         self.assertIn('$PROVISION_TOOLS_DIRECTORY/venv/bin/python', shell)
         self.assertNotIn("IDF_PATH", makefile)
+        self.assertNotIn("--pull=always", makefile)
         self.assertIn(
             "espressif/idf@sha256:"
             "f1e9f69dc052b9afc7801ca884e0ef40c17e014bb05ce73d9c09d29290bd17fb",

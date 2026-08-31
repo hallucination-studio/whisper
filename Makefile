@@ -12,7 +12,7 @@ esp32-native-frame-development-config: esp32-native-frame-firmware esp32-native-
 	"$(PROVISION_PYTHON)" "$(FIRMWARE_DIRECTORY)/prepare_development_config.py"
 
 esp32-native-frame-firmware:
-	docker run --rm --pull=always \
+	docker run --rm \
 		--mount type=bind,source="$(CURDIR)",target=/project \
 		--workdir /project/firmware/esp32-native-frame \
 		"$(IDF_IMAGE)" \
@@ -23,7 +23,7 @@ esp32-native-frame-host:
 
 esp32-native-frame-provision-tools:
 	mkdir -p "$(NVS_PARTITION_TOOL_DIRECTORY)"
-	docker run --rm --pull=always \
+	docker run --rm \
 		--user "$$(id -u):$$(id -g)" \
 		--mount type=bind,source="$(NVS_PARTITION_TOOL_DIRECTORY)",target=/output \
 		--entrypoint /bin/sh \

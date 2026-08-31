@@ -69,6 +69,7 @@ class ProvisionWifiTests(unittest.TestCase):
         self.assertEqual(arguments.device_id, "1")
         self.assertEqual(arguments.key_epoch, "1")
         self.assertEqual(arguments.ssid, "Private Lab SSID")
+        self.assertFalse(hasattr(arguments, "wifi_country"))
         self.assertEqual(arguments.probe_port, "9000")
         self.assertEqual(arguments.collector_ip, "192.0.2.44")
         self.assertEqual(arguments.collector_port, "9000")
@@ -166,6 +167,16 @@ class ProvisionWifiTests(unittest.TestCase):
         ioreg = '    "IO80211SSID" = "Private Lab SSID"\n'
         with mock.patch.object(provision_wifi, "run_optional", side_effect=[None, ioreg]):
             self.assertEqual(provision_wifi.resolve_current_ssid("en0"), "Private Lab SSID")
+
+        redacted = "<SSID Redacted>"
+        with mock.patch.object(
+                provision_wifi, "run_optional",
+                side_effect=[f"Current Wi-Fi Network: {redacted}\n", None]):
+            self.assertIsNone(provision_wifi.resolve_current_ssid("en0"))
+        with mock.patch.object(
+                provision_wifi, "run_optional",
+                side_effect=[None, f'    "IO80211SSID" = "{redacted}"\n']):
+            self.assertIsNone(provision_wifi.resolve_current_ssid("en0"))
 
         with mock.patch.object(provision_wifi, "run_optional", return_value=None):
             self.assertIsNone(provision_wifi.resolve_current_ssid("en0"))

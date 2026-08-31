@@ -28,7 +28,6 @@ static const char *TAG = "native_frame";
 #define ASSOCIATION_TIMEOUT_MS UINT32_C(30000)
 #define CAPABILITIES_PERIOD_US UINT64_C(30000000)
 #define HEALTH_PERIOD_US UINT64_C(10000000)
-#define WIFI_DYNAMIC_CHANNEL UINT8_C(0)
 #define WIFI_READY_BIT BIT0
 #define WIFI_FAILED_BIT BIT1
 #define SENDER_READY_BIT BIT2
@@ -153,9 +152,6 @@ static esp_err_t start_station(const provisioning_v1_t *provisioning)
         strnlen(provisioning->station_ssid, sizeof(config.sta.ssid)));
     memcpy(config.sta.password, provisioning->station_password,
         strnlen(provisioning->station_password, sizeof(config.sta.password)));
-    config.sta.bssid_set = false;
-    /* ESP-IDF channel zero scans all supported channels for the configured SSID. */
-    config.sta.channel = WIFI_DYNAMIC_CHANNEL;
     if (result == ESP_OK) result = esp_wifi_set_config(WIFI_IF_STA, &config);
     mbedtls_platform_zeroize(&config, sizeof(config));
     if (result == ESP_OK) result = esp_wifi_start();

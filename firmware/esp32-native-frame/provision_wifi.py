@@ -32,6 +32,7 @@ FIXTURE_FACTS = (
     "WHISPER_FIXTURE_CAPTURE_PORT",
 )
 SYSTEM_PROFILER = "/usr/sbin/system_profiler"
+MACOS_REDACTED_SSID = "<SSID Redacted>"
 IOREG = "/usr/sbin/ioreg"
 
 
@@ -162,13 +163,16 @@ def resolve_collector_ip(interface):
 
 def resolve_current_ssid(interface):
     """Return the associated SSID when macOS makes it available."""
+    def usable(value):
+        return bool(value) and value.casefold() != MACOS_REDACTED_SSID.casefold()
+
     output = run_optional(["networksetup", "-getairportnetwork", interface])
     if output is not None:
         prefix = "Current Wi-Fi Network: "
         line = output.rstrip("\r\n")
         if line.startswith(prefix):
             ssid = line[len(prefix):]
-            if ssid:
+            if usable(ssid):
                 return ssid
     output = run_optional([IOREG, "-l"])
     if output is None:
@@ -180,7 +184,7 @@ def resolve_current_ssid(interface):
             decoded = json.loads(value)
         except ValueError:
             continue
-        if isinstance(decoded, str) and decoded:
+        if isinstance(decoded, str) and usable(decoded):
             values.append(decoded)
     values = list(dict.fromkeys(values))
     return values[0] if len(values) == 1 else None

@@ -250,6 +250,7 @@ class ProvisionTest(unittest.TestCase):
         self.assertEqual(rows["collector_ip"][3], "192.0.2.10")
         self.assertEqual(rows["aes_key"][3], bytes(range(32)).hex())
         self.assertEqual(rows["schema"][3], "2")
+        self.assertNotIn("wifi_country", rows)
         self.assertNotIn("bssid", rows)
         self.assertNotIn("channel", rows)
         patched = Path(self.temporary.name) / "patched.py"
