@@ -4,6 +4,14 @@ This index distinguishes clean-HEAD implementation facts, checked-in test
 source, fresh execution receipts, accepted targets, and uncommitted WIP for
 host configuration, sessions, and persistence. It owns no normative behavior.
 
+## Executed demo-smoke
+
+The [physical `e151145` demo-smoke](receipts/demo-smoke-e151145/README.md)
+retains one fresh Store whose final HTTP and SQLite snapshots share the same
+Store, Capture Session, Projection watermark, and visible CSI record. Its
+controlled Host shutdown reports zero capture-to-writer queue drops. The
+receipt establishes only the bounded `demo-smoke` run.
+
 ## Snapshot classification
 
 Baseline revision: `f83428c31aba285277fc95db4079228b97ecaa62`

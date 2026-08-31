@@ -34,6 +34,12 @@ the executions remain attributed to `ed466ae`.
 These QEMU receipts establish no physical-board, flash/write/verify, Wi-Fi,
 UDP, live CSI, or production host-decode result.
 
+The [physical `e151145` demo-smoke](receipts/demo-smoke-e151145/README.md)
+additionally retains the sanitized application identity and one authenticated
+real-board native-coordinate CSI path through the Host to an unchanged Chrome
+page. It is not a general firmware, provisioning, radio-environment, or
+`live-physical-e2e` acceptance result.
+
 ## Coverage and receipt matrix
 
 | Acceptance surface | Implementation/test source at baseline | Repository-retained execution receipt | Status |

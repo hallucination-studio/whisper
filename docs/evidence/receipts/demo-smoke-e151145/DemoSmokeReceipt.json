@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "classification": "demo-smoke",
+  "host_revision": "e15114515fcb97142dd1e62cd65ccf7c69b8025f",
+  "host_executable_sha256": "6f8ff9a975e9c6a9a6fc9e77364373c601ddec48ef56bcb0439d3b724d7b5b31",
+  "firmware_image_sha256": "8ecbbc286da0acce894c95addc96d743efbed52806a7fbc13294e32d7f8fb879",
+  "firmware_build_digest": "9cb65df51de06ac950627e935b69030fe133d22c89372a33e04fba1ed4cc7601",
+  "screenshot_sha256": "f2d01dea9e025203cfe26635c3b678edf7ac655de8c87035b392f724416b18fc",
+  "store_id": "72f1e110f3d7255cbf4bb9cf70e69dd14a5f815029eac56a9384162d71722689",
+  "session_id": "capture-c85ca274eea15cd46b5b023d9f8f8e7f",
+  "record_seq": "23",
+  "projection_commit_seq": "37",
+  "admitted_packet_count": "37",
+  "csi_observation_count": "12",
+  "queue_drop_count": "0",
+  "chrome_version": "151.0.7922.174",
+  "started_at": "2026-08-31T09:52:23Z",
+  "finished_at": "2026-08-31T09:55:51Z",
+  "result": "pass"
+}

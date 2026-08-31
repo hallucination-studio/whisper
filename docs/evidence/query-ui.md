@@ -8,6 +8,15 @@
 This index separates source availability from executed evidence. It is not an
 execution receipt and does not turn an accepted target into current behavior.
 
+## Executed demo-smoke
+
+The [physical `e151145` demo-smoke](receipts/demo-smoke-e151145/README.md)
+retains one sanitized real-board-to-unchanged-Chrome execution. The page was
+loaded once with no signal rows, then visibly updated to `LIVE` through the
+committed Host path. Its exact receipt, final HTTP bodies, and screenshot are
+retained together. This result has only the bounded `demo-smoke`
+classification stated by that receipt.
+
 ## Clean HEAD implementation facts
 
 At the identified HEAD, the crate declares `capture`, `config`, `domain`,

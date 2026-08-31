@@ -1,0 +1,40 @@
+{
+  "http_schema_version": 1,
+  "kind": "ok",
+  "resource": "topology",
+  "data": {
+    "deployment": "development",
+    "sessions": [
+      "capture-c85ca274eea15cd46b5b023d9f8f8e7f"
+    ],
+    "spaces": [
+      {
+        "id": "development-space"
+      }
+    ],
+    "sensors": [
+      {
+        "id": "sensor-a",
+        "hardware_kind": "esp32-s3",
+        "device_id": "1"
+      }
+    ],
+    "links": [
+      {
+        "id": "development-link",
+        "space": "development-space",
+        "transmitter": "development-transmitter",
+        "receiver": "sensor-a",
+        "profiles": [
+          "b0715ac00c08501307b0a5dfae49b6a492569114cf7fbc8e9e51a31fa76d37e8"
+        ]
+      }
+    ]
+  },
+  "receipt": {
+    "projection_commit": {
+      "store_id": "72f1e110f3d7255cbf4bb9cf70e69dd14a5f815029eac56a9384162d71722689",
+      "sequence": "37"
+    }
+  }
+}
