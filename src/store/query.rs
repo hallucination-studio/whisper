@@ -384,6 +384,25 @@ impl QueryStore {
         Ok(ProjectionCommit::new(store_id, sequence))
     }
 
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn evidence_snapshot(
+        &self,
+    ) -> Result<super::evidence::EvidenceStoreSnapshot, QueryError> {
+        let mut reader = self.reader()?;
+        validate_pinned_path(&reader)?;
+        let expected_store_id = reader.store_id;
+        let connection = reader
+            .connection
+            .as_mut()
+            .ok_or_else(|| QueryError::new(QueryErrorKind::Incompatible))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let snapshot = super::evidence::snapshot(&transaction, expected_store_id)
+            .map_err(|_| QueryError::new(QueryErrorKind::Incompatible))?;
+        transaction.commit()?;
+        validate_pinned_path(&reader)?;
+        Ok(snapshot)
+    }
+
     fn reader(&self) -> Result<MutexGuard<'_, PinnedReader>, QueryError> {
         self.inner.lock().map_err(|_| QueryError::new(QueryErrorKind::Incompatible))
     }

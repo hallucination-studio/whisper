@@ -15,7 +15,9 @@ use tokio::sync::{Notify, watch};
 
 use crate::store::QueryError;
 #[cfg(feature = "ingest-test-hooks")]
-use crate::store::{QueryHold, QueryStore};
+use crate::store::QueryHold;
+#[cfg(any(feature = "development-fixture", feature = "ingest-test-hooks"))]
+use crate::store::QueryStore;
 use crate::{Config, LifecycleError};
 
 mod capture;
@@ -282,14 +284,74 @@ pub struct HostRuntime {
     http_address: SocketAddr,
     control: RuntimeControl,
     completion: Arc<RuntimeCompletion>,
+    #[cfg(feature = "development-fixture")]
+    served_asset_sha256: String,
     #[cfg(feature = "ingest-test-hooks")]
     writer_hold: Arc<Mutex<Option<crate::application::WriterHold>>>,
     #[cfg(feature = "ingest-test-hooks")]
     query_hold: Arc<Mutex<Option<QueryHold>>>,
-    #[cfg(feature = "ingest-test-hooks")]
+    #[cfg(any(feature = "development-fixture", feature = "ingest-test-hooks"))]
     query: Option<QueryStore>,
+    #[cfg(feature = "development-fixture")]
+    rebuild_evidence: Option<crate::store::EvidenceRebuildSnapshot>,
+    #[cfg(feature = "development-fixture")]
+    transaction_b_audit: Arc<Mutex<crate::store::EvidenceTransactionBAudit>>,
+    #[cfg(all(feature = "development-fixture", feature = "ingest-test-hooks"))]
+    evidence_snapshot_gate: Option<Arc<EvidenceSnapshotGate>>,
     #[cfg(feature = "ingest-test-hooks")]
     manual_clock: Option<crate::application::ManualClockControl>,
+}
+
+#[cfg(all(feature = "development-fixture", feature = "ingest-test-hooks"))]
+struct EvidenceSnapshotGate {
+    changed: std::sync::Condvar,
+    entered: std::sync::mpsc::SyncSender<()>,
+    released: Mutex<bool>,
+}
+
+/// Test-only gate that pauses a combined evidence audit and Store snapshot read.
+#[cfg(all(feature = "development-fixture", feature = "ingest-test-hooks"))]
+#[doc(hidden)]
+pub struct EvidenceSnapshotHold {
+    gate: Arc<EvidenceSnapshotGate>,
+    entered: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(all(feature = "development-fixture", feature = "ingest-test-hooks"))]
+impl fmt::Debug for EvidenceSnapshotHold {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("EvidenceSnapshotHold").finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "development-fixture", feature = "ingest-test-hooks"))]
+impl EvidenceSnapshotHold {
+    /// Blocks until one combined evidence read reaches the test gate.
+    pub fn wait_until_blocked(&mut self) {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.recv();
+        }
+    }
+
+    /// Releases the combined evidence read without changing runtime state.
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        let mut released =
+            self.gate.released.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *released = true;
+        drop(released);
+        self.gate.changed.notify_all();
+    }
+}
+
+#[cfg(all(feature = "development-fixture", feature = "ingest-test-hooks"))]
+impl Drop for EvidenceSnapshotHold {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
 }
 
 /// Test-only gate that pauses final teardown on the independent supervisor.
@@ -465,14 +527,14 @@ impl HostRuntime {
     ///
     /// Returns the first writer, query, socket, task, or shutdown failure after all tasks join.
     pub async fn shutdown(self) -> Result<u64, RuntimeError> {
-        #[cfg(feature = "ingest-test-hooks")]
+        #[cfg(any(feature = "development-fixture", feature = "ingest-test-hooks"))]
         let mut runtime = self;
-        #[cfg(not(feature = "ingest-test-hooks"))]
+        #[cfg(not(any(feature = "development-fixture", feature = "ingest-test-hooks")))]
         let runtime = self;
         runtime.control.stop();
         #[cfg(feature = "ingest-test-hooks")]
         runtime.writer_hold.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
-        #[cfg(feature = "ingest-test-hooks")]
+        #[cfg(any(feature = "development-fixture", feature = "ingest-test-hooks"))]
         runtime.query.take();
         let result = runtime.completion.wait().await;
         let queue_drop_count = runtime.queue_drop_count();
@@ -482,6 +544,85 @@ impl HostRuntime {
     #[cfg(feature = "ingest-test-hooks")]
     pub(crate) fn query_store_for_test(&self) -> QueryStore {
         self.query.as_ref().expect("test Query Store is present").clone()
+    }
+
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn evidence_snapshot(
+        &self,
+    ) -> Result<crate::store::EvidenceStoreSnapshot, QueryError> {
+        self.query.as_ref().expect("evidence Query Store is present").evidence_snapshot()
+    }
+
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn evidence_snapshot_with_transaction_b_audit(
+        &self,
+    ) -> Result<
+        Option<(
+            crate::store::EvidenceStoreSnapshot,
+            Vec<crate::store::EvidenceTransactionBEffect>,
+        )>,
+        QueryError,
+    > {
+        let transaction_b_audit =
+            self.transaction_b_audit.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !transaction_b_audit.is_complete() {
+            return Ok(None);
+        }
+        let snapshot =
+            self.query.as_ref().expect("evidence Query Store is present").evidence_snapshot()?;
+        #[cfg(feature = "ingest-test-hooks")]
+        if let Some(gate) = self.evidence_snapshot_gate.as_ref() {
+            let _ = gate.entered.try_send(());
+            let released = gate.released.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _released = gate
+                .changed
+                .wait_while(released, |released| !*released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let effects =
+            transaction_b_audit.snapshot().expect("complete evidence audit has a snapshot");
+        Ok(Some((snapshot, effects)))
+    }
+
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn evidence_served_asset_sha256(&self) -> &str {
+        &self.served_asset_sha256
+    }
+
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn evidence_relationship_latest(
+        &self,
+        selection: &crate::store::RelationshipSelection,
+    ) -> Result<impl serde::Serialize, QueryError> {
+        self.query.as_ref().expect("evidence Query Store is present").relationship_latest(selection)
+    }
+
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn rebuild_evidence_snapshot(
+        &self,
+    ) -> Option<&crate::store::EvidenceRebuildSnapshot> {
+        self.rebuild_evidence.as_ref()
+    }
+
+    #[cfg(all(feature = "development-fixture", feature = "ingest-test-hooks"))]
+    pub(crate) fn set_evidence_snapshot_row_limit_for_test(&self, limit: u64) {
+        self.transaction_b_audit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_snapshot_row_limit_for_test(limit);
+    }
+
+    #[cfg(all(feature = "development-fixture", feature = "ingest-test-hooks"))]
+    pub(crate) fn hold_evidence_snapshot_for_test(&mut self) -> EvidenceSnapshotHold {
+        assert!(self.evidence_snapshot_gate.is_none(), "evidence snapshot is already held");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let gate = Arc::new(EvidenceSnapshotGate {
+            changed: std::sync::Condvar::new(),
+            entered: entered_tx,
+            released: Mutex::new(false),
+        });
+        self.evidence_snapshot_gate = Some(Arc::clone(&gate));
+        EvidenceSnapshotHold { gate, entered: Some(entered_rx) }
     }
 
     #[cfg(feature = "ingest-test-hooks")]

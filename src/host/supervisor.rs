@@ -38,8 +38,12 @@ struct Startup {
     capture_address: SocketAddr,
     queue_drop_count: Arc<AtomicU64>,
     http_address: SocketAddr,
-    #[cfg(feature = "ingest-test-hooks")]
+    #[cfg(any(feature = "development-fixture", feature = "ingest-test-hooks"))]
     query: QueryStore,
+    #[cfg(feature = "development-fixture")]
+    rebuild_evidence: Option<crate::store::EvidenceRebuildSnapshot>,
+    #[cfg(feature = "development-fixture")]
+    transaction_b_audit: Arc<Mutex<crate::store::EvidenceTransactionBAudit>>,
 }
 
 #[derive(Default)]
@@ -195,12 +199,20 @@ async fn start_inner(
         http_address: startup.http_address,
         control,
         completion,
+        #[cfg(feature = "development-fixture")]
+        served_asset_sha256: http::served_asset_sha256(config.view().max_time_buckets()),
         #[cfg(feature = "ingest-test-hooks")]
         writer_hold,
         #[cfg(feature = "ingest-test-hooks")]
         query_hold,
-        #[cfg(feature = "ingest-test-hooks")]
+        #[cfg(any(feature = "development-fixture", feature = "ingest-test-hooks"))]
         query: Some(startup.query),
+        #[cfg(feature = "development-fixture")]
+        rebuild_evidence: startup.rebuild_evidence,
+        #[cfg(feature = "development-fixture")]
+        transaction_b_audit: startup.transaction_b_audit,
+        #[cfg(all(feature = "development-fixture", feature = "ingest-test-hooks"))]
+        evidence_snapshot_gate: None,
         #[cfg(feature = "ingest-test-hooks")]
         manual_clock,
     })
@@ -281,10 +293,14 @@ impl Supervisor {
         })?;
         let capture = crate::application::serve_with_clock(&self.config, self.clock.clone())
             .map_err(LifecycleError::host)?;
-        #[cfg(feature = "ingest-test-hooks")]
+        #[cfg(any(feature = "development-fixture", feature = "ingest-test-hooks"))]
         let mut capture = capture;
         let store_id = capture.store_id();
         let query = capture.query_store()?;
+        #[cfg(feature = "development-fixture")]
+        let rebuild_evidence = capture.take_rebuild_evidence();
+        #[cfg(feature = "development-fixture")]
+        let transaction_b_audit = capture.transaction_b_audit();
         #[cfg(feature = "ingest-test-hooks")]
         let query = if self.controls.hold_query {
             let (query, hold) = query.hold_for_test();
@@ -343,8 +359,12 @@ impl Supervisor {
             capture_address,
             queue_drop_count: Arc::clone(&queue_drop_count),
             http_address,
-            #[cfg(feature = "ingest-test-hooks")]
+            #[cfg(any(feature = "development-fixture", feature = "ingest-test-hooks"))]
             query: query.clone(),
+            #[cfg(feature = "development-fixture")]
+            rebuild_evidence,
+            #[cfg(feature = "development-fixture")]
+            transaction_b_audit,
         };
         let mut http_shutdown_rx = self.control.shutdown.subscribe();
         let task_control = self.control.clone();

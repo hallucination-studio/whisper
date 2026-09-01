@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+#[cfg(feature = "development-fixture")]
+use std::sync::Mutex;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -283,6 +285,10 @@ pub(crate) struct CaptureSession {
     connection: Connection,
     admissions: Vec<AdmissionEpochSeed>,
     config: Config,
+    #[cfg(feature = "development-fixture")]
+    transaction_b_audit: Arc<Mutex<super::evidence::EvidenceTransactionBAudit>>,
+    #[cfg(feature = "development-fixture")]
+    rebuild_evidence: Option<super::evidence::EvidenceRebuildSnapshot>,
     #[cfg(feature = "ingest-test-hooks")]
     relationship_failure: Option<RelationshipFailureStage>,
 }
@@ -305,6 +311,20 @@ impl CaptureSession {
 
     pub(crate) const fn monotonic_origin(&self) -> Instant {
         self.monotonic_origin
+    }
+
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn take_rebuild_evidence(
+        &mut self,
+    ) -> Option<super::evidence::EvidenceRebuildSnapshot> {
+        self.rebuild_evidence.take()
+    }
+
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn transaction_b_audit(
+        &self,
+    ) -> Arc<Mutex<super::evidence::EvidenceTransactionBAudit>> {
+        Arc::clone(&self.transaction_b_audit)
     }
 
     #[cfg(feature = "ingest-test-hooks")]
@@ -468,6 +488,12 @@ impl CaptureSession {
         observation: Option<&crate::domain::csi::CsiObservation>,
         transition: &CoordinatorTransition,
     ) -> Result<ProjectionSequence, StoreError> {
+        #[cfg(feature = "development-fixture")]
+        let (capture_transaction_b_effect, transaction_b_snapshot_row_limit) = {
+            let transaction_b_audit =
+                self.transaction_b_audit.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            (transaction_b_audit.can_record(), transaction_b_audit.snapshot_row_limit())
+        };
         #[cfg(feature = "ingest-test-hooks")]
         let fail_transaction =
             if self.relationship_failure == Some(RelationshipFailureStage::TransactionB) {
@@ -613,11 +639,35 @@ impl CaptureSession {
         if updated != 1 {
             return Err(StoreError::incompatible());
         }
+        #[cfg(feature = "development-fixture")]
+        let transaction_b_effect = capture_transaction_b_effect
+            .then(|| {
+                super::evidence::transaction_b_effect(
+                    &transaction,
+                    super::evidence::EvidenceTransactionBEffectInput::new(
+                        semantic_id.as_str(),
+                        fact.record_seq,
+                        u64::from_be_bytes(projection.to_be_bytes()),
+                        &transition.timeline_digest,
+                        !transition.baseline_states.is_empty(),
+                        !transition.relationships.is_empty(),
+                        transaction_b_snapshot_row_limit,
+                    ),
+                )
+            })
+            .transpose()
+            .ok()
+            .flatten();
         #[cfg(feature = "ingest-test-hooks")]
         if fail_transaction {
             return Err(StoreError::incompatible());
         }
+        #[cfg(feature = "development-fixture")]
+        let mut transaction_b_audit =
+            self.transaction_b_audit.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         transaction.commit()?;
+        #[cfg(feature = "development-fixture")]
+        transaction_b_audit.record_committed(transaction_b_effect);
         Ok(projection)
     }
 }
@@ -1010,6 +1060,12 @@ fn open_capture_session(
         connection,
         admissions: expected.admissions,
         config: config.clone(),
+        #[cfg(feature = "development-fixture")]
+        transaction_b_audit: Arc::new(
+            Mutex::new(super::evidence::EvidenceTransactionBAudit::new()),
+        ),
+        #[cfg(feature = "development-fixture")]
+        rebuild_evidence: recovered.evidence_snapshot,
         #[cfg(feature = "ingest-test-hooks")]
         relationship_failure: None,
     })
@@ -1017,6 +1073,8 @@ fn open_capture_session(
 
 pub(crate) struct RecoveredStore {
     store_id: [u8; STORE_ID_BYTES],
+    #[cfg(feature = "development-fixture")]
+    evidence_snapshot: Option<super::evidence::EvidenceRebuildSnapshot>,
 }
 
 struct RetainedRecovery {
@@ -1029,6 +1087,7 @@ struct RetainedRecovery {
 pub(crate) struct RecoverySnapshot {
     connection: Connection,
     config: Config,
+    query_only: bool,
     store_id: [u8; STORE_ID_BYTES],
     write_attempted: Arc<AtomicBool>,
     input: Option<RecoveryInput>,
@@ -1079,13 +1138,43 @@ impl RecoverySnapshot {
             }
             _ => return Err(StoreError::incompatible()),
         }
+        #[cfg(feature = "development-fixture")]
+        let evidence_store = self
+            .retained
+            .as_ref()
+            .map(|_| super::evidence::snapshot(&self.connection, self.store_id))
+            .transpose()
+            .map_err(|_| StoreError::incompatible())?;
         self.connection.execute_batch("ROLLBACK")?;
-        if self.write_attempted.load(Ordering::Acquire) || self.connection.total_changes() != 0 {
+        let write_attempted = self.write_attempted.load(Ordering::Acquire);
+        let total_changes = self.connection.total_changes();
+        let read_only = self.connection.is_readonly("main")?;
+        let query_only = self.query_only;
+        if write_attempted || total_changes != 0 || !read_only || !query_only {
             return Err(StoreError::incompatible());
         }
+        #[cfg(feature = "development-fixture")]
+        let evidence_snapshot =
+            evidence_store.map(|store| super::evidence::EvidenceRebuildSnapshot {
+                audit: super::evidence::EvidenceRebuildAudit {
+                    authorizer_write_deny: true,
+                    no_mutex: true,
+                    nofollow: true,
+                    query_only,
+                    read_only,
+                    total_changes,
+                    write_attempted,
+                    writer_opens: 0,
+                },
+                store,
+            });
         self.connection.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
         self.connection.close().map_err(|(_, error)| StoreError::from(error))?;
-        Ok(RecoveredStore { store_id: self.store_id })
+        Ok(RecoveredStore {
+            store_id: self.store_id,
+            #[cfg(feature = "development-fixture")]
+            evidence_snapshot,
+        })
     }
 }
 
@@ -1129,6 +1218,7 @@ fn open_recovery_snapshot(
     connection.pragma_update(None, "foreign_keys", true)?;
     connection.pragma_update(None, "trusted_schema", false)?;
     connection.pragma_update(None, "query_only", true)?;
+    let query_only: bool = connection.pragma_query_value(None, "query_only", |row| row.get(0))?;
     verify_persistent_settings(&connection)?;
     verify_connection(&connection, ConnectionKind::Reader)?;
     validate_schema(&connection)?;
@@ -1164,6 +1254,7 @@ fn open_recovery_snapshot(
     Ok(RecoverySnapshot {
         connection,
         config: config.clone(),
+        query_only,
         store_id,
         write_attempted,
         input,

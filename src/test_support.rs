@@ -11,6 +11,9 @@ pub use crate::capture::{
 };
 #[doc(inline)]
 pub use crate::domain::time::SessionTime;
+#[cfg(feature = "development-fixture")]
+#[doc(inline)]
+pub use crate::host::EvidenceSnapshotHold;
 #[doc(inline)]
 pub use crate::host::TeardownHold;
 #[doc(inline)]
@@ -329,6 +332,33 @@ pub async fn start_host_with_manual_clock(config: &Config) -> Result<HostRuntime
 /// representable range.
 pub fn advance_host_clock(runtime: &HostRuntime, elapsed: std::time::Duration) {
     runtime.advance_clock_for_test(elapsed);
+}
+
+/// Lowers one Host's private transaction-B evidence row budget for boundary testing.
+///
+/// Production evidence capture always uses its fixed schema-v1 budget. Encrypted packets and
+/// commands still enter through production Host seams, and committed state remains observable only
+/// through the ordinary query interfaces.
+///
+/// # Panics
+///
+/// Panics when `limit` is zero or the Host has already committed evidence-audited input.
+#[cfg(feature = "development-fixture")]
+pub fn set_evidence_snapshot_row_limit(runtime: &HostRuntime, limit: u64) {
+    runtime.set_evidence_snapshot_row_limit_for_test(limit);
+}
+
+/// Pauses one combined evidence audit and Store snapshot read until released.
+///
+/// The gate changes no Host, Timeline, Store, estimator, or projection state. It exists only to
+/// overlap ordinary authenticated ingress with the evidence read-side consistency boundary.
+///
+/// # Panics
+///
+/// Panics when the same Host already has a held evidence snapshot.
+#[cfg(feature = "development-fixture")]
+pub fn hold_evidence_snapshot(runtime: &mut HostRuntime) -> EvidenceSnapshotHold {
+    runtime.hold_evidence_snapshot_for_test()
 }
 
 /// Returns the Host's ordinary committed read-side handle for behavior tests.

@@ -70,6 +70,7 @@
     readToken: null,
     stale: false,
     protocolError: false,
+    websocketReconnected: false,
   };
 
   class HttpFailure extends Error {}
@@ -954,6 +955,7 @@
   }
   function connect() {
     if (state.websocket && state.websocket.readyState < WebSocket.CLOSING) return;
+    if (state.websocket !== null) state.websocketReconnected = true;
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(`${protocol}//${location.host}/api/live`);
     let deliverySequence = null;

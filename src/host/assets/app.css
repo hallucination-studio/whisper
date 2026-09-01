@@ -68,6 +68,7 @@ button, input, select { font: inherit; }
 .bench { display: grid; grid-template-columns: minmax(310px, 390px) minmax(0, 1fr); min-height: calc(100vh - 144px); }
 .topology-panel { position: relative; padding: 36px 34px 48px; border-right: 1px solid var(--ink); background: #eef3f3; }
 .topology-panel h1, .signal-panel h2 { margin: 8px 0 0; font: 600 31px/1.02 "Avenir Next Condensed", "Arial Narrow", sans-serif; letter-spacing: 0; }
+.signal-panel h2 { line-height: 32px; }
 .context-copy { max-width: 33ch; margin: 13px 0 28px; color: var(--quiet); font-size: 14px; line-height: 1.45; }
 .topology-trace { position: absolute; top: 145px; bottom: 270px; left: 24px; width: 2px; background: var(--copper); }
 .topology-trace::before, .topology-trace::after { content: ""; position: absolute; left: -4px; width: 10px; height: 10px; border: 2px solid var(--copper); border-radius: 50%; background: #eef3f3; }

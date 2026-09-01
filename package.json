@@ -2,6 +2,7 @@
   "name": "whisper-read-only-ui",
   "private": true,
   "scripts": {
+    "evidence:observe": "node scripts/evidence-observer.mjs",
     "test:browser": "playwright test"
   },
   "devDependencies": {

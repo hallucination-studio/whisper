@@ -736,12 +736,14 @@ struct SemanticWriter {
     semantic_time_offset_ns: u64,
     next_timeline_advance_ns: Option<u64>,
     physical_continuation_pending: bool,
+    #[cfg(feature = "development-fixture")]
+    rebuild_evidence: Option<crate::store::EvidenceRebuildSnapshot>,
 }
 
 #[cfg(unix)]
 impl SemanticWriter {
     fn new(
-        capture: CaptureSession,
+        mut capture: CaptureSession,
         config: Config,
         executable_identity: crate::executable::ExecutableIdentity,
         rebuilt: Option<RebuiltSession>,
@@ -762,6 +764,8 @@ impl SemanticWriter {
                 Some(rebuilt.next_timeline_advance_ns),
             )
         });
+        #[cfg(feature = "development-fixture")]
+        let rebuild_evidence = capture.take_rebuild_evidence();
         Self {
             capture,
             config,
@@ -772,6 +776,8 @@ impl SemanticWriter {
             semantic_time_offset_ns,
             next_timeline_advance_ns,
             physical_continuation_pending,
+            #[cfg(feature = "development-fixture")]
+            rebuild_evidence,
         }
     }
 
@@ -789,6 +795,16 @@ impl SemanticWriter {
 
     const fn physical_continuation_pending(&self) -> bool {
         self.physical_continuation_pending
+    }
+
+    #[cfg(feature = "development-fixture")]
+    fn take_rebuild_evidence(&mut self) -> Option<crate::store::EvidenceRebuildSnapshot> {
+        self.rebuild_evidence.take()
+    }
+
+    #[cfg(feature = "development-fixture")]
+    fn transaction_b_audit(&self) -> Arc<Mutex<crate::store::EvidenceTransactionBAudit>> {
+        self.capture.transaction_b_audit()
     }
 
     fn next_timeline_deadline(&self) -> Option<Instant> {
@@ -1003,6 +1019,10 @@ pub(crate) struct CaptureRuntime {
     queue_drop_count: u64,
     #[cfg(unix)]
     store: Store,
+    #[cfg(feature = "development-fixture")]
+    rebuild_evidence: Option<crate::store::EvidenceRebuildSnapshot>,
+    #[cfg(feature = "development-fixture")]
+    transaction_b_audit: Arc<Mutex<crate::store::EvidenceTransactionBAudit>>,
 }
 
 impl CaptureRuntime {
@@ -1010,12 +1030,16 @@ impl CaptureRuntime {
     fn new(
         store: Store,
         config: Config,
-        writer_state: SemanticWriter,
+        mut writer_state: SemanticWriter,
         clock: RuntimeClock,
     ) -> Result<Self, HostError> {
         let store_id = writer_state.store_id();
         let session_id = writer_state.capture_session_id().to_owned();
         let monotonic_origin = writer_state.monotonic_origin();
+        #[cfg(feature = "development-fixture")]
+        let rebuild_evidence = writer_state.take_rebuild_evidence();
+        #[cfg(feature = "development-fixture")]
+        let transaction_b_audit = writer_state.transaction_b_audit();
         let capacity = usize::try_from(config.server().command_queue_capacity())
             .map_err(|_| HostError::WriterQueueCapacity)?;
         let writer_stopped = Arc::new(AtomicBool::new(false));
@@ -1067,12 +1091,30 @@ impl CaptureRuntime {
             last_receive: None,
             queue_drop_count: 0,
             store,
+            #[cfg(feature = "development-fixture")]
+            rebuild_evidence,
+            #[cfg(feature = "development-fixture")]
+            transaction_b_audit,
         })
     }
 
     #[cfg(unix)]
     pub(crate) fn query_store(&self) -> Result<QueryStore, QueryError> {
         self.store.query_store()
+    }
+
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn take_rebuild_evidence(
+        &mut self,
+    ) -> Option<crate::store::EvidenceRebuildSnapshot> {
+        self.rebuild_evidence.take()
+    }
+
+    #[cfg(feature = "development-fixture")]
+    pub(crate) fn transaction_b_audit(
+        &self,
+    ) -> Arc<Mutex<crate::store::EvidenceTransactionBAudit>> {
+        Arc::clone(&self.transaction_b_audit)
     }
 
     pub(crate) const fn store_id(&self) -> [u8; 32] {

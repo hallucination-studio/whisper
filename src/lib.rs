@@ -9,6 +9,8 @@ pub(crate) mod database;
 #[cfg(feature = "development-fixture")]
 pub mod development_fixture;
 pub(crate) mod domain;
+#[cfg(feature = "development-fixture")]
+pub mod evidence;
 #[cfg(unix)]
 mod executable;
 #[cfg(unix)]

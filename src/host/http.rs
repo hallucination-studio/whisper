@@ -16,6 +16,7 @@ use axum::routing::{MethodFilter, on};
 use axum::serve::Listener;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -34,6 +35,31 @@ const MAX_U64_DECIMAL_DIGITS: usize = 20;
 const PAGE_SHELL: &str = include_str!("assets/index.html");
 const PAGE_STYLES: &str = include_str!("assets/app.css");
 const PAGE_SCRIPT: &str = include_str!("assets/app.js");
+// These are the exact production routes whose served bytes define the Sensing asset identity.
+// Adding, removing, or renaming one changes the evidence digest contract and requires coordinated
+// Host, observer, and verifier compatibility review.
+const PAGE_SHELL_PATH: &str = "/";
+const PAGE_STYLES_PATH: &str = "/assets/app.css";
+const PAGE_SCRIPT_PATH: &str = "/assets/app.js";
+
+pub(crate) fn served_asset_sha256(max_time_buckets: u32) -> String {
+    let mut digest = Sha256::new();
+    let page = PAGE_SHELL.replace("__MAX_TIME_BUCKETS__", &max_time_buckets.to_string());
+    // The v1 preimage concatenates each route in serving order as big-endian u64 path length,
+    // UTF-8 path bytes, big-endian u64 body length, then exact response bytes. Changing this frame
+    // invalidates retained asset identities even when the rendered page bytes remain unchanged.
+    for (path, bytes) in [
+        (PAGE_SHELL_PATH, page.as_bytes()),
+        (PAGE_STYLES_PATH, PAGE_STYLES.as_bytes()),
+        (PAGE_SCRIPT_PATH, PAGE_SCRIPT.as_bytes()),
+    ] {
+        digest.update(u64::try_from(path.len()).expect("asset path length fits u64").to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update(u64::try_from(bytes.len()).expect("asset length fits u64").to_be_bytes());
+        digest.update(bytes);
+    }
+    digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 #[derive(Clone)]
 pub(super) struct HttpState {
@@ -444,7 +470,7 @@ async fn relationship_latest(
     let control = state.control.clone();
     match uri.query() {
         None => match run_query(&control, move || state.query.relationship_subjects()).await {
-            Ok(response) => Json(response).into_response(),
+            Ok(response) => canonical_json_response(StatusCode::OK, response),
             Err(()) => projection_failure_response(),
         },
         Some("") => invalid_request_response("invalid relationship query"),
@@ -463,11 +489,24 @@ async fn relationship_latest(
                 Ok(response) => {
                     let status = StatusCode::from_u16(response.http_status())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (status, Json(response)).into_response()
+                    canonical_json_response(status, response)
                 }
                 Err(()) => projection_failure_response(),
             }
         }
+    }
+}
+
+fn canonical_json_response(status: StatusCode, value: impl Serialize) -> Response {
+    let body = serde_json::to_value(value).and_then(|value| serde_json::to_vec(&value));
+    match body {
+        Ok(body) => (status, [(header::CONTENT_TYPE, "application/json")], body).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            br#"{"error":{"code":"projection_failed","message":"committed projection could not be read"},"http_schema_version":1,"kind":"error"}"#.to_vec(),
+        )
+            .into_response(),
     }
 }
 

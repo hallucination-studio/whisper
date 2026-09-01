@@ -63,6 +63,8 @@ test('switches between Capture Session signals and Semantic Session relationship
 });
 
 test('same Sensing page renders the committed BaselineLearning to Stable change', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', (error) => pageErrors.push(error.message));
   let stable = false;
   let socket;
   await page.route('**/api/topology', (route) => {
@@ -99,8 +101,10 @@ test('same Sensing page renders the committed BaselineLearning to Stable change'
   });
 
   await page.goto('/');
+  await expect.poll(() => pageErrors).toEqual([]);
   await page.getByRole('radio', { name: 'Sensing' }).check();
   await expect(page.getByTestId('relationship-state')).toHaveText('Unknown(BaselineLearning)');
+  await expect(page.locator('[data-testid="relationship-evidence-marker"]')).toHaveCount(0);
 
   stable = true;
   socket.send(JSON.stringify({

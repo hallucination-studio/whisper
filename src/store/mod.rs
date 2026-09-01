@@ -1,9 +1,16 @@
 //! Store lifecycle, atomic capture, and committed query interfaces.
 
+#[cfg(feature = "development-fixture")]
+mod evidence;
 mod managed;
 mod query;
 mod sqlite;
 
+#[cfg(feature = "development-fixture")]
+pub(crate) use evidence::{
+    EvidenceBaselineCommand, EvidenceKnowledge, EvidenceRebuildSnapshot, EvidenceRelationship,
+    EvidenceStoreSnapshot, EvidenceTransactionBAudit, EvidenceTransactionBEffect,
+};
 #[cfg(all(unix, feature = "ingest-test-hooks"))]
 pub use query::QueryHold;
 #[cfg(feature = "ingest-test-hooks")]

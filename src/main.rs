@@ -40,6 +40,11 @@ fn main() -> ExitCode {
     }
 
     #[cfg(feature = "development-fixture")]
+    if command == "evidence" {
+        return evidence_command(args.collect());
+    }
+
+    #[cfg(feature = "development-fixture")]
     if command == "development-fixture" {
         return development_fixture_command(args.collect());
     }
@@ -196,6 +201,35 @@ fn development_fixture_command(args: Vec<OsString>) -> ExitCode {
     }
 }
 
+#[cfg(feature = "development-fixture")]
+fn evidence_command(args: Vec<OsString>) -> ExitCode {
+    let [operation, root] = args.as_slice() else {
+        print_usage();
+        return ExitCode::from(2);
+    };
+    let operation = operation.to_str();
+    let result = match operation {
+        Some("seal-producer") => whisper::evidence::seal_evidence_producer(Path::new(root)),
+        Some("seal-observer") => whisper::evidence::seal_evidence_observer(Path::new(root)),
+        Some("verify") => whisper::evidence::verify_evidence_package(Path::new(root)),
+        _ => {
+            eprintln!("unknown evidence command");
+            print_usage();
+            return ExitCode::from(2);
+        }
+    };
+    match result {
+        Ok(()) => {
+            println!("evidence {} completed", operation.expect("matched UTF-8 operation"));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("evidence verification failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 #[cfg(all(feature = "development-fixture", unix))]
 struct FixtureInterruptGuard {
     _runtime: tokio::runtime::Runtime,
@@ -222,6 +256,12 @@ fn print_usage() {
     eprintln!(
         "       whisper development-fixture <config-path> <sensor-id> <program> [arguments...]"
     );
+    #[cfg(feature = "development-fixture")]
+    eprintln!("       whisper evidence seal-producer <package-root>");
+    #[cfg(feature = "development-fixture")]
+    eprintln!("       whisper evidence seal-observer <package-root>");
+    #[cfg(feature = "development-fixture")]
+    eprintln!("       whisper evidence verify <package-root>");
 }
 
 fn check_config(path: &Path) -> Result<Config, ConfigError> {

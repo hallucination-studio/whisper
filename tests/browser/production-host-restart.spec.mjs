@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { chromium, expect, test } from '@playwright/test';
 import { createCipheriv, createHash } from 'node:crypto';
 import { createSocket } from 'node:dgram';
 import { execFile, spawn } from 'node:child_process';
@@ -8,11 +8,178 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
+import {
+  chromeIdentity,
+  observe,
+  ObserverRetentionBudget,
+  observerTiming,
+  productionLiveWebSocketUrl,
+  servedAssetSha256,
+  screenshotState,
+  signedChromeApplication,
+} from '../../scripts/evidence-observer.mjs';
+
 const execFileAsync = promisify(execFile);
 const profile = '61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2';
 const key = Buffer.alloc(32, 0x11);
 const csiFrameIntervalMs = 50;
 const csiFrameIntervalUs = 50_000;
+// The simulated RF stream shares one event loop with Chrome orchestration. A 500 ms fixture-only
+// receive-jitter allowance prevents host scheduling pauses from fabricating an RF quality change.
+const simulatedReceiveJitterBudgetNs = 500_000_000;
+
+test('evidence observer timing uses an injected monotonic and UTC clock', () => {
+  const timing = observerTiming({ monotonicNowMs: () => 25, utcNowNs: () => 30n }, 100);
+  expect(timing).toEqual({ deadlineMs: 125, startedUtcNs: 30n });
+  expect(() => observerTiming({
+    monotonicNowMs: () => { throw new Error('clock unavailable'); },
+    utcNowNs: () => 30n,
+  }, 100)).toThrow('clock unavailable');
+  expect(() => observerTiming({ monotonicNowMs: () => 0, utcNowNs: () => 0n }, 120_001))
+    .toThrow('observer timeout exceeds its bounded maximum');
+});
+
+test('evidence observer applies one total deadline while Chrome identity is unavailable', async () => {
+  const sockets = new Set();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise((resolveListen, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolveListen);
+  });
+  const port = server.address().port;
+  const clock = {
+    monotonicNowMs: () => performance.now(),
+    sleep: (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds)),
+    utcNowNs: () => BigInt(Date.now()) * 1_000_000n,
+  };
+  try {
+    await expect(observe(clock, [
+      '/unused',
+      `cdp:http://127.0.0.1:${port}`,
+      'http://127.0.0.1:9001/',
+      'deadline-page',
+      '50',
+    ])).rejects.toThrow('total deadline');
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolveClose) => server.close(resolveClose));
+  }
+});
+
+test('evidence observer derives only the production loopback live WebSocket', () => {
+  expect(productionLiveWebSocketUrl('http://127.0.0.1:9001/'))
+    .toBe('ws://127.0.0.1:9001/api/live');
+  expect(() => productionLiveWebSocketUrl('http://192.0.2.10:9001/'))
+    .toThrow('loopback');
+  expect(() => productionLiveWebSocketUrl('file:///tmp/index.html'))
+    .toThrow('HTTP');
+});
+
+test('evidence observer bounds WebSocket and HTTP retention before package sealing', () => {
+  const budget = new ObserverRetentionBudget();
+  expect(() => budget.recordWebSocketEvent(65_537)).toThrow('WebSocket frame exceeds');
+  budget.reserveHttpResponse();
+  expect(() => budget.beginHttpResponse(null)).toThrow('Content-Length');
+  expect(() => budget.beginHttpResponse(String(1024 * 1024 + 1)))
+    .toThrow('HTTP response exceeds');
+  const expected = budget.beginHttpResponse('12');
+  expect(() => budget.finishHttpResponse(expected, 13)).toThrow('Content-Length');
+  budget.releaseHttpResponse();
+  for (let index = 0; index < 16; index += 1) budget.reserveHttpResponse();
+  expect(() => budget.reserveHttpResponse()).toThrow('pending HTTP response count exceeds');
+  for (let index = 0; index < 16; index += 1) budget.releaseHttpResponse();
+});
+
+test('served asset identity is derived from exact response paths and bytes', () => {
+  expect(servedAssetSha256(new Map([
+    ['/', Buffer.from('page')],
+    ['/assets/app.js', Buffer.from('script')],
+    ['/assets/app.css', Buffer.from('style')],
+  ]))).toBe('a344377c1053e4a7cefd9d5232947d3028c23271d0382e0ec9af5b6fd54ff571');
+  expect(() => servedAssetSha256(new Map([
+    ['/assets/app.js', Buffer.from('script')],
+  ]))).toThrow('served asset response set is incomplete');
+});
+
+test('evidence observer accepts Chrome and rejects Chromium identity', async () => {
+  const response = (Browser) => async () => ({ ok: true, json: async () => ({ Browser }) });
+  const official = async () => ({
+    application_id: 'com.google.Chrome',
+    executable_sha256: 'ab'.repeat(32),
+    signature_verified: true,
+    team_id: 'EQHXZ8M8AV',
+  });
+  await expect(chromeIdentity(
+    'cdp:http://127.0.0.1:9222', response('Chrome/151.0.0.0'), official,
+  )).resolves.toEqual({
+    application_id: 'com.google.Chrome',
+    endpoint: 'http://127.0.0.1:9222',
+    executable_sha256: 'ab'.repeat(32),
+    name: 'Chrome',
+    team_id: 'EQHXZ8M8AV',
+    version: '151.0.0.0',
+  });
+  await expect(chromeIdentity(
+    'cdp:http://127.0.0.1:9222', response('Chromium/151.0.0.0'), official,
+  ))
+    .rejects.toThrow('not Google Chrome');
+  await expect(chromeIdentity(
+    'cdp:http://127.0.0.1:9222', response('Chrome/151.0.0.0'),
+    async () => ({ application_id: 'org.chromium.Chromium', team_id: '-', executable_sha256: 'cd'.repeat(32) }),
+  )).rejects.toThrow('not the signed Google Chrome application');
+  await expect(chromeIdentity(
+    'cdp:http://127.0.0.1:9222', response('Chrome/151.0.0.0'),
+    async () => ({
+      application_id: 'com.google.Chrome',
+      executable_sha256: 'cd'.repeat(32),
+      signature_verified: false,
+      team_id: 'EQHXZ8M8AV',
+    }),
+  )).rejects.toThrow('not the signed Google Chrome application');
+});
+
+test('evidence observer cryptographically verifies the Chrome application bundle', async () => {
+  const commands = [];
+  const run = async (command, args) => {
+    commands.push([command, args]);
+    if (command === 'lsof') return { stdout: 'p123\n', stderr: '' };
+    if (command === 'ps') {
+      return {
+        stdout: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n',
+        stderr: '',
+      };
+    }
+    if (args.includes('--verify')) return { stdout: '', stderr: '' };
+    return {
+      stdout: '',
+      stderr: 'Identifier=com.google.Chrome\nTeamIdentifier=EQHXZ8M8AV\n',
+    };
+  };
+  const identity = await signedChromeApplication(
+    'http://127.0.0.1:9222',
+    run,
+    async () => 'ab'.repeat(32),
+  );
+  expect(identity.signature_verified).toBe(true);
+  expect(commands).toContainEqual([
+    'codesign',
+    [
+      '--verify',
+      '--verbose=4',
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    ],
+  ]);
+});
+
+test('evidence screenshot stability includes visible DOM text', () => {
+  const baseline = { knowledge: 'stable', visible_text: ['Stable'] };
+  expect(screenshotState(baseline)).not.toEqual(
+    screenshotState({ ...baseline, visible_text: ['operator-secret-token'] }),
+  );
+});
 
 function delay(milliseconds) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
@@ -188,7 +355,7 @@ async function sendCommand(baseUrl, command) {
   if (response.status !== 202) throw new Error(`command ${command} returned ${response.status}`);
 }
 
-test('one production Host restart keeps the actual served Sensing page and selection', async ({ page }) => {
+test('one production Host restart keeps the actual served Sensing page and selection', async () => {
   test.setTimeout(60_000);
   const root = await mkdtemp(join(tmpdir(), 'whisper-host-restart-browser-'));
   const managed = join(root, 'managed');
@@ -197,10 +364,13 @@ test('one production Host restart keeps the actual served Sensing page and selec
   const database = join(managed, 'host.sqlite3');
   const httpPort = await freePort();
   const capturePort = await freePort();
+  const chromeDebugPort = await freePort();
   const baseUrl = `http://127.0.0.1:${httpPort}`;
   const binary = resolve(process.env.CARGO_TARGET_DIR ?? 'target', 'debug', 'whisper');
   const socket = createSocket('udp4');
   let host = null;
+  let observer = null;
+  let operatorContext = null;
   let messageSequence = 0;
   let captureSequence = 0;
   let timestampUs = 0;
@@ -259,11 +429,56 @@ test('one production Host restart keeps the actual served Sensing page and selec
       .replace('bind = "127.0.0.1:9000"', `bind = "0.0.0.0:${capturePort}"`)
       .replace('bind = "127.0.0.1:8080"', `bind = "127.0.0.1:${httpPort}"`)
       .replace('secret_root = "./data/secrets"', `secret_root = "${secrets}"`)
-      .replace('database_path = "./data/whisper.sqlite3"', `database_path = "${database}"`);
+      .replace('database_path = "./data/whisper.sqlite3"', `database_path = "${database}"`)
+      .replace(
+        'maximum_receive_jitter_ns = 100000000',
+        `maximum_receive_jitter_ns = ${simulatedReceiveJitterBudgetNs}`,
+      );
     await writeFile(configPath, source);
     await execFileAsync(binary, ['init-admission', configPath]);
 
     host = await startHost(binary, configPath);
+    operatorContext = await chromium.launchPersistentContext(join(root, 'chrome-profile'), {
+      args: [`--remote-debugging-port=${chromeDebugPort}`],
+      channel: 'chrome',
+      headless: true,
+      viewport: { width: 1440, height: 900 },
+    });
+    const page = operatorContext.pages()[0] ?? await operatorContext.newPage();
+    const observerRoot = join(root, 'observer');
+    await mkdir(observerRoot, { mode: 0o700 });
+    const observerChild = spawn(process.execPath, [
+      resolve('scripts/evidence-observer.mjs'),
+      observerRoot,
+      `cdp:http://127.0.0.1:${chromeDebugPort}`,
+      baseUrl,
+      'production-restart-page',
+      '55000',
+    ], {
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let observerStdout = '';
+    let observerStderr = '';
+    observerChild.stdout.on('data', (chunk) => { observerStdout += chunk; });
+    observerChild.stderr.on('data', (chunk) => { observerStderr += chunk; });
+    const observerExited = new Promise((resolveExit) => observerChild.once('exit', (code, signal) => {
+      resolveExit({ code, signal });
+    }));
+    observer = { child: observerChild, exited: observerExited, stderr: () => observerStderr };
+    await Promise.race([
+      waitFor(
+        async () => observerStdout,
+        (output) => output.includes('"state":"ready"'),
+        'separate evidence observer',
+        800,
+      ),
+      observerExited.then((result) => {
+        throw new Error(
+          `evidence observer exited before ready: ${JSON.stringify(result)} ${observerStderr}`,
+        );
+      }),
+    ]);
     await page.goto(baseUrl);
     await page.getByRole('radio', { name: 'Sensing' }).check();
     await sendCommand(baseUrl, 'begin_learning');
@@ -296,6 +511,10 @@ test('one production Host restart keeps the actual served Sensing page and selec
     await expect(page.getByTestId('relationship-state')).toHaveText('Stable');
     await expect(page.locator('#relationship-change-state'))
       .toHaveText('Unknown(BaselineLearning) → Stable');
+    const projectionBeforeStableWindow = BigInt(
+      initialStable.receipt.projection_commit.sequence,
+    );
+    const captureBeforeStableWindow = captureSequence;
     let stableBefore = await waitFor(
       () => relationshipLatest(baseUrl),
       (latest) => latest?.data?.knowledge?.value === 'stable'
@@ -303,23 +522,28 @@ test('one production Host restart keeps the actual served Sensing page and selec
       'pre-stop eligible Stable window',
     );
     expect(stableBefore.data.most_recent_change).toEqual(initialStable.data.most_recent_change);
-    const projectionBeforeTail = BigInt(stableBefore.receipt.projection_commit.sequence);
-    const captureBeforeTail = captureSequence;
-    await waitFor(
-      async () => captureSequence,
-      (sequence) => sequence >= captureBeforeTail + 6,
-      'eligible pre-stop open window',
-    );
     await stopCsiStream();
-    const sentTailFrames = BigInt(captureSequence - captureBeforeTail);
+    const sentStableFrames = BigInt(captureSequence - captureBeforeStableWindow);
     stableBefore = await waitFor(
       () => relationshipLatest(baseUrl),
       (latest) => BigInt(latest.receipt.projection_commit.sequence)
-        >= projectionBeforeTail + sentTailFrames,
+        >= projectionBeforeStableWindow + sentStableFrames,
       'fully processed pre-stop cursor',
     );
     expect(stableBefore.data.knowledge.value).toBe('stable');
     expect(stableBefore.data.most_recent_change).toEqual(initialStable.data.most_recent_change);
+    await waitFor(
+      async () => ({
+        exit_code: observerChild.exitCode,
+        stderr: observerStderr,
+        stdout: observerStdout,
+      }),
+      (observerState) => observerState.stdout.includes(
+        `"result_time":"${stableBefore.data.result_time}","state":"stable-pre-captured"`,
+      ),
+      'observer capture of fully processed pre-restart Stable',
+      800,
+    );
     const topologyBefore = await jsonGet(baseUrl, '/api/topology');
     expect(topologyBefore.data.sessions).toHaveLength(1);
 
@@ -390,11 +614,111 @@ test('one production Host restart keeps the actual served Sensing page and selec
     expect(staleIndex).toBeGreaterThanOrEqual(0);
     expect(resynchronizingIndex).toBeGreaterThan(staleIndex);
     expect(liveIndex).toBeGreaterThan(resynchronizingIndex);
+    const observerResult = await observerExited;
+    expect(observerResult, observerStderr).toEqual({ code: 0, signal: null });
+    expect(observerStdout).toContain('"result":"captured"');
+    const observerReceipt = JSON.parse(await readFile(join(observerRoot, 'observer.json'), 'utf8'));
+    const observerTrace = JSON.parse(await readFile(join(observerRoot, 'chrome-trace.json'), 'utf8'));
+    const observerWebSocket = JSON.parse(
+      await readFile(join(observerRoot, 'websocket.json'), 'utf8'),
+    );
+    const observedUnknown = JSON.parse(await readFile(join(observerRoot, 'http/unknown.json'), 'utf8'));
+    const observedStablePre = JSON.parse(
+      await readFile(join(observerRoot, 'http/stable-pre-restart.json'), 'utf8'),
+    );
+    const observedStablePost = JSON.parse(
+      await readFile(join(observerRoot, 'http/stable-post-restart.json'), 'utf8'),
+    );
+    expect(observerReceipt.page_instance_id).toBe('production-restart-page');
+    expect(observerReceipt.browser.name).toBe('Chrome');
+    expect(observerReceipt.browser.application_id).toBe('com.google.Chrome');
+    expect(observerReceipt.browser.team_id).toBe('EQHXZ8M8AV');
+    expect(observerReceipt.browser.executable_sha256).toMatch(/^[0-9a-f]{64}$/);
+    const scale = Number(observerReceipt.viewport.device_scale_factor);
+    const expectedScreenshotWidth = Number(observerReceipt.viewport.width) * scale;
+    const expectedScreenshotHeight = Number(observerReceipt.viewport.height) * scale;
+    expect(Number.isInteger(expectedScreenshotWidth)).toBe(true);
+    expect(Number.isInteger(expectedScreenshotHeight)).toBe(true);
+    for (const path of [
+      'screenshots/unknown.png',
+      'screenshots/stable-pre-restart.png',
+      'screenshots/stable-post-restart.png',
+    ]) {
+      const screenshot = await readFile(join(observerRoot, path));
+      expect(screenshot.subarray(0, 8)).toEqual(Buffer.from('\x89PNG\r\n\x1a\n', 'binary'));
+      expect(screenshot.readUInt32BE(16)).toBe(expectedScreenshotWidth);
+      expect(screenshot.readUInt32BE(20)).toBe(expectedScreenshotHeight);
+      expect(screenshot[24]).toBe(8);
+      expect(screenshot[25]).toBe(2);
+    }
+    expect(observerReceipt.artifacts.map((artifact) => artifact.path)).toEqual([
+      'chrome-trace.json',
+      'http/stable-post-restart.json',
+      'http/stable-pre-restart.json',
+      'http/unknown.json',
+      'screenshots/stable-post-restart.png',
+      'screenshots/stable-pre-restart.png',
+      'screenshots/unknown.png',
+      'websocket.json',
+    ]);
+    expect(observerTrace.events.map((event) => event.kind)).toEqual([
+      'unknown',
+      'stable_pre_restart',
+      'stale',
+      'resynchronizing',
+      'stable_post_restart',
+    ]);
+    expect(observerTrace.document_id).toMatch(/^[0-9a-f]{64}$/);
+    for (const event of observerTrace.events) {
+      expect(event.document_id).toBe(observerTrace.document_id);
+      expect(event.selection).toEqual(observerTrace.selection);
+    }
+    for (const event of [observerTrace.events[0], observerTrace.events[1], observerTrace.events[4]]) {
+      expect(event.screenshot_sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(event.visible_text).toEqual(expect.any(Array));
+      expect(event.opaque_visual_surfaces).toEqual([]);
+    }
+    expect(observerTrace.events[0]).toMatchObject({
+      change_state: null,
+      change_time: null,
+      knowledge: 'unknown:baseline_learning',
+      result_time: observedUnknown.data.result_time,
+    });
+    expect(observerTrace.events[1]).toMatchObject({
+      change_state: 'Unknown(BaselineLearning) → Stable',
+      change_time: observedStablePre.data.most_recent_change.changed_at,
+      knowledge: 'stable',
+      result_time: observedStablePre.data.result_time,
+    });
+    expect(observerTrace.events[4]).toMatchObject({
+      change_state: 'Unknown(BaselineLearning) → Stable',
+      change_time: observedStablePost.data.most_recent_change.changed_at,
+      knowledge: 'stable',
+      result_time: observedStablePost.data.result_time,
+    });
+    for (const [eventIndex, response] of [
+      [1, observedStablePre],
+      [4, observedStablePost],
+    ]) {
+      const event = observerTrace.events[eventIndex];
+      const trigger = observerWebSocket.events[Number(event.trigger_websocket_order)];
+      expect(trigger.kind).toBe('message');
+      expect(event.trigger_websocket_watermark).toBe(response.data.creator_commit.sequence);
+      expect(trigger.watermark).toBe(response.data.creator_commit.sequence);
+    }
+    expect(BigInt(observerTrace.events[4].result_time))
+      .toBeGreaterThan(BigInt(observerTrace.events[1].result_time));
+    observer = null;
   } finally {
     try {
       await stopCsiStream();
       if (host) await stopHost(host);
     } finally {
+      if (observer?.child.exitCode === null && observer.child.signalCode === null) {
+        observer.child.kill('SIGKILL');
+        await observer.exited;
+      }
+      if (operatorContext) await operatorContext.close();
       socket.close();
       await rm(root, { recursive: true, force: true });
     }
