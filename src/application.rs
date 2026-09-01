@@ -15,12 +15,14 @@ use std::sync::Weak;
 #[cfg(unix)]
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
     mpsc::{self, Receiver, SyncSender},
 };
 #[cfg(unix)]
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use tokio::sync::Notify;
 
 use crate::Config;
 use crate::config::RouteConfig;
@@ -33,10 +35,20 @@ use crate::domain::identity::{DeploymentId, DeviceId, KeyEpoch};
 #[cfg(unix)]
 use crate::domain::world::{BaselineCommand, TargetedBaselineCommand};
 use crate::key_material::{EpochKey, SecretStoreError, load_epoch_key};
+#[cfg(unix)]
+use crate::relationship::{
+    CoordinatorError, RebuiltSession, RelationshipCoordinator, process_packet,
+    rebuild as rebuild_relationship,
+};
+#[cfg(unix)]
+use crate::session::{SessionRecordKind, encode_record_body};
 #[cfg(all(unix, feature = "ingest-test-hooks"))]
 use crate::store::RelationshipFailureStage;
 #[cfg(unix)]
-use crate::store::{AdmissionEpochSeed, CaptureSession, QueryError, QueryStore, Store, StoreError};
+use crate::store::{
+    AdmissionEpochSeed, CaptureSession, PreparedSession, QueryError, QueryStore, Store, StoreError,
+    prepare_semantic_session,
+};
 #[cfg(unix)]
 use crate::wire::{self, IngestError};
 #[cfg(unix)]
@@ -121,6 +133,210 @@ impl RuntimeClock {
             *state.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 Some(Arc::downgrade(writer));
         }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct IngressOrder {
+    capture_origin: Instant,
+    capacity: usize,
+    sampling: AtomicUsize,
+    state: Mutex<IngressOrderState>,
+    changed: Condvar,
+    async_changed: Notify,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct IngressOrderState {
+    pending: VecDeque<IngressEntry>,
+    active: Option<u64>,
+    boundary_deadline_ns: Option<u64>,
+    next_id: u64,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct IngressEntry {
+    id: u64,
+    elapsed_ns: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct IngressReceipt {
+    order: Arc<IngressOrder>,
+    id: u64,
+    received: (Instant, SystemTime),
+}
+
+#[cfg(unix)]
+struct IngressSampling<'a>(&'a IngressOrder);
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct IngressReservation {
+    receipt: IngressReceipt,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct IngressBoundary {
+    order: Arc<IngressOrder>,
+}
+
+#[cfg(unix)]
+impl IngressOrder {
+    fn new(capture_origin: Instant, capacity: usize) -> Self {
+        Self {
+            capture_origin,
+            capacity,
+            sampling: AtomicUsize::new(0),
+            state: Mutex::new(IngressOrderState::default()),
+            changed: Condvar::new(),
+            async_changed: Notify::new(),
+        }
+    }
+
+    pub(crate) fn begin(
+        self: &Arc<Self>,
+        clock: &RuntimeClock,
+    ) -> Result<IngressReceipt, HostError> {
+        let sampling = self.start_sampling()?;
+        let received = clock.sample();
+        let elapsed_ns = self.elapsed_ns(received.0)?;
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let registered_and_sampling = state
+            .pending
+            .len()
+            .checked_add(self.sampling.load(AtomicOrdering::Acquire))
+            .ok_or(HostError::IngressSamplingOverflow)?;
+        if registered_and_sampling > self.capacity {
+            return Err(HostError::WriterQueueFull);
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.checked_add(1).ok_or(HostError::CaptureTimeOverflow)?;
+        state.pending.push_back(IngressEntry { id, elapsed_ns });
+        state.pending.make_contiguous().sort_by_key(|entry| (entry.elapsed_ns, entry.id));
+        drop(state);
+        drop(sampling);
+        self.changed.notify_all();
+        self.async_changed.notify_waiters();
+        Ok(IngressReceipt { order: Arc::clone(self), id, received })
+    }
+
+    fn hold_boundary(self: &Arc<Self>, deadline: Instant) -> Result<IngressBoundary, HostError> {
+        let deadline_elapsed_ns = self.elapsed_ns(deadline)?;
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.boundary_deadline_ns.replace(deadline_elapsed_ns).is_none(),
+            "the single capture writer must not overlap ingress deadline boundaries"
+        );
+        self.async_changed.notify_waiters();
+        state = self
+            .changed
+            .wait_while(state, |state| {
+                self.sampling.load(AtomicOrdering::Acquire) != 0
+                    || state.pending.iter().any(|entry| entry.elapsed_ns < deadline_elapsed_ns)
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(state);
+        Ok(IngressBoundary { order: Arc::clone(self) })
+    }
+
+    fn elapsed_ns(&self, instant: Instant) -> Result<u64, HostError> {
+        let elapsed = instant
+            .checked_duration_since(self.capture_origin)
+            .ok_or(HostError::ReceiveBeforeSession)?;
+        let elapsed_ns =
+            u64::try_from(elapsed.as_nanos()).map_err(|_| HostError::CaptureTimeOverflow)?;
+        Ok(elapsed_ns)
+    }
+
+    fn start_sampling(&self) -> Result<IngressSampling<'_>, HostError> {
+        self.sampling
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| HostError::IngressSamplingOverflow)?;
+        Ok(IngressSampling(self))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IngressSampling<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.sampling.fetch_sub(1, AtomicOrdering::AcqRel);
+        assert!(previous != 0, "ingress sampling count must not underflow");
+        self.0.changed.notify_all();
+        self.0.async_changed.notify_waiters();
+    }
+}
+
+#[cfg(unix)]
+impl IngressReservation {
+    pub(crate) const fn received(&self) -> (Instant, SystemTime) {
+        self.receipt.received
+    }
+}
+
+#[cfg(unix)]
+impl IngressReceipt {
+    pub(crate) async fn reserve(self) -> IngressReservation {
+        let order = Arc::clone(&self.order);
+        loop {
+            let changed = order.async_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = order.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let is_front = state.pending.front().is_some_and(|entry| entry.id == self.id);
+                let before_boundary = state.boundary_deadline_ns.is_none_or(|deadline| {
+                    state
+                        .pending
+                        .front()
+                        .is_some_and(|entry| entry.id == self.id && entry.elapsed_ns < deadline)
+                });
+                if order.sampling.load(AtomicOrdering::Acquire) == 0
+                    && is_front
+                    && state.active.is_none()
+                    && before_boundary
+                {
+                    state.active = Some(self.id);
+                    drop(state);
+                    return IngressReservation { receipt: self };
+                }
+            }
+            changed.await;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IngressReceipt {
+    fn drop(&mut self) {
+        let mut state = self.order.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active == Some(self.id) {
+            state.active = None;
+        }
+        if let Some(position) = state.pending.iter().position(|entry| entry.id == self.id) {
+            state.pending.remove(position);
+        }
+        drop(state);
+        self.order.changed.notify_all();
+        self.order.async_changed.notify_waiters();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IngressBoundary {
+    fn drop(&mut self) {
+        let mut state = self.order.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.boundary_deadline_ns = None;
+        drop(state);
+        self.order.changed.notify_all();
+        self.order.async_changed.notify_waiters();
     }
 }
 
@@ -454,8 +670,14 @@ pub(crate) enum HostError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[cfg(unix)]
+    #[error("semantic coordinator failed: {0}")]
+    Coordinator(#[from] CoordinatorError),
+    #[cfg(unix)]
     #[error(transparent)]
     Ingest(#[from] IngestError),
+    #[cfg(unix)]
+    #[error(transparent)]
+    ExecutableIdentity(#[from] crate::executable::ExecutableIdentityError),
     #[cfg(unix)]
     #[error("capture receive time precedes the Capture Session origin")]
     ReceiveBeforeSession,
@@ -465,6 +687,9 @@ pub(crate) enum HostError {
     #[cfg(unix)]
     #[error("capture receive time exceeds the capture u64 nanosecond range")]
     CaptureTimeOverflow,
+    #[cfg(unix)]
+    #[error("the concurrent ingress sampling count overflowed")]
+    IngressSamplingOverflow,
     #[cfg(unix)]
     #[error("capture UTC time is outside the capture timestamp range")]
     CaptureClock,
@@ -500,6 +725,259 @@ pub(crate) enum HostError {
     UnsupportedManagedStorePlatform,
 }
 
+#[cfg(unix)]
+struct SemanticWriter {
+    capture: CaptureSession,
+    config: Config,
+    executable_identity: crate::executable::ExecutableIdentity,
+    semantic_session_id: Option<crate::SessionId>,
+    coordinator: Option<RelationshipCoordinator>,
+    capabilities: BTreeMap<(DeviceId, KeyEpoch, u32), crate::wire::CapabilitiesV1>,
+    semantic_time_offset_ns: u64,
+    next_timeline_advance_ns: Option<u64>,
+    physical_continuation_pending: bool,
+}
+
+#[cfg(unix)]
+impl SemanticWriter {
+    fn new(
+        capture: CaptureSession,
+        config: Config,
+        executable_identity: crate::executable::ExecutableIdentity,
+        rebuilt: Option<RebuiltSession>,
+    ) -> Self {
+        let physical_continuation_pending = rebuilt.is_some();
+        let (
+            semantic_session_id,
+            coordinator,
+            capabilities,
+            semantic_time_offset_ns,
+            next_timeline_advance_ns,
+        ) = rebuilt.map_or((None, None, BTreeMap::new(), 0, None), |rebuilt| {
+            (
+                Some(rebuilt.semantic_id),
+                Some(rebuilt.coordinator),
+                rebuilt.capabilities,
+                rebuilt.last_session_time.as_nanos(),
+                Some(rebuilt.next_timeline_advance_ns),
+            )
+        });
+        Self {
+            capture,
+            config,
+            executable_identity,
+            semantic_session_id,
+            coordinator,
+            capabilities,
+            semantic_time_offset_ns,
+            next_timeline_advance_ns,
+            physical_continuation_pending,
+        }
+    }
+
+    fn store_id(&self) -> [u8; 32] {
+        self.capture.store_id()
+    }
+
+    fn capture_session_id(&self) -> &str {
+        self.capture.session_id()
+    }
+
+    fn monotonic_origin(&self) -> Instant {
+        self.capture.monotonic_origin()
+    }
+
+    const fn physical_continuation_pending(&self) -> bool {
+        self.physical_continuation_pending
+    }
+
+    fn next_timeline_deadline(&self) -> Option<Instant> {
+        if self.physical_continuation_pending {
+            return None;
+        }
+        self.next_timeline_advance_ns
+            .and_then(|at| at.checked_sub(self.semantic_time_offset_ns))
+            .and_then(|at| self.monotonic_origin().checked_add(Duration::from_nanos(at)))
+    }
+
+    fn prepare_session(
+        &self,
+        started_utc_ns: i64,
+    ) -> Result<Option<(PreparedSession, RelationshipCoordinator)>, HostError> {
+        if self.semantic_session_id.is_some() {
+            return Ok(None);
+        }
+        let (manifest, prepared) =
+            prepare_semantic_session(&self.config, started_utc_ns, self.executable_identity)?;
+        let coordinator = RelationshipCoordinator::new(&manifest, &self.config)?;
+        Ok(Some((prepared, coordinator)))
+    }
+
+    fn install_prepared(&mut self, prepared: Option<(PreparedSession, RelationshipCoordinator)>) {
+        if let Some((prepared, coordinator)) = prepared {
+            self.semantic_session_id = Some(prepared.id().clone());
+            self.coordinator = Some(coordinator);
+        }
+    }
+
+    fn schedule_first_timeline_advance(
+        &mut self,
+        after: crate::domain::time::SessionTime,
+    ) -> Result<(), HostError> {
+        let step = self.config.window().step_ns();
+        self.next_timeline_advance_ns = Some(
+            after
+                .as_nanos()
+                .checked_div(step)
+                .and_then(|index| index.checked_add(1))
+                .and_then(|index| index.checked_mul(step))
+                .ok_or(CoordinatorError::Incompatible)?,
+        );
+        Ok(())
+    }
+
+    fn commit_candidate(
+        &mut self,
+        candidate: crate::wire::WireCandidate,
+    ) -> Result<CommitOutcome, HostError> {
+        let continuation_pending = self.physical_continuation_pending;
+        let capture_session_time = candidate.session_time();
+        let semantic_time = crate::domain::time::SessionTime::from_nanos(
+            self.semantic_time_offset_ns
+                .checked_add(capture_session_time.as_nanos())
+                .ok_or(CoordinatorError::Incompatible)?,
+        );
+        let candidate = candidate.with_session_time(semantic_time);
+        let started_utc_ns =
+            i64::try_from(candidate.receive_utc_ns()).map_err(|_| HostError::CaptureClock)?;
+        let prepared = self.prepare_session(started_utc_ns)?;
+        let semantic_id = prepared
+            .as_ref()
+            .map(|(prepared, _)| prepared.id().clone())
+            .or_else(|| self.semantic_session_id.clone())
+            .ok_or(CoordinatorError::Incompatible)?;
+        let fact = self.capture.append_packet_fact(
+            &semantic_id,
+            prepared.as_ref().map(|(prepared, _)| prepared),
+            &candidate,
+            capture_session_time,
+        )?;
+        if fact.replay_rejected() {
+            return Ok(CommitOutcome::ReplayRejected);
+        }
+        let created = prepared.is_some();
+        self.install_prepared(prepared);
+        if created {
+            self.schedule_first_timeline_advance(fact.at())?;
+        }
+        let processing = process_packet(
+            &self.config,
+            &semantic_id,
+            fact.record_seq(),
+            self.coordinator.as_ref().ok_or(CoordinatorError::Incompatible)?,
+            &self.capabilities,
+            &candidate,
+        )?;
+        let projection = self.capture.persist_projection(
+            &fact,
+            processing.kind,
+            processing.observation.as_ref(),
+            &processing.transition,
+        )?;
+        self.coordinator = Some(processing.coordinator);
+        if let Some((key, capability)) = processing.capability {
+            self.capabilities.insert(key, capability);
+        }
+        if continuation_pending {
+            self.schedule_first_timeline_advance(fact.at())?;
+        }
+        self.physical_continuation_pending = false;
+        Ok(CommitOutcome::Committed(crate::CommitReceipt::new(
+            processing.disposition,
+            fact.capture_record_seq().ok_or(CoordinatorError::Incompatible)?,
+            projection,
+        )))
+    }
+
+    fn commit_relationship_command(
+        &mut self,
+        command: TargetedBaselineCommand,
+        (monotonic_now, utc_now): (Instant, SystemTime),
+    ) -> Result<ProjectionSequence, HostError> {
+        if self.physical_continuation_pending {
+            return Err(CoordinatorError::Incompatible.into());
+        }
+        let now = utc_now.duration_since(UNIX_EPOCH).map_err(|_| HostError::CaptureClock)?;
+        let started_utc_ns = i64::try_from(now.as_nanos()).map_err(|_| HostError::CaptureClock)?;
+        let capture_time = u64::try_from(
+            monotonic_now
+                .checked_duration_since(self.monotonic_origin())
+                .ok_or(HostError::CaptureClock)?
+                .as_nanos(),
+        )
+        .map_err(|_| HostError::CaptureClock)?;
+        let at = crate::domain::time::SessionTime::from_nanos(
+            self.semantic_time_offset_ns
+                .checked_add(capture_time)
+                .ok_or(CoordinatorError::Incompatible)?,
+        );
+        let prepared = self.prepare_session(started_utc_ns)?;
+        let semantic_id = prepared
+            .as_ref()
+            .map(|(prepared, _)| prepared.id().clone())
+            .or_else(|| self.semantic_session_id.clone())
+            .ok_or(CoordinatorError::Incompatible)?;
+        let body = encode_record_body(&SessionRecordKind::BaselineCommand(command.clone()))
+            .map_err(StoreError::from)?;
+        let fact = self.capture.append_semantic_fact(
+            &semantic_id,
+            prepared.as_ref().map(|(prepared, _)| prepared),
+            at,
+            "baseline_command",
+            &body,
+        )?;
+        let created = prepared.is_some();
+        self.install_prepared(prepared);
+        if created {
+            self.schedule_first_timeline_advance(fact.at())?;
+        }
+        let (coordinator, transition) =
+            self.coordinator.as_ref().ok_or(CoordinatorError::Incompatible)?.command(&command)?;
+        let projection = self.capture.persist_projection(&fact, "semantic", None, &transition)?;
+        self.coordinator = Some(coordinator);
+        Ok(projection)
+    }
+
+    fn commit_timeline_advance(&mut self) -> Result<ProjectionSequence, HostError> {
+        let at = crate::domain::time::SessionTime::from_nanos(
+            self.next_timeline_advance_ns.ok_or(CoordinatorError::Incompatible)?,
+        );
+        let semantic_id = self.semantic_session_id.clone().ok_or(CoordinatorError::Incompatible)?;
+        let body =
+            encode_record_body(&SessionRecordKind::TimelineAdvance).map_err(StoreError::from)?;
+        let fact =
+            self.capture.append_semantic_fact(&semantic_id, None, at, "timeline_advance", &body)?;
+        let (coordinator, transition) = self
+            .coordinator
+            .as_ref()
+            .ok_or(CoordinatorError::Incompatible)?
+            .advance(fact.record_seq(), at)?;
+        let projection = self.capture.persist_projection(&fact, "semantic", None, &transition)?;
+        self.coordinator = Some(coordinator);
+        self.next_timeline_advance_ns = Some(
+            at.as_nanos()
+                .checked_add(self.config.window().step_ns())
+                .ok_or(CoordinatorError::Incompatible)?,
+        );
+        Ok(projection)
+    }
+
+    #[cfg(feature = "ingest-test-hooks")]
+    fn arm_relationship_failure(&mut self, stage: RelationshipFailureStage) {
+        self.capture.arm_relationship_failure(stage);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CaptureRuntime {
     store_id: [u8; 32],
@@ -523,8 +1001,6 @@ pub(crate) struct CaptureRuntime {
     last_receive: Option<Instant>,
     #[cfg(unix)]
     queue_drop_count: u64,
-    #[cfg(all(unix, feature = "ingest-test-hooks"))]
-    reject_next_csi_domain: bool,
     #[cfg(unix)]
     store: Store,
 }
@@ -534,20 +1010,24 @@ impl CaptureRuntime {
     fn new(
         store: Store,
         config: Config,
-        capture: CaptureSession,
+        writer_state: SemanticWriter,
         clock: RuntimeClock,
     ) -> Result<Self, HostError> {
-        let store_id = capture.store_id();
-        let session_id = capture.session_id().to_owned();
-        let monotonic_origin = capture.monotonic_origin();
+        let store_id = writer_state.store_id();
+        let session_id = writer_state.capture_session_id().to_owned();
+        let monotonic_origin = writer_state.monotonic_origin();
         let capacity = usize::try_from(config.server().command_queue_capacity())
             .map_err(|_| HostError::WriterQueueCapacity)?;
         let writer_stopped = Arc::new(AtomicBool::new(false));
         let writer_panicked = Arc::new(AtomicBool::new(false));
+        let physical_continuation_pending =
+            Arc::new(AtomicBool::new(writer_state.physical_continuation_pending()));
+        let ingress_order = Arc::new(IngressOrder::new(monotonic_origin, capacity));
         let writer_inbox = Arc::new(WriterInbox::new(
             capacity,
             Arc::clone(&writer_stopped),
             Arc::clone(&writer_panicked),
+            Arc::clone(&ingress_order),
         ));
         #[cfg(feature = "ingest-test-hooks")]
         clock.attach_writer(&writer_inbox);
@@ -557,10 +1037,20 @@ impl CaptureRuntime {
             writer_inbox: Arc::clone(&writer_inbox),
             configured_links: config.registry().links().keys().cloned().collect(),
             next_correlation: Arc::new(AtomicU64::new(0)),
+            clock: clock.clone(),
+            ingress_order,
+            physical_continuation_pending: Arc::clone(&physical_continuation_pending),
         };
         let writer = thread::Builder::new()
             .name("whisper-capture-writer".to_owned())
-            .spawn(move || writer_loop(capture, writer_inbox_for_thread, writer_clock))
+            .spawn(move || {
+                writer_loop(
+                    writer_state,
+                    writer_inbox_for_thread,
+                    writer_clock,
+                    physical_continuation_pending,
+                )
+            })
             .map_err(HostError::WriterSpawn)?;
         Ok(Self {
             store_id,
@@ -576,8 +1066,6 @@ impl CaptureRuntime {
             rate_windows: BTreeMap::new(),
             last_receive: None,
             queue_drop_count: 0,
-            #[cfg(feature = "ingest-test-hooks")]
-            reject_next_csi_domain: false,
             store,
         })
     }
@@ -652,12 +1140,7 @@ impl CaptureRuntime {
         self.last_receive = Some(received_monotonic);
         let candidate = authenticated.into_candidate(session_time, receive_utc_ns);
         let (response_tx, response_rx) = mpsc::sync_channel(1);
-        let pending = PendingCandidate {
-            candidate,
-            response: response_tx,
-            #[cfg(feature = "ingest-test-hooks")]
-            reject_csi_domain: std::mem::take(&mut self.reject_next_csi_domain),
-        };
+        let pending = PendingCandidate { candidate, response: response_tx };
         match self.writer_inbox.try_push(PendingWork::Candidate(pending)) {
             Ok(()) => Ok(CommitTicket { response: response_rx }),
             Err(PushError::Full) => {
@@ -680,6 +1163,11 @@ impl CaptureRuntime {
     }
 
     #[cfg(unix)]
+    pub(crate) fn ingress_order(&self) -> Arc<IngressOrder> {
+        Arc::clone(&self.writer_inbox.ingress_order)
+    }
+
+    #[cfg(unix)]
     pub(crate) fn shutdown(mut self) -> Result<(), HostError> {
         self.stop_writer()
     }
@@ -693,11 +1181,6 @@ impl CaptureRuntime {
     pub(crate) fn hold_writer(&mut self) -> Result<WriterHold, HostError> {
         self.writer_inbox.hold()?;
         Ok(WriterHold { inbox: Arc::clone(&self.writer_inbox), active: true })
-    }
-
-    #[cfg(all(unix, feature = "ingest-test-hooks"))]
-    pub(crate) fn reject_next_csi_domain(&mut self) {
-        self.reject_next_csi_domain = true;
     }
 
     #[cfg(all(unix, feature = "ingest-test-hooks"))]
@@ -773,8 +1256,6 @@ pub(crate) enum WriterEvent {
 struct PendingCandidate {
     candidate: crate::wire::WireCandidate,
     response: SyncSender<Result<CommitOutcome, Arc<HostError>>>,
-    #[cfg(feature = "ingest-test-hooks")]
-    reject_csi_domain: bool,
 }
 
 #[cfg(unix)]
@@ -783,25 +1264,33 @@ pub(crate) struct RelationshipCommandIngress {
     writer_inbox: Arc<WriterInbox>,
     configured_links: BTreeSet<RadioLinkId>,
     next_correlation: Arc<AtomicU64>,
+    clock: RuntimeClock,
+    ingress_order: Arc<IngressOrder>,
+    physical_continuation_pending: Arc<AtomicBool>,
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum RelationshipCommandAdmissionError {
     InvalidTarget,
+    ContinuationPending,
     QueueFull,
     WriterStopped,
     CorrelationOverflow,
+    Clock(HostError),
 }
 
 #[cfg(unix)]
 impl RelationshipCommandIngress {
-    pub(crate) fn try_command(
+    pub(crate) async fn try_command(
         &self,
         link: RadioLinkId,
         profile: CaptureProfileId,
         command: BaselineCommand,
     ) -> Result<String, RelationshipCommandAdmissionError> {
+        if self.physical_continuation_pending.load(AtomicOrdering::Acquire) {
+            return Err(RelationshipCommandAdmissionError::ContinuationPending);
+        }
         if !self.configured_links.contains(&link) {
             return Err(RelationshipCommandAdmissionError::InvalidTarget);
         }
@@ -817,12 +1306,22 @@ impl RelationshipCommandIngress {
             crate::domain::identity::LinkProfileKey::new(link, profile),
             command,
         );
-        self.writer_inbox.try_push(PendingWork::RelationshipCommand(command)).map_err(|error| {
-            match error {
-                PushError::Full => RelationshipCommandAdmissionError::QueueFull,
-                PushError::Stopped => RelationshipCommandAdmissionError::WriterStopped,
+        let receipt = self.ingress_order.begin(&self.clock).map_err(|error| {
+            if error.is_writer_queue_full() {
+                RelationshipCommandAdmissionError::QueueFull
+            } else {
+                RelationshipCommandAdmissionError::Clock(error)
             }
         })?;
+        let reservation = receipt.reserve().await;
+        let received = reservation.received();
+        self.writer_inbox
+            .try_push(PendingWork::RelationshipCommand { command, received })
+            .map_err(|error| match error {
+                PushError::Full => RelationshipCommandAdmissionError::QueueFull,
+                PushError::Stopped => RelationshipCommandAdmissionError::WriterStopped,
+            })?;
+        drop(reservation);
         Ok(format!("relationship-command-{correlation}"))
     }
 }
@@ -830,12 +1329,29 @@ impl RelationshipCommandIngress {
 #[cfg(unix)]
 enum PendingWork {
     Candidate(PendingCandidate),
-    RelationshipCommand(TargetedBaselineCommand),
+    RelationshipCommand {
+        command: TargetedBaselineCommand,
+        received: (Instant, SystemTime),
+    },
     #[cfg(feature = "ingest-test-hooks")]
     ArmRelationshipFailure {
         stage: RelationshipFailureStage,
         response: SyncSender<()>,
     },
+}
+
+#[cfg(unix)]
+impl PendingWork {
+    fn precedes_timeline_deadline(&self, deadline: Instant, capture_origin: Instant) -> bool {
+        let received = match self {
+            Self::Candidate(pending) => capture_origin
+                .checked_add(Duration::from_nanos(pending.candidate.session_time().as_nanos())),
+            Self::RelationshipCommand { received, .. } => Some(received.0),
+            #[cfg(feature = "ingest-test-hooks")]
+            Self::ArmRelationshipFailure { .. } => return true,
+        };
+        received.is_some_and(|received| received < deadline)
+    }
 }
 
 #[cfg(unix)]
@@ -847,6 +1363,7 @@ enum WriterAction {
     Work(PendingWork),
     TimelineAdvance,
     Closed,
+    Fatal(HostError),
 }
 
 #[cfg(unix)]
@@ -862,6 +1379,7 @@ struct WriterInbox {
     changed: Condvar,
     stopped: Arc<AtomicBool>,
     panicked: Arc<AtomicBool>,
+    ingress_order: Arc<IngressOrder>,
 }
 
 #[cfg(unix)]
@@ -890,13 +1408,19 @@ struct WriterInboxState {
 
 #[cfg(unix)]
 impl WriterInbox {
-    fn new(capacity: usize, stopped: Arc<AtomicBool>, panicked: Arc<AtomicBool>) -> Self {
+    fn new(
+        capacity: usize,
+        stopped: Arc<AtomicBool>,
+        panicked: Arc<AtomicBool>,
+        ingress_order: Arc<IngressOrder>,
+    ) -> Self {
         Self {
             capacity,
             state: Mutex::new(WriterInboxState::default()),
             changed: Condvar::new(),
             stopped,
             panicked,
+            ingress_order,
         }
     }
 
@@ -922,7 +1446,12 @@ impl WriterInbox {
         self.changed.notify_all();
     }
 
-    fn next(&self, timeline_deadline: Option<Instant>, clock: &RuntimeClock) -> WriterAction {
+    fn next(
+        &self,
+        timeline_deadline: Option<Instant>,
+        capture_origin: Instant,
+        clock: &RuntimeClock,
+    ) -> WriterAction {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
             #[cfg(feature = "ingest-test-hooks")]
@@ -943,7 +1472,31 @@ impl WriterInbox {
             if state.closed {
                 return state.work.pop_front().map_or(WriterAction::Closed, WriterAction::Work);
             }
-            if timeline_deadline.is_some_and(|deadline| clock.sample().0 >= deadline) {
+            if let Some(deadline) = timeline_deadline
+                && clock.sample().0 >= deadline
+            {
+                drop(state);
+                let _boundary = match self.ingress_order.hold_boundary(deadline) {
+                    Ok(boundary) => boundary,
+                    Err(error) => return WriterAction::Fatal(error),
+                };
+                state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                #[cfg(feature = "ingest-test-hooks")]
+                if state.panic_requested || state.hold_requested {
+                    continue;
+                }
+                if state.closed {
+                    return state.work.pop_front().map_or(WriterAction::Closed, WriterAction::Work);
+                }
+                if state
+                    .work
+                    .front()
+                    .is_some_and(|work| work.precedes_timeline_deadline(deadline, capture_origin))
+                {
+                    return WriterAction::Work(
+                        state.work.pop_front().expect("the checked writer work item must exist"),
+                    );
+                }
                 return WriterAction::TimelineAdvance;
             }
             if let Some(work) = state.work.pop_front() {
@@ -1053,69 +1606,62 @@ impl Drop for WriterHold {
 }
 
 #[cfg(unix)]
-fn writer_loop(mut capture: CaptureSession, inbox: Arc<WriterInbox>, clock: RuntimeClock) {
+fn writer_loop(
+    mut writer: SemanticWriter,
+    inbox: Arc<WriterInbox>,
+    clock: RuntimeClock,
+    physical_continuation_pending: Arc<AtomicBool>,
+) {
     let _stopped = WriterStoppedGuard(Arc::clone(&inbox));
     loop {
-        match inbox.next(capture.next_timeline_deadline(), &clock) {
+        match inbox.next(writer.next_timeline_deadline(), writer.monotonic_origin(), &clock) {
             WriterAction::Closed => break,
-            WriterAction::TimelineAdvance => match capture.commit_timeline_advance() {
+            WriterAction::Fatal(error) => {
+                inbox.stopped.store(true, AtomicOrdering::Release);
+                inbox.notify(WriterEvent::Fatal(Arc::new(error)));
+                break;
+            }
+            WriterAction::TimelineAdvance => match writer.commit_timeline_advance() {
                 Ok(projection) => inbox.notify(WriterEvent::Committed(projection)),
                 Err(error) => {
                     inbox.stopped.store(true, AtomicOrdering::Release);
-                    inbox.notify(WriterEvent::Fatal(Arc::new(HostError::Store(error))));
+                    inbox.notify(WriterEvent::Fatal(Arc::new(error)));
                     break;
                 }
             },
             WriterAction::Work(work) => match work {
-                PendingWork::Candidate(PendingCandidate {
-                    candidate,
-                    response,
-                    #[cfg(feature = "ingest-test-hooks")]
-                    reject_csi_domain,
-                }) => {
-                    let outcome = {
-                        #[cfg(feature = "ingest-test-hooks")]
-                        {
-                            if reject_csi_domain {
-                                capture.commit_with_domain_rejection(candidate)
-                            } else {
-                                capture.commit(candidate)
-                            }
-                        }
-                        #[cfg(not(feature = "ingest-test-hooks"))]
-                        {
-                            capture.commit(candidate)
-                        }
-                    };
+                PendingWork::Candidate(PendingCandidate { candidate, response }) => {
+                    let outcome = writer.commit_candidate(candidate);
                     match outcome {
                         Ok(outcome) => {
                             let _ = response.send(Ok(outcome));
                             if let CommitOutcome::Committed(receipt) = outcome {
+                                physical_continuation_pending.store(false, AtomicOrdering::Release);
                                 inbox.notify(WriterEvent::Committed(receipt.projection_sequence()));
                             }
                         }
                         Err(error) => {
                             inbox.stopped.store(true, AtomicOrdering::Release);
-                            let error = Arc::new(HostError::Store(error));
+                            let error = Arc::new(error);
                             let _ = response.send(Err(Arc::clone(&error)));
                             inbox.notify(WriterEvent::Fatal(error));
                             break;
                         }
                     }
                 }
-                PendingWork::RelationshipCommand(command) => {
-                    match capture.commit_relationship_command(command, clock.sample()) {
+                PendingWork::RelationshipCommand { command, received } => {
+                    match writer.commit_relationship_command(command, received) {
                         Ok(projection) => inbox.notify(WriterEvent::Committed(projection)),
                         Err(error) => {
                             inbox.stopped.store(true, AtomicOrdering::Release);
-                            inbox.notify(WriterEvent::Fatal(Arc::new(HostError::Store(error))));
+                            inbox.notify(WriterEvent::Fatal(Arc::new(error)));
                             break;
                         }
                     }
                 }
                 #[cfg(feature = "ingest-test-hooks")]
                 PendingWork::ArmRelationshipFailure { stage, response } => {
-                    capture.arm_relationship_failure(stage);
+                    writer.arm_relationship_failure(stage);
                     let _ = response.send(());
                 }
             },
@@ -1204,7 +1750,6 @@ impl HostError {
         }
     }
 
-    #[cfg(feature = "ingest-test-hooks")]
     pub(crate) const fn is_writer_queue_full(&self) -> bool {
         #[cfg(unix)]
         {
@@ -1250,10 +1795,16 @@ pub(crate) fn serve_with_clock(
     config: &Config,
     clock: RuntimeClock,
 ) -> Result<CaptureRuntime, HostError> {
+    let executable_identity = crate::executable::ExecutableIdentity::running()?;
     let store = Store::acquire_existing(config)?;
     let admissions = admission_seeds(config)?;
-    let capture = store.create_capture_session(config, admissions, clock.sample())?;
-    CaptureRuntime::new(store, config.clone(), capture, clock)
+    let mut recovery = store.recover_capture(config, admissions.clone(), executable_identity)?;
+    let rebuilt =
+        recovery.take_input().map(|input| rebuild_relationship(config, input)).transpose()?;
+    let recovered = recovery.finish(rebuilt.as_ref())?;
+    let capture = store.create_capture_session(config, admissions, || clock.sample(), recovered)?;
+    let writer = SemanticWriter::new(capture, config.clone(), executable_identity, rebuilt);
+    CaptureRuntime::new(store, config.clone(), writer, clock)
 }
 
 #[cfg(not(unix))]
@@ -1280,6 +1831,7 @@ fn admission_seeds(config: &Config) -> Result<Vec<AdmissionEpochSeed>, HostError
             key_epoch,
             replay_window_identity: identity,
             replay_window_size,
+            epoch_key: Arc::new(epoch_key),
         });
     }
     admissions.sort_by_key(|admission| (admission.device, admission.key_epoch));
@@ -1293,7 +1845,11 @@ pub(crate) fn open_capture_database(config: &Config) -> Result<Database, HostErr
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
+    use std::time::Duration;
 
     use rusqlite::Connection;
 
@@ -1303,11 +1859,167 @@ mod tests {
         replay_admission_config, replay_window_identity, replay_window_identity_preimage,
         select_replay_admission_route, validate_capture_epoch,
     };
+    #[cfg(unix)]
+    use super::{IngressOrder, RuntimeClock};
     use crate::database::{Database, DatabaseError};
     use crate::domain::identity::{DeploymentId, DeviceId, KeyEpoch};
     use crate::{Config, parse_config};
 
     static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingress_reservation_waits_without_blocking_and_releases_after_cancellation() {
+        let clock = RuntimeClock::system();
+        let capture_origin = clock.sample().0;
+        let order = Arc::new(IngressOrder::new(capture_origin, 2));
+        let first = order.begin(&clock).expect("first receipt").reserve().await;
+
+        let cancelled = tokio::spawn({
+            let order = Arc::clone(&order);
+            let clock = clock.clone();
+            async move { order.begin(&clock).expect("cancelled receipt").reserve().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!cancelled.is_finished());
+        cancelled.abort();
+        assert!(cancelled.await.expect_err("cancelled reservation waiter").is_cancelled());
+
+        let waiting = tokio::spawn({
+            let order = Arc::clone(&order);
+            let clock = clock.clone();
+            async move { order.begin(&clock).expect("waiting receipt").reserve().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(first);
+
+        let second = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("next reservation must not block the executor")
+            .expect("reservation task");
+        drop(second);
+    }
+
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingress_receipt_keeps_the_sample_taken_before_waiting() {
+        let (clock, control) = RuntimeClock::manual();
+        let capture_origin = clock.sample().0;
+        let order = Arc::new(IngressOrder::new(capture_origin, 2));
+        let first = order.begin(&clock).expect("first receipt").reserve().await;
+
+        assert!(control.advance(Duration::from_secs(1)));
+        let waiting = order.begin(&clock).expect("queued receipt");
+        assert!(control.advance(Duration::from_secs(1)));
+        drop(first);
+
+        let reservation = waiting.reserve().await;
+        assert_eq!(
+            reservation
+                .received()
+                .0
+                .checked_duration_since(capture_origin)
+                .expect("receipt follows capture origin"),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingress_reserves_by_sample_time_when_registration_order_inverts() {
+        let (clock, control) = RuntimeClock::manual();
+        let capture_origin = clock.sample().0;
+        let order = Arc::new(IngressOrder::new(capture_origin, 2));
+        let state = order.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+
+        let earlier_thread = std::thread::spawn({
+            let order = Arc::clone(&order);
+            let clock = clock.clone();
+            let sender = sender.clone();
+            move || sender.send((true, order.begin(&clock))).expect("return earlier receipt")
+        });
+        while order.sampling.load(Ordering::Acquire) != 1 {
+            std::thread::yield_now();
+        }
+        assert!(control.advance(Duration::from_secs(1)));
+        let later_thread = std::thread::spawn({
+            let order = Arc::clone(&order);
+            let clock = clock.clone();
+            move || sender.send((false, order.begin(&clock))).expect("return later receipt")
+        });
+        while order.sampling.load(Ordering::Acquire) != 2 {
+            std::thread::yield_now();
+        }
+        drop(state);
+
+        let mut earlier = None;
+        let mut later = None;
+        for _ in 0..2 {
+            let (is_earlier, receipt) = receiver.recv().expect("receive ingress receipt");
+            let receipt = receipt.expect("register ingress receipt");
+            if is_earlier {
+                earlier = Some(receipt);
+            } else {
+                later = Some(receipt);
+            }
+        }
+        earlier_thread.join().expect("join earlier sampler");
+        later_thread.join().expect("join later sampler");
+
+        let first = earlier.expect("earlier receipt").reserve().await;
+        let mut later = tokio::spawn(later.expect("later receipt").reserve());
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut later).await.is_err());
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), later)
+            .await
+            .expect("later receipt must become reservable")
+            .expect("later reservation task");
+        assert_eq!(
+            second
+                .received()
+                .0
+                .checked_duration_since(capture_origin)
+                .expect("later receipt follows capture origin"),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingress_boundary_waits_only_for_reservations_before_the_deadline() {
+        let (clock, control) = RuntimeClock::manual();
+        let capture_origin = clock.sample().0;
+        let deadline = capture_origin.checked_add(Duration::from_secs(1)).expect("deadline");
+        let order = Arc::new(IngressOrder::new(capture_origin, 2));
+
+        let before = order.begin(&clock).expect("pre-deadline receipt").reserve().await;
+        let mut waiting = tokio::task::spawn_blocking({
+            let order = Arc::clone(&order);
+            move || drop(order.hold_boundary(deadline).expect("pre-deadline boundary"))
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut waiting).await.is_err());
+        drop(before);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("boundary must follow the released reservation")
+            .expect("boundary task");
+
+        assert!(control.advance(Duration::from_secs(1)));
+        let at_deadline = order.begin(&clock).expect("at-deadline receipt").reserve().await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking({
+                let order = Arc::clone(&order);
+                move || drop(order.hold_boundary(deadline).expect("at-deadline boundary"))
+            }),
+        )
+        .await
+        .expect("boundary must not wait for an at-deadline reservation")
+        .expect("boundary task");
+        drop(at_deadline);
+    }
 
     fn database_path() -> PathBuf {
         std::env::temp_dir().join(format!(

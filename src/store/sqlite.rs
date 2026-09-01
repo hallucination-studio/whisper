@@ -5,34 +5,42 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ciborium::ser::into_writer;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior,
+    hooks::{AuthAction, Authorization},
+    params,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::managed::{ManagedRoot, ManagedStage, ManagedStoreError, fill_random};
 use super::query::{QueryError, QueryStore};
-use super::relationship::{
-    CoordinatorError, CoordinatorTransition, RelationshipCoordinator, algorithm_version,
-};
 use crate::Config;
 use crate::database::{
     Admission, DatabaseError, EpochHandle, ReplayWindowIdentity, advance_admission,
 };
-use crate::domain::identity::{DeviceId, HardwareKind, KeyEpoch};
-use crate::domain::world::{Knowledge, StableOrChanging, TargetedBaselineCommand, UnknownReason};
+use crate::domain::identity::{DeviceId, HardwareKind, KeyEpoch, LinkProfileKey, RadioLinkId};
+use crate::domain::world::{Knowledge, StableOrChanging, UnknownReason};
+use crate::executable::ExecutableIdentity;
 use crate::hex;
+use crate::relationship::{
+    CoordinatorTransition, RebuiltBaseline, RebuiltRelationship, RebuiltSession, RecoveryInput,
+    RecoveryRecord, algorithm_version,
+};
 use crate::session::{
-    SessionManifest, SessionRecordKind, WireAdmissionPin, encode_baseline_state, encode_manifest,
+    RecordKind, SessionManifest, SessionRecord, SessionRecordKind, WireAdmissionPin,
+    decode_manifest, decode_record_body, encode_baseline_state, encode_manifest,
     encode_record_body,
 };
-use crate::wire::{CandidateBody, WireCandidate};
-use crate::{
-    CaptureRecordSequence, CommitOutcome, CommitReceipt, PacketDisposition, ProjectionSequence,
-};
+use crate::wire::WireCandidate;
+use crate::{CaptureRecordSequence, ProjectionSequence};
 
 // `WSPD` is the SQLite application identity. Changing it makes every existing
 // Store incompatible.
@@ -45,6 +53,8 @@ const STORE_ID_BYTES: usize = 32;
 // digits after this exact prefix.
 const CAPTURE_SESSION_RANDOM_BYTES: usize = 16;
 const CAPTURE_SESSION_ID_PREFIX: &str = "capture-";
+// Semantic Session IDs use the same 128-bit random suffix as Capture Sessions.
+const SEMANTIC_SESSION_ID_PREFIX: &str = "semantic-";
 // A new Store initializes its eight-byte big-endian Projection watermark to zero.
 const PROJECTION_SEQUENCE_ZERO: [u8; 8] = [0; 8];
 // SQLite reports synchronous=FULL as numeric pragma value 2. Changing this
@@ -57,12 +67,14 @@ const TOPOLOGY_MANIFEST_SCHEMA_VERSION: u8 = 1;
 // behavior used for newly committed observations.
 const DECODER_VERSION: &str = "native-frame-v1";
 const CAPTURE_ALGORITHM_VERSION: &str = "native-coordinate-ingest-v1";
-#[derive(Clone, Debug, Eq, PartialEq)]
+
+#[derive(Clone, Debug)]
 pub(crate) struct AdmissionEpochSeed {
     pub(crate) device: DeviceId,
     pub(crate) key_epoch: KeyEpoch,
     pub(crate) replay_window_identity: ReplayWindowIdentity,
     pub(crate) replay_window_size: u16,
+    pub(crate) epoch_key: Arc<crate::key_material::EpochKey>,
 }
 
 /// One validated Store and its retained Managed-root lifecycle lease.
@@ -102,17 +114,33 @@ impl Store {
         Ok(Self { managed: Arc::new(managed) })
     }
 
+    pub(crate) fn recover_capture(
+        &self,
+        config: &Config,
+        admissions: Vec<AdmissionEpochSeed>,
+        executable_identity: ExecutableIdentity,
+    ) -> Result<RecoverySnapshot, StoreError> {
+        open_recovery_snapshot(
+            self.managed.database_path(),
+            config,
+            admissions,
+            executable_identity,
+        )
+    }
+
     pub(crate) fn create_capture_session(
         &self,
         config: &Config,
         admissions: Vec<AdmissionEpochSeed>,
-        started_at: (Instant, SystemTime),
+        sample_clock: impl FnOnce() -> (Instant, SystemTime),
+        recovered: RecoveredStore,
     ) -> Result<CaptureSession, StoreError> {
-        open_and_create_capture_session(
+        open_capture_session(
             self.managed.database_path(),
             config,
             admissions,
-            started_at,
+            sample_clock,
+            recovered,
         )
     }
 
@@ -150,8 +178,6 @@ enum StoreErrorKind {
     Topology(String),
     #[error("Semantic Session encoding failed: {0}")]
     Session(#[source] crate::session::SessionError),
-    #[error("relationship coordinator failed: {0}")]
-    Coordinator(#[source] CoordinatorError),
     #[error("Store identity, schema, settings, or initial rows are incompatible")]
     Incompatible,
     #[error("Store WAL checkpoint did not fully complete")]
@@ -197,12 +223,6 @@ impl From<ManagedStoreError> for StoreError {
 impl From<crate::session::SessionError> for StoreError {
     fn from(source: crate::session::SessionError) -> Self {
         Self::new(StoreErrorKind::Session(source))
-    }
-}
-
-impl From<CoordinatorError> for StoreError {
-    fn from(source: CoordinatorError) -> Self {
-        Self::new(StoreErrorKind::Coordinator(source))
     }
 }
 
@@ -263,10 +283,6 @@ pub(crate) struct CaptureSession {
     connection: Connection,
     admissions: Vec<AdmissionEpochSeed>,
     config: Config,
-    semantic_session_id: Option<crate::SessionId>,
-    coordinator: Option<RelationshipCoordinator>,
-    capabilities: BTreeMap<(DeviceId, KeyEpoch, u32), crate::wire::CapabilitiesV1>,
-    next_timeline_advance_ns: Option<u64>,
     #[cfg(feature = "ingest-test-hooks")]
     relationship_failure: Option<RelationshipFailureStage>,
 }
@@ -291,330 +307,17 @@ impl CaptureSession {
         self.monotonic_origin
     }
 
-    pub(crate) fn commit(&mut self, candidate: WireCandidate) -> Result<CommitOutcome, StoreError> {
-        self.commit_inner(candidate, false)
-    }
-
-    pub(crate) fn commit_relationship_command(
-        &mut self,
-        command: TargetedBaselineCommand,
-        now: (Instant, SystemTime),
-    ) -> Result<ProjectionSequence, StoreError> {
-        self.commit_command_inner(command, now)
-    }
-
-    pub(crate) fn next_timeline_deadline(&self) -> Option<Instant> {
-        self.next_timeline_advance_ns
-            .and_then(|at| self.monotonic_origin.checked_add(Duration::from_nanos(at)))
-    }
-
-    pub(crate) fn commit_timeline_advance(&mut self) -> Result<ProjectionSequence, StoreError> {
-        let at = self.next_timeline_advance_ns.ok_or(StoreError::incompatible())?;
-        let semantic_id = self.semantic_session_id.clone().ok_or(StoreError::incompatible())?;
-        let at = crate::domain::time::SessionTime::from_nanos(at);
-        let body = encode_record_body(&SessionRecordKind::TimelineAdvance)?;
-        let fact = self.append_semantic_fact(&semantic_id, None, at, "timeline_advance", &body)?;
-        let coordinator = self.coordinator.as_ref().ok_or(StoreError::incompatible())?;
-        let (staged, transition) = coordinator.advance(fact.record_seq, at)?;
-        let projection = self.persist_projection(&fact, "semantic", None, &transition)?;
-        self.coordinator = Some(staged);
-        self.next_timeline_advance_ns = Some(
-            at.as_nanos()
-                .checked_add(self.config.window().step_ns())
-                .ok_or(StoreError::incompatible())?,
-        );
-        Ok(projection)
-    }
-
     #[cfg(feature = "ingest-test-hooks")]
     pub(crate) fn arm_relationship_failure(&mut self, stage: RelationshipFailureStage) {
         self.relationship_failure = Some(stage);
     }
 
-    #[cfg(feature = "ingest-test-hooks")]
-    pub(crate) fn commit_with_domain_rejection(
-        &mut self,
-        candidate: WireCandidate,
-    ) -> Result<CommitOutcome, StoreError> {
-        self.commit_inner(candidate, true)
-    }
-
-    fn commit_inner(
-        &mut self,
-        candidate: WireCandidate,
-        reject_csi_domain: bool,
-    ) -> Result<CommitOutcome, StoreError> {
-        let started_utc_ns =
-            i64::try_from(candidate.receive_utc_ns()).map_err(|_| StoreError::clock())?;
-        let prepared = self.prepare_semantic_session(started_utc_ns)?;
-        let semantic_id = prepared
-            .as_ref()
-            .map_or_else(|| self.semantic_session_id.clone(), |value| Some(value.id.clone()))
-            .ok_or(StoreError::incompatible())?;
-        let semantic_record =
-            self.append_packet_fact(&semantic_id, prepared.as_ref(), &candidate)?;
-        if semantic_record.replay_rejected {
-            return Ok(CommitOutcome::ReplayRejected);
-        }
-        if let Some(prepared) = prepared {
-            self.semantic_session_id = Some(prepared.id);
-            self.coordinator = Some(prepared.coordinator);
-            self.schedule_first_timeline_advance(semantic_record.at)?;
-        }
-
-        let route = candidate.header_route();
-        let header = candidate.header();
-        let mut staged_capability = None;
-        let mut observation_row = None;
-        let disposition = match candidate.body() {
-            CandidateBody::UnknownKind { .. } => PacketDisposition::UnknownKind,
-            CandidateBody::MalformedKnownBody => PacketDisposition::MalformedKnownBody,
-            CandidateBody::Capabilities(capability) => {
-                let resolved = self
-                    .config
-                    .registry()
-                    .resolve_authenticated_route(route)
-                    .map_err(|_| StoreError::incompatible())?;
-                if capability.descriptor().firmware_build_digest()
-                    != resolved.sensor.firmware_build_digest()
-                {
-                    PacketDisposition::BuildMismatch
-                } else if capability.capability_digest() != resolved.sensor.capability_digest()
-                    || capability.descriptor().datagram_budget_bytes()
-                        > resolved.route.admission_limits().maximum_datagram_bytes()
-                {
-                    PacketDisposition::CapabilityPinMismatch
-                } else {
-                    staged_capability = Some((
-                        (route.device(), route.key_epoch(), header.boot_generation()),
-                        capability.clone(),
-                    ));
-                    PacketDisposition::CapabilityCommitted
-                }
-            }
-            CandidateBody::Health(health) => {
-                let resolved = self
-                    .config
-                    .registry()
-                    .resolve_authenticated_route(route)
-                    .map_err(|_| StoreError::incompatible())?;
-                if health.capability_digest() == resolved.sensor.capability_digest() {
-                    PacketDisposition::HealthCommitted
-                } else {
-                    PacketDisposition::CapabilityMismatch
-                }
-            }
-            CandidateBody::CsiData(data) => {
-                let key = (route.device(), route.key_epoch(), header.boot_generation());
-                let Some(capability) = self.capabilities.get(&key) else {
-                    return self.commit_projection(
-                        semantic_record,
-                        PacketDisposition::CapabilityUnavailable,
-                        None,
-                        None,
-                    );
-                };
-                let resolved = self
-                    .config
-                    .registry()
-                    .resolve_authenticated_route(route)
-                    .map_err(|_| StoreError::incompatible())?;
-                let radio = data.radio();
-                let plaintext_bytes = crate::wire::CSI_FIXED_BODY_BYTES
-                    .checked_add(
-                        data.blocks()
-                            .len()
-                            .checked_mul(crate::wire::LTF_BLOCK_BYTES)
-                            .ok_or(StoreError::incompatible())?,
-                    )
-                    .and_then(|bytes| bytes.checked_add(data.raw_csi().len()))
-                    .ok_or(StoreError::incompatible())?;
-                if capability.descriptor().firmware_build_digest()
-                    != resolved.sensor.firmware_build_digest()
-                {
-                    PacketDisposition::BuildMismatch
-                } else if capability.capability_digest() != resolved.sensor.capability_digest()
-                    || data.capability_digest() != capability.capability_digest()
-                {
-                    PacketDisposition::CapabilityMismatch
-                } else if data.source_mac() != resolved.link.expected_transmitter_mac() {
-                    PacketDisposition::SourceMismatch
-                } else if !resolved.link.channel_policy().allowed().contains(&radio.channel())
-                    || resolved
-                        .link
-                        .channel_policy()
-                        .expected()
-                        .is_some_and(|expected| expected != radio.channel())
-                {
-                    PacketDisposition::RadioMismatch
-                } else if data.raw_csi().len()
-                    > usize::from(resolved.sensor.maximum_raw_csi_bytes())
-                    || plaintext_bytes > usize::from(resolved.sensor.maximum_plaintext_bytes())
-                {
-                    PacketDisposition::BodyBudgetMismatch
-                } else if reject_csi_domain {
-                    PacketDisposition::DecodedDomainRejected
-                } else {
-                    let input = crate::wire::ObservationCandidateInput::try_new(
-                        semantic_id.as_str(),
-                        CaptureRecordSequence::new(semantic_record.record_seq),
-                        candidate.session_time(),
-                    )
-                    .map_err(|_| StoreError::incompatible())?;
-                    match crate::wire::resolve_capture_csi(
-                        input,
-                        route,
-                        header,
-                        self.config.registry(),
-                        data.clone(),
-                        capability,
-                    ) {
-                        Ok((profile, observation)) => {
-                            let observation_cbor = crate::timeline::encode_csi_observation_root(
-                                self.config.replay().digest(),
-                                self.config.conditioning().version().as_str(),
-                                &observation,
-                            );
-                            observation_row = Some(ObservationRow {
-                                sensor: observation.sensor().as_str().to_owned(),
-                                link: observation.link().as_str().to_owned(),
-                                profile: profile.id().as_bytes(),
-                                cbor: observation_cbor,
-                                observation,
-                            });
-                            PacketDisposition::CsiCommitted
-                        }
-                        Err(_) => PacketDisposition::DecodedDomainRejected,
-                    }
-                }
-            }
-        };
-        let outcome = self.commit_projection(
-            semantic_record,
-            disposition,
-            observation_row,
-            staged_capability.as_ref().map(|(key, capability)| (*key, capability.clone())),
-        )?;
-        if let Some((key, capability)) = staged_capability {
-            self.capabilities.insert(key, capability);
-        }
-        Ok(outcome)
-    }
-
-    fn commit_command_inner(
-        &mut self,
-        command: TargetedBaselineCommand,
-        (monotonic_now, utc_now): (Instant, SystemTime),
-    ) -> Result<ProjectionSequence, StoreError> {
-        let now = utc_now.duration_since(UNIX_EPOCH).map_err(|_| StoreError::clock())?;
-        let started_utc_ns = i64::try_from(now.as_nanos()).map_err(|_| StoreError::clock())?;
-        let at = crate::domain::time::SessionTime::from_nanos(
-            u64::try_from(
-                monotonic_now
-                    .checked_duration_since(self.monotonic_origin)
-                    .ok_or(StoreError::clock())?
-                    .as_nanos(),
-            )
-            .map_err(|_| StoreError::clock())?,
-        );
-        let prepared = self.prepare_semantic_session(started_utc_ns)?;
-        let semantic_id = prepared
-            .as_ref()
-            .map_or_else(|| self.semantic_session_id.clone(), |value| Some(value.id.clone()))
-            .ok_or(StoreError::incompatible())?;
-        let body = encode_record_body(&SessionRecordKind::BaselineCommand(command.clone()))?;
-        let fact = self.append_semantic_fact(
-            &semantic_id,
-            prepared.as_ref(),
-            at,
-            "baseline_command",
-            &body,
-        )?;
-        if let Some(prepared) = prepared {
-            self.semantic_session_id = Some(prepared.id);
-            self.coordinator = Some(prepared.coordinator);
-            self.schedule_first_timeline_advance(fact.at)?;
-        }
-        let coordinator = self.coordinator.as_ref().ok_or(StoreError::incompatible())?;
-        let (staged, transition) = coordinator.command(&command)?;
-        let projection = self.persist_projection(&fact, "semantic", None, &transition)?;
-        self.coordinator = Some(staged);
-        Ok(projection)
-    }
-
-    fn schedule_first_timeline_advance(
-        &mut self,
-        after: crate::domain::time::SessionTime,
-    ) -> Result<(), StoreError> {
-        let step = self.config.window().step_ns();
-        let next = after
-            .as_nanos()
-            .checked_div(step)
-            .and_then(|index| index.checked_add(1))
-            .and_then(|index| index.checked_mul(step))
-            .ok_or(StoreError::incompatible())?;
-        self.next_timeline_advance_ns = Some(next);
-        Ok(())
-    }
-
-    fn prepare_semantic_session(
-        &self,
-        started_utc_ns: i64,
-    ) -> Result<Option<PreparedSession>, StoreError> {
-        if self.semantic_session_id.is_some() {
-            return Ok(None);
-        }
-        let mut random = [0_u8; CAPTURE_SESSION_RANDOM_BYTES];
-        fill_random(&mut random)?;
-        let id = crate::SessionId::new(format!("semantic-{}", hex::encode(&random)))
-            .map_err(|_| StoreError::incompatible())?;
-        let mut wire_admission = Vec::with_capacity(self.config.registry().routes().len());
-        for route in self.config.registry().routes() {
-            let link = self
-                .config
-                .registry()
-                .links()
-                .get(route.link())
-                .ok_or(StoreError::incompatible())?;
-            let sensor = self
-                .config
-                .registry()
-                .sensors()
-                .get(link.receiver())
-                .ok_or(StoreError::incompatible())?;
-            wire_admission.push(WireAdmissionPin {
-                wire_version: 1,
-                device_id: route.device_id(),
-                key_epoch: route.key_epoch(),
-                firmware_build_digest: sensor.firmware_build_digest(),
-                capability_digest: sensor.capability_digest(),
-                maximum_plaintext_bytes: sensor.maximum_plaintext_bytes(),
-                transport_datagram_budget_bytes: route.admission_limits().maximum_datagram_bytes(),
-            });
-        }
-        let manifest = SessionManifest {
-            session_id: id.clone(),
-            started_utc_ns,
-            replay_config: self.config.replay().clone(),
-            config_digest: self.config.replay().digest(),
-            application_version: env!("CARGO_PKG_VERSION").to_owned(),
-            build_fingerprint: Sha256::digest(env!("CARGO_PKG_VERSION").as_bytes()).into(),
-            decoder_version: DECODER_VERSION.to_owned(),
-            wire_admission,
-            conditioning_version: self.config.conditioning().version().as_str().to_owned(),
-            algorithm_version: algorithm_version().to_owned(),
-            initial_baseline_states: Vec::new(),
-        };
-        let manifest_cbor = encode_manifest(&manifest)?;
-        let coordinator = RelationshipCoordinator::new(&manifest, &self.config)?;
-        Ok(Some(PreparedSession { id, started_utc_ns, manifest_cbor, coordinator }))
-    }
-
-    fn append_packet_fact(
+    pub(crate) fn append_packet_fact(
         &mut self,
         semantic_id: &crate::SessionId,
         prepared: Option<&PreparedSession>,
         candidate: &WireCandidate,
+        capture_session_time: crate::domain::time::SessionTime,
     ) -> Result<PersistedFact, StoreError> {
         let receive_utc_ns =
             i64::try_from(candidate.receive_utc_ns()).map_err(|_| StoreError::clock())?;
@@ -648,7 +351,9 @@ impl CaptureSession {
             Admission::new(&epoch, header.boot_generation(), header.message_seq()),
         ) {
             Ok(()) => {}
-            Err(DatabaseError::Replay) => return Ok(PersistedFact::replay()),
+            Err(DatabaseError::Replay) => {
+                return Ok(PersistedFact::replay(semantic_id.clone()));
+            }
             Err(error) => return Err(StoreError::admission(error)),
         }
 
@@ -674,7 +379,7 @@ impl CaptureSession {
                 record_seq.to_be_bytes(),
                 &self.session_id,
                 capture_record_seq.to_be_bytes(),
-                candidate.session_time().as_nanos().to_be_bytes(),
+                capture_session_time.as_nanos().to_be_bytes(),
             ],
         )?;
         advance_fact_bytes(
@@ -688,7 +393,7 @@ impl CaptureSession {
              WHERE capture_session_id = ?3",
             params![
                 capture_record_seq.to_be_bytes(),
-                candidate.session_time().as_nanos().to_be_bytes(),
+                capture_session_time.as_nanos().to_be_bytes(),
                 &self.session_id,
             ],
         )?;
@@ -697,6 +402,7 @@ impl CaptureSession {
         }
         transaction.commit()?;
         Ok(PersistedFact {
+            semantic_id: semantic_id.clone(),
             record_seq,
             capture_record_seq: Some(capture_record_seq),
             at: candidate.session_time(),
@@ -704,7 +410,7 @@ impl CaptureSession {
         })
     }
 
-    fn append_semantic_fact(
+    pub(crate) fn append_semantic_fact(
         &mut self,
         semantic_id: &crate::SessionId,
         prepared: Option<&PreparedSession>,
@@ -746,46 +452,20 @@ impl CaptureSession {
             return Err(StoreError::incompatible());
         }
         transaction.commit()?;
-        Ok(PersistedFact { record_seq, capture_record_seq: None, at, replay_rejected: false })
+        Ok(PersistedFact {
+            semantic_id: semantic_id.clone(),
+            record_seq,
+            capture_record_seq: None,
+            at,
+            replay_rejected: false,
+        })
     }
 
-    fn commit_projection(
-        &mut self,
-        fact: PersistedFact,
-        disposition: PacketDisposition,
-        observation: Option<ObservationRow>,
-        _capability: Option<((DeviceId, KeyEpoch, u32), crate::wire::CapabilitiesV1)>,
-    ) -> Result<CommitOutcome, StoreError> {
-        if fact.replay_rejected {
-            return Ok(CommitOutcome::ReplayRejected);
-        }
-        let coordinator = self.coordinator.as_ref().ok_or(StoreError::incompatible())?;
-        let (staged, transition) = match observation.as_ref() {
-            Some(row) => coordinator.observe(row.observation.clone())?,
-            None => (coordinator.clone(), coordinator.unchanged()?),
-        };
-        let kind = if matches!(
-            disposition,
-            PacketDisposition::MalformedKnownBody | PacketDisposition::DecodedDomainRejected
-        ) {
-            "decode_rejected"
-        } else {
-            "semantic"
-        };
-        let projection = self.persist_projection(&fact, kind, observation.as_ref(), &transition)?;
-        self.coordinator = Some(staged);
-        Ok(CommitOutcome::Committed(CommitReceipt::new(
-            disposition,
-            fact.capture_record_seq.ok_or(StoreError::incompatible())?,
-            projection,
-        )))
-    }
-
-    fn persist_projection(
+    pub(crate) fn persist_projection(
         &mut self,
         fact: &PersistedFact,
         kind: &'static str,
-        observation: Option<&ObservationRow>,
+        observation: Option<&crate::domain::csi::CsiObservation>,
         transition: &CoordinatorTransition,
     ) -> Result<ProjectionSequence, StoreError> {
         #[cfg(feature = "ingest-test-hooks")]
@@ -796,7 +476,7 @@ impl CaptureSession {
             } else {
                 false
             };
-        let semantic_id = self.semantic_session_id.as_ref().ok_or(StoreError::incompatible())?;
+        let semantic_id = &fact.semantic_id;
         let transaction =
             self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let watermark: Vec<u8> = transaction
@@ -810,6 +490,7 @@ impl CaptureSession {
         let watermark = ProjectionSequence::new(decode_u64(&watermark)?);
         let projection = watermark.checked_next().ok_or(StoreError::incompatible())?;
         if let Some(observation) = observation {
+            let observation = ObservationRow::new(&self.config, observation);
             transaction.execute(
                 "INSERT INTO csi_observations
                  (session_id, record_seq, session_time, sensor_id, link_id, profile_id,
@@ -942,15 +623,48 @@ impl CaptureSession {
 }
 
 #[derive(Debug)]
-struct PreparedSession {
-    id: crate::SessionId,
+pub(crate) struct PreparedSession {
+    pub(crate) id: crate::SessionId,
     started_utc_ns: i64,
     manifest_cbor: Vec<u8>,
-    coordinator: RelationshipCoordinator,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PersistedFact {
+impl PreparedSession {
+    pub(crate) fn id(&self) -> &crate::SessionId {
+        &self.id
+    }
+}
+
+pub(crate) fn prepare_semantic_session(
+    config: &Config,
+    started_utc_ns: i64,
+    executable_identity: ExecutableIdentity,
+) -> Result<(SessionManifest, PreparedSession), StoreError> {
+    let mut random = [0_u8; CAPTURE_SESSION_RANDOM_BYTES];
+    fill_random(&mut random)?;
+    let id = crate::SessionId::new(format!("{SEMANTIC_SESSION_ID_PREFIX}{}", hex::encode(&random)))
+        .map_err(|_| StoreError::incompatible())?;
+    let manifest = SessionManifest {
+        session_id: id.clone(),
+        started_utc_ns,
+        replay_config: config.replay().clone(),
+        config_digest: config.replay().digest(),
+        application_version: env!("CARGO_PKG_VERSION").to_owned(),
+        build_fingerprint: executable_identity.as_bytes(),
+        decoder_version: DECODER_VERSION.to_owned(),
+        wire_admission: wire_admission_pins(config)?,
+        conditioning_version: config.conditioning().version().as_str().to_owned(),
+        algorithm_version: algorithm_version().to_owned(),
+        initial_baseline_states: Vec::new(),
+    };
+    let prepared =
+        PreparedSession { id, started_utc_ns, manifest_cbor: encode_manifest(&manifest)? };
+    Ok((manifest, prepared))
+}
+
+#[derive(Debug)]
+pub(crate) struct PersistedFact {
+    semantic_id: crate::SessionId,
     record_seq: u64,
     capture_record_seq: Option<CaptureRecordSequence>,
     at: crate::domain::time::SessionTime,
@@ -958,13 +672,30 @@ struct PersistedFact {
 }
 
 impl PersistedFact {
-    const fn replay() -> Self {
+    fn replay(semantic_id: crate::SessionId) -> Self {
         Self {
+            semantic_id,
             record_seq: 0,
             capture_record_seq: None,
             at: crate::domain::time::SessionTime::from_nanos(0),
             replay_rejected: true,
         }
+    }
+
+    pub(crate) const fn record_seq(&self) -> u64 {
+        self.record_seq
+    }
+
+    pub(crate) const fn capture_record_seq(&self) -> Option<CaptureRecordSequence> {
+        self.capture_record_seq
+    }
+
+    pub(crate) const fn at(&self) -> crate::domain::time::SessionTime {
+        self.at
+    }
+
+    pub(crate) const fn replay_rejected(&self) -> bool {
+        self.replay_rejected
     }
 }
 
@@ -974,7 +705,47 @@ struct ObservationRow {
     link: String,
     profile: [u8; 32],
     cbor: Box<[u8]>,
-    observation: crate::domain::csi::CsiObservation,
+}
+
+impl ObservationRow {
+    fn new(config: &Config, observation: &crate::domain::csi::CsiObservation) -> Self {
+        Self {
+            sensor: observation.sensor().as_str().to_owned(),
+            link: observation.link().as_str().to_owned(),
+            profile: observation.profile().as_bytes(),
+            cbor: crate::timeline::encode_csi_observation_root(
+                config.replay().digest(),
+                config.conditioning().version().as_str(),
+                observation,
+            ),
+        }
+    }
+}
+
+fn wire_admission_pins(config: &Config) -> Result<Vec<WireAdmissionPin>, StoreError> {
+    config
+        .registry()
+        .routes()
+        .iter()
+        .map(|route| {
+            let link =
+                config.registry().links().get(route.link()).ok_or(StoreError::incompatible())?;
+            let sensor = config
+                .registry()
+                .sensors()
+                .get(link.receiver())
+                .ok_or(StoreError::incompatible())?;
+            Ok(WireAdmissionPin {
+                wire_version: 1,
+                device_id: route.device_id(),
+                key_epoch: route.key_epoch(),
+                firmware_build_digest: sensor.firmware_build_digest(),
+                capability_digest: sensor.capability_digest(),
+                maximum_plaintext_bytes: sensor.maximum_plaintext_bytes(),
+                transport_datagram_budget_bytes: route.admission_limits().maximum_datagram_bytes(),
+            })
+        })
+        .collect()
 }
 
 fn insert_prepared_session(
@@ -1184,14 +955,16 @@ fn initialize_stage(
     Ok(InitializedStore { expected, store_id })
 }
 
-fn open_and_create_capture_session(
+fn open_capture_session(
     path: &Path,
     config: &Config,
     admissions: Vec<AdmissionEpochSeed>,
-    (monotonic_origin, started_utc): (Instant, SystemTime),
+    sample_clock: impl FnOnce() -> (Instant, SystemTime),
+    recovered: RecoveredStore,
 ) -> Result<CaptureSession, StoreError> {
     let topology = encode_topology(config)?;
     let topology_digest = Sha256::digest(&topology).into();
+    let expected = ExpectedStore { topology, topology_digest, admissions };
     let mut connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -1203,9 +976,12 @@ fn open_and_create_capture_session(
     configure_writer(&connection)?;
     verify_connection(&connection, ConnectionKind::Writer)?;
     validate_schema(&connection)?;
-    let expected = ExpectedStore { topology, topology_digest, admissions };
     let store_id = validate_state(&connection, &expected, AdmissionExpectation::Existing)?;
+    if store_id != recovered.store_id {
+        return Err(StoreError::incompatible());
+    }
 
+    let (monotonic_origin, started_utc) = sample_clock();
     let started_utc_ns =
         started_utc.duration_since(UNIX_EPOCH).map_err(|_| StoreError::clock())?.as_nanos();
     let started_utc_ns = i64::try_from(started_utc_ns).map_err(|_| StoreError::clock())?;
@@ -1234,13 +1010,514 @@ fn open_and_create_capture_session(
         connection,
         admissions: expected.admissions,
         config: config.clone(),
-        semantic_session_id: None,
-        coordinator: None,
-        capabilities: BTreeMap::new(),
-        next_timeline_advance_ns: None,
         #[cfg(feature = "ingest-test-hooks")]
         relationship_failure: None,
     })
+}
+
+pub(crate) struct RecoveredStore {
+    store_id: [u8; STORE_ID_BYTES],
+}
+
+struct RetainedRecovery {
+    semantic_id: crate::SessionId,
+    timeline_digest: [u8; 32],
+    projection: u64,
+    tail: u64,
+}
+
+pub(crate) struct RecoverySnapshot {
+    connection: Connection,
+    config: Config,
+    store_id: [u8; STORE_ID_BYTES],
+    write_attempted: Arc<AtomicBool>,
+    input: Option<RecoveryInput>,
+    retained: Option<RetainedRecovery>,
+}
+
+impl RecoverySnapshot {
+    pub(crate) fn take_input(&mut self) -> Option<RecoveryInput> {
+        self.input.take()
+    }
+
+    pub(crate) fn finish(
+        self,
+        rebuilt: Option<&RebuiltSession>,
+    ) -> Result<RecoveredStore, StoreError> {
+        if self.input.is_some() {
+            return Err(StoreError::incompatible());
+        }
+        match (self.retained.as_ref(), rebuilt) {
+            (None, None) => {}
+            (Some(retained), Some(rebuilt)) => {
+                if rebuilt.semantic_id != retained.semantic_id
+                    || rebuilt.final_timeline_digest != retained.timeline_digest
+                    || retained.projection
+                        != retained.tail.checked_add(1).ok_or(StoreError::incompatible())?
+                {
+                    return Err(StoreError::incompatible());
+                }
+                compare_complete_baselines(
+                    &self.connection,
+                    &self.config,
+                    &retained.semantic_id,
+                    &rebuilt.baselines,
+                )?;
+                compare_relationships(
+                    &self.connection,
+                    &retained.semantic_id,
+                    &rebuilt.relationships,
+                )?;
+                let global_watermark: Vec<u8> = self.connection.query_row(
+                    "SELECT projection_commit_seq FROM store_state WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if decode_u64(&global_watermark)? != retained.projection {
+                    return Err(StoreError::incompatible());
+                }
+            }
+            _ => return Err(StoreError::incompatible()),
+        }
+        self.connection.execute_batch("ROLLBACK")?;
+        if self.write_attempted.load(Ordering::Acquire) || self.connection.total_changes() != 0 {
+            return Err(StoreError::incompatible());
+        }
+        self.connection.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
+        self.connection.close().map_err(|(_, error)| StoreError::from(error))?;
+        Ok(RecoveredStore { store_id: self.store_id })
+    }
+}
+
+fn recover_storage(
+    path: &Path,
+    expected: &ExpectedStore,
+) -> Result<[u8; STORE_ID_BYTES], StoreError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(Duration::ZERO)?;
+    verify_persistent_settings(&connection)?;
+    configure_writer(&connection)?;
+    verify_connection(&connection, ConnectionKind::Writer)?;
+    validate_schema(&connection)?;
+    let store_id = validate_state(&connection, expected, AdmissionExpectation::Existing)?;
+    connection.close().map_err(|(_, error)| StoreError::from(error))?;
+    Ok(store_id)
+}
+
+fn open_recovery_snapshot(
+    path: &Path,
+    config: &Config,
+    admissions: Vec<AdmissionEpochSeed>,
+    executable_identity: ExecutableIdentity,
+) -> Result<RecoverySnapshot, StoreError> {
+    let topology = encode_topology(config)?;
+    let topology_digest = Sha256::digest(&topology).into();
+    let expected = ExpectedStore { topology, topology_digest, admissions };
+    let expected_store_id = recover_storage(path, &expected)?;
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(Duration::ZERO)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    connection.pragma_update(None, "trusted_schema", false)?;
+    connection.pragma_update(None, "query_only", true)?;
+    verify_persistent_settings(&connection)?;
+    verify_connection(&connection, ConnectionKind::Reader)?;
+    validate_schema(&connection)?;
+    let store_id = validate_state(&connection, &expected, AdmissionExpectation::Existing)?;
+    if store_id != expected_store_id || !connection.is_readonly("main")? {
+        return Err(StoreError::incompatible());
+    }
+
+    let write_attempted = Arc::new(AtomicBool::new(false));
+    let write_attempted_by_authorizer = Arc::clone(&write_attempted);
+    connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+        let allowed = matches!(
+            context.action,
+            AuthAction::Read { .. }
+                | AuthAction::Select
+                | AuthAction::Function { .. }
+                | AuthAction::Recursive
+                | AuthAction::Transaction { .. }
+                | AuthAction::Savepoint { .. }
+        );
+        if allowed {
+            Authorization::Allow
+        } else {
+            write_attempted_by_authorizer.store(true, Ordering::Release);
+            Authorization::Deny
+        }
+    }));
+    connection.execute_batch("BEGIN")?;
+    let recovered =
+        read_active_session_snapshot(&connection, config, &expected, executable_identity)?;
+    let (input, retained) =
+        recovered.map_or((None, None), |(input, retained)| (Some(input), Some(retained)));
+    Ok(RecoverySnapshot {
+        connection,
+        config: config.clone(),
+        store_id,
+        write_attempted,
+        input,
+        retained,
+    })
+}
+
+struct ActiveSessionRow {
+    id: String,
+    manifest: Vec<u8>,
+}
+
+struct ActiveProcessingRow {
+    processed_cursor: Option<Vec<u8>>,
+    timeline_digest: Option<Vec<u8>>,
+    projection_commit: Option<Vec<u8>>,
+    config_digest: Vec<u8>,
+    decoder_version: String,
+    conditioning_version: String,
+    algorithm_version: String,
+}
+
+fn read_active_session_snapshot(
+    connection: &Connection,
+    config: &Config,
+    expected: &ExpectedStore,
+    executable_identity: ExecutableIdentity,
+) -> Result<Option<(RecoveryInput, RetainedRecovery)>, StoreError> {
+    let active_count: u64 = connection.query_row(
+        "SELECT count(*) FROM sessions WHERE lifecycle='active'",
+        [],
+        |row| row.get(0),
+    )?;
+    if active_count > 1 {
+        return Err(StoreError::incompatible());
+    }
+    let active = connection
+        .query_row(
+            "SELECT session_id, manifest_cbor FROM sessions WHERE lifecycle='active'",
+            [],
+            |row| Ok(ActiveSessionRow { id: row.get(0)?, manifest: row.get(1)? }),
+        )
+        .optional()?;
+    let Some(active) = active else {
+        return Ok(None);
+    };
+
+    let processing = connection
+        .query_row(
+            "SELECT processed_through_record_seq, timeline_state_digest,
+                    projection_commit_seq, config_digest, decoder_version,
+                    conditioning_version, algorithm_version
+             FROM session_processing_state WHERE session_id=?1",
+            [&active.id],
+            |row| {
+                Ok(ActiveProcessingRow {
+                    processed_cursor: row.get(0)?,
+                    timeline_digest: row.get(1)?,
+                    projection_commit: row.get(2)?,
+                    config_digest: row.get(3)?,
+                    decoder_version: row.get(4)?,
+                    conditioning_version: row.get(5)?,
+                    algorithm_version: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    let processing = processing.ok_or(StoreError::incompatible())?;
+
+    let manifest = decode_manifest(&active.manifest, 0)?;
+    validate_recovery_manifest(&manifest, &processing, config, executable_identity)?;
+    let semantic_id =
+        crate::SessionId::new(active.id.clone()).map_err(|_| StoreError::incompatible())?;
+    if semantic_id != manifest.session_id {
+        return Err(StoreError::incompatible());
+    }
+
+    let cursor =
+        decode_u64(processing.processed_cursor.as_deref().ok_or(StoreError::incompatible())?)?;
+    let stored_timeline_digest: [u8; 32] = processing
+        .timeline_digest
+        .as_deref()
+        .ok_or(StoreError::incompatible())?
+        .try_into()
+        .map_err(|_| StoreError::incompatible())?;
+    let stored_projection =
+        decode_u64(processing.projection_commit.as_deref().ok_or(StoreError::incompatible())?)?;
+    let records = read_ordered_records(connection, &semantic_id)?;
+    let tail = records.last().ok_or(StoreError::incompatible())?.record_seq;
+    if tail != cursor {
+        return Err(StoreError::incompatible());
+    }
+
+    let mut retained_records = Vec::with_capacity(records.len());
+    for record in records {
+        let (commit_sequence, retained_kind, retained_digest) = connection
+            .query_row(
+                "SELECT commit_seq, kind, timeline_state_digest
+                 FROM projection_commits WHERE session_id=?1 AND record_seq=?2",
+                params![semantic_id.as_str(), record.record_seq.to_be_bytes()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::incompatible())?;
+        let commit_sequence = decode_u64(&commit_sequence)?;
+        if commit_sequence != record.record_seq.checked_add(1).ok_or(StoreError::incompatible())? {
+            return Err(StoreError::incompatible());
+        }
+        let retained_timeline_digest =
+            retained_digest.try_into().map_err(|_| StoreError::incompatible())?;
+        retained_records.push(RecoveryRecord {
+            record,
+            commit_sequence,
+            retained_kind,
+            retained_timeline_digest,
+        });
+    }
+    let epoch_keys = expected
+        .admissions
+        .iter()
+        .map(|admission| {
+            ((admission.device, admission.key_epoch), Arc::clone(&admission.epoch_key))
+        })
+        .collect();
+    Ok(Some((
+        RecoveryInput {
+            semantic_id: semantic_id.clone(),
+            manifest,
+            records: retained_records,
+            epoch_keys,
+        },
+        RetainedRecovery {
+            semantic_id,
+            timeline_digest: stored_timeline_digest,
+            projection: stored_projection,
+            tail,
+        },
+    )))
+}
+
+fn validate_recovery_manifest(
+    manifest: &SessionManifest,
+    processing: &ActiveProcessingRow,
+    config: &Config,
+    executable_identity: ExecutableIdentity,
+) -> Result<(), StoreError> {
+    if manifest.replay_config.canonical_bytes()? != config.replay().canonical_bytes()?
+        || manifest.config_digest != config.replay().digest()
+        || manifest.application_version != env!("CARGO_PKG_VERSION")
+        || manifest.build_fingerprint != executable_identity.as_bytes()
+        || manifest.decoder_version != DECODER_VERSION
+        || manifest.wire_admission != wire_admission_pins(config)?
+        || manifest.conditioning_version != config.conditioning().version().as_str()
+        || manifest.algorithm_version != algorithm_version()
+        || !manifest.initial_baseline_states.is_empty()
+        || processing.config_digest.as_slice() != manifest.config_digest
+        || processing.decoder_version != manifest.decoder_version
+        || processing.conditioning_version != manifest.conditioning_version
+        || processing.algorithm_version != manifest.algorithm_version
+    {
+        return Err(StoreError::incompatible());
+    }
+    Ok(())
+}
+
+fn read_ordered_records(
+    connection: &Connection,
+    semantic_id: &crate::SessionId,
+) -> Result<Vec<SessionRecord>, StoreError> {
+    let rows = connection
+        .prepare(
+            "SELECT record_seq, session_time, kind, body_cbor
+             FROM session_records WHERE session_id=?1 ORDER BY record_seq",
+        )?
+        .query_map([semantic_id.as_str()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(record_seq, at, kind, body)| {
+            let record_seq = decode_u64(&record_seq)?;
+            let at = crate::domain::time::SessionTime::from_nanos(decode_u64(&at)?);
+            let kind = match kind.as_str() {
+                "packet" => RecordKind::Packet,
+                "baseline_command" => RecordKind::BaselineCommand,
+                "timeline_advance" => RecordKind::TimelineAdvance,
+                _ => return Err(StoreError::incompatible()),
+            };
+            Ok(SessionRecord { record_seq, at, kind: decode_record_body(kind, &body)? })
+        })
+        .collect()
+}
+
+fn compare_complete_baselines(
+    connection: &Connection,
+    config: &Config,
+    semantic_id: &crate::SessionId,
+    expected_rows: &BTreeMap<LinkProfileKey, RebuiltBaseline>,
+) -> Result<(), StoreError> {
+    let rows = connection
+        .prepare(
+            "SELECT deployment_id, link_id, profile_id, estimator_state_cbor,
+                    source_session_id, source_record_seq, config_digest,
+                    decoder_version, conditioning_version, algorithm_version
+             FROM baseline_states ORDER BY link_id, profile_id",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() != expected_rows.len() {
+        return Err(StoreError::incompatible());
+    }
+    for (
+        deployment,
+        link,
+        profile,
+        bytes,
+        source_session,
+        source_record,
+        digest,
+        decoder,
+        conditioning,
+        algorithm,
+    ) in rows
+    {
+        let profile: [u8; 32] = profile.try_into().map_err(|_| StoreError::incompatible())?;
+        let key = LinkProfileKey::new(
+            RadioLinkId::new(link).map_err(|_| StoreError::incompatible())?,
+            crate::domain::csi::CaptureProfileId::from_bytes(profile),
+        );
+        let expected = expected_rows.get(&key).ok_or(StoreError::incompatible())?;
+        if deployment != config.deployment().id().as_str()
+            || bytes != encode_baseline_state(&expected.state)?
+            || source_session != semantic_id.as_str()
+            || decode_u64(&source_record)? != expected.source_record_seq
+            || digest.as_slice() != config.replay().digest()
+            || decoder != DECODER_VERSION
+            || conditioning != config.conditioning().version().as_str()
+            || algorithm != algorithm_version()
+        {
+            return Err(StoreError::incompatible());
+        }
+    }
+    Ok(())
+}
+
+fn compare_relationships(
+    connection: &Connection,
+    semantic_id: &crate::SessionId,
+    expected: &BTreeMap<LinkProfileKey, RebuiltRelationship>,
+) -> Result<(), StoreError> {
+    let rows = connection
+        .prepare(
+            "SELECT link_id, profile_id, knowledge_cbor, result_time,
+                    change_previous_cbor, change_current_cbor, changed_at,
+                    source_record_seq, creator_commit_seq
+             FROM relationship_latest WHERE session_id=?1 ORDER BY link_id, profile_id",
+        )?
+        .query_map([semantic_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() != expected.len() {
+        return Err(StoreError::incompatible());
+    }
+    for (link, profile, knowledge, result_time, previous, current, changed_at, source, creator) in
+        rows
+    {
+        let profile: [u8; 32] = profile.try_into().map_err(|_| StoreError::incompatible())?;
+        let key = LinkProfileKey::new(
+            RadioLinkId::new(link).map_err(|_| StoreError::incompatible())?,
+            crate::domain::csi::CaptureProfileId::from_bytes(profile),
+        );
+        let expected = expected.get(&key).ok_or(StoreError::incompatible())?;
+        let most_recent_change = decode_rebuilt_relationship_change(previous, current, changed_at)?;
+        let expected_change = expected
+            .most_recent_change
+            .as_ref()
+            .map(|change| {
+                Ok::<_, StoreError>(EncodedRelationshipChange {
+                    previous: encode_relationship_knowledge(&change.previous)?,
+                    current: encode_relationship_knowledge(&change.current)?,
+                    changed_at: change.changed_at,
+                })
+            })
+            .transpose()?;
+        if knowledge != encode_relationship_knowledge(&expected.knowledge)?
+            || decode_u64(&result_time)? != expected.result_time
+            || most_recent_change != expected_change
+            || decode_u64(&source)? != expected.source_record_seq
+            || decode_u64(&creator)? != expected.creator_commit_seq
+            || expected.creator_commit_seq
+                != expected.source_record_seq.checked_add(1).ok_or(StoreError::incompatible())?
+        {
+            return Err(StoreError::incompatible());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Eq, PartialEq)]
+struct EncodedRelationshipChange {
+    previous: Vec<u8>,
+    current: Vec<u8>,
+    changed_at: u64,
+}
+
+fn decode_rebuilt_relationship_change(
+    previous: Option<Vec<u8>>,
+    current: Option<Vec<u8>>,
+    changed_at: Option<Vec<u8>>,
+) -> Result<Option<EncodedRelationshipChange>, StoreError> {
+    match (previous, current, changed_at) {
+        (None, None, None) => Ok(None),
+        (Some(previous), Some(current), Some(changed_at)) => Ok(Some(EncodedRelationshipChange {
+            previous,
+            current,
+            changed_at: decode_u64(&changed_at)?,
+        })),
+        _ => Err(StoreError::incompatible()),
+    }
 }
 
 fn decode_u64(bytes: &[u8]) -> Result<u64, StoreError> {

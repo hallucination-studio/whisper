@@ -301,6 +301,7 @@ impl Supervisor {
                 writer_events_tx.send_replace(Some(event));
             }))
             .map_err(LifecycleError::host)?;
+        let ingress_order = capture.ingress_order();
         let relationship_commands = capture.relationship_commands();
         #[cfg(feature = "ingest-test-hooks")]
         if self.controls.hold_writer {
@@ -395,7 +396,7 @@ impl Supervisor {
                     maximum_datagram_bytes,
                     task_control.shutdown.subscribe(),
                     queue_drop_count,
-                    self.clock.clone(),
+                    capture::IngressTiming::new(self.clock.clone(), ingress_order),
                 ),
                 task_control.clone(),
             );

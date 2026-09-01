@@ -121,11 +121,6 @@ impl CaptureRuntime {
             .map_err(LifecycleError::host)
     }
 
-    /// Forces the next conforming CSI candidate through decoded-domain rejection.
-    pub fn reject_next_csi_domain(&mut self) {
-        self.inner.reject_next_csi_domain();
-    }
-
     /// Authenticates and attempts to enqueue one captured datagram.
     ///
     /// # Errors

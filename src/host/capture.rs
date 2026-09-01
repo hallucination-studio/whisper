@@ -10,8 +10,19 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, watch};
 
 use super::{RuntimeError, RuntimeErrorKind, SocketOperation, SocketRole};
-use crate::application::{CaptureRuntime, RuntimeClock};
+use crate::application::{CaptureRuntime, IngressOrder, RuntimeClock};
 use crate::{CapturedDatagram, ProjectionCommit};
+
+pub(super) struct IngressTiming {
+    clock: RuntimeClock,
+    order: Arc<IngressOrder>,
+}
+
+impl IngressTiming {
+    pub(super) fn new(clock: RuntimeClock, order: Arc<IngressOrder>) -> Self {
+        Self { clock, order }
+    }
+}
 
 pub(super) fn bind_socket(
     address: SocketAddr,
@@ -42,7 +53,7 @@ pub(super) async fn run(
     maximum_datagram_bytes: usize,
     mut shutdown: watch::Receiver<bool>,
     queue_drop_count: Arc<AtomicU64>,
-    clock: RuntimeClock,
+    ingress: IngressTiming,
 ) -> Result<(), RuntimeError> {
     let receive_capacity = maximum_datagram_bytes
         .checked_add(1)
@@ -67,10 +78,27 @@ pub(super) async fn run(
                         source,
                     )
                 })?;
+                let receipt = match ingress.order.begin(&ingress.clock) {
+                    Ok(receipt) => receipt,
+                    Err(error) if error.is_writer_queue_full() => {
+                        queue_drop_count
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                                current.checked_add(1)
+                            })
+                            .map_err(|_| {
+                                RuntimeError::new(RuntimeErrorKind::Capacity(
+                                    "capture queue-drop counter",
+                                ))
+                            })?;
+                        continue;
+                    }
+                    Err(error) => return Err(RuntimeError::submit(error)),
+                };
                 if length > maximum_datagram_bytes {
                     continue;
                 }
-                let (received_monotonic, received_utc) = clock.sample();
+                let reservation = receipt.reserve().await;
+                let (received_monotonic, received_utc) = reservation.received();
                 let datagram = CapturedDatagram::new(
                     peer,
                     received_monotonic,
@@ -86,6 +114,7 @@ pub(super) async fn run(
                         RuntimeError::new(RuntimeErrorKind::State("Capture runtime ownership"))
                     })?;
                     let result = capture.try_submit(datagram);
+                    drop(reservation);
                     Ok::<_, RuntimeError>((result, capture.queue_drop_count()))
                 })
                 .await

@@ -1,5 +1,7 @@
 //! Command-line entry point for configuration validation.
 
+#![forbid(unsafe_code)]
+
 use std::env;
 use std::ffi::OsString;
 use std::fs;

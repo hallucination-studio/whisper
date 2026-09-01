@@ -1829,6 +1829,11 @@ pub(crate) struct WireCandidate {
 }
 
 impl WireCandidate {
+    pub(crate) fn with_session_time(mut self, session_time: SessionTime) -> Self {
+        self.session_time = session_time;
+        self
+    }
+
     #[must_use]
     pub(crate) const fn peer(&self) -> SocketAddr {
         self.peer

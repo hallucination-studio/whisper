@@ -1,13 +1,50 @@
 [package]
 name = "whisper"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.91"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "A deterministic, replayable RF world model"
-license = "MIT"
+license.workspace = true
 
 # Isolate this single package from the unrelated parent workspace.
 [workspace]
+members = ["crates/whisper-executable-sys"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+
+[workspace.dependencies]
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+axum = { version = "0.8.9", features = ["json", "tokio", "ws"] }
+ciborium = "0.2.2"
+futures-util = "0.3.34"
+libc = "0.2.189"
+mimalloc = "0.1.48"
+rusqlite = { version = "0.37.0", features = ["bundled", "hooks"] }
+rustix = { version = "1.1.2", features = ["process"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+socket2 = "0.6.5"
+thiserror = "2.0.17"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = "0.29.0"
+toml = "0.9.5"
+whisper-executable-sys = { path = "crates/whisper-executable-sys", version = "0.1.0" }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
 
 [features]
 default = []
@@ -15,31 +52,29 @@ development-fixture = []
 ingest-test-hooks = []
 
 [dependencies]
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
-ciborium = "0.2.2"
-mimalloc = "0.1.48"
-rusqlite = { version = "0.37.0", features = ["bundled"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.10.9"
-thiserror = "2.0.17"
-toml = "0.9.5"
+aes-gcm.workspace = true
+ciborium.workspace = true
+mimalloc.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-axum = { version = "0.8.9", features = ["json", "tokio", "ws"] }
-futures-util = "0.3.34"
-libc = "0.2.189"
-rustix = { version = "1.1.2", features = ["process"] }
-socket2 = "0.6.5"
-tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+axum.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+rustix.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-executable-sys.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
-missing_debug_implementations = "warn"
-missing_docs = "warn"
-
-[lints.clippy]
-all = "warn"
+[lints]
+workspace = true

@@ -16,6 +16,7 @@
     <div class="connection-block" aria-live="polite">
       <span class="connection-state" data-testid="connection-state">POLLING</span>
       <span id="connection-detail">Waiting for complete Store reads</span>
+      <span id="stale-indicator" class="stale-indicator" hidden>Retained result · stale</span>
     </div>
     <dl class="store-facts">
       <div><dt>Deployment</dt><dd id="deployment-id">Not read</dd></div>
@@ -80,7 +81,6 @@
           <div class="section-label">Committed native coordinates</div>
           <h2 id="signal-heading">Signal cells</h2>
         </div>
-        <div id="stale-indicator" class="stale-indicator" hidden>Retained result · stale</div>
       </div>
       <div id="message" class="message" role="status">Reading topology…</div>
       <div id="signal-view" class="signal-view" aria-live="polite"></div>

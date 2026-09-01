@@ -1114,6 +1114,14 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml",
+ "whisper-executable-sys",
+]
+
+[[package]]
+name = "whisper-executable-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

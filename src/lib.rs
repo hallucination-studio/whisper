@@ -1,5 +1,7 @@
 //! Deterministic domain types and validated configuration for the Whisper RF world model.
 
+#![forbid(unsafe_code)]
+
 pub(crate) mod application;
 pub(crate) mod capture;
 mod config;
@@ -8,10 +10,14 @@ pub(crate) mod database;
 pub mod development_fixture;
 pub(crate) mod domain;
 #[cfg(unix)]
+mod executable;
+#[cfg(unix)]
 mod hex;
 #[cfg(unix)]
 mod host;
 pub(crate) mod key_material;
+#[cfg(unix)]
+mod relationship;
 pub(crate) mod session;
 #[cfg(unix)]
 mod store;

@@ -48,6 +48,7 @@ impl RuntimeFixture {
         Self::with_runtime_settings(queue_capacity, "0.000001")
     }
 
+    #[cfg(feature = "ingest-test-hooks")]
     fn with_unit_variance_floor() -> Self {
         Self::with_runtime_settings(64, "1.0")
     }
@@ -201,6 +202,36 @@ fn response_json(response: &[u8]) -> serde_json::Value {
     serde_json::from_slice(&response[separator + 4..]).expect("JSON response")
 }
 
+async fn capture_session_ids(address: std::net::SocketAddr) -> Vec<String> {
+    let topology = response_json(
+        &http_request(
+            address,
+            "GET /api/topology HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await,
+    );
+    topology["data"]["sessions"]
+        .as_array()
+        .expect("Capture Sessions")
+        .iter()
+        .map(|session| session.as_str().expect("Capture Session ID").to_owned())
+        .collect()
+}
+
+async fn raw_signals(
+    address: std::net::SocketAddr,
+    session: &str,
+    sensor: &str,
+    link: &str,
+) -> serde_json::Value {
+    let request = format!(
+        "GET /api/signals?session={session}&sensor={sensor}&link={link}&from=0&to=18446744073709551615&metric=i&max_time_buckets=8 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    );
+    let response = http_request(address, &request).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    response_json(&response)
+}
+
 fn relationship_command_request(link: &str, profile: &str) -> String {
     relationship_command_request_for(link, profile, "begin_learning")
 }
@@ -215,7 +246,6 @@ fn relationship_command_request_for(link: &str, profile: &str, command: &str) ->
     )
 }
 
-#[cfg(feature = "ingest-test-hooks")]
 async fn wait_for_projection(address: std::net::SocketAddr, expected: u64) {
     let expected = expected.to_string();
     for _ in 0..100 {
@@ -283,6 +313,21 @@ async fn latest_relationship(address: std::net::SocketAddr, profile: &str) -> se
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("relationship did not become query-visible");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+async fn stop_host_with_processed_begin_learning(fixture: &RuntimeFixture) {
+    let runtime = HostRuntime::start(&fixture.config).await.expect("start first Host");
+    assert!(
+        http_request(
+            runtime.http_address(),
+            &relationship_command_request("link-a", &"11".repeat(32)),
+        )
+        .await
+        .starts_with(b"HTTP/1.1 202 Accepted\r\n")
+    );
+    wait_for_projection(runtime.http_address(), 1).await;
+    runtime.shutdown().await.expect("stop first Host");
 }
 
 #[cfg(feature = "ingest-test-hooks")]
@@ -1630,6 +1675,63 @@ async fn relationship_transaction_b_failure_stops_without_projection_or_invalida
 
 #[cfg(feature = "ingest-test-hooks")]
 #[tokio::test]
+async fn restart_rejects_an_a_only_tail() {
+    let fixture = RuntimeFixture::new();
+    let runtime = start_host_with_relationship_transaction_b_failure(&fixture.config)
+        .await
+        .expect("start transaction-B-failing Host runtime");
+    assert!(
+        http_request(
+            runtime.http_address(),
+            &relationship_command_request("link-a", &"11".repeat(32)),
+        )
+        .await
+        .starts_with(b"HTTP/1.1 202 Accepted\r\n")
+    );
+    tokio::time::timeout(Duration::from_secs(1), runtime.wait_for_stop())
+        .await
+        .expect("transaction-B failure stop timeout");
+    let error = runtime.shutdown().await.expect_err("transaction B must fail the writer");
+    assert!(error.is_writer_failure());
+
+    let error = HostRuntime::start(&fixture.config)
+        .await
+        .expect_err("A-only tail must reject controlled restart");
+    assert_eq!(error.failure(), RuntimeFailure::Capture);
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn restart_rejects_a_replay_configuration_mismatch() {
+    let fixture = RuntimeFixture::new();
+    stop_host_with_processed_begin_learning(&fixture).await;
+
+    let source = fs::read_to_string(&fixture.config_path).expect("read runtime configuration");
+    let mismatched =
+        parse_config(&source.replacen("variance_floor = 0.000001", "variance_floor = 0.000002", 1))
+            .expect("parse mismatched replay configuration");
+    let error = HostRuntime::start(&mismatched)
+        .await
+        .expect_err("replay configuration mismatch must reject controlled restart");
+    assert_eq!(error.failure(), RuntimeFailure::Capture);
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn restart_rejects_a_distinct_real_executable() {
+    let fixture = RuntimeFixture::new();
+    stop_host_with_processed_begin_learning(&fixture).await;
+
+    let restarted = Command::new(env!("CARGO_BIN_EXE_whisper"))
+        .args(["serve", fixture.config_path.to_str().expect("UTF-8 config path")])
+        .output()
+        .expect("run the distinct production executable");
+    assert!(!restarted.status.success());
+    assert!(String::from_utf8_lossy(&restarted.stderr).contains("Capture"));
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
 async fn relationship_transaction_a_failure_has_no_projection_or_invalidation_effect() {
     let fixture = RuntimeFixture::new();
     let runtime = start_host_with_relationship_transaction_a_failure(&fixture.config)
@@ -1662,17 +1764,16 @@ async fn relationship_transaction_a_failure_has_no_projection_or_invalidation_ef
 }
 
 #[tokio::test]
-async fn runtime_routes_a_nonfirst_configured_sensor_without_singleton_shortcuts() {
+async fn controlled_restart_preserves_dynamic_relationship_subjects() {
     let fixture = RuntimeFixture::new();
-    let runtime = HostRuntime::start(&fixture.config).await.expect("start Host runtime");
-    let session = runtime.session_id().to_owned();
-    let address = runtime.http_address();
+    let first = HostRuntime::start(&fixture.config).await.expect("start Host runtime");
+    let address = first.http_address();
     let profile = "61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2";
     for link in ["link-a", "link-b"] {
         let response = http_request(address, &relationship_command_request(link, profile)).await;
         assert!(response.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
     }
-    let capture = runtime.capture_address();
+    let capture = first.capture_address();
     let destination =
         std::net::SocketAddr::new("127.0.0.1".parse().expect("loopback"), capture.port());
     let sender =
@@ -1721,11 +1822,14 @@ async fn runtime_routes_a_nonfirst_configured_sensor_without_singleton_shortcuts
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(committed, "both Sensors' packets did not commit");
+    let first_capture_sessions = capture_session_ids(address).await;
+    assert_eq!(first_capture_sessions.len(), 1);
+    let session = &first_capture_sessions[0];
     let first_request = format!(
         "GET /api/signals?session={session}&sensor=sensor-a&link=link-a&from=0&to=18446744073709551615&metric=i&max_time_buckets=8 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     );
-    let first = response_json(&http_request(address, &first_request).await);
-    assert_eq!(first["data"]["tiles"][0]["stream"]["key"]["sensor"], "sensor-a");
+    let first_signals = response_json(&http_request(address, &first_request).await);
+    assert_eq!(first_signals["data"]["tiles"][0]["stream"]["key"]["sensor"], "sensor-a");
     let request = format!(
         "GET /api/signals?session={session}&sensor=sensor-b&link=link-b&from=0&to=18446744073709551615&metric=q&max_time_buckets=8 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     );
@@ -1750,7 +1854,70 @@ async fn runtime_routes_a_nonfirst_configured_sensor_without_singleton_shortcuts
         ])
     );
 
-    runtime.shutdown().await.expect("stop Host runtime");
+    let semantic_session = subjects["data"]["subjects"][0]["session_id"].clone();
+    first.shutdown().await.expect("stop first Host runtime");
+
+    let second = HostRuntime::start(&fixture.config).await.expect("restart Host runtime");
+    let restarted_subjects = response_json(
+        &http_request(
+            second.http_address(),
+            "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await,
+    );
+    assert_eq!(restarted_subjects["data"], subjects["data"]);
+    assert_eq!(restarted_subjects["receipt"], subjects["receipt"]);
+    assert_eq!(capture_session_ids(second.http_address()).await, first_capture_sessions);
+
+    let destination = std::net::SocketAddr::new(
+        "127.0.0.1".parse().expect("loopback"),
+        second.capture_address().port(),
+    );
+    let mut first_csi = csi_body(&first_capability[..32]);
+    first_csi[32..40].copy_from_slice(&2_u64.to_le_bytes());
+    sender
+        .send_to(&seal_raw(2, 3, &first_csi), destination)
+        .await
+        .expect("continue first Sensor after restart");
+    wait_for_projection(second.http_address(), 7).await;
+    let continued_capture_sessions = capture_session_ids(second.http_address()).await;
+    assert_eq!(continued_capture_sessions.len(), 2);
+    assert!(continued_capture_sessions.contains(session));
+    let second_capture = continued_capture_sessions
+        .iter()
+        .find(|candidate| *candidate != session)
+        .expect("new Capture Session");
+    let first_continuation =
+        raw_signals(second.http_address(), second_capture, "sensor-a", "link-a").await;
+    assert_eq!(first_continuation["receipt"]["session_id"], second_capture.as_str());
+    assert_eq!(first_continuation["receipt"]["first_record_seq"], "0");
+    assert_eq!(first_continuation["receipt"]["last_record_seq"], "0");
+
+    let mut second_csi = csi_body_for(&capability[..32], [2, 0, 0, 0, 0, 11], 6);
+    second_csi[32..40].copy_from_slice(&2_u64.to_le_bytes());
+    sender
+        .send_to(&seal_raw_for(&[0x22; 32], 2, 2, 3, &second_csi), destination)
+        .await
+        .expect("continue second Sensor after restart");
+    wait_for_projection(second.http_address(), 8).await;
+    let second_continuation =
+        raw_signals(second.http_address(), second_capture, "sensor-b", "link-b").await;
+    assert_eq!(second_continuation["receipt"]["session_id"], second_capture.as_str());
+    assert_eq!(second_continuation["receipt"]["first_record_seq"], "0");
+    assert_eq!(second_continuation["receipt"]["last_record_seq"], "1");
+
+    let continued_subjects = response_json(
+        &http_request(
+            second.http_address(),
+            "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await,
+    );
+    assert_eq!(continued_subjects["data"], subjects["data"]);
+    assert_eq!(continued_subjects["data"]["subjects"][0]["session_id"], semantic_session);
+    assert_eq!(continued_subjects["data"]["subjects"].as_array().expect("subjects").len(), 2);
+    assert_eq!(continued_subjects["receipt"]["projection_commit"]["sequence"], "8");
+    second.shutdown().await.expect("stop restarted Host runtime");
 }
 
 #[cfg(feature = "ingest-test-hooks")]
@@ -2059,6 +2226,267 @@ fn dropping_the_handle_and_callers_executor_cannot_cancel_supervisor_cleanup() {
                 .shutdown(),
         )
         .expect("stop replacement Host runtime");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn fully_processed_restart_continues_the_active_semantic_session() {
+    let fixture = RuntimeFixture::new();
+    let first = start_host_with_manual_clock(&fixture.config).await.expect("start first Host");
+    let profile = "61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2";
+    let first_destination = std::net::SocketAddr::new(
+        "127.0.0.1".parse().expect("loopback"),
+        first.capture_address().port(),
+    );
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP sender");
+    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
+    sender
+        .send_to(&seal_raw(1, 1, &capability), first_destination)
+        .await
+        .expect("send pre-restart capability");
+    wait_for_projection(first.http_address(), 1).await;
+    for capture_sequence in 1_u64..=4 {
+        advance_host_clock(&first, Duration::from_millis(200));
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+        sender
+            .send_to(&seal_raw(2, capture_sequence + 1, &csi), first_destination)
+            .await
+            .expect("send pre-restart CSI");
+        wait_for_projection(first.http_address(), capture_sequence + 1).await;
+    }
+    advance_host_clock(&first, Duration::from_millis(400));
+    let mut csi = csi_body(&capability[..32]);
+    csi[32..40].copy_from_slice(&5_u64.to_le_bytes());
+    sender
+        .send_to(&seal_raw(2, 6, &csi), first_destination)
+        .await
+        .expect("send pre-restart physical tail");
+    wait_for_projection(first.http_address(), 7).await;
+    let before = response_json(
+        &http_request(
+            first.http_address(),
+            "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await,
+    );
+    let semantic_session = before["data"]["subjects"][0]["session_id"]
+        .as_str()
+        .expect("active Semantic Session")
+        .to_owned();
+    let first_capture_sessions = capture_session_ids(first.http_address()).await;
+    assert_eq!(first_capture_sessions.len(), 1);
+    first.shutdown().await.expect("stop first Host");
+
+    let second = start_host_with_manual_clock(&fixture.config).await.expect("restart Host");
+    assert_eq!(capture_session_ids(second.http_address()).await, first_capture_sessions);
+    advance_host_clock(&second, Duration::from_secs(2));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after_deadline = response_json(
+        &http_request(
+            second.http_address(),
+            "GET /api/topology HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await,
+    );
+    assert_eq!(after_deadline["receipt"]["projection_commit"]["sequence"], "7");
+    let command =
+        http_request(second.http_address(), &relationship_command_request("link-a", profile)).await;
+    assert!(command.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert_eq!(response_json(&command)["error"]["code"], "invalid_request");
+    let after_command = response_json(
+        &http_request(
+            second.http_address(),
+            "GET /api/topology HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await,
+    );
+    assert_eq!(after_command["receipt"]["projection_commit"]["sequence"], "7");
+    let destination = std::net::SocketAddr::new(
+        "127.0.0.1".parse().expect("loopback"),
+        second.capture_address().port(),
+    );
+    let mut tail_plus_one = csi_body(&capability[..32]);
+    tail_plus_one[32..40].copy_from_slice(&6_u64.to_le_bytes());
+    sender
+        .send_to(&seal_raw(2, 7, &tail_plus_one), destination)
+        .await
+        .expect("send physical tail plus one");
+    let first_post_restart_projection =
+        wait_for_projection_at_least(second.http_address(), 8).await;
+    assert_eq!(first_post_restart_projection, 8);
+    let continued_capture_sessions = capture_session_ids(second.http_address()).await;
+    assert_eq!(continued_capture_sessions.len(), 2);
+    assert!(continued_capture_sessions.contains(&first_capture_sessions[0]));
+    let second_capture = continued_capture_sessions
+        .iter()
+        .find(|candidate| !first_capture_sessions.contains(candidate))
+        .expect("new Capture Session");
+    let first_continuation =
+        raw_signals(second.http_address(), second_capture, "sensor-a", "link-a").await;
+    assert_eq!(first_continuation["receipt"]["session_id"], second_capture.as_str());
+    assert_eq!(first_continuation["receipt"]["first_record_seq"], "0");
+    assert_eq!(first_continuation["receipt"]["last_record_seq"], "0");
+    assert_eq!(first_continuation["receipt"]["projection_commit"]["sequence"], "8");
+
+    let accepted =
+        http_request(second.http_address(), &relationship_command_request("link-a", profile)).await;
+    assert!(accepted.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    wait_for_projection(second.http_address(), 9).await;
+
+    sender
+        .send_to(&seal_raw(2, 7, &tail_plus_one), destination)
+        .await
+        .expect("repeat first post-restart physical record");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after_replay = response_json(
+        &http_request(
+            second.http_address(),
+            "GET /api/topology HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await,
+    );
+    assert_eq!(after_replay["receipt"]["projection_commit"]["sequence"], "9");
+    let after_replay_signals =
+        raw_signals(second.http_address(), second_capture, "sensor-a", "link-a").await;
+    assert_eq!(after_replay_signals["receipt"]["session_id"], second_capture.as_str());
+    assert_eq!(after_replay_signals["receipt"]["first_record_seq"], "0");
+    assert_eq!(after_replay_signals["receipt"]["last_record_seq"], "0");
+    assert_eq!(after_replay_signals["receipt"]["projection_commit"]["sequence"], "9");
+
+    let after = response_json(
+        &http_request(
+            second.http_address(),
+            "GET /api/relationships/latest HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await,
+    );
+    assert_eq!(after["data"]["subjects"].as_array().expect("subjects").len(), 1);
+    assert_eq!(after["data"]["subjects"][0]["session_id"], semantic_session);
+    second.shutdown().await.expect("stop restarted Host");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn restart_rebuilds_stable_and_later_equal_window_preserves_the_last_change() {
+    let fixture = RuntimeFixture::new();
+    let first = start_host_with_manual_clock(&fixture.config).await.expect("start first Host");
+    let profile = "61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2";
+    let destination = std::net::SocketAddr::new(
+        "127.0.0.1".parse().expect("loopback"),
+        first.capture_address().port(),
+    );
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP sender");
+    assert!(
+        http_request(first.http_address(), &relationship_command_request("link-a", profile))
+            .await
+            .starts_with(b"HTTP/1.1 202 Accepted\r\n")
+    );
+    wait_for_projection(first.http_address(), 1).await;
+    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
+    sender.send_to(&seal_raw(1, 1, &capability), destination).await.expect("send capability");
+    wait_for_projection(first.http_address(), 2).await;
+    let mut counters = (0_u64, 1_u64, 2_u64);
+    for window in 0..15 {
+        send_csi_window_after_carry(
+            &first,
+            &sender,
+            destination,
+            &capability[..32],
+            &mut counters,
+            WindowAfterCarry {
+                samples: [1, 2, 3, 4, 5, 6],
+                next_samples: [1, 2, 3, 4, 5, 6],
+                additional_frames: if window == 0 { 4 } else { 3 },
+            },
+        )
+        .await;
+    }
+    assert!(
+        http_request(
+            first.http_address(),
+            &relationship_command_request_for("link-a", profile, "commit"),
+        )
+        .await
+        .starts_with(b"HTTP/1.1 202 Accepted\r\n")
+    );
+    counters.2 += 1;
+    counters.2 = wait_for_projection_at_least(first.http_address(), counters.2).await;
+    send_csi_window_after_carry(
+        &first,
+        &sender,
+        destination,
+        &capability[..32],
+        &mut counters,
+        WindowAfterCarry {
+            samples: [1, 2, 3, 4, 5, 6],
+            next_samples: [1, 2, 3, 4, 5, 6],
+            additional_frames: 3,
+        },
+    )
+    .await;
+    let stable = latest_relationship(first.http_address(), profile).await;
+    assert_eq!(
+        stable["data"]["knowledge"],
+        serde_json::json!({"kind": "known", "value": "stable"})
+    );
+    let semantic_session = stable["data"]["session_id"].clone();
+    let previous_result_time = stable["data"]["result_time"]
+        .as_str()
+        .expect("result time")
+        .parse::<u64>()
+        .expect("u64 result time");
+    let previous_change = stable["data"]["most_recent_change"].clone();
+    let previous_creator = stable["data"]["creator_commit"].clone();
+    let previous_store = stable["receipt"]["projection_commit"]["store_id"].clone();
+    let first_capture_sessions = capture_session_ids(first.http_address()).await;
+    assert_eq!(first_capture_sessions.len(), 1);
+    first.shutdown().await.expect("stop first Host");
+
+    let second = start_host_with_manual_clock(&fixture.config).await.expect("restart Host");
+    let rebuilt = latest_relationship(second.http_address(), profile).await;
+    assert_eq!(rebuilt["data"], stable["data"]);
+    assert_eq!(rebuilt["receipt"], stable["receipt"]);
+    assert_eq!(capture_session_ids(second.http_address()).await, first_capture_sessions);
+
+    let destination = std::net::SocketAddr::new(
+        "127.0.0.1".parse().expect("loopback"),
+        second.capture_address().port(),
+    );
+    counters.1 += 1;
+    sender
+        .send_to(&seal_raw(1, counters.1, &capability), destination)
+        .await
+        .expect("send first post-restart physical record");
+    counters.2 += 1;
+    counters.2 = wait_for_projection_at_least(second.http_address(), counters.2).await;
+    let continued_capture_sessions = capture_session_ids(second.http_address()).await;
+    assert_eq!(continued_capture_sessions.len(), 2);
+    assert!(continued_capture_sessions.contains(&first_capture_sessions[0]));
+    send_csi_window_after_carry(
+        &second,
+        &sender,
+        destination,
+        &capability[..32],
+        &mut counters,
+        WindowAfterCarry {
+            samples: [1, 2, 3, 4, 5, 6],
+            next_samples: [1, 2, 3, 4, 5, 6],
+            additional_frames: 3,
+        },
+    )
+    .await;
+    let continued = latest_relationship(second.http_address(), profile).await;
+    assert_eq!(continued["data"]["session_id"], semantic_session);
+    assert_eq!(continued["receipt"]["projection_commit"]["store_id"], previous_store);
+    assert_eq!(continued["data"]["knowledge"], stable["data"]["knowledge"]);
+    assert_eq!(continued["data"]["most_recent_change"], previous_change);
+    assert_eq!(
+        continued["data"]["result_time"],
+        (previous_result_time + 1_000_000_000).to_string()
+    );
+    assert_ne!(continued["data"]["creator_commit"], previous_creator);
+    second.shutdown().await.expect("stop restarted Host");
 }
 
 #[test]

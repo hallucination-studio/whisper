@@ -324,7 +324,7 @@ async fn relationship_command(
     let Ok(profile) = decode_profile(&request.target.profile) else {
         return invalid_request_response("invalid relationship command");
     };
-    match state.relationship_commands.try_command(link, profile, command) {
+    match state.relationship_commands.try_command(link, profile, command).await {
         Ok(correlation_id) => (
             StatusCode::ACCEPTED,
             Json(RelationshipCommandAccepted {
@@ -336,9 +336,16 @@ async fn relationship_command(
             }),
         )
             .into_response(),
+        Err(crate::application::RelationshipCommandAdmissionError::ContinuationPending) => {
+            invalid_request_response("invalid relationship command")
+        }
         Err(crate::application::RelationshipCommandAdmissionError::QueueFull) => {
             (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorEnvelope::command_queue_full()))
                 .into_response()
+        }
+        Err(crate::application::RelationshipCommandAdmissionError::Clock(error)) => {
+            let _clock_error = error;
+            invalid_request_response("invalid relationship command")
         }
         Err(_) => invalid_request_response("invalid relationship command"),
     }

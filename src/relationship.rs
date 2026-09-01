@@ -1,15 +1,16 @@
-//! Private canonical Timeline, conditioning, and relationship-estimator coordinator.
+//! Private canonical Timeline, conditioning, and relationship-estimator Engine.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 
+use crate::CaptureRecordSequence;
 use crate::Config;
 use crate::config::TimeQualityConfig;
 use crate::domain::csi::CsiObservation;
 use crate::domain::identity::{
-    BaselineContractId, BaselineRevision, BaselineStateSequence, LinkProfileKey, RadioLinkId,
-    SpaceId, StreamInstanceId,
+    BaselineContractId, BaselineRevision, BaselineStateSequence, DeviceId, KeyEpoch,
+    LinkProfileKey, RadioLinkId, SpaceId, StreamInstanceId,
 };
 use crate::domain::time::{EventTimeSource, SessionTime, TimeInterval};
 use crate::domain::world::{
@@ -18,17 +19,20 @@ use crate::domain::world::{
     WelfordState,
 };
 use crate::session::SessionManifest;
+use crate::session::{SessionRecord, SessionRecordKind};
 use crate::timeline::{
     AlignedWindow, SequenceClassification, StreamSegmentId, Timeline, TimelineConfig,
     TimelineError, TimelineInput,
 };
+use crate::wire::{CandidateBody, CapabilitiesV1, WireCandidate};
+use crate::{PacketDisposition, SessionId};
 
 // `baseline-v1` is the canonical algorithm identity imported by #147. Changing
 // it invalidates persisted processing receipts and query compatibility.
 const ALGORITHM_VERSION: &str = "baseline-v1";
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum CoordinatorError {
+pub(crate) enum CoordinatorError {
     #[error("Timeline configuration is incompatible: {0}")]
     Config(#[from] crate::timeline::TimelineConfigError),
     #[error("Timeline transition failed: {0}")]
@@ -47,10 +51,12 @@ pub(super) enum CoordinatorError {
     UnsupportedCommand,
     #[error("relationship estimator arithmetic overflowed")]
     ArithmeticOverflow,
+    #[error("relationship processing input is incompatible")]
+    Incompatible,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct RelationshipCoordinator {
+pub(crate) struct RelationshipCoordinator {
     timeline: Timeline,
     baselines: BTreeMap<LinkProfileKey, BaselineState>,
     deployment: crate::domain::identity::DeploymentId,
@@ -77,10 +83,10 @@ pub(super) struct RelationshipCoordinator {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct RelationshipResult {
-    pub(super) key: LinkProfileKey,
-    pub(super) knowledge: Knowledge<StableOrChanging>,
-    pub(super) result_time: SessionTime,
+pub(crate) struct RelationshipResult {
+    pub(crate) key: LinkProfileKey,
+    pub(crate) knowledge: Knowledge<StableOrChanging>,
+    pub(crate) result_time: SessionTime,
 }
 
 #[derive(Debug)]
@@ -107,14 +113,364 @@ struct CoordinateFold {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct CoordinatorTransition {
-    pub(super) timeline_digest: [u8; 32],
-    pub(super) baseline_states: Vec<BaselineState>,
-    pub(super) relationships: Vec<RelationshipResult>,
+pub(crate) struct CoordinatorTransition {
+    pub(crate) timeline_digest: [u8; 32],
+    pub(crate) baseline_states: Vec<BaselineState>,
+    pub(crate) relationships: Vec<RelationshipResult>,
+}
+
+pub(crate) struct PacketProcessing {
+    pub(crate) disposition: PacketDisposition,
+    pub(crate) kind: &'static str,
+    pub(crate) observation: Option<CsiObservation>,
+    pub(crate) capability: Option<((DeviceId, KeyEpoch, u32), CapabilitiesV1)>,
+    pub(crate) coordinator: RelationshipCoordinator,
+    pub(crate) transition: CoordinatorTransition,
+}
+
+pub(crate) fn process_packet(
+    config: &Config,
+    semantic_id: &SessionId,
+    record_seq: u64,
+    coordinator: &RelationshipCoordinator,
+    capabilities: &BTreeMap<(DeviceId, KeyEpoch, u32), CapabilitiesV1>,
+    candidate: &WireCandidate,
+) -> Result<PacketProcessing, CoordinatorError> {
+    let route = candidate.header_route();
+    let header = candidate.header();
+    let mut staged_capability = None;
+    let mut observation = None;
+    let disposition = match candidate.body() {
+        CandidateBody::UnknownKind { .. } => PacketDisposition::UnknownKind,
+        CandidateBody::MalformedKnownBody => PacketDisposition::MalformedKnownBody,
+        CandidateBody::Capabilities(capability) => {
+            let resolved = config
+                .registry()
+                .resolve_authenticated_route(route)
+                .map_err(|_| CoordinatorError::Incompatible)?;
+            if capability.descriptor().firmware_build_digest()
+                != resolved.sensor.firmware_build_digest()
+            {
+                PacketDisposition::BuildMismatch
+            } else if capability.capability_digest() != resolved.sensor.capability_digest()
+                || capability.descriptor().datagram_budget_bytes()
+                    > resolved.route.admission_limits().maximum_datagram_bytes()
+            {
+                PacketDisposition::CapabilityPinMismatch
+            } else {
+                staged_capability = Some((
+                    (route.device(), route.key_epoch(), header.boot_generation()),
+                    capability.clone(),
+                ));
+                PacketDisposition::CapabilityCommitted
+            }
+        }
+        CandidateBody::Health(health) => {
+            let resolved = config
+                .registry()
+                .resolve_authenticated_route(route)
+                .map_err(|_| CoordinatorError::Incompatible)?;
+            if health.capability_digest() == resolved.sensor.capability_digest() {
+                PacketDisposition::HealthCommitted
+            } else {
+                PacketDisposition::CapabilityMismatch
+            }
+        }
+        CandidateBody::CsiData(data) => {
+            let key = (route.device(), route.key_epoch(), header.boot_generation());
+            if let Some(capability) = capabilities.get(&key) {
+                let resolved = config
+                    .registry()
+                    .resolve_authenticated_route(route)
+                    .map_err(|_| CoordinatorError::Incompatible)?;
+                let radio = data.radio();
+                let plaintext_bytes = crate::wire::CSI_FIXED_BODY_BYTES
+                    .checked_add(
+                        data.blocks()
+                            .len()
+                            .checked_mul(crate::wire::LTF_BLOCK_BYTES)
+                            .ok_or(CoordinatorError::Incompatible)?,
+                    )
+                    .and_then(|bytes| bytes.checked_add(data.raw_csi().len()))
+                    .ok_or(CoordinatorError::Incompatible)?;
+                if capability.descriptor().firmware_build_digest()
+                    != resolved.sensor.firmware_build_digest()
+                {
+                    PacketDisposition::BuildMismatch
+                } else if capability.capability_digest() != resolved.sensor.capability_digest()
+                    || data.capability_digest() != capability.capability_digest()
+                {
+                    PacketDisposition::CapabilityMismatch
+                } else if data.source_mac() != resolved.link.expected_transmitter_mac() {
+                    PacketDisposition::SourceMismatch
+                } else if !resolved.link.channel_policy().allowed().contains(&radio.channel())
+                    || resolved
+                        .link
+                        .channel_policy()
+                        .expected()
+                        .is_some_and(|expected| expected != radio.channel())
+                {
+                    PacketDisposition::RadioMismatch
+                } else if data.raw_csi().len()
+                    > usize::from(resolved.sensor.maximum_raw_csi_bytes())
+                    || plaintext_bytes > usize::from(resolved.sensor.maximum_plaintext_bytes())
+                {
+                    PacketDisposition::BodyBudgetMismatch
+                } else {
+                    let input = crate::wire::ObservationCandidateInput::try_new(
+                        semantic_id.as_str(),
+                        CaptureRecordSequence::new(record_seq),
+                        candidate.session_time(),
+                    )
+                    .map_err(|_| CoordinatorError::Incompatible)?;
+                    match crate::wire::resolve_capture_csi(
+                        input,
+                        route,
+                        header,
+                        config.registry(),
+                        data.clone(),
+                        capability,
+                    ) {
+                        Ok((_, value)) => {
+                            observation = Some(value);
+                            PacketDisposition::CsiCommitted
+                        }
+                        Err(_) => PacketDisposition::DecodedDomainRejected,
+                    }
+                }
+            } else {
+                PacketDisposition::CapabilityUnavailable
+            }
+        }
+    };
+    let (coordinator, transition) = match observation.as_ref() {
+        Some(value) => coordinator.observe(value.clone())?,
+        None => (coordinator.clone(), coordinator.unchanged()?),
+    };
+    let kind = if matches!(
+        disposition,
+        PacketDisposition::MalformedKnownBody | PacketDisposition::DecodedDomainRejected
+    ) {
+        "decode_rejected"
+    } else {
+        "semantic"
+    };
+    Ok(PacketProcessing {
+        disposition,
+        kind,
+        observation,
+        capability: staged_capability,
+        coordinator,
+        transition,
+    })
+}
+
+#[derive(Clone)]
+pub(crate) struct RecoveryRecord {
+    pub(crate) record: SessionRecord,
+    pub(crate) commit_sequence: u64,
+    pub(crate) retained_kind: String,
+    pub(crate) retained_timeline_digest: [u8; 32],
+}
+
+pub(crate) struct RecoveryInput {
+    pub(crate) semantic_id: SessionId,
+    pub(crate) manifest: SessionManifest,
+    pub(crate) records: Vec<RecoveryRecord>,
+    pub(crate) epoch_keys:
+        BTreeMap<(DeviceId, KeyEpoch), std::sync::Arc<crate::key_material::EpochKey>>,
+}
+
+pub(crate) struct RebuiltBaseline {
+    pub(crate) state: BaselineState,
+    pub(crate) source_record_seq: u64,
+}
+
+pub(crate) struct RebuiltRelationship {
+    pub(crate) knowledge: Knowledge<StableOrChanging>,
+    pub(crate) result_time: u64,
+    pub(crate) most_recent_change: Option<RebuiltRelationshipChange>,
+    pub(crate) source_record_seq: u64,
+    pub(crate) creator_commit_seq: u64,
+}
+
+#[derive(Eq, PartialEq)]
+pub(crate) struct RebuiltRelationshipChange {
+    pub(crate) previous: Knowledge<StableOrChanging>,
+    pub(crate) current: Knowledge<StableOrChanging>,
+    pub(crate) changed_at: u64,
+}
+
+pub(crate) struct RebuiltSession {
+    pub(crate) semantic_id: SessionId,
+    pub(crate) coordinator: RelationshipCoordinator,
+    pub(crate) capabilities: BTreeMap<(DeviceId, KeyEpoch, u32), CapabilitiesV1>,
+    pub(crate) last_session_time: SessionTime,
+    pub(crate) next_timeline_advance_ns: u64,
+    pub(crate) final_timeline_digest: [u8; 32],
+    pub(crate) baselines: BTreeMap<LinkProfileKey, RebuiltBaseline>,
+    pub(crate) relationships: BTreeMap<LinkProfileKey, RebuiltRelationship>,
+}
+
+pub(crate) fn rebuild(
+    config: &Config,
+    input: RecoveryInput,
+) -> Result<RebuiltSession, CoordinatorError> {
+    let RecoveryInput { semantic_id, manifest, records, epoch_keys } = input;
+    let mut coordinator = RelationshipCoordinator::new(&manifest, config)?;
+    let mut capabilities = BTreeMap::new();
+    let mut baselines = BTreeMap::<LinkProfileKey, RebuiltBaseline>::new();
+    let mut relationships = BTreeMap::<LinkProfileKey, RebuiltRelationship>::new();
+    let mut next_timeline_advance_ns = None;
+    let mut previous_time = None;
+
+    for (expected_record_seq, retained) in records.into_iter().enumerate() {
+        let expected_record_seq =
+            u64::try_from(expected_record_seq).map_err(|_| CoordinatorError::Incompatible)?;
+        let record = retained.record;
+        if record.record_seq != expected_record_seq
+            || previous_time.is_some_and(|previous| record.at < previous)
+        {
+            return Err(CoordinatorError::Incompatible);
+        }
+        previous_time = Some(record.at);
+        if next_timeline_advance_ns.is_none() {
+            next_timeline_advance_ns =
+                Some(next_window_boundary(record.at.as_nanos(), config.window().step_ns())?);
+        }
+
+        let (produced_kind, transition) = match &record.kind {
+            SessionRecordKind::Packet { receive_utc_ns, peer, wire_format, bytes } => {
+                if *wire_format != crate::capture::WireFormat::NativeFrameUdp {
+                    return Err(CoordinatorError::Incompatible);
+                }
+                let route = crate::wire::select_header_route(
+                    *peer,
+                    bytes,
+                    config.capture().max_datagram_bytes(),
+                    config.registry(),
+                )
+                .map_err(|_| CoordinatorError::Incompatible)?;
+                let epoch_key = epoch_keys
+                    .get(&(route.device(), route.key_epoch()))
+                    .ok_or(CoordinatorError::Incompatible)?;
+                let admitted = crate::wire::admit_datagram(
+                    *peer,
+                    *wire_format,
+                    bytes.clone(),
+                    config.capture().max_datagram_bytes(),
+                    config.registry(),
+                    epoch_key.as_bytes(),
+                )
+                .map_err(|_| CoordinatorError::Incompatible)?;
+                let receive_utc_ns =
+                    u64::try_from(*receive_utc_ns).map_err(|_| CoordinatorError::Incompatible)?;
+                let candidate = admitted.into_candidate(record.at, receive_utc_ns);
+                let processing = process_packet(
+                    config,
+                    &semantic_id,
+                    record.record_seq,
+                    &coordinator,
+                    &capabilities,
+                    &candidate,
+                )?;
+                coordinator = processing.coordinator;
+                if let Some((key, capability)) = processing.capability {
+                    capabilities.insert(key, capability);
+                }
+                (processing.kind, processing.transition)
+            }
+            SessionRecordKind::BaselineCommand(command) => {
+                let (next, transition) = coordinator.command(command)?;
+                coordinator = next;
+                ("semantic", transition)
+            }
+            SessionRecordKind::TimelineAdvance => {
+                let (next, transition) = coordinator.advance(record.record_seq, record.at)?;
+                coordinator = next;
+                next_timeline_advance_ns = Some(
+                    record
+                        .at
+                        .as_nanos()
+                        .checked_add(config.window().step_ns())
+                        .ok_or(CoordinatorError::Incompatible)?,
+                );
+                ("semantic", transition)
+            }
+            SessionRecordKind::Closed => return Err(CoordinatorError::Incompatible),
+        };
+        if produced_kind != retained.retained_kind
+            || retained.retained_timeline_digest != transition.timeline_digest
+        {
+            return Err(CoordinatorError::Incompatible);
+        }
+        for state in &transition.baseline_states {
+            baselines.insert(
+                state.key().clone(),
+                RebuiltBaseline { state: state.clone(), source_record_seq: record.record_seq },
+            );
+        }
+        for result in &transition.relationships {
+            match relationships.get_mut(&result.key) {
+                Some(previous) => {
+                    if previous.knowledge != result.knowledge {
+                        previous.most_recent_change = Some(RebuiltRelationshipChange {
+                            previous: previous.knowledge.clone(),
+                            current: result.knowledge.clone(),
+                            changed_at: result.result_time.as_nanos(),
+                        });
+                    }
+                    previous.knowledge = result.knowledge.clone();
+                    previous.result_time = result.result_time.as_nanos();
+                    previous.source_record_seq = record.record_seq;
+                    previous.creator_commit_seq = retained.commit_sequence;
+                }
+                None => {
+                    relationships.insert(
+                        result.key.clone(),
+                        RebuiltRelationship {
+                            knowledge: result.knowledge.clone(),
+                            result_time: result.result_time.as_nanos(),
+                            most_recent_change: None,
+                            source_record_seq: record.record_seq,
+                            creator_commit_seq: retained.commit_sequence,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let last_session_time = previous_time.ok_or(CoordinatorError::Incompatible)?;
+    if coordinator.complete_baseline_states().count() != baselines.len()
+        || coordinator
+            .complete_baseline_states()
+            .any(|state| baselines.get(state.key()).is_none_or(|rebuilt| rebuilt.state != *state))
+    {
+        return Err(CoordinatorError::Incompatible);
+    }
+    let final_timeline_digest = coordinator.unchanged()?.timeline_digest;
+    Ok(RebuiltSession {
+        semantic_id,
+        coordinator,
+        capabilities,
+        last_session_time,
+        next_timeline_advance_ns: next_timeline_advance_ns.ok_or(CoordinatorError::Incompatible)?,
+        final_timeline_digest,
+        baselines,
+        relationships,
+    })
+}
+
+fn next_window_boundary(at: u64, step: u64) -> Result<u64, CoordinatorError> {
+    at.checked_div(step)
+        .and_then(|index| index.checked_add(1))
+        .and_then(|index| index.checked_mul(step))
+        .ok_or(CoordinatorError::Incompatible)
 }
 
 impl RelationshipCoordinator {
-    pub(super) fn new(
+    pub(crate) fn new(
         manifest: &SessionManifest,
         config: &Config,
     ) -> Result<Self, CoordinatorError> {
@@ -158,7 +514,7 @@ impl RelationshipCoordinator {
         })
     }
 
-    pub(super) fn begin_learning(
+    pub(crate) fn begin_learning(
         &self,
         command: &TargetedBaselineCommand,
     ) -> Result<(Self, CoordinatorTransition), CoordinatorError> {
@@ -200,7 +556,7 @@ impl RelationshipCoordinator {
         ))
     }
 
-    pub(super) fn command(
+    pub(crate) fn command(
         &self,
         command: &TargetedBaselineCommand,
     ) -> Result<(Self, CoordinatorTransition), CoordinatorError> {
@@ -279,7 +635,7 @@ impl RelationshipCoordinator {
         ))
     }
 
-    pub(super) fn observe(
+    pub(crate) fn observe(
         &self,
         observation: CsiObservation,
     ) -> Result<(Self, CoordinatorTransition), CoordinatorError> {
@@ -291,7 +647,7 @@ impl RelationshipCoordinator {
         Ok((staged, CoordinatorTransition { timeline_digest, baseline_states, relationships }))
     }
 
-    pub(super) fn advance(
+    pub(crate) fn advance(
         &self,
         record_seq: u64,
         at: SessionTime,
@@ -305,12 +661,16 @@ impl RelationshipCoordinator {
         Ok((staged, CoordinatorTransition { timeline_digest, baseline_states, relationships }))
     }
 
-    pub(super) fn unchanged(&self) -> Result<CoordinatorTransition, CoordinatorError> {
+    pub(crate) fn unchanged(&self) -> Result<CoordinatorTransition, CoordinatorError> {
         Ok(CoordinatorTransition {
             timeline_digest: Sha256::digest(self.timeline.state()?.as_bytes()).into(),
             baseline_states: Vec::new(),
             relationships: Vec::new(),
         })
+    }
+
+    pub(crate) fn complete_baseline_states(&self) -> impl Iterator<Item = &BaselineState> {
+        self.baselines.values()
     }
 
     fn process_windows(
@@ -761,6 +1121,6 @@ fn union_exposure_ns(
     Ok(exposure.min(maximum))
 }
 
-pub(super) const fn algorithm_version() -> &'static str {
+pub(crate) const fn algorithm_version() -> &'static str {
     ALGORITHM_VERSION
 }
