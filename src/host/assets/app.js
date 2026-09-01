@@ -403,7 +403,10 @@
   }
   function relationshipKnowledge(value) {
     if (!object(value)) return false;
-    if (value.kind === 'stable' || value.kind === 'changing') return exact(value, ['kind']);
+    if (value.kind === 'known') {
+      return exact(value, ['kind', 'value'])
+        && (value.value === 'stable' || value.value === 'changing');
+    }
     return value.kind === 'unknown' && exact(value, ['kind', 'reason'])
       && RELATIONSHIP_UNKNOWN_REASONS.has(value.reason);
   }
@@ -769,7 +772,7 @@
   }
   function knowledgeLabel(knowledge) {
     if (knowledge.kind === 'unknown') return `Unknown(${titleCaseToken(knowledge.reason)})`;
-    return titleCaseToken(knowledge.kind);
+    return titleCaseToken(knowledge.value);
   }
   function mountRelationship(topology, subjects, latest) {
     state.topology = topology;

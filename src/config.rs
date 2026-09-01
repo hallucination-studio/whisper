@@ -1141,7 +1141,6 @@ impl Config {
 
     /// Returns baseline settings.
     #[must_use]
-    #[expect(dead_code, reason = "consumed by later estimator work package")]
     pub(crate) const fn baseline(&self) -> &BaselineConfig {
         self.replay.baseline()
     }

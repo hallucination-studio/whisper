@@ -8,12 +8,13 @@ use crate::Config;
 use crate::config::TimeQualityConfig;
 use crate::domain::csi::CsiObservation;
 use crate::domain::identity::{
-    BaselineContractId, LinkProfileKey, RadioLinkId, SpaceId, StreamInstanceId,
+    BaselineContractId, BaselineRevision, BaselineStateSequence, LinkProfileKey, RadioLinkId,
+    SpaceId, StreamInstanceId,
 };
 use crate::domain::time::{EventTimeSource, SessionTime, TimeInterval};
 use crate::domain::world::{
     BaselineCommand, BaselineCompatibilityReceipt, BaselineCoordinateKey, BaselineLifecycle,
-    BaselineState, Knowledge, StableOrChanging, TargetedBaselineCommand, UnknownReason,
+    BaselineState, EwState, Knowledge, StableOrChanging, TargetedBaselineCommand, UnknownReason,
     WelfordState,
 };
 use crate::session::SessionManifest;
@@ -38,7 +39,11 @@ pub(super) enum CoordinatorError {
     UnknownLink,
     #[error("BeginLearning requires a missing baseline")]
     BaselineAlreadyPresent,
-    #[error("only BeginLearning is implemented by this bounded coordinator")]
+    #[error("baseline learning has not reached configured maturity")]
+    BaselineNotMature,
+    #[error("Commit requires a learning baseline")]
+    CommitRequiresLearning,
+    #[error("only BeginLearning and Commit are implemented by this bounded coordinator")]
     UnsupportedCommand,
     #[error("relationship estimator arithmetic overflowed")]
     ArithmeticOverflow,
@@ -58,6 +63,17 @@ pub(super) struct RelationshipCoordinator {
     maximum_gap_ratio: f64,
     maximum_receive_jitter_ns: u64,
     minimum_time_quality: TimeQualityConfig,
+    minimum_learning_windows: u32,
+    minimum_valid_exposure_ns: u64,
+    minimum_samples_per_coordinate: u32,
+    minimum_exposure_per_coordinate_ns: u64,
+    minimum_ready_coordinate_coverage: f64,
+    variance_floor: f64,
+    ew_time_constant_ns: u64,
+    deviation_quantile: f64,
+    adaptation_gate: f64,
+    stable_threshold: f64,
+    changing_threshold: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +88,7 @@ struct ConditionedWindow {
     coordinates: BTreeMap<BaselineCoordinateKey, ConditionedCoordinate>,
     accepted_exposure_ns: u64,
     eligible: bool,
+    unknown_reason: Option<UnknownReason>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +129,7 @@ impl RelationshipCoordinator {
             .collect();
         let conditioning = config.conditioning();
         let quality = config.quality();
+        let baseline = config.baseline();
         Ok(Self {
             timeline,
             baselines: BTreeMap::new(),
@@ -126,6 +144,17 @@ impl RelationshipCoordinator {
             maximum_gap_ratio: quality.maximum_gap_ratio(),
             maximum_receive_jitter_ns: quality.maximum_receive_jitter_ns(),
             minimum_time_quality: quality.minimum_time_quality(),
+            minimum_learning_windows: baseline.minimum_learning_windows(),
+            minimum_valid_exposure_ns: baseline.minimum_valid_exposure_ns(),
+            minimum_samples_per_coordinate: baseline.minimum_samples_per_coordinate(),
+            minimum_exposure_per_coordinate_ns: baseline.minimum_exposure_per_coordinate_ns(),
+            minimum_ready_coordinate_coverage: baseline.minimum_ready_coordinate_coverage(),
+            variance_floor: baseline.variance_floor(),
+            ew_time_constant_ns: baseline.ew_time_constant_ns(),
+            deviation_quantile: baseline.deviation_quantile(),
+            adaptation_gate: baseline.adaptation_gate(),
+            stable_threshold: baseline.stable_threshold(),
+            changing_threshold: baseline.changing_threshold(),
         })
     }
 
@@ -166,6 +195,85 @@ impl RelationshipCoordinator {
             CoordinatorTransition {
                 timeline_digest,
                 baseline_states: vec![state],
+                relationships: Vec::new(),
+            },
+        ))
+    }
+
+    pub(super) fn command(
+        &self,
+        command: &TargetedBaselineCommand,
+    ) -> Result<(Self, CoordinatorTransition), CoordinatorError> {
+        match command.command() {
+            BaselineCommand::BeginLearning => self.begin_learning(command),
+            BaselineCommand::Commit => self.commit(command),
+            _ => Err(CoordinatorError::UnsupportedCommand),
+        }
+    }
+
+    fn commit(
+        &self,
+        command: &TargetedBaselineCommand,
+    ) -> Result<(Self, CoordinatorTransition), CoordinatorError> {
+        let mut staged = self.clone();
+        let key = command.target();
+        let previous = staged.baselines.get(key).ok_or(CoordinatorError::CommitRequiresLearning)?;
+        let BaselineLifecycle::Learning { accepted_windows, accepted_exposure_ns } =
+            previous.lifecycle()
+        else {
+            return Err(CoordinatorError::CommitRequiresLearning);
+        };
+        let ready = previous
+            .learning()
+            .iter()
+            .filter(|(_, state)| {
+                state.count() >= u64::from(staged.minimum_samples_per_coordinate)
+                    && state.accepted_exposure_ns() >= staged.minimum_exposure_per_coordinate_ns
+            })
+            .collect::<Vec<_>>();
+        let ready_coverage = if previous.learning().is_empty() {
+            0.0
+        } else {
+            ready.len() as f64 / previous.learning().len() as f64
+        };
+        if accepted_windows < u64::from(staged.minimum_learning_windows)
+            || accepted_exposure_ns < staged.minimum_valid_exposure_ns
+            || ready.is_empty()
+            || ready_coverage < staged.minimum_ready_coordinate_coverage
+        {
+            return Err(CoordinatorError::BaselineNotMature);
+        }
+        let mut active = BTreeMap::new();
+        for (coordinate, state) in ready {
+            let variance = (state.m2() / (state.count() - 1) as f64).max(staged.variance_floor);
+            active.insert(
+                *coordinate,
+                EwState::try_new(
+                    state.count(),
+                    state.mean(),
+                    variance,
+                    state.accepted_exposure_ns(),
+                )?,
+            );
+        }
+        let next = BaselineState::try_new(
+            key.clone(),
+            BaselineLifecycle::Active,
+            BTreeMap::new(),
+            active,
+            Some(BaselineRevision::new(1)),
+            Some(BaselineStateSequence::new(1)),
+            false,
+            previous.session_last_eligible_at(),
+            previous.compatibility().clone(),
+        )?;
+        staged.baselines.insert(key.clone(), next.clone());
+        let timeline_digest: [u8; 32] = Sha256::digest(staged.timeline.state()?.as_bytes()).into();
+        Ok((
+            staged,
+            CoordinatorTransition {
+                timeline_digest,
+                baseline_states: vec![next],
                 relationships: Vec::new(),
             },
         ))
@@ -224,12 +332,22 @@ impl RelationshipCoordinator {
             }));
 
             for key in keys {
-                let knowledge = if self.baselines.contains_key(&key) {
-                    Knowledge::unknown(UnknownReason::BaselineLearning)
-                } else {
-                    Knowledge::unknown(UnknownReason::BaselineMissing)
+                let (next, knowledge) = match self.baselines.get(&key).map(BaselineState::lifecycle)
+                {
+                    None => (None, Knowledge::unknown(UnknownReason::BaselineMissing)),
+                    Some(BaselineLifecycle::Learning { .. }) => (
+                        self.update_learning_state(&key, window)?,
+                        Knowledge::unknown(UnknownReason::BaselineLearning),
+                    ),
+                    Some(BaselineLifecycle::Active) => self.update_active_state(&key, window)?,
+                    Some(BaselineLifecycle::Frozen) => {
+                        (None, Knowledge::unknown(UnknownReason::Frozen))
+                    }
+                    Some(BaselineLifecycle::Stale { .. }) => {
+                        (None, Knowledge::unknown(UnknownReason::Stale))
+                    }
                 };
-                if let Some(next) = self.update_learning_state(&key, window)? {
+                if let Some(next) = next {
                     self.baselines.insert(key.clone(), next.clone());
                     changed.insert(key.clone(), next);
                 }
@@ -241,6 +359,97 @@ impl RelationshipCoordinator {
             }
         }
         Ok((changed.into_values().collect(), relationships))
+    }
+
+    fn update_active_state(
+        &self,
+        key: &LinkProfileKey,
+        window: &AlignedWindow,
+    ) -> Result<(Option<BaselineState>, Knowledge<StableOrChanging>), CoordinatorError> {
+        let previous = self.baselines.get(key).ok_or(CoordinatorError::CommitRequiresLearning)?;
+        let conditioned = self.condition_window(key, window)?;
+        let covered = conditioned
+            .coordinates
+            .iter()
+            .filter(|(coordinate, _)| previous.active().contains_key(coordinate))
+            .collect::<Vec<_>>();
+        let ready_coverage = covered.len() as f64 / previous.active().len() as f64;
+        if !conditioned.eligible || ready_coverage < self.minimum_ready_coordinate_coverage {
+            return Ok((
+                None,
+                Knowledge::unknown(conditioned.unknown_reason.unwrap_or(UnknownReason::LowQuality)),
+            ));
+        }
+        let mut residuals = covered
+            .iter()
+            .map(|(coordinate, observed)| {
+                let baseline =
+                    previous.active().get(coordinate).expect("covered Active coordinate");
+                ((observed.observed - baseline.mean())
+                    / baseline.variance().max(self.variance_floor).sqrt())
+                .abs()
+            })
+            .collect::<Vec<_>>();
+        let Some(deviation) = nearest_rank(&mut residuals, self.deviation_quantile) else {
+            return Ok((None, Knowledge::unknown(UnknownReason::MissingData)));
+        };
+        let knowledge = if deviation <= self.stable_threshold {
+            Knowledge::known(StableOrChanging::Stable)
+        } else if deviation >= self.changing_threshold {
+            Knowledge::known(StableOrChanging::Changing)
+        } else {
+            Knowledge::unknown(UnknownReason::AmbiguousEvidence)
+        };
+
+        let mut active = previous.active().clone();
+        let first_active_window = !previous.adaptation_armed();
+        let adaptation_accepted = !first_active_window && deviation <= self.adaptation_gate;
+        if adaptation_accepted {
+            for (coordinate, observed) in covered {
+                let current = active.get(coordinate).copied().expect("covered Active coordinate");
+                let alpha = 1.0
+                    - (-(observed.accepted_exposure_ns as f64 / self.ew_time_constant_ns as f64))
+                        .exp();
+                let delta = observed.observed - current.mean();
+                let mean = current.mean() + alpha * delta;
+                let variance = (1.0 - alpha) * (current.variance() + alpha * delta * delta);
+                active.insert(
+                    *coordinate,
+                    EwState::try_new(
+                        current
+                            .count()
+                            .checked_add(1)
+                            .ok_or(CoordinatorError::ArithmeticOverflow)?,
+                        mean,
+                        variance,
+                        current
+                            .accepted_exposure_ns()
+                            .checked_add(observed.accepted_exposure_ns)
+                            .ok_or(CoordinatorError::ArithmeticOverflow)?,
+                    )?,
+                );
+            }
+        }
+        let sequence = previous.state_sequence().ok_or(CoordinatorError::CommitRequiresLearning)?;
+        let sequence = if first_active_window || adaptation_accepted {
+            BaselineStateSequence::new(
+                sequence.get().checked_add(1).ok_or(CoordinatorError::ArithmeticOverflow)?,
+            )
+        } else {
+            sequence
+        };
+        let next = BaselineState::try_new(
+            key.clone(),
+            BaselineLifecycle::Active,
+            BTreeMap::new(),
+            active,
+            previous.revision(),
+            Some(sequence),
+            true,
+            Some(window.interval().end()),
+            previous.compatibility().clone(),
+        )?;
+        Ok((Some(next), knowledge))
     }
 
     fn update_learning_state(
@@ -418,6 +627,7 @@ impl RelationshipCoordinator {
         }
 
         let total_coordinates = folds.len();
+        let folds_non_finite = folds.values().any(|fold| fold.non_finite);
         let mut coordinates = BTreeMap::new();
         let mut aggregate_valid_coverage = Vec::new();
         for (key, fold) in folds {
@@ -460,8 +670,25 @@ impl RelationshipCoordinator {
             && finite_and_ordered
             && time_quality_sufficient
             && accepted_exposure_ns > 0;
-        Ok(ConditionedWindow { coordinates, accepted_exposure_ns, eligible })
+        let unknown_reason = if observations.is_empty() {
+            Some(UnknownReason::MissingData)
+        } else if folds_non_finite {
+            Some(UnknownReason::NonFinite)
+        } else if !finite_and_ordered || !time_quality_sufficient {
+            Some(UnknownReason::TimeUncertain)
+        } else if !eligible {
+            Some(UnknownReason::LowQuality)
+        } else {
+            None
+        };
+        Ok(ConditionedWindow { coordinates, accepted_exposure_ns, eligible, unknown_reason })
     }
+}
+
+fn nearest_rank(values: &mut [f64], quantile: f64) -> Option<f64> {
+    values.sort_by(f64::total_cmp);
+    let rank = (quantile * values.len() as f64).ceil() as usize;
+    values.get(rank.saturating_sub(1)).copied()
 }
 
 fn valid_coverage_spans(

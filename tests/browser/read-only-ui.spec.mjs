@@ -62,6 +62,60 @@ test('switches between Capture Session signals and Semantic Session relationship
   await expect(page.locator('button')).toHaveCount(0);
 });
 
+test('same Sensing page renders the committed BaselineLearning to Stable change', async ({ page }) => {
+  let stable = false;
+  let socket;
+  await page.route('**/api/topology', (route) => {
+    const response = structuredClone(topology);
+    response.receipt.projection_commit.sequence = stable ? '6' : '5';
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
+  });
+  await page.route('**/api/signals?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(signalsFor(route.request().url())),
+  }));
+  await page.route('**/api/relationships/latest', (route) => {
+    const response = structuredClone(relationshipSubjects);
+    response.receipt.projection_commit.sequence = stable ? '6' : '5';
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
+  });
+  await page.route('**/api/relationships/latest?**', (route) => {
+    const response = relationshipLatestFor(route.request().url(), storeId, stable ? '6' : '5');
+    if (stable) {
+      response.data.knowledge = { kind: 'known', value: 'stable' };
+      response.data.result_time = '2000000000';
+      response.data.most_recent_change = {
+        previous: { kind: 'unknown', reason: 'baseline_learning' },
+        current: { kind: 'known', value: 'stable' },
+        changed_at: '2000000000',
+      };
+    }
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
+  });
+  await page.routeWebSocket('**/api/live', (websocket) => {
+    socket = websocket;
+    websocket.send(JSON.stringify(live));
+  });
+
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'Sensing' }).check();
+  await expect(page.getByTestId('relationship-state')).toHaveText('Unknown(BaselineLearning)');
+
+  stable = true;
+  socket.send(JSON.stringify({
+    ...live,
+    delivery_sequence: '1',
+    projection_commit: { store_id: storeId, sequence: '6' },
+  }));
+  await expect(page.getByTestId('relationship-state')).toHaveText('Stable');
+  await expect(page.getByTestId('relationship-result-time')).toHaveText('2000000000 ns');
+  await expect(page.locator('#relationship-change-state'))
+    .toHaveText('Unknown(BaselineLearning) → Stable');
+  await expect(page.locator('#relationship-change-time')).toHaveText('2000000000 ns');
+  await expect(page.getByTestId('connection-state')).toHaveText('LIVE');
+});
+
 test('rejects a relationship response outside the closed HTTP schema', async ({ page }) => {
   await page.route('**/api/topology', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(topology) }),
@@ -88,6 +142,50 @@ test('rejects a relationship response outside the closed HTTP schema', async ({ 
   await expect(page.getByTestId('connection-state')).toHaveText('PROTOCOL ERROR');
   await expect(page.getByTestId('relationship-state')).toBeHidden();
   await expect(page.locator('button')).toHaveCount(0);
+});
+
+test('rejects legacy and malformed known Knowledge without mounting relationship state', async ({ page }) => {
+  let knowledge;
+  await page.route('**/api/topology', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(topology) }),
+  );
+  await page.route('**/api/signals?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(signalsFor(route.request().url())),
+  }));
+  await page.route('**/api/relationships/latest', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(relationshipSubjects),
+  }));
+  await page.route('**/api/relationships/latest?**', (route) => {
+    const response = relationshipLatestFor(route.request().url());
+    response.data.knowledge = knowledge;
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(response),
+    });
+  });
+  await page.routeWebSocket('**/api/live', (socket) => socket.send(JSON.stringify(live)));
+
+  for (const [label, invalidKnowledge] of [
+    ['legacy Stable', { kind: 'stable' }],
+    ['legacy Changing', { kind: 'changing' }],
+    ['missing known value', { kind: 'known' }],
+    ['invalid known value', { kind: 'known', value: 'unknown' }],
+    ['extra known property', { kind: 'known', value: 'stable', extra: true }],
+  ]) {
+    await test.step(label, async () => {
+      knowledge = invalidKnowledge;
+      await page.goto('/');
+      await page.getByRole('radio', { name: 'Sensing' }).check();
+      await expect(page.getByTestId('connection-state')).toHaveText('PROTOCOL ERROR');
+      await expect(page.getByTestId('relationship-state')).toBeHidden();
+      await expect(page.locator('#relationship-change')).toBeHidden();
+    });
+  }
 });
 
 test('keeps Sensing POLLING until every relationship receipt reaches the WebSocket watermark', async ({ page }) => {

@@ -536,7 +536,7 @@ impl CaptureSession {
             self.schedule_first_timeline_advance(fact.at)?;
         }
         let coordinator = self.coordinator.as_ref().ok_or(StoreError::incompatible())?;
-        let (staged, transition) = coordinator.begin_learning(&command)?;
+        let (staged, transition) = coordinator.command(&command)?;
         let projection = self.persist_projection(&fact, "semantic", None, &transition)?;
         self.coordinator = Some(staged);
         Ok(projection)

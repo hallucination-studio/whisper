@@ -796,10 +796,11 @@ pub(crate) enum RelationshipCommandAdmissionError {
 
 #[cfg(unix)]
 impl RelationshipCommandIngress {
-    pub(crate) fn try_begin_learning(
+    pub(crate) fn try_command(
         &self,
         link: RadioLinkId,
         profile: CaptureProfileId,
+        command: BaselineCommand,
     ) -> Result<String, RelationshipCommandAdmissionError> {
         if !self.configured_links.contains(&link) {
             return Err(RelationshipCommandAdmissionError::InvalidTarget);
@@ -814,7 +815,7 @@ impl RelationshipCommandIngress {
             .ok_or(RelationshipCommandAdmissionError::CorrelationOverflow)?;
         let command = TargetedBaselineCommand::new(
             crate::domain::identity::LinkProfileKey::new(link, profile),
-            BaselineCommand::BeginLearning,
+            command,
         );
         self.writer_inbox.try_push(PendingWork::RelationshipCommand(command)).map_err(|error| {
             match error {

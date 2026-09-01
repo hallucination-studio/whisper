@@ -785,9 +785,15 @@ struct RelationshipChange {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RelationshipKnowledge {
+    Known { value: RelationshipKnownValue },
+    Unknown { reason: RelationshipUnknownReason },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RelationshipKnownValue {
     Stable,
     Changing,
-    Unknown { reason: RelationshipUnknownReason },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

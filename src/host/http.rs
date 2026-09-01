@@ -310,16 +310,21 @@ async fn relationship_command(
     let Ok(Json(request)) = body else {
         return invalid_request_response("invalid relationship command");
     };
-    if request.http_schema_version != 1 || request.command != "begin_learning" {
+    if request.http_schema_version != 1 {
         return invalid_request_response("invalid relationship command");
     }
+    let command = match request.command.as_str() {
+        "begin_learning" => crate::domain::world::BaselineCommand::BeginLearning,
+        "commit" => crate::domain::world::BaselineCommand::Commit,
+        _ => return invalid_request_response("invalid relationship command"),
+    };
     let Ok(link) = crate::domain::identity::RadioLinkId::new(request.target.link.as_str()) else {
         return invalid_request_response("invalid relationship command");
     };
     let Ok(profile) = decode_profile(&request.target.profile) else {
         return invalid_request_response("invalid relationship command");
     };
-    match state.relationship_commands.try_begin_learning(link, profile) {
+    match state.relationship_commands.try_command(link, profile, command) {
         Ok(correlation_id) => (
             StatusCode::ACCEPTED,
             Json(RelationshipCommandAccepted {

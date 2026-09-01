@@ -45,6 +45,14 @@ impl RuntimeFixture {
     }
 
     fn with_queue_capacity(queue_capacity: u32) -> Self {
+        Self::with_runtime_settings(queue_capacity, "0.000001")
+    }
+
+    fn with_unit_variance_floor() -> Self {
+        Self::with_runtime_settings(64, "1.0")
+    }
+
+    fn with_runtime_settings(queue_capacity: u32, variance_floor: &str) -> Self {
         let root = std::env::temp_dir().join(format!(
             "whisper-runtime-{}-{}",
             std::process::id(),
@@ -85,6 +93,7 @@ impl RuntimeFixture {
                 &format!("command_queue_capacity = {queue_capacity}"),
                 1,
             )
+            .replacen("variance_floor = 0.000001", &format!("variance_floor = {variance_floor}"), 1)
             .replace(
                 "secret_root = \"./data/secrets\"",
                 &format!("secret_root = \"{}\"", secrets.display()),
@@ -193,8 +202,12 @@ fn response_json(response: &[u8]) -> serde_json::Value {
 }
 
 fn relationship_command_request(link: &str, profile: &str) -> String {
+    relationship_command_request_for(link, profile, "begin_learning")
+}
+
+fn relationship_command_request_for(link: &str, profile: &str, command: &str) -> String {
     let body = format!(
-        r#"{{"http_schema_version":1,"target":{{"link":"{link}","profile":"{profile}"}},"command":"begin_learning"}}"#
+        r#"{{"http_schema_version":1,"target":{{"link":"{link}","profile":"{profile}"}},"command":"{command}"}}"#
     );
     format!(
         "POST /api/relationships/commands HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -219,6 +232,29 @@ async fn wait_for_projection(address: std::net::SocketAddr, expected: u64) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("projection {expected} did not become query-visible");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+async fn wait_for_projection_at_least(address: std::net::SocketAddr, minimum: u64) -> u64 {
+    for _ in 0..200 {
+        let body = response_json(
+            &http_request(
+                address,
+                "GET /api/topology HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await,
+        );
+        let sequence = body["receipt"]["projection_commit"]["sequence"]
+            .as_str()
+            .expect("projection sequence")
+            .parse::<u64>()
+            .expect("u64 projection sequence");
+        if sequence >= minimum {
+            return sequence;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("projection did not reach {minimum}");
 }
 
 #[cfg(feature = "ingest-test-hooks")]
@@ -247,6 +283,54 @@ async fn latest_relationship(address: std::net::SocketAddr, profile: &str) -> se
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("relationship did not become query-visible");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+struct WindowAfterCarry {
+    samples: [u8; 6],
+    next_samples: [u8; 6],
+    additional_frames: u32,
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+async fn send_csi_window_after_carry(
+    runtime: &HostRuntime,
+    sender: &tokio::net::UdpSocket,
+    destination: std::net::SocketAddr,
+    capability_digest: &[u8],
+    counters: &mut (u64, u64, u64),
+    window: WindowAfterCarry,
+) {
+    let frame_step_ms = 200_u64;
+    for _ in 0..window.additional_frames {
+        advance_host_clock(runtime, Duration::from_millis(frame_step_ms));
+        counters.0 += 1;
+        counters.1 += 1;
+        let mut csi = csi_body(capability_digest);
+        csi[32..40].copy_from_slice(&counters.0.to_le_bytes());
+        let raw = csi.len() - window.samples.len();
+        csi[raw..].copy_from_slice(&window.samples);
+        sender
+            .send_to(&seal_raw(2, counters.1, &csi), destination)
+            .await
+            .expect("send CSI in current window");
+        counters.2 += 1;
+        counters.2 = wait_for_projection_at_least(runtime.http_address(), counters.2).await;
+    }
+    let elapsed_ms = frame_step_ms * u64::from(window.additional_frames);
+    advance_host_clock(runtime, Duration::from_millis(1_000 - elapsed_ms));
+    counters.0 += 1;
+    counters.1 += 1;
+    let mut csi = csi_body(capability_digest);
+    csi[32..40].copy_from_slice(&counters.0.to_le_bytes());
+    let raw = csi.len() - window.next_samples.len();
+    csi[raw..].copy_from_slice(&window.next_samples);
+    sender
+        .send_to(&seal_raw(2, counters.1, &csi), destination)
+        .await
+        .expect("send next-window carry CSI");
+    counters.2 += 2;
+    counters.2 = wait_for_projection_at_least(runtime.http_address(), counters.2).await;
 }
 
 fn spawn_serve_cli(
@@ -512,7 +596,7 @@ async fn runtime_serves_read_only_shell_topology_and_exact_live_upgrade_failure(
 
 #[cfg(feature = "ingest-test-hooks")]
 #[tokio::test]
-async fn relationship_command_ingress_accepts_only_the_closed_begin_learning_request() {
+async fn relationship_command_ingress_accepts_only_the_closed_command_set() {
     let fixture = RuntimeFixture::new();
     let runtime = start_host_with_manual_clock(&fixture.config).await.expect("start Host runtime");
     let address = runtime.http_address();
@@ -540,6 +624,11 @@ async fn relationship_command_ingress_accepts_only_the_closed_begin_learning_req
     let invalid = http_request(address, &invalid_request).await;
     assert!(invalid.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
     assert_eq!(response_json(&invalid)["error"]["code"], "invalid_request");
+
+    let unsupported_request = relationship_command_request_for("link-a", &profile, "freeze");
+    let unsupported = http_request(address, &unsupported_request).await;
+    assert!(unsupported.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    assert_eq!(response_json(&unsupported)["error"]["code"], "invalid_request");
 
     for method in ["GET", "HEAD", "PUT"] {
         let response = http_request(
@@ -631,6 +720,438 @@ async fn relationship_command_ingress_accepts_only_the_closed_begin_learning_req
                 "conditioning_version": "amplitude-v1",
                 "algorithm_version": "baseline-v1"
             }
+        })
+    );
+
+    runtime.shutdown().await.expect("stop Host runtime");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn immature_commit_is_accepted_into_order_without_fabricating_active_state() {
+    let fixture = RuntimeFixture::new();
+    let runtime = start_host_with_manual_clock(&fixture.config).await.expect("start Host runtime");
+    let query = host_query_store(&runtime);
+    let address = runtime.http_address();
+    let profile = "11".repeat(32);
+    let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/api/live"))
+        .await
+        .expect("connect runtime WebSocket");
+    websocket.next().await.expect("handshake message").expect("valid handshake message");
+
+    let begin = relationship_command_request("link-a", &profile);
+    assert!(http_request(address, &begin).await.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    let begin_commit = websocket
+        .next()
+        .await
+        .expect("BeginLearning invalidation")
+        .expect("valid BeginLearning invalidation");
+    let begin_commit: serde_json::Value =
+        serde_json::from_str(begin_commit.to_text().expect("text invalidation"))
+            .expect("invalidation JSON");
+    assert_eq!(begin_commit["projection_commit"]["sequence"], "1");
+
+    let commit = relationship_command_request_for("link-a", &profile, "commit");
+    let accepted = http_request(address, &commit).await;
+    assert!(accepted.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    assert_eq!(response_json(&accepted)["correlation_id"], "relationship-command-2");
+
+    tokio::time::timeout(Duration::from_secs(1), runtime.wait_for_stop())
+        .await
+        .expect("immature Commit did not stop processing");
+    if let Ok(Some(Ok(message))) =
+        tokio::time::timeout(Duration::from_millis(100), websocket.next()).await
+        && message.is_text()
+    {
+        panic!("immature Commit emitted an invalidation: {message:?}");
+    }
+    let subjects = serde_json::to_value(query.relationship_subjects().expect("query subjects"))
+        .expect("serialize subjects");
+    assert_eq!(subjects["receipt"]["projection_commit"]["sequence"], "1");
+    assert_eq!(subjects["data"]["subjects"].as_array().expect("subjects").len(), 1);
+
+    drop(websocket);
+    drop(query);
+    let error = runtime.shutdown().await.expect_err("immature Commit must stop the writer");
+    assert!(error.is_writer_failure());
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn mature_commit_and_first_active_window_publish_stable_with_exact_change() {
+    let fixture = RuntimeFixture::new();
+    let runtime = start_host_with_manual_clock(&fixture.config).await.expect("start Host runtime");
+    let address = runtime.http_address();
+    let profile = "61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2";
+    let capture = runtime.capture_address();
+    let destination =
+        std::net::SocketAddr::new("127.0.0.1".parse().expect("loopback"), capture.port());
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP sender");
+
+    let begin = relationship_command_request("link-a", profile);
+    assert!(http_request(address, &begin).await.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    wait_for_projection(address, 1).await;
+    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
+    sender.send_to(&seal_raw(1, 1, &capability), destination).await.expect("send capability");
+    wait_for_projection(address, 2).await;
+
+    let mut capture_sequence = 0_u64;
+    let mut message_sequence = 1_u64;
+    let mut minimum_projection = 2_u64;
+    for window in 0..15 {
+        let frames_before_close = if window == 0 { 4 } else { 3 };
+        for _ in 0..frames_before_close {
+            advance_host_clock(&runtime, Duration::from_millis(200));
+            capture_sequence += 1;
+            message_sequence += 1;
+            let mut csi = csi_body(&capability[..32]);
+            csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+            sender
+                .send_to(&seal_raw(2, message_sequence, &csi), destination)
+                .await
+                .expect("send eligible learning CSI");
+            minimum_projection += 1;
+            minimum_projection = wait_for_projection_at_least(address, minimum_projection).await;
+        }
+        advance_host_clock(&runtime, Duration::from_millis(400));
+        capture_sequence += 1;
+        message_sequence += 1;
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+        sender
+            .send_to(&seal_raw(2, message_sequence, &csi), destination)
+            .await
+            .expect("close eligible learning window");
+        minimum_projection += 2;
+        minimum_projection = wait_for_projection_at_least(address, minimum_projection).await;
+    }
+
+    let learning = latest_relationship(address, profile).await;
+    assert_eq!(
+        learning["data"]["knowledge"],
+        serde_json::json!({"kind": "unknown", "reason": "baseline_learning"})
+    );
+
+    let commit = relationship_command_request_for("link-a", profile, "commit");
+    let accepted = http_request(address, &commit).await;
+    assert!(accepted.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    minimum_projection += 1;
+    minimum_projection = wait_for_projection_at_least(address, minimum_projection).await;
+
+    for _ in 0..3 {
+        advance_host_clock(&runtime, Duration::from_millis(200));
+        capture_sequence += 1;
+        message_sequence += 1;
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+        sender
+            .send_to(&seal_raw(2, message_sequence, &csi), destination)
+            .await
+            .expect("send eligible Active CSI");
+        minimum_projection += 1;
+        minimum_projection = wait_for_projection_at_least(address, minimum_projection).await;
+    }
+    advance_host_clock(&runtime, Duration::from_millis(400));
+    capture_sequence += 1;
+    message_sequence += 1;
+    let mut csi = csi_body(&capability[..32]);
+    csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+    sender
+        .send_to(&seal_raw(2, message_sequence, &csi), destination)
+        .await
+        .expect("close eligible Active window");
+    minimum_projection += 2;
+    let global_sequence = wait_for_projection_at_least(address, minimum_projection).await;
+    minimum_projection = global_sequence;
+
+    let stable = latest_relationship(address, profile).await;
+    let store_id = stable["receipt"]["projection_commit"]["store_id"].as_str().expect("Store ID");
+    let creator_sequence = stable["data"]["creator_commit"]["sequence"]
+        .as_str()
+        .expect("creator sequence")
+        .parse::<u64>()
+        .expect("u64 creator sequence");
+    assert_eq!(
+        stable["data"]["knowledge"],
+        serde_json::json!({"kind": "known", "value": "stable"})
+    );
+    assert_eq!(stable["data"]["result_time"], "16000000000");
+    assert_eq!(stable["data"]["creator_commit"]["store_id"], store_id);
+    assert!(creator_sequence <= global_sequence);
+    assert_eq!(
+        stable["data"]["most_recent_change"],
+        serde_json::json!({
+            "previous": {"kind": "unknown", "reason": "baseline_learning"},
+            "current": {"kind": "known", "value": "stable"},
+            "changed_at": "16000000000"
+        })
+    );
+
+    for _ in 0..3 {
+        advance_host_clock(&runtime, Duration::from_millis(200));
+        capture_sequence += 1;
+        message_sequence += 1;
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+        sender
+            .send_to(&seal_raw(2, message_sequence, &csi), destination)
+            .await
+            .expect("send repeated Stable CSI");
+        minimum_projection += 1;
+        minimum_projection = wait_for_projection_at_least(address, minimum_projection).await;
+    }
+    advance_host_clock(&runtime, Duration::from_millis(400));
+    capture_sequence += 1;
+    message_sequence += 1;
+    let mut csi = csi_body(&capability[..32]);
+    csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+    sender
+        .send_to(&seal_raw(2, message_sequence, &csi), destination)
+        .await
+        .expect("close repeated Stable window");
+    minimum_projection += 2;
+    minimum_projection = wait_for_projection_at_least(address, minimum_projection).await;
+
+    let equal = latest_relationship(address, profile).await;
+    assert_eq!(equal["data"]["knowledge"], stable["data"]["knowledge"]);
+    assert_eq!(equal["data"]["result_time"], "17000000000");
+    assert_ne!(equal["data"]["creator_commit"], stable["data"]["creator_commit"]);
+    assert_eq!(equal["data"]["most_recent_change"], stable["data"]["most_recent_change"]);
+
+    for _ in 0..3 {
+        advance_host_clock(&runtime, Duration::from_millis(200));
+        capture_sequence += 1;
+        message_sequence += 1;
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+        let raw = csi.len() - 6;
+        csi[raw..].copy_from_slice(&[120, 120, 120, 120, 120, 120]);
+        sender
+            .send_to(&seal_raw(2, message_sequence, &csi), destination)
+            .await
+            .expect("send Changing CSI");
+        minimum_projection += 1;
+        minimum_projection = wait_for_projection_at_least(address, minimum_projection).await;
+    }
+    advance_host_clock(&runtime, Duration::from_millis(400));
+    capture_sequence += 1;
+    message_sequence += 1;
+    let mut csi = csi_body(&capability[..32]);
+    csi[32..40].copy_from_slice(&capture_sequence.to_le_bytes());
+    let raw = csi.len() - 6;
+    csi[raw..].copy_from_slice(&[120, 120, 120, 120, 120, 120]);
+    sender
+        .send_to(&seal_raw(2, message_sequence, &csi), destination)
+        .await
+        .expect("close Changing window");
+    minimum_projection += 2;
+    wait_for_projection_at_least(address, minimum_projection).await;
+
+    let changing = latest_relationship(address, profile).await;
+    assert_eq!(
+        changing["data"]["knowledge"],
+        serde_json::json!({"kind": "known", "value": "changing"})
+    );
+    assert_eq!(changing["data"]["result_time"], "18000000000");
+    assert_eq!(
+        changing["data"]["most_recent_change"],
+        serde_json::json!({
+            "previous": {"kind": "known", "value": "stable"},
+            "current": {"kind": "known", "value": "changing"},
+            "changed_at": "18000000000"
+        })
+    );
+
+    runtime.shutdown().await.expect("stop Host runtime");
+}
+
+#[cfg(feature = "ingest-test-hooks")]
+#[tokio::test]
+async fn active_windows_arm_then_adapt_and_reject_low_quality_through_committed_results() {
+    let fixture = RuntimeFixture::with_unit_variance_floor();
+    let runtime = start_host_with_manual_clock(&fixture.config).await.expect("start Host runtime");
+    let address = runtime.http_address();
+    let profile = "61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2";
+    let destination = std::net::SocketAddr::new(
+        "127.0.0.1".parse().expect("loopback"),
+        runtime.capture_address().port(),
+    );
+    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP sender");
+    let baseline_samples = [1, 2, 3, 4, 5, 6];
+    let adaptation_samples = [2, 4, 6, 8, 10, 12];
+    let threshold_probe_samples = [5, 29, 17, 47, 11, 70];
+
+    let begin = relationship_command_request("link-a", profile);
+    assert!(http_request(address, &begin).await.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    wait_for_projection(address, 1).await;
+    let capability = capability_body([0x01; 32], [0x22; 32], 1024);
+    sender.send_to(&seal_raw(1, 1, &capability), destination).await.expect("send capability");
+    wait_for_projection(address, 2).await;
+
+    let mut counters = (0_u64, 1_u64, 2_u64);
+    for window in 0..15 {
+        let frames_before_close = if window == 0 { 4 } else { 3 };
+        for _ in 0..frames_before_close {
+            advance_host_clock(&runtime, Duration::from_millis(200));
+            counters.0 += 1;
+            counters.1 += 1;
+            let mut csi = csi_body(&capability[..32]);
+            csi[32..40].copy_from_slice(&counters.0.to_le_bytes());
+            sender
+                .send_to(&seal_raw(2, counters.1, &csi), destination)
+                .await
+                .expect("send eligible learning CSI");
+            counters.2 += 1;
+            counters.2 = wait_for_projection_at_least(address, counters.2).await;
+        }
+        advance_host_clock(&runtime, Duration::from_millis(400));
+        counters.0 += 1;
+        counters.1 += 1;
+        let mut csi = csi_body(&capability[..32]);
+        csi[32..40].copy_from_slice(&counters.0.to_le_bytes());
+        if window == 14 {
+            let raw = csi.len() - adaptation_samples.len();
+            csi[raw..].copy_from_slice(&adaptation_samples);
+        }
+        sender
+            .send_to(&seal_raw(2, counters.1, &csi), destination)
+            .await
+            .expect("close eligible learning window");
+        counters.2 += 2;
+        counters.2 = wait_for_projection_at_least(address, counters.2).await;
+    }
+
+    let commit = relationship_command_request_for("link-a", profile, "commit");
+    assert!(http_request(address, &commit).await.starts_with(b"HTTP/1.1 202 Accepted\r\n"));
+    counters.2 += 1;
+    counters.2 = wait_for_projection_at_least(address, counters.2).await;
+
+    send_csi_window_after_carry(
+        &runtime,
+        &sender,
+        destination,
+        &capability[..32],
+        &mut counters,
+        WindowAfterCarry {
+            samples: adaptation_samples,
+            next_samples: threshold_probe_samples,
+            additional_frames: 3,
+        },
+    )
+    .await;
+    let armed = latest_relationship(address, profile).await;
+    assert_eq!(armed["data"]["knowledge"], serde_json::json!({"kind": "known", "value": "stable"}));
+    assert_eq!(armed["data"]["result_time"], "16000000000");
+
+    send_csi_window_after_carry(
+        &runtime,
+        &sender,
+        destination,
+        &capability[..32],
+        &mut counters,
+        WindowAfterCarry {
+            samples: threshold_probe_samples,
+            next_samples: adaptation_samples,
+            additional_frames: 3,
+        },
+    )
+    .await;
+    let before_adaptation = latest_relationship(address, profile).await;
+    assert_eq!(
+        before_adaptation["data"]["knowledge"],
+        serde_json::json!({"kind": "unknown", "reason": "ambiguous_evidence"})
+    );
+    assert_eq!(before_adaptation["data"]["result_time"], "17000000000");
+    assert_ne!(before_adaptation["data"]["creator_commit"], armed["data"]["creator_commit"]);
+    assert_eq!(
+        before_adaptation["data"]["most_recent_change"],
+        serde_json::json!({
+            "previous": {"kind": "known", "value": "stable"},
+            "current": {"kind": "unknown", "reason": "ambiguous_evidence"},
+            "changed_at": "17000000000"
+        })
+    );
+
+    send_csi_window_after_carry(
+        &runtime,
+        &sender,
+        destination,
+        &capability[..32],
+        &mut counters,
+        WindowAfterCarry {
+            samples: adaptation_samples,
+            next_samples: threshold_probe_samples,
+            additional_frames: 3,
+        },
+    )
+    .await;
+    let adapted = latest_relationship(address, profile).await;
+    assert_eq!(
+        adapted["data"]["knowledge"],
+        serde_json::json!({"kind": "known", "value": "stable"})
+    );
+    assert_eq!(adapted["data"]["result_time"], "18000000000");
+    assert_ne!(adapted["data"]["creator_commit"], before_adaptation["data"]["creator_commit"]);
+    assert_eq!(
+        adapted["data"]["most_recent_change"],
+        serde_json::json!({
+            "previous": {"kind": "unknown", "reason": "ambiguous_evidence"},
+            "current": {"kind": "known", "value": "stable"},
+            "changed_at": "18000000000"
+        })
+    );
+
+    send_csi_window_after_carry(
+        &runtime,
+        &sender,
+        destination,
+        &capability[..32],
+        &mut counters,
+        WindowAfterCarry {
+            samples: threshold_probe_samples,
+            next_samples: baseline_samples,
+            additional_frames: 3,
+        },
+    )
+    .await;
+    let after_adaptation = latest_relationship(address, profile).await;
+    assert_eq!(
+        after_adaptation["data"]["knowledge"],
+        serde_json::json!({"kind": "known", "value": "stable"})
+    );
+    assert_eq!(after_adaptation["data"]["result_time"], "19000000000");
+    assert_ne!(after_adaptation["data"]["creator_commit"], adapted["data"]["creator_commit"]);
+    assert_eq!(
+        after_adaptation["data"]["most_recent_change"],
+        adapted["data"]["most_recent_change"]
+    );
+
+    send_csi_window_after_carry(
+        &runtime,
+        &sender,
+        destination,
+        &capability[..32],
+        &mut counters,
+        WindowAfterCarry {
+            samples: baseline_samples,
+            next_samples: baseline_samples,
+            additional_frames: 2,
+        },
+    )
+    .await;
+    let rejected = latest_relationship(address, profile).await;
+    assert_eq!(
+        rejected["data"]["knowledge"],
+        serde_json::json!({"kind": "unknown", "reason": "low_quality"})
+    );
+    assert_eq!(rejected["data"]["result_time"], "20000000000");
+    assert_ne!(rejected["data"]["creator_commit"], after_adaptation["data"]["creator_commit"]);
+    assert_eq!(
+        rejected["data"]["most_recent_change"],
+        serde_json::json!({
+            "previous": {"kind": "known", "value": "stable"},
+            "current": {"kind": "unknown", "reason": "low_quality"},
+            "changed_at": "20000000000"
         })
     );
 
