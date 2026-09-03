@@ -723,6 +723,10 @@ fn live_payload(store_id: &str, watermark: &str, delivery_sequence: &str) -> Vec
 }
 
 fn complete_package(root: &Path) {
+    complete_package_with_producer_update(root, |_| {});
+}
+
+fn complete_package_with_producer_update(root: &Path, update_producer: impl FnOnce(&Path)) {
     fs::create_dir(root).expect("create complete package root");
 
     let mut datagrams = (1_u64..=13).map(fixture_datagram).collect::<Vec<_>>();
@@ -1205,6 +1209,7 @@ fn complete_package(root: &Path) {
         "schema_version": 1
     }));
     write_file(root, "run.json", &run);
+    update_producer(root);
     let producer_seal = run_evidence_operation(root, "seal-producer");
     assert!(
         producer_seal.status.success(),
@@ -1435,6 +1440,18 @@ fn complete_package(root: &Path) {
         "observer sealing failed: {}",
         String::from_utf8_lossy(&observer_seal.stderr)
     );
+}
+
+#[test]
+fn producer_accepts_twelve_digit_canonical_decimal_time() {
+    let root = package_directory();
+    complete_package_with_producer_update(&root, |root| {
+        update_root_receipt(root, |run| {
+            run["interval"]["ended_utc_ns"] = Value::String("100000000020".to_owned());
+        });
+    });
+
+    remove_package(&root);
 }
 
 fn unseal_file(path: &Path) {
@@ -2565,7 +2582,14 @@ fn verifier_rejects_changed_selection_or_sensitive_visible_chrome_text() {
 
 #[test]
 fn verifier_rejects_raw_cisco_mac_and_private_ipv6_cleartext() {
-    for sensitive_text in ["source 02000000000a", "source 0200.0000.000a", "peer fd00::1"] {
+    for sensitive_text in [
+        "source 02:00:00:00:00:0a",
+        "source 02-00-00-00-00-0a",
+        "source 02000000000a",
+        "source 020000000010",
+        "source 0200.0000.000a",
+        "peer fd00::1",
+    ] {
         let root = package_directory();
         complete_package(&root);
         update_json_artifact(&root, "chrome-trace.json", "observer.json", |trace| {

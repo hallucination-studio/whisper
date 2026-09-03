@@ -403,26 +403,91 @@ pub(super) fn inspect_cbor_cleartext(path: &str, value: &CborValue) -> Result<()
 }
 
 pub(super) fn inspect_json_cleartext(path: &str, value: &JsonValue) -> Result<(), EvidenceError> {
+    inspect_json_value_cleartext(path, None, value)
+}
+
+fn inspect_json_value_cleartext(
+    path: &str,
+    field: Option<&str>,
+    value: &JsonValue,
+) -> Result<(), EvidenceError> {
     match value {
         JsonValue::Object(fields) => {
             for (key, value) in fields {
                 if forbidden_sensitive_key(key) {
                     return Err(EvidenceError::Sensitive(path.to_owned()));
                 }
-                inspect_json_cleartext(path, value)?;
+                inspect_json_value_cleartext(path, Some(key), value)?;
             }
         }
         JsonValue::Array(values) => {
             for value in values {
-                inspect_json_cleartext(path, value)?;
+                inspect_json_value_cleartext(path, field, value)?;
             }
         }
-        JsonValue::String(value) if sensitive_string(value) => {
+        JsonValue::String(value)
+            if !field.is_some_and(|field| {
+                canonical_decimal_field(field) && parse_decimal(value).is_some()
+            }) && sensitive_string(value) =>
+        {
             return Err(EvidenceError::Sensitive(path.to_owned()));
         }
         _ => {}
     }
     Ok(())
+}
+
+fn canonical_decimal_field(field: &str) -> bool {
+    matches!(
+        field,
+        "callback_tick_us"
+            | "capture_record_seq"
+            | "capture_seen"
+            | "capture_sequence"
+            | "capture_session_time"
+            | "changed_at"
+            | "change_time"
+            | "channel"
+            | "commit_seq"
+            | "complex_sample_count"
+            | "creator_commit_seq"
+            | "delivery_sequence"
+            | "device_id"
+            | "device_scale_factor"
+            | "driver_rx_timestamp_us"
+            | "durable_tail"
+            | "ended_utc_ns"
+            | "first_commit_seq"
+            | "first_record_seq"
+            | "height"
+            | "key_epoch"
+            | "last_record_seq"
+            | "later_commit_seq"
+            | "later_record_seq"
+            | "later_result_time"
+            | "order"
+            | "previous_result_time"
+            | "processed_cursor"
+            | "queue_drop_full"
+            | "queue_drop_no_slot"
+            | "receive_order"
+            | "received_monotonic_ns"
+            | "received_utc_ns"
+            | "record_seq"
+            | "result_time"
+            | "semantic_record_seq"
+            | "semantic_session_time"
+            | "sequence"
+            | "session_time"
+            | "started_utc_ns"
+            | "total_changes"
+            | "trigger_websocket_order"
+            | "trigger_websocket_watermark"
+            | "utc_ns"
+            | "watermark"
+            | "width"
+            | "writer_opens"
+    )
 }
 
 pub(super) fn forbidden_sensitive_key(key: &str) -> bool {
