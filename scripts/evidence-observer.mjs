@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
+import { parseStrictJson } from './strict-json.mjs';
+
 // Polling is observer-local and does not drive Host state; changing it affects capture latency
 // and browser load, while the two-minute default bounds one manual physical transition interval.
 const OBSERVER_POLL_INTERVAL_MS = 25;
@@ -47,6 +49,25 @@ const GOOGLE_CHROME_TEAM_ID = 'EQHXZ8M8AV';
 // The production Host serves exactly this document, stylesheet, and script for Sensing. Changing
 // the set changes the asset digest preimage and requires coordinated Host routes and package checks.
 const SERVED_ASSET_PATHS = ['/', '/assets/app.css', '/assets/app.js'];
+// This is the closed Knowledge vocabulary from api-ui-v1's relationship schema. Adding a valid
+// state requires updating this map or the observer will fail closed; removing one makes runs that
+// encounter that state ineligible for evidence capture.
+const RELATIONSHIP_KNOWLEDGE_DOM = new Map([
+  ['known:changing', 'Changing'],
+  ['known:stable', 'Stable'],
+  ['unknown:ambiguous_evidence', 'Unknown(AmbiguousEvidence)'],
+  ['unknown:baseline_learning', 'Unknown(BaselineLearning)'],
+  ['unknown:baseline_missing', 'Unknown(BaselineMissing)'],
+  ['unknown:frozen', 'Unknown(Frozen)'],
+  ['unknown:inactive', 'Unknown(Inactive)'],
+  ['unknown:insufficient_coverage', 'Unknown(InsufficientCoverage)'],
+  ['unknown:low_quality', 'Unknown(LowQuality)'],
+  ['unknown:missing_data', 'Unknown(MissingData)'],
+  ['unknown:non_finite', 'Unknown(NonFinite)'],
+  ['unknown:profile_mismatch', 'Unknown(ProfileMismatch)'],
+  ['unknown:stale', 'Unknown(Stale)'],
+  ['unknown:time_uncertain', 'Unknown(TimeUncertain)'],
+]);
 
 export class ObserverRetentionBudget {
   constructor() {
@@ -158,11 +179,11 @@ export function servedAssetSha256(responses) {
   return digest.digest('hex');
 }
 
-function exactKeys(value, keys) {
-  return value !== null
-    && typeof value === 'object'
-    && !Array.isArray(value)
-    && Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
+function exactKeys(value, required, optional = []) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)
+    || required.some((key) => !Object.hasOwn(value, key))) return false;
+  const allowed = new Set([...required, ...optional]);
+  return Object.keys(value).every((key) => allowed.has(key));
 }
 
 function traceSnapshot(snapshot) {
@@ -188,19 +209,111 @@ function parseLiveMessage(text) {
   return value;
 }
 
-function relationshipKind(value) {
-  if (value?.resource !== 'relationship_latest' || value?.kind !== 'ok') return null;
-  if (value.data?.knowledge?.kind === 'unknown'
-    && value.data.knowledge.reason === 'baseline_learning') return 'unknown';
-  if (value.data?.knowledge?.kind === 'known' && value.data.knowledge.value === 'stable') {
-    return 'stable';
+function canonicalU64(value) {
+  return typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value)
+    && BigInt(value) <= 18_446_744_073_709_551_615n;
+}
+
+function canonicalId(value) {
+  if (typeof value !== 'string' || !/[^\p{White_Space}]/u.test(value)
+    || Buffer.byteLength(value) > 0xffff_ffff) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) return false;
+  }
+  return true;
+}
+
+function projectionWatermark(value, committed = false) {
+  return exactKeys(value, ['store_id', 'sequence'])
+    && typeof value.store_id === 'string' && /^[0-9a-f]{64}$/.test(value.store_id)
+    && canonicalU64(value.sequence) && (!committed || value.sequence !== '0');
+}
+
+function viewReceipt(value) {
+  return exactKeys(value, [
+    'projection_commit', 'session_id', 'first_record_seq', 'last_record_seq',
+    'decoder_version', 'conditioning_version', 'algorithm_version',
+  ])
+    && projectionWatermark(value.projection_commit, true)
+    && canonicalId(value.session_id)
+    && canonicalU64(value.first_record_seq)
+    && canonicalU64(value.last_record_seq)
+    && BigInt(value.first_record_seq) <= BigInt(value.last_record_seq)
+    && canonicalId(value.decoder_version)
+    && canonicalId(value.conditioning_version)
+    && canonicalId(value.algorithm_version);
+}
+
+function relationshipKnowledgeKey(value) {
+  if (exactKeys(value, ['kind', 'value']) && value.kind === 'known') {
+    const key = `known:${value.value}`;
+    return RELATIONSHIP_KNOWLEDGE_DOM.has(key) ? key : null;
+  }
+  if (exactKeys(value, ['kind', 'reason']) && value.kind === 'unknown') {
+    const key = `unknown:${value.reason}`;
+    return RELATIONSHIP_KNOWLEDGE_DOM.has(key) ? key : null;
   }
   return null;
 }
 
+function relationshipChange(value) {
+  return exactKeys(value, ['previous', 'current', 'changed_at'])
+    && relationshipKnowledgeKey(value.previous) !== null
+    && relationshipKnowledgeKey(value.current) !== null
+    && canonicalU64(value.changed_at);
+}
+
+function relationshipKind(value) {
+  if (!exactKeys(value, ['http_schema_version', 'kind', 'resource', 'receipt'], ['data'])
+    || value.http_schema_version !== 1 || value.resource !== 'relationship_latest'
+    || !viewReceipt(value.receipt)) {
+    throw new Error('relationship HTTP body is outside the closed schema');
+  }
+  if (value.kind === 'empty' && !Object.hasOwn(value, 'data')) return 'other';
+  if (value.kind !== 'ok' || !exactKeys(value.data, [
+    'session_id', 'link', 'profile', 'knowledge', 'result_time', 'creator_commit',
+  ], ['most_recent_change'])) {
+    throw new Error('relationship HTTP body is outside the closed schema');
+  }
+  const data = value.data;
+  const knowledge = relationshipKnowledgeKey(data.knowledge);
+  if (!canonicalId(data.session_id) || !canonicalId(data.link)
+    || typeof data.profile !== 'string' || !/^[0-9a-f]{64}$/.test(data.profile)
+    || knowledge === null || !canonicalU64(data.result_time)
+    || !projectionWatermark(data.creator_commit, true)
+    || data.creator_commit.store_id !== value.receipt.projection_commit.store_id
+    || BigInt(data.creator_commit.sequence) > BigInt(value.receipt.projection_commit.sequence)
+    || value.receipt.session_id !== data.session_id
+    || (Object.hasOwn(data, 'most_recent_change')
+      && !relationshipChange(data.most_recent_change))) {
+    throw new Error('relationship HTTP body is outside the closed schema');
+  }
+  if (knowledge === 'unknown:baseline_learning') return 'unknown';
+  if (knowledge === 'known:stable') return 'stable';
+  return 'other';
+}
+
+function parseRelationshipBody(body) {
+  const text = body.toString('utf8');
+  if (!Buffer.from(text).equals(body)) {
+    throw new Error('relationship HTTP body is not exact UTF-8');
+  }
+  return parseStrictJson(text);
+}
+
 function domKnowledge(text) {
-  if (text === 'Unknown(BaselineLearning)') return 'unknown:baseline_learning';
-  if (text === 'Stable') return 'stable';
+  for (const [knowledge, label] of RELATIONSHIP_KNOWLEDGE_DOM) {
+    if (text === label) {
+      if (knowledge === 'unknown:baseline_learning') return knowledge;
+      if (knowledge === 'known:stable') return 'stable';
+      return 'other';
+    }
+  }
   throw new Error(`unexpected DOM relationship state: ${text}`);
 }
 
@@ -313,28 +426,37 @@ async function readRelationshipDom(page, cdp, expectedDocumentId = null) {
 
 async function matchingRelationshipDom(page, cdp, value, expectedDocumentId) {
   const expectedState = relationshipKind(value) === 'unknown'
-    ? 'Unknown(BaselineLearning)' : 'Stable';
+    ? 'unknown:baseline_learning' : 'stable';
   const dom = await readRelationshipDom(page, cdp, expectedDocumentId);
-  return dom.knowledge === (expectedState === 'Stable' ? 'stable' : 'unknown:baseline_learning')
-      && dom.result_time === value.data.result_time
-    ? dom : null;
-}
-
-async function captureRelationshipPage(page, cdp, value, expectedDocumentId, clock, deadlineMs) {
-  await page.waitForFunction(() => (
-    document.querySelector('[data-testid="connection-state"]')?.textContent === 'LIVE'
-  ), null, { timeout: remainingObserverMs(clock, deadlineMs, 'LIVE Sensing page') });
-  remainingObserverMs(clock, deadlineMs, 'relationship DOM');
-  const before = await matchingRelationshipDom(page, cdp, value, expectedDocumentId);
-  if (before === null) return null;
   const expectedSelection = {
     link: value.data.link,
     profile: value.data.profile,
     session_id: value.data.session_id,
   };
+  if (canonicalJson(dom.selection) !== canonicalJson(expectedSelection)) {
+    throw new Error('relationship DOM selection disagrees with the HTTP target');
+  }
+  if (dom.knowledge !== expectedState) {
+    if (dom.knowledge === 'unknown:baseline_learning' || dom.knowledge === 'stable') {
+      throw new Error('relationship DOM target disagrees with the HTTP target');
+    }
+    return null;
+  }
+  if (dom.result_time !== value.data.result_time) {
+    throw new Error('relationship DOM result time disagrees with the HTTP target');
+  }
+  return dom;
+}
+
+async function captureRelationshipPage(page, cdp, value, expectedDocumentId, clock, deadlineMs) {
+  remainingObserverMs(clock, deadlineMs, 'relationship DOM');
+  const before = await matchingRelationshipDom(page, cdp, value, expectedDocumentId);
+  if (before === null) return null;
+  await page.waitForFunction(() => (
+    document.querySelector('[data-testid="connection-state"]')?.textContent === 'LIVE'
+  ), null, { timeout: remainingObserverMs(clock, deadlineMs, 'LIVE Sensing page') });
   if (before.connection_text !== 'LIVE'
-    || before.stale
-    || canonicalJson(before.selection) !== canonicalJson(expectedSelection)) {
+    || before.stale) {
     return null;
   }
   const screenshot = await page.screenshot({
@@ -533,6 +655,7 @@ let reconnected = false;
 let finished = false;
 let responseChain = Promise.resolve();
 let retainedDocumentId = null;
+let retainedSelection = null;
 let unknownBody = null;
 let unknownDom = null;
 let unknownStateBounds = null;
@@ -637,8 +760,19 @@ page.on('response', (response) => {
   const afterReconnect = reconnected;
   const websocketEventLimit = websocketEvents.length;
   queueObservedHttp(response, async (body) => {
-    const value = JSON.parse(body.toString('utf8'));
+    const value = parseRelationshipBody(body);
     const kind = relationshipKind(value);
+    if (value.kind === 'ok') {
+      const responseSelection = {
+        link: value.data.link,
+        profile: value.data.profile,
+        session_id: value.data.session_id,
+      };
+      if (retainedSelection === null) retainedSelection = responseSelection;
+      else if (canonicalJson(retainedSelection) !== canonicalJson(responseSelection)) {
+        throw new Error('relationship HTTP selection changed during observation');
+      }
+    }
     const websocketTrigger = websocketEvents
       .slice(0, websocketEventLimit)
       .findLast((event) => event.kind === 'message') ?? null;
@@ -646,12 +780,22 @@ page.on('response', (response) => {
       const captured = await captureRelationshipPage(
         page, cdp, value, retainedDocumentId, clock, deadlineMs,
       );
-      if (captured !== null) {
-        retainedDocumentId = captured.dom.document_id;
-        unknownBody = body;
-        ({ dom: unknownDom, screenshot: unknownScreenshot, stateBounds: unknownStateBounds } =
-          captured);
+      if (captured === null) {
+        process.stdout.write(`${canonicalJson({
+          page_instance_id: pageInstanceId,
+          state: 'non-target-observed',
+        })}\n`);
+        return;
       }
+      retainedDocumentId = captured.dom.document_id;
+      unknownBody = body;
+      ({ dom: unknownDom, screenshot: unknownScreenshot, stateBounds: unknownStateBounds } =
+        captured);
+      process.stdout.write(`${canonicalJson({
+        page_instance_id: pageInstanceId,
+        result_time: value.data.result_time,
+        state: 'unknown-captured',
+      })}\n`);
     } else if (kind === 'stable' && beforeDisconnect
       && value.data.result_time !== stablePreValue?.data.result_time) {
       if (websocketTrigger?.watermark !== value.data.creator_commit.sequence) return;

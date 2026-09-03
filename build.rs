@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 const EVIDENCE_SOURCE_FILES: &[&str] = &[
     "build.rs",
     "scripts/evidence-observer.mjs",
+    "scripts/strict-json.mjs",
     "Cargo.toml",
     "Cargo.lock",
     "package.json",

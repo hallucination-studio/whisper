@@ -355,86 +355,218 @@ async function sendCommand(baseUrl, command) {
   if (response.status !== 202) throw new Error(`command ${command} returned ${response.status}`);
 }
 
-test('one production Host restart keeps the actual served Sensing page and selection', async () => {
-  test.setTimeout(60_000);
-  const root = await mkdtemp(join(tmpdir(), 'whisper-host-restart-browser-'));
+function createPhysicalStream(socket, capturePort) {
+  const capability = capabilityBody(0x01, 0x22, 1024);
+  let messageSequence = 0;
+  let captureSequence = 0;
+  let timestampUs = 0;
+  let csiStream = null;
+  return {
+    capability,
+    captureSequence: () => captureSequence,
+    async sendCapability() {
+      messageSequence += 1;
+      await udpSend(socket, capturePort, sealNativeFrame(1, messageSequence, capability));
+    },
+    async start() {
+      if (csiStream) throw new Error('CSI stream is already running');
+      const stream = { stopping: false, done: null };
+      stream.done = (async () => {
+        while (!stream.stopping) {
+          messageSequence += 1;
+          captureSequence += 1;
+          timestampUs += csiFrameIntervalUs;
+          const body = csiBody(capability.subarray(0, 32), captureSequence, timestampUs);
+          await udpSend(socket, capturePort, sealNativeFrame(2, messageSequence, body));
+          await delay(csiFrameIntervalMs);
+        }
+      })();
+      csiStream = stream;
+    },
+    async stop() {
+      if (!csiStream) return;
+      const stream = csiStream;
+      csiStream = null;
+      stream.stopping = true;
+      await stream.done;
+    },
+  };
+}
+
+async function writeHostFixtureConfig(root, httpPort, capturePort, capability) {
   const managed = join(root, 'managed');
   const secrets = join(root, 'secrets');
   const configPath = join(root, 'host.toml');
   const database = join(managed, 'host.sqlite3');
+  await mkdir(managed, { mode: 0o700 });
+  await mkdir(secrets, { mode: 0o700 });
+  for (const [device, byte] of [[1, 0x11], [2, 0x22]]) {
+    const directory = join(secrets, `device-${device}`);
+    await mkdir(directory, { mode: 0o700 });
+    const path = join(directory, 'key-1.bin');
+    await writeFile(path, Buffer.alloc(32, byte), { mode: 0o600 });
+    await chmod(path, 0o600);
+  }
+  const firstCapability = capability.subarray(0, 32).toString('hex');
+  const secondCapability = capabilityBody(0x03, 0x44, 2048).subarray(0, 32).toString('hex');
+  const source = (await readFile('tests/fixtures/config/valid-two-esp32.toml', 'utf8'))
+    .replace('0202020202020202020202020202020202020202020202020202020202020202', firstCapability)
+    .replace('0404040404040404040404040404040404040404040404040404040404040404', secondCapability)
+    .replaceAll('expected_peer_ip = "192.0.2.10"', 'expected_peer_ip = "127.0.0.1"')
+    .replaceAll('expected_peer_ip = "192.0.2.11"', 'expected_peer_ip = "127.0.0.1"')
+    .replace('peer = "192.0.2.10"', 'peer = "127.0.0.1"')
+    .replace('peer = "192.0.2.11"', 'peer = "127.0.0.1"')
+    .replace('bind = "127.0.0.1:9000"', `bind = "0.0.0.0:${capturePort}"`)
+    .replace('bind = "127.0.0.1:8080"', `bind = "127.0.0.1:${httpPort}"`)
+    .replace('secret_root = "./data/secrets"', `secret_root = "${secrets}"`)
+    .replace('database_path = "./data/whisper.sqlite3"', `database_path = "${database}"`)
+    .replace(
+      'maximum_receive_jitter_ns = 100000000',
+      `maximum_receive_jitter_ns = ${simulatedReceiveJitterBudgetNs}`,
+    );
+  await writeFile(configPath, source);
+  return { configPath, database };
+}
+
+test('evidence observer waits through a committed valid non-target relationship state', async () => {
+  test.setTimeout(40_000);
+  const root = await mkdtemp(join(tmpdir(), 'whisper-observer-transient-browser-'));
   const httpPort = await freePort();
   const capturePort = await freePort();
   const chromeDebugPort = await freePort();
   const baseUrl = `http://127.0.0.1:${httpPort}`;
   const binary = resolve(process.env.CARGO_TARGET_DIR ?? 'target', 'debug', 'whisper');
   const socket = createSocket('udp4');
+  const physical = createPhysicalStream(socket, capturePort);
   let host = null;
   let observer = null;
   let operatorContext = null;
-  let messageSequence = 0;
-  let captureSequence = 0;
-  let timestampUs = 0;
-  let csiStream = null;
-  const capability = capabilityBody(0x01, 0x22, 1024);
-
-  async function sendCapability() {
-    messageSequence += 1;
-    await udpSend(socket, capturePort, sealNativeFrame(1, messageSequence, capability));
-  }
-
-  async function startCsiStream() {
-    if (csiStream) throw new Error('CSI stream is already running');
-    const stream = { stopping: false, done: null };
-    stream.done = (async () => {
-      while (!stream.stopping) {
-        messageSequence += 1;
-        captureSequence += 1;
-        timestampUs += csiFrameIntervalUs;
-        const body = csiBody(capability.subarray(0, 32), captureSequence, timestampUs);
-        await udpSend(socket, capturePort, sealNativeFrame(2, messageSequence, body));
-        await delay(csiFrameIntervalMs);
+  try {
+    await execFileAsync('cargo', ['build']);
+    const { configPath } = await writeHostFixtureConfig(
+      root, httpPort, capturePort, physical.capability,
+    );
+    await execFileAsync(binary, ['init-admission', configPath]);
+    host = await startHost(binary, configPath);
+    operatorContext = await chromium.launchPersistentContext(join(root, 'chrome-profile'), {
+      args: [`--remote-debugging-port=${chromeDebugPort}`],
+      channel: 'chrome',
+      headless: true,
+      viewport: { width: 1440, height: 900 },
+    });
+    const page = operatorContext.pages()[0] ?? await operatorContext.newPage();
+    const observerRoot = join(root, 'observer');
+    await mkdir(observerRoot, { mode: 0o700 });
+    const child = spawn(process.execPath, [
+      resolve('scripts/evidence-observer.mjs'), observerRoot,
+      `cdp:http://127.0.0.1:${chromeDebugPort}`, baseUrl, 'transient-page', '30000',
+    ], { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const exited = new Promise((resolveExit) => child.once('exit', (code, signal) => {
+      resolveExit({ code, signal });
+    }));
+    observer = { child, exited };
+    await Promise.race([
+      waitFor(() => stdout, (output) => output.includes('"state":"ready"'), 'observer ready'),
+      exited.then((result) => { throw new Error(`observer exited before ready: ${JSON.stringify(result)} ${stderr}`); }),
+    ]);
+    await page.goto(baseUrl);
+    await page.getByRole('radio', { name: 'Sensing' }).check();
+    await physical.sendCapability();
+    await physical.start();
+    await waitFor(
+      () => relationshipLatest(baseUrl),
+      (latest) => latest?.data?.knowledge?.reason === 'baseline_missing',
+      'BaselineMissing relationship',
+    );
+    await expect(page.getByTestId('relationship-state')).toHaveText('Unknown(BaselineMissing)');
+    let releasePageReads;
+    const pageReadsBlocked = new Promise((resolveRelease) => { releasePageReads = resolveRelease; });
+    await page.route('**/api/relationships/latest?*', async (route) => {
+      if (route.request().headers()['x-observer-probe'] === '1') {
+        await route.continue();
+        return;
       }
-    })();
-    csiStream = stream;
+      await pageReadsBlocked;
+      await route.continue();
+    });
+    await sendCommand(baseUrl, 'begin_learning');
+    await waitFor(
+      () => relationshipLatest(baseUrl),
+      (latest) => latest?.data?.knowledge?.reason === 'baseline_learning',
+      'committed BaselineLearning relationship',
+    );
+    await physical.stop();
+    await delay(100);
+    const settledLearning = await relationshipLatest(baseUrl);
+    expect(settledLearning?.data?.knowledge?.reason).toBe('baseline_learning');
+    const query = new URLSearchParams({
+      session: settledLearning.data.session_id,
+      link: settledLearning.data.link,
+      profile: settledLearning.data.profile,
+    });
+    await page.evaluate(async (url) => {
+      const response = await fetch(url, {
+        cache: 'no-store',
+        headers: { accept: 'application/json', 'x-observer-probe': '1' },
+      });
+      await response.arrayBuffer();
+    }, `${baseUrl}/api/relationships/latest?${query}`);
+    await Promise.race([
+      waitFor(
+        () => stdout,
+        (output) => output.includes('"state":"non-target-observed"'),
+        'observer non-target DOM read',
+      ),
+      exited.then((result) => { throw new Error(`observer exited on non-target DOM: ${JSON.stringify(result)} ${stderr}`); }),
+    ]);
+    expect(child.exitCode).toBeNull();
+    releasePageReads();
+    await Promise.race([
+      waitFor(
+        () => stdout,
+        (output) => output.includes('"state":"unknown-captured"'),
+        'observer BaselineLearning capture',
+      ),
+      exited.then((result) => { throw new Error(`observer exited before target: ${JSON.stringify(result)} ${stderr}`); }),
+    ]);
+    expect(child.exitCode).toBeNull();
+    await page.unroute('**/api/relationships/latest?*');
+  } finally {
+    await physical.stop();
+    if (observer?.child.exitCode === null && observer.child.signalCode === null) {
+      observer.child.kill('SIGKILL');
+      await observer.exited;
+    }
+    if (host) await stopHost(host);
+    if (operatorContext) await operatorContext.close();
+    socket.close();
+    await rm(root, { recursive: true, force: true });
   }
+});
 
-  async function stopCsiStream() {
-    if (!csiStream) return;
-    const stream = csiStream;
-    csiStream = null;
-    stream.stopping = true;
-    await stream.done;
-  }
+test('one production Host restart keeps the actual served Sensing page and selection', async () => {
+  test.setTimeout(60_000);
+  const root = await mkdtemp(join(tmpdir(), 'whisper-host-restart-browser-'));
+  const httpPort = await freePort();
+  const capturePort = await freePort();
+  const chromeDebugPort = await freePort();
+  const baseUrl = `http://127.0.0.1:${httpPort}`;
+  const binary = resolve(process.env.CARGO_TARGET_DIR ?? 'target', 'debug', 'whisper');
+  const socket = createSocket('udp4');
+  const physical = createPhysicalStream(socket, capturePort);
+  let host = null;
+  let observer = null;
+  let operatorContext = null;
 
   try {
     await execFileAsync('cargo', ['build']);
-    await mkdir(managed, { mode: 0o700 });
-    await mkdir(secrets, { mode: 0o700 });
-    for (const [device, byte] of [[1, 0x11], [2, 0x22]]) {
-      const directory = join(secrets, `device-${device}`);
-      await mkdir(directory, { mode: 0o700 });
-      const path = join(directory, 'key-1.bin');
-      await writeFile(path, Buffer.alloc(32, byte), { mode: 0o600 });
-      await chmod(path, 0o600);
-    }
-    const firstCapability = capability.subarray(0, 32).toString('hex');
-    const secondCapability = capabilityBody(0x03, 0x44, 2048).subarray(0, 32).toString('hex');
-    const source = (await readFile('tests/fixtures/config/valid-two-esp32.toml', 'utf8'))
-      .replace('0202020202020202020202020202020202020202020202020202020202020202', firstCapability)
-      .replace('0404040404040404040404040404040404040404040404040404040404040404', secondCapability)
-      .replaceAll('expected_peer_ip = "192.0.2.10"', 'expected_peer_ip = "127.0.0.1"')
-      .replaceAll('expected_peer_ip = "192.0.2.11"', 'expected_peer_ip = "127.0.0.1"')
-      .replace('peer = "192.0.2.10"', 'peer = "127.0.0.1"')
-      .replace('peer = "192.0.2.11"', 'peer = "127.0.0.1"')
-      .replace('bind = "127.0.0.1:9000"', `bind = "0.0.0.0:${capturePort}"`)
-      .replace('bind = "127.0.0.1:8080"', `bind = "127.0.0.1:${httpPort}"`)
-      .replace('secret_root = "./data/secrets"', `secret_root = "${secrets}"`)
-      .replace('database_path = "./data/whisper.sqlite3"', `database_path = "${database}"`)
-      .replace(
-        'maximum_receive_jitter_ns = 100000000',
-        `maximum_receive_jitter_ns = ${simulatedReceiveJitterBudgetNs}`,
-      );
-    await writeFile(configPath, source);
+    const { configPath } = await writeHostFixtureConfig(
+      root, httpPort, capturePort, physical.capability,
+    );
     await execFileAsync(binary, ['init-admission', configPath]);
 
     host = await startHost(binary, configPath);
@@ -482,8 +614,8 @@ test('one production Host restart keeps the actual served Sensing page and selec
     await page.goto(baseUrl);
     await page.getByRole('radio', { name: 'Sensing' }).check();
     await sendCommand(baseUrl, 'begin_learning');
-    await sendCapability();
-    await startCsiStream();
+    await physical.sendCapability();
+    await physical.start();
     const initialLearning = await waitFor(
       () => relationshipLatest(baseUrl),
       (latest) => latest?.data?.knowledge?.reason === 'baseline_learning',
@@ -514,7 +646,7 @@ test('one production Host restart keeps the actual served Sensing page and selec
     const projectionBeforeStableWindow = BigInt(
       initialStable.receipt.projection_commit.sequence,
     );
-    const captureBeforeStableWindow = captureSequence;
+    const captureBeforeStableWindow = physical.captureSequence();
     let stableBefore = await waitFor(
       () => relationshipLatest(baseUrl),
       (latest) => latest?.data?.knowledge?.value === 'stable'
@@ -522,8 +654,8 @@ test('one production Host restart keeps the actual served Sensing page and selec
       'pre-stop eligible Stable window',
     );
     expect(stableBefore.data.most_recent_change).toEqual(initialStable.data.most_recent_change);
-    await stopCsiStream();
-    const sentStableFrames = BigInt(captureSequence - captureBeforeStableWindow);
+    await physical.stop();
+    const sentStableFrames = BigInt(physical.captureSequence() - captureBeforeStableWindow);
     stableBefore = await waitFor(
       () => relationshipLatest(baseUrl),
       (latest) => BigInt(latest.receipt.projection_commit.sequence)
@@ -580,7 +712,7 @@ test('one production Host restart keeps the actual served Sensing page and selec
       .toBe(stableBefore.receipt.projection_commit.store_id);
     expect(BigInt(rebuilt.receipt.projection_commit.sequence))
       .toBeGreaterThanOrEqual(BigInt(stableBefore.receipt.projection_commit.sequence));
-    await startCsiStream();
+    await physical.start();
     const stableAfter = await waitFor(
       () => relationshipLatest(baseUrl),
       (latest) => latest?.data?.knowledge?.value === 'stable'
@@ -684,6 +816,10 @@ test('one production Host restart keeps the actual served Sensing page and selec
       knowledge: 'unknown:baseline_learning',
       result_time: observedUnknown.data.result_time,
     });
+    expect(observedUnknown.data.knowledge).toEqual({
+      kind: 'unknown',
+      reason: 'baseline_learning',
+    });
     expect(observerTrace.events[1]).toMatchObject({
       change_state: 'Unknown(BaselineLearning) → Stable',
       change_time: observedStablePre.data.most_recent_change.changed_at,
@@ -711,7 +847,7 @@ test('one production Host restart keeps the actual served Sensing page and selec
     observer = null;
   } finally {
     try {
-      await stopCsiStream();
+      await physical.stop();
       if (host) await stopHost(host);
     } finally {
       if (observer?.child.exitCode === null && observer.child.signalCode === null) {
