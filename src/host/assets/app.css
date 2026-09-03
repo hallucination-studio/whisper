@@ -36,7 +36,8 @@ button, input, select { font: inherit; }
 .connection-state[data-mode="polling"] { color: var(--copper); }
 .connection-state[data-mode="protocol-error"] { color: var(--fault); }
 .connection-state::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 9px; background: currentColor; border-radius: 50%; }
-#connection-detail { color: var(--quiet); font-size: 13px; }
+/* Keep stale-state wrapping on whole CSS pixels; `normal` resolves to 15.5px in signed Chrome. */
+#connection-detail { color: var(--quiet); font-size: 13px; line-height: 14px; }
 .store-facts { display: grid; grid-template-columns: .7fr 1.5fr .5fr; gap: 20px; margin: 0; }
 .store-facts div { min-width: 0; align-self: center; }
 .store-facts dt, .section-label { color: var(--quiet); font: 700 10px/1.2 SFMono-Regular, Consolas, monospace; letter-spacing: .13em; text-transform: uppercase; }

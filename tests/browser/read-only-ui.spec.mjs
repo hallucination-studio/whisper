@@ -62,6 +62,45 @@ test('switches between Capture Session signals and Semantic Session relationship
   await expect(page.locator('button')).toHaveCount(0);
 });
 
+test('keeps the retained Sensing state on integral CSS pixel bounds', async ({ page }) => {
+  let socket;
+  await page.route('**/api/topology', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(topology) }),
+  );
+  await page.route('**/api/relationships/latest', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(relationshipSubjects),
+  }));
+  await page.route('**/api/relationships/latest?**', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(relationshipLatestFor(route.request().url())),
+  }));
+  await page.routeWebSocket('**/api/live', (websocket) => {
+    if (!socket) {
+      socket = websocket;
+      websocket.send(JSON.stringify(live));
+    }
+  });
+
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'Sensing' }).check();
+  await expect(page.getByTestId('connection-state')).toHaveText('LIVE');
+  await expect(page.getByTestId('relationship-state')).toHaveText('Unknown(BaselineLearning)');
+  const relationshipState = page.getByTestId('relationship-state');
+  const liveBounds = await relationshipState.boundingBox();
+  expect(Object.values(liveBounds).every(Number.isInteger)).toBe(true);
+  expect(Object.values(liveBounds).every((value) => value > 0)).toBe(true);
+
+  await socket.close();
+  await expect(page.getByTestId('connection-state')).toHaveText('POLLING');
+  await expect(page.getByText('Retained result · stale')).toBeVisible();
+  const staleBounds = await relationshipState.boundingBox();
+  expect(Object.values(staleBounds).every(Number.isInteger)).toBe(true);
+  expect(Object.values(staleBounds).every((value) => value > 0)).toBe(true);
+});
+
 test('same Sensing page renders the committed BaselineLearning to Stable change', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (error) => pageErrors.push(error.message));
