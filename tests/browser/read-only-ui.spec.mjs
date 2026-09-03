@@ -159,6 +159,88 @@ test('same Sensing page renders the committed BaselineLearning to Stable change'
   await expect(page.getByTestId('connection-state')).toHaveText('LIVE');
 });
 
+test('mounts a complete Sensing read while newer watermarks continue arriving', async ({ page }) => {
+  let sequence = 5;
+  let stable = false;
+  let delayReads = false;
+  let socket;
+  const blockedTopologyReads = [];
+  const blockNextTopologyRead = () => {
+    let markStarted;
+    let release;
+    const started = new Promise((resolve) => { markStarted = resolve; });
+    const released = new Promise((resolve) => { release = resolve; });
+    blockedTopologyReads.push({ markStarted, released });
+    return { started, release };
+  };
+  await page.route('**/api/topology', async (route) => {
+    const response = structuredClone(topology);
+    const responseSequence = String(sequence);
+    response.receipt.projection_commit.sequence = responseSequence;
+    if (delayReads) {
+      const blockedRead = blockedTopologyReads.shift();
+      expect(blockedRead).toBeDefined();
+      blockedRead.markStarted();
+      await blockedRead.released;
+    }
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
+  });
+  await page.route('**/api/relationships/latest', async (route) => {
+    const response = structuredClone(relationshipSubjects);
+    const responseSequence = String(sequence);
+    response.receipt.projection_commit.sequence = responseSequence;
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
+  });
+  await page.route('**/api/relationships/latest?**', async (route) => {
+    const responseSequence = String(sequence);
+    const response = relationshipLatestFor(route.request().url(), storeId, responseSequence);
+    if (stable) {
+      response.data.knowledge = { kind: 'known', value: 'stable' };
+      response.data.result_time = '2000000000';
+      response.data.most_recent_change = {
+        previous: { kind: 'unknown', reason: 'baseline_learning' },
+        current: { kind: 'known', value: 'stable' },
+        changed_at: '2000000000',
+      };
+    }
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(response) });
+  });
+  await page.routeWebSocket('**/api/live', (websocket) => {
+    socket = websocket;
+    websocket.send(JSON.stringify(live));
+  });
+
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'Sensing' }).check();
+  await expect(page.getByTestId('relationship-state')).toHaveText('Unknown(BaselineLearning)');
+
+  stable = true;
+  delayReads = true;
+  const firstRead = blockNextTopologyRead();
+  sequence = 6;
+  socket.send(JSON.stringify({
+    ...live,
+    delivery_sequence: '1',
+    projection_commit: { store_id: storeId, sequence: '6' },
+  }));
+  await firstRead.started;
+
+  const followUpRead = blockNextTopologyRead();
+  sequence = 7;
+  socket.send(JSON.stringify({
+    ...live,
+    delivery_sequence: '2',
+    projection_commit: { store_id: storeId, sequence: '7' },
+  }));
+  firstRead.release();
+  await followUpRead.started;
+
+  await expect(page.getByTestId('relationship-state')).toHaveText('Stable');
+  await expect(page.getByTestId('connection-state')).toHaveText('POLLING');
+  followUpRead.release();
+  await expect(page.getByTestId('connection-state')).toHaveText('LIVE');
+});
+
 test('rejects a relationship response outside the closed HTTP schema', async ({ page }) => {
   await page.route('**/api/topology', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(topology) }),

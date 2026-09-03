@@ -984,7 +984,6 @@
         state.pendingWatermark = message.projection_commit;
         state.websocketReady = true;
         state.protocolError = false;
-        state.readToken = null;
         state.refreshRequested = true;
         setStale(hasRetainedResult());
         setMode('POLLING', 'Watermark received · reading complete HTTP resources');
