@@ -726,6 +726,65 @@ pub(crate) enum HostError {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum SessionTimeMapping {
+    CaptureSession,
+    AwaitingContinuation {
+        semantic_origin: crate::domain::time::SessionTime,
+    },
+    Continued {
+        semantic_origin: crate::domain::time::SessionTime,
+        capture_origin: crate::domain::time::SessionTime,
+    },
+}
+
+#[cfg(unix)]
+impl SessionTimeMapping {
+    fn time_at(
+        self,
+        capture_time: crate::domain::time::SessionTime,
+    ) -> Result<crate::domain::time::SessionTime, CoordinatorError> {
+        match self {
+            Self::CaptureSession => Ok(capture_time),
+            Self::AwaitingContinuation { semantic_origin } => Ok(semantic_origin),
+            Self::Continued { semantic_origin, capture_origin } => semantic_origin
+                .checked_add(
+                    capture_time
+                        .checked_duration_since(capture_origin)
+                        .ok_or(CoordinatorError::Incompatible)?,
+                )
+                .ok_or(CoordinatorError::Incompatible),
+        }
+    }
+
+    const fn awaiting_continuation(self) -> bool {
+        matches!(self, Self::AwaitingContinuation { .. })
+    }
+
+    fn continue_at(
+        &mut self,
+        capture_origin: crate::domain::time::SessionTime,
+    ) -> Result<(), CoordinatorError> {
+        let Self::AwaitingContinuation { semantic_origin } = *self else {
+            return Err(CoordinatorError::Incompatible);
+        };
+        *self = Self::Continued { semantic_origin, capture_origin };
+        Ok(())
+    }
+
+    fn capture_deadline(self, semantic_time: crate::domain::time::SessionTime) -> Option<Duration> {
+        match self {
+            Self::CaptureSession => Some(Duration::from_nanos(semantic_time.as_nanos())),
+            Self::AwaitingContinuation { .. } => None,
+            Self::Continued { semantic_origin, capture_origin } => semantic_time
+                .checked_duration_since(semantic_origin)
+                .and_then(|elapsed| capture_origin.checked_add(elapsed))
+                .map(|time| Duration::from_nanos(time.as_nanos())),
+        }
+    }
+}
+
+#[cfg(unix)]
 struct SemanticWriter {
     capture: CaptureSession,
     config: Config,
@@ -733,9 +792,8 @@ struct SemanticWriter {
     semantic_session_id: Option<crate::SessionId>,
     coordinator: Option<RelationshipCoordinator>,
     capabilities: BTreeMap<(DeviceId, KeyEpoch, u32), crate::wire::CapabilitiesV1>,
-    semantic_time_offset_ns: u64,
+    session_time: SessionTimeMapping,
     next_timeline_advance_ns: Option<u64>,
-    physical_continuation_pending: bool,
     #[cfg(feature = "development-fixture")]
     rebuild_evidence: Option<crate::store::EvidenceRebuildSnapshot>,
 }
@@ -748,22 +806,26 @@ impl SemanticWriter {
         executable_identity: crate::executable::ExecutableIdentity,
         rebuilt: Option<RebuiltSession>,
     ) -> Self {
-        let physical_continuation_pending = rebuilt.is_some();
         let (
             semantic_session_id,
             coordinator,
             capabilities,
-            semantic_time_offset_ns,
+            session_time,
             next_timeline_advance_ns,
-        ) = rebuilt.map_or((None, None, BTreeMap::new(), 0, None), |rebuilt| {
-            (
-                Some(rebuilt.semantic_id),
-                Some(rebuilt.coordinator),
-                rebuilt.capabilities,
-                rebuilt.last_session_time.as_nanos(),
-                Some(rebuilt.next_timeline_advance_ns),
-            )
-        });
+        ) = rebuilt.map_or(
+            (None, None, BTreeMap::new(), SessionTimeMapping::CaptureSession, None),
+            |rebuilt| {
+                (
+                    Some(rebuilt.semantic_id),
+                    Some(rebuilt.coordinator),
+                    rebuilt.capabilities,
+                    SessionTimeMapping::AwaitingContinuation {
+                        semantic_origin: rebuilt.last_session_time,
+                    },
+                    Some(rebuilt.next_timeline_advance_ns),
+                )
+            },
+        );
         #[cfg(feature = "development-fixture")]
         let rebuild_evidence = capture.take_rebuild_evidence();
         Self {
@@ -773,9 +835,8 @@ impl SemanticWriter {
             semantic_session_id,
             coordinator,
             capabilities,
-            semantic_time_offset_ns,
+            session_time,
             next_timeline_advance_ns,
-            physical_continuation_pending,
             #[cfg(feature = "development-fixture")]
             rebuild_evidence,
         }
@@ -794,7 +855,7 @@ impl SemanticWriter {
     }
 
     const fn physical_continuation_pending(&self) -> bool {
-        self.physical_continuation_pending
+        self.session_time.awaiting_continuation()
     }
 
     #[cfg(feature = "development-fixture")]
@@ -808,12 +869,10 @@ impl SemanticWriter {
     }
 
     fn next_timeline_deadline(&self) -> Option<Instant> {
-        if self.physical_continuation_pending {
-            return None;
-        }
         self.next_timeline_advance_ns
-            .and_then(|at| at.checked_sub(self.semantic_time_offset_ns))
-            .and_then(|at| self.monotonic_origin().checked_add(Duration::from_nanos(at)))
+            .map(crate::domain::time::SessionTime::from_nanos)
+            .and_then(|at| self.session_time.capture_deadline(at))
+            .and_then(|at| self.monotonic_origin().checked_add(at))
     }
 
     fn prepare_session(
@@ -856,13 +915,9 @@ impl SemanticWriter {
         &mut self,
         candidate: crate::wire::WireCandidate,
     ) -> Result<CommitOutcome, HostError> {
-        let continuation_pending = self.physical_continuation_pending;
+        let continuation_pending = self.session_time.awaiting_continuation();
         let capture_session_time = candidate.session_time();
-        let semantic_time = crate::domain::time::SessionTime::from_nanos(
-            self.semantic_time_offset_ns
-                .checked_add(capture_session_time.as_nanos())
-                .ok_or(CoordinatorError::Incompatible)?,
-        );
+        let semantic_time = self.session_time.time_at(capture_session_time)?;
         let candidate = candidate.with_session_time(semantic_time);
         let started_utc_ns =
             i64::try_from(candidate.receive_utc_ns()).map_err(|_| HostError::CaptureClock)?;
@@ -905,9 +960,9 @@ impl SemanticWriter {
             self.capabilities.insert(key, capability);
         }
         if continuation_pending {
+            self.session_time.continue_at(capture_session_time)?;
             self.schedule_first_timeline_advance(fact.at())?;
         }
-        self.physical_continuation_pending = false;
         Ok(CommitOutcome::Committed(crate::CommitReceipt::new(
             processing.disposition,
             fact.capture_record_seq().ok_or(CoordinatorError::Incompatible)?,
@@ -920,7 +975,7 @@ impl SemanticWriter {
         command: TargetedBaselineCommand,
         (monotonic_now, utc_now): (Instant, SystemTime),
     ) -> Result<ProjectionSequence, HostError> {
-        if self.physical_continuation_pending {
+        if self.session_time.awaiting_continuation() {
             return Err(CoordinatorError::Incompatible.into());
         }
         let now = utc_now.duration_since(UNIX_EPOCH).map_err(|_| HostError::CaptureClock)?;
@@ -932,11 +987,9 @@ impl SemanticWriter {
                 .as_nanos(),
         )
         .map_err(|_| HostError::CaptureClock)?;
-        let at = crate::domain::time::SessionTime::from_nanos(
-            self.semantic_time_offset_ns
-                .checked_add(capture_time)
-                .ok_or(CoordinatorError::Incompatible)?,
-        );
+        let at = self
+            .session_time
+            .time_at(crate::domain::time::SessionTime::from_nanos(capture_time))?;
         let prepared = self.prepare_session(started_utc_ns)?;
         let semantic_id = prepared
             .as_ref()

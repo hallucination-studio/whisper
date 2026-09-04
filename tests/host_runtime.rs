@@ -2453,6 +2453,7 @@ async fn restart_rebuilds_stable_and_later_equal_window_preserves_the_last_chang
         "127.0.0.1".parse().expect("loopback"),
         second.capture_address().port(),
     );
+    advance_host_clock(&second, Duration::from_secs(3));
     counters.1 += 1;
     sender
         .send_to(&seal_raw(1, counters.1, &capability), destination)
@@ -2463,6 +2464,15 @@ async fn restart_rebuilds_stable_and_later_equal_window_preserves_the_last_chang
     let continued_capture_sessions = capture_session_ids(second.http_address()).await;
     assert_eq!(continued_capture_sessions.len(), 2);
     assert!(continued_capture_sessions.contains(&first_capture_sessions[0]));
+    let second_capture = continued_capture_sessions
+        .iter()
+        .find(|candidate| !first_capture_sessions.contains(candidate))
+        .expect("new Capture Session");
+    let first_continuation =
+        raw_signals(second.http_address(), second_capture, "sensor-a", "link-a").await;
+    assert_eq!(first_continuation["receipt"]["first_record_seq"], "0");
+    assert_eq!(first_continuation["receipt"]["last_record_seq"], "0");
+
     send_csi_window_after_carry(
         &second,
         &sender,
