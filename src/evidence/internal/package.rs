@@ -250,6 +250,13 @@ pub(super) fn validate_canonical_cbor(path: &str, bytes: &[u8]) -> Result<(), Ev
     Ok(())
 }
 
+pub(crate) fn canonical_cbor_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, EvidenceError> {
+    let value = CborValue::serialized(value).map_err(|_| cbor_error())?;
+    let mut bytes = Vec::new();
+    write_cbor(&value, &mut bytes)?;
+    Ok(bytes)
+}
+
 pub(super) fn write_cbor(value: &CborValue, output: &mut Vec<u8>) -> Result<(), EvidenceError> {
     match value {
         CborValue::Integer(integer) => {

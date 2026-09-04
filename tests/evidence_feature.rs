@@ -2254,6 +2254,45 @@ async fn real_host_exports_byte_equal_committed_state_across_read_only_rebuild()
         &fs::read(package.join("host-commit-trace.json")).expect("read Host trace"),
     )
     .expect("parse Host trace");
+    let trace_facts = trace["facts"].as_array().expect("Host trace facts");
+    let baseline_source_record = post_store["baselines"]
+        .as_array()
+        .expect("Store baselines")
+        .iter()
+        .filter_map(|baseline| baseline["source_record_seq"].as_u64())
+        .max()
+        .expect("complete baseline source record");
+    let baseline_effect = trace_facts
+        .iter()
+        .find(|fact| {
+            fact["record_seq"].as_str().and_then(|value| value.parse::<u64>().ok())
+                == Some(baseline_source_record)
+        })
+        .expect("complete baseline transaction-B effect");
+    assert_eq!(
+        baseline_effect["transaction_b"]["baseline_sha256"],
+        store_collection_sha256(&package, "store-post-continuation.cbor", "baselines"),
+        "producer and verifier must digest the same canonical complete baseline bytes"
+    );
+    let relationship_creator_commit = post_store["relationships"]
+        .as_array()
+        .expect("Store relationships")
+        .iter()
+        .filter_map(|relationship| relationship["creator_commit_seq"].as_u64())
+        .max()
+        .expect("relationship creator commit");
+    let relationship_effect = trace_facts
+        .iter()
+        .find(|fact| {
+            fact["transaction_b"]["commit_seq"].as_str().and_then(|value| value.parse::<u64>().ok())
+                == Some(relationship_creator_commit)
+        })
+        .expect("relationship creator transaction-B effect");
+    assert_eq!(
+        relationship_effect["transaction_b"]["relationship_sha256"],
+        store_collection_sha256(&package, "store-post-continuation.cbor", "relationships"),
+        "producer and verifier must digest the same canonical relationship bytes"
+    );
     let unknown_creator = learning["data"]["creator_commit"]["sequence"]
         .as_str()
         .expect("Unknown creator commit")

@@ -719,6 +719,8 @@ mod verifier;
 use format::sensitive_string;
 use package::{canonical_json, is_producer_path, parse_canonical_json};
 
+pub(crate) use package::canonical_cbor_bytes;
+
 pub(crate) use producer::{
     seal_observer, seal_producer, write_current_store_export, write_input_and_commit_artifacts,
     write_observer_receipt, write_rebuild_store_export, write_restart_artifact, write_run_receipt,

@@ -568,10 +568,7 @@ fn validate_snapshot_effect_bindings(
 }
 
 pub(super) fn canonical_cbor_sha256<T: Serialize>(value: &T) -> Result<String, EvidenceError> {
-    let value = CborValue::serialized(value).map_err(|_| cbor_error())?;
-    let mut bytes = Vec::new();
-    write_cbor(&value, &mut bytes)?;
-    Ok(sha256(&bytes))
+    Ok(sha256(&canonical_cbor_bytes(value)?))
 }
 
 pub(super) fn parse_store_export(

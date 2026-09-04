@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 
-use ciborium::ser::into_writer;
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -984,8 +983,8 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 fn canonical_sha256(value: &impl Serialize) -> Result<String, EvidenceSnapshotError> {
-    let mut bytes = Vec::new();
-    into_writer(value, &mut bytes).map_err(|_| EvidenceSnapshotError::Incompatible)?;
+    let bytes = crate::evidence::canonical_cbor_bytes(value)
+        .map_err(|_| EvidenceSnapshotError::Incompatible)?;
     Ok(sha256(&bytes))
 }
 

@@ -7,6 +7,8 @@
 
 mod internal;
 
+pub(crate) use internal::canonical_cbor_bytes;
+
 use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt;

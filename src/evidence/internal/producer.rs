@@ -518,9 +518,7 @@ pub(super) fn write_store_export(
     path: &Path,
     snapshot: &crate::store::EvidenceStoreSnapshot,
 ) -> Result<(), EvidenceError> {
-    let value = CborValue::serialized(snapshot).map_err(|_| cbor_error())?;
-    let mut bytes = Vec::new();
-    write_cbor(&value, &mut bytes)?;
+    let bytes = canonical_cbor_bytes(snapshot)?;
     write_new_file(path, &bytes)
 }
 
