@@ -2459,6 +2459,83 @@ fn verifier_accepts_one_complete_sealed_package_and_emits_the_only_pass_receipt(
     remove_package(&root);
 }
 
+fn add_baseline_completion_to_unknown_creator(root: &Path) {
+    update_json_artifact(root, "host-commit-trace.json", "run.json", |trace| {
+        trace["facts"][2]["transaction_b"]["baseline_sha256"] = Value::String("01".repeat(32));
+        trace["facts"][2]["transaction_b"]["effects"] = json!([
+            "processed_cursor",
+            "timeline_digest",
+            "projection_watermark",
+            "complete_baseline",
+            "relationship_projection",
+            "creator_commit"
+        ]);
+    });
+}
+
+#[test]
+fn verifier_accepts_unknown_creator_that_completes_baseline_in_same_transaction() {
+    let root = package_directory();
+    complete_package(&root);
+    add_baseline_completion_to_unknown_creator(&root);
+
+    let output = run_verifier(&root);
+    assert!(
+        output.status.success(),
+        "same-transaction baseline completion was rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    remove_package(&root);
+}
+
+#[test]
+fn verifier_rejects_invalid_baseline_completing_unknown_effect_sequences() {
+    for effects in [
+        json!([
+            "processed_cursor",
+            "timeline_digest",
+            "projection_watermark",
+            "relationship_projection",
+            "complete_baseline",
+            "creator_commit"
+        ]),
+        json!([
+            "processed_cursor",
+            "timeline_digest",
+            "projection_watermark",
+            "relationship_projection",
+            "creator_commit"
+        ]),
+        json!([
+            "processed_cursor",
+            "timeline_digest",
+            "projection_watermark",
+            "complete_baseline",
+            "complete_baseline",
+            "relationship_projection",
+            "creator_commit"
+        ]),
+        json!([
+            "processed_cursor",
+            "timeline_digest",
+            "projection_watermark",
+            "complete_baseline",
+            "unrelated_effect",
+            "relationship_projection",
+            "creator_commit"
+        ]),
+    ] {
+        let root = package_directory();
+        complete_package(&root);
+        add_baseline_completion_to_unknown_creator(&root);
+        update_json_artifact(&root, "host-commit-trace.json", "run.json", |trace| {
+            trace["facts"][2]["transaction_b"]["effects"] = effects;
+        });
+        assert_rejected(&root);
+        remove_package(&root);
+    }
+}
+
 #[test]
 fn verifier_accepts_chrome_rgb_state_screenshots() {
     let root = package_directory();

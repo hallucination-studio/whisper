@@ -873,13 +873,6 @@ pub(super) fn validate_unknown_trace_binding(
         source_record_seq,
     }];
     let expected_relationship_sha256 = canonical_cbor_sha256(&expected_relationship)?;
-    let expected_effects = [
-        "processed_cursor",
-        "timeline_digest",
-        "projection_watermark",
-        "relationship_projection",
-        "creator_commit",
-    ];
     let valid = matches!((begin, commit), (Some(begin), Some(commit)) if begin < creator && creator < commit)
         && matches!(creator_fact.kind.as_str(), "packet" | "timeline_advance")
         && creator_fact.transaction_b.processed_cursor == creator_fact.record_seq
@@ -887,7 +880,6 @@ pub(super) fn validate_unknown_trace_binding(
             == Some(response.data.creator_commit.sequence.as_str())
         && creator_fact.transaction_b.relationship_sha256.as_deref()
             == Some(expected_relationship_sha256.as_str())
-        && creator_fact.transaction_b.effects.iter().map(String::as_str).eq(expected_effects)
         && receipt.transaction_b.processed_cursor == response.receipt.last_record_seq
         && response.data.most_recent_change.is_none();
     if valid {
