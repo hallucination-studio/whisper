@@ -78,6 +78,8 @@ struct ManualClockState {
     monotonic_origin: Instant,
     utc_origin: SystemTime,
     elapsed_ns: AtomicU64,
+    #[cfg(test)]
+    sample_count: AtomicUsize,
     writer: Mutex<Option<Weak<WriterInbox>>>,
 }
 
@@ -99,7 +101,7 @@ impl RuntimeClock {
             #[cfg(feature = "ingest-test-hooks")]
             RuntimeClockSource::Manual(state) => {
                 let elapsed = Duration::from_nanos(state.elapsed_ns.load(AtomicOrdering::Acquire));
-                (
+                let sample = (
                     state
                         .monotonic_origin
                         .checked_add(elapsed)
@@ -108,7 +110,10 @@ impl RuntimeClock {
                         .utc_origin
                         .checked_add(elapsed)
                         .expect("manual clock advance validates the UTC range"),
-                )
+                );
+                #[cfg(test)]
+                state.sample_count.fetch_add(1, AtomicOrdering::Release);
+                sample
             }
         }
     }
@@ -119,6 +124,8 @@ impl RuntimeClock {
             monotonic_origin: Instant::now(),
             utc_origin: SystemTime::now(),
             elapsed_ns: AtomicU64::new(0),
+            #[cfg(test)]
+            sample_count: AtomicUsize::new(0),
             writer: Mutex::new(None),
         });
         (
@@ -145,6 +152,15 @@ pub(crate) struct IngressOrder {
     state: Mutex<IngressOrderState>,
     changed: Condvar,
     async_changed: Notify,
+    #[cfg(test)]
+    registration_transition_hold: Mutex<Option<Arc<IngressRegistrationTransitionHold>>>,
+}
+
+#[cfg(all(unix, test))]
+#[derive(Debug)]
+struct IngressRegistrationTransitionHold {
+    arrived: std::sync::Barrier,
+    release: std::sync::Barrier,
 }
 
 #[cfg(unix)]
@@ -196,6 +212,8 @@ impl IngressOrder {
             state: Mutex::new(IngressOrderState::default()),
             changed: Condvar::new(),
             async_changed: Notify::new(),
+            #[cfg(test)]
+            registration_transition_hold: Mutex::new(None),
         }
     }
 
@@ -219,8 +237,10 @@ impl IngressOrder {
         state.next_id = state.next_id.checked_add(1).ok_or(HostError::CaptureTimeOverflow)?;
         state.pending.push_back(IngressEntry { id, elapsed_ns });
         state.pending.make_contiguous().sort_by_key(|entry| (entry.elapsed_ns, entry.id));
-        drop(state);
         drop(sampling);
+        #[cfg(test)]
+        self.wait_at_registration_transition();
+        drop(state);
         self.changed.notify_all();
         self.async_changed.notify_waiters();
         Ok(IngressReceipt { order: Arc::clone(self), id, received })
@@ -261,6 +281,34 @@ impl IngressOrder {
             })
             .map_err(|_| HostError::IngressSamplingOverflow)?;
         Ok(IngressSampling(self))
+    }
+
+    #[cfg(test)]
+    fn hold_next_registration_transition(&self) -> Arc<IngressRegistrationTransitionHold> {
+        let hold = Arc::new(IngressRegistrationTransitionHold {
+            arrived: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        });
+        let previous = self
+            .registration_transition_hold
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(Arc::clone(&hold));
+        assert!(previous.is_none(), "only one registration transition may be held");
+        hold
+    }
+
+    #[cfg(test)]
+    fn wait_at_registration_transition(&self) {
+        let hold = self
+            .registration_transition_hold
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hold) = hold {
+            hold.arrived.wait();
+            hold.release.wait();
+        }
     }
 }
 
@@ -2035,7 +2083,7 @@ mod tests {
             let sender = sender.clone();
             move || sender.send((true, order.begin(&clock))).expect("return earlier receipt")
         });
-        while order.sampling.load(Ordering::Acquire) != 1 {
+        while control.state.sample_count.load(Ordering::Acquire) != 2 {
             std::thread::yield_now();
         }
         assert!(control.advance(Duration::from_secs(1)));
@@ -2044,7 +2092,7 @@ mod tests {
             let clock = clock.clone();
             move || sender.send((false, order.begin(&clock))).expect("return later receipt")
         });
-        while order.sampling.load(Ordering::Acquire) != 2 {
+        while control.state.sample_count.load(Ordering::Acquire) != 3 {
             std::thread::yield_now();
         }
         drop(state);
@@ -2079,6 +2127,40 @@ mod tests {
                 .expect("later receipt follows capture origin"),
             Duration::from_secs(1)
         );
+    }
+
+    #[cfg(all(unix, feature = "ingest-test-hooks"))]
+    #[test]
+    fn ingress_does_not_double_count_a_published_sampler() {
+        let (clock, control) = RuntimeClock::manual();
+        let capture_origin = clock.sample().0;
+        let order = Arc::new(IngressOrder::new(capture_origin, 2));
+        let hold = order.hold_next_registration_transition();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+
+        let first_thread = std::thread::spawn({
+            let order = Arc::clone(&order);
+            let clock = clock.clone();
+            let sender = sender.clone();
+            move || sender.send(order.begin(&clock)).expect("return first receipt")
+        });
+        hold.arrived.wait();
+        assert!(control.advance(Duration::from_secs(1)));
+        let second_thread = std::thread::spawn({
+            let order = Arc::clone(&order);
+            let clock = clock.clone();
+            move || sender.send(order.begin(&clock)).expect("return second receipt")
+        });
+        while control.state.sample_count.load(Ordering::Acquire) != 3 {
+            std::thread::yield_now();
+        }
+        hold.release.wait();
+
+        let receipts =
+            (0..2).map(|_| receiver.recv().expect("receive ingress receipt")).collect::<Vec<_>>();
+        first_thread.join().expect("join first sampler");
+        second_thread.join().expect("join second sampler");
+        assert!(receipts.iter().all(Result::is_ok));
     }
 
     #[cfg(all(unix, feature = "ingest-test-hooks"))]
