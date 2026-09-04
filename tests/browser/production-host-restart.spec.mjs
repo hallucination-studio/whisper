@@ -2,8 +2,9 @@ import { chromium, expect, test } from '@playwright/test';
 import { createCipheriv, createHash } from 'node:crypto';
 import { createSocket } from 'node:dgram';
 import { execFile, spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { createServer as createHttpServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -18,6 +19,14 @@ import {
   screenshotState,
   signedChromeApplication,
 } from '../../scripts/evidence-observer.mjs';
+import {
+  live,
+  relationshipLatestFor,
+  relationshipSubjects,
+  signalsFor,
+  storeId,
+  topology,
+} from './responses.mjs';
 
 const execFileAsync = promisify(execFile);
 const profile = '61971bc9476bdeacd7703e3516457df620147f73157cd1d4ad836fb9c7b74be2';
@@ -41,7 +50,7 @@ test('evidence observer timing uses an injected monotonic and UTC clock', () => 
 
 test('evidence observer applies one total deadline while Chrome identity is unavailable', async () => {
   const sockets = new Set();
-  const server = createServer((socket) => {
+  const server = createNetServer((socket) => {
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
   });
@@ -186,7 +195,7 @@ function delay(milliseconds) {
 }
 
 async function freePort() {
-  const server = createServer();
+  const server = createNetServer();
   await new Promise((resolveListen, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolveListen);
@@ -427,6 +436,169 @@ async function writeHostFixtureConfig(root, httpPort, capturePort, capability) {
   await writeFile(configPath, source);
   return { configPath, database };
 }
+
+test('evidence observer retries HTTP behind a newer same-subject Sensing DOM', async () => {
+  test.setTimeout(30_000);
+  const root = await mkdtemp(join(tmpdir(), 'whisper-observer-result-skew-'));
+  const httpPort = await freePort();
+  const chromeDebugPort = await freePort();
+  const baseUrl = `http://127.0.0.1:${httpPort}`;
+  const assetRoot = resolve('src/host/assets');
+  const assets = new Map([
+    ['/', ['index.html', 'text/html; charset=utf-8']],
+    ['/assets/app.css', ['app.css', 'text/css; charset=utf-8']],
+    ['/assets/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ]);
+  let currentSequence = '5';
+  let currentResultTime = '900000000';
+  let currentKnowledge = { kind: 'unknown', reason: 'baseline_missing' };
+  let releaseStaleBody;
+  let markStaleStarted;
+  const staleBodyReleased = new Promise((resolveRelease) => { releaseStaleBody = resolveRelease; });
+  const staleStarted = new Promise((resolveStarted) => { markStaleStarted = resolveStarted; });
+  const server = createHttpServer(async (request, response) => {
+    try {
+      const url = new URL(request.url, baseUrl);
+      const asset = assets.get(url.pathname);
+      if (asset) {
+        let body = await readFile(resolve(assetRoot, asset[0]));
+        body = Buffer.from(body.toString('utf8').replace('__MAX_TIME_BUCKETS__', '64'));
+        response.writeHead(200, {
+          'cache-control': 'no-store',
+          'content-length': String(body.length),
+          'content-type': asset[1],
+        }).end(body);
+        return;
+      }
+      let value;
+      if (url.pathname === '/api/topology') {
+        value = structuredClone(topology);
+        value.receipt.projection_commit.sequence = currentSequence;
+      } else if (url.pathname === '/api/signals') {
+        value = signalsFor(url.toString(), storeId, currentSequence);
+      } else if (url.pathname === '/api/relationships/latest' && !url.search) {
+        value = structuredClone(relationshipSubjects);
+        value.receipt.projection_commit.sequence = currentSequence;
+      } else if (url.pathname === '/api/relationships/latest') {
+        const sequence = url.searchParams.get('observer_case') === 'stale' ? '6' : currentSequence;
+        value = relationshipLatestFor(url.toString(), storeId, sequence);
+        value.data.knowledge = url.searchParams.get('observer_case') === 'stale'
+          ? { kind: 'unknown', reason: 'baseline_learning' } : currentKnowledge;
+        value.data.result_time = url.searchParams.get('observer_case') === 'stale'
+          ? '1000000000' : currentResultTime;
+      } else {
+        response.writeHead(404, { 'content-length': '0' }).end();
+        return;
+      }
+      const body = Buffer.from(JSON.stringify(value));
+      response.writeHead(200, {
+        'cache-control': 'no-store',
+        'content-length': String(body.length),
+        'content-type': 'application/json',
+      });
+      if (url.searchParams.get('observer_case') === 'stale') {
+        response.flushHeaders();
+        markStaleStarted();
+        await staleBodyReleased;
+      }
+      response.end(body);
+    } catch {
+      response.destroy();
+    }
+  });
+  await new Promise((resolveListen, reject) => {
+    server.once('error', reject);
+    server.listen(httpPort, '127.0.0.1', resolveListen);
+  });
+  let observer;
+  let operatorContext;
+  try {
+    operatorContext = await chromium.launchPersistentContext(join(root, 'chrome-profile'), {
+      args: [`--remote-debugging-port=${chromeDebugPort}`],
+      channel: 'chrome',
+      headless: true,
+      viewport: { width: 1440, height: 900 },
+    });
+    const page = operatorContext.pages()[0] ?? await operatorContext.newPage();
+    let socket;
+    await page.routeWebSocket('**/api/live', (websocket) => {
+      socket = websocket;
+      websocket.send(JSON.stringify(live));
+    });
+    const observerRoot = join(root, 'observer');
+    await mkdir(observerRoot, { mode: 0o700 });
+    const child = spawn(process.execPath, [
+      resolve('scripts/evidence-observer.mjs'), observerRoot,
+      `cdp:http://127.0.0.1:${chromeDebugPort}`, baseUrl, 'result-skew-page', '20000',
+    ], { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const exited = new Promise((resolveExit) => child.once('exit', (code, signal) => {
+      resolveExit({ code, signal });
+    }));
+    observer = { child, exited };
+    await Promise.race([
+      waitFor(() => stdout, (output) => output.includes('"state":"ready"'), 'observer ready'),
+      exited.then((result) => { throw new Error(`observer exited before ready: ${JSON.stringify(result)} ${stderr}`); }),
+    ]);
+    await page.goto(baseUrl);
+    await page.getByRole('radio', { name: 'Sensing' }).check();
+    await expect(page.getByTestId('relationship-state')).toHaveText('Unknown(BaselineMissing)');
+    await expect(page.getByTestId('connection-state')).toHaveText('LIVE');
+    const selection = await page.evaluate(() => ({
+      link: document.querySelector('#relationship-link-select').value,
+      profile: document.querySelector('#relationship-profile-select').value,
+      session: document.querySelector('#relationship-session-select').value,
+    }));
+    const staleQuery = new URLSearchParams({ ...selection, observer_case: 'stale' });
+    const staleFetch = page.evaluate(async (url) => {
+      const response = await fetch(url, { cache: 'no-store' });
+      await response.arrayBuffer();
+    }, `${baseUrl}/api/relationships/latest?${staleQuery}`);
+    await staleStarted;
+
+    currentSequence = '7';
+    currentResultTime = '1000000001';
+    currentKnowledge = { kind: 'unknown', reason: 'baseline_learning' };
+    socket.send(JSON.stringify({
+      ...live,
+      delivery_sequence: '1',
+      projection_commit: { store_id: storeId, sequence: currentSequence },
+    }));
+    await expect(page.getByTestId('relationship-state')).toHaveText('Unknown(BaselineLearning)');
+    await expect(page.getByTestId('relationship-result-time')).toHaveText(`${currentResultTime} ns`);
+    releaseStaleBody();
+    await staleFetch;
+    await Promise.race([
+      waitFor(
+        () => stdout,
+        (output) => output.includes('"state":"non-target-observed"')
+          && output.includes('"state":"unknown-captured"'),
+        'observer retry and exact capture',
+      ),
+      exited.then((result) => { throw new Error(`observer exited during result skew: ${JSON.stringify(result)} ${stderr}`); }),
+    ]);
+    const events = stdout.trim().split('\n').map((line) => JSON.parse(line));
+    expect(events.filter((event) => event.state === 'unknown-captured'))
+      .toEqual([{ page_instance_id: 'result-skew-page', result_time: currentResultTime,
+        state: 'unknown-captured' }]);
+    expect(events.findIndex((event) => event.state === 'non-target-observed'))
+      .toBeLessThan(events.findIndex((event) => event.state === 'unknown-captured'));
+    expect(await readdir(observerRoot)).toEqual([]);
+    expect(child.exitCode).toBeNull();
+  } finally {
+    releaseStaleBody();
+    if (observer?.child.exitCode === null && observer.child.signalCode === null) {
+      observer.child.kill('SIGKILL');
+      await observer.exited;
+    }
+    if (operatorContext) await operatorContext.close();
+    await new Promise((resolveClose) => server.close(resolveClose));
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('evidence observer waits through a committed valid non-target relationship state', async () => {
   test.setTimeout(40_000);

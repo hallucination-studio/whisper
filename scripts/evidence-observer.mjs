@@ -424,10 +424,9 @@ async function readRelationshipDom(page, cdp, expectedDocumentId = null) {
   };
 }
 
-async function matchingRelationshipDom(page, cdp, value, expectedDocumentId) {
+function matchRelationshipDom(value, dom) {
   const expectedState = relationshipKind(value) === 'unknown'
     ? 'unknown:baseline_learning' : 'stable';
-  const dom = await readRelationshipDom(page, cdp, expectedDocumentId);
   const expectedSelection = {
     link: value.data.link,
     profile: value.data.profile,
@@ -443,9 +442,15 @@ async function matchingRelationshipDom(page, cdp, value, expectedDocumentId) {
     return null;
   }
   if (dom.result_time !== value.data.result_time) {
+    if (BigInt(dom.result_time) > BigInt(value.data.result_time)) return null;
     throw new Error('relationship DOM result time disagrees with the HTTP target');
   }
   return dom;
+}
+
+async function matchingRelationshipDom(page, cdp, value, expectedDocumentId) {
+  const dom = await readRelationshipDom(page, cdp, expectedDocumentId);
+  return matchRelationshipDom(value, dom);
 }
 
 async function captureRelationshipPage(page, cdp, value, expectedDocumentId, clock, deadlineMs) {
