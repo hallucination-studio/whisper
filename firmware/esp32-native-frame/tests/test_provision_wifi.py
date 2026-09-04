@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import types
 import unittest
@@ -200,6 +201,20 @@ class ProvisionWifiTests(unittest.TestCase):
             self.assertIsNone(provision_wifi.resolve_current_ssid("en0"))
 
         with mock.patch.object(provision_wifi, "run_optional", return_value=None):
+            self.assertIsNone(provision_wifi.resolve_current_ssid("en0"))
+
+    def test_current_ssid_treats_undecodable_optional_output_as_unavailable(self):
+        original_run_optional = provision_wifi.run_optional
+
+        def undecodable_output(arguments, **_kwargs):
+            if arguments == [provision_wifi.IOREG, "-l"]:
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+            return subprocess.CompletedProcess(arguments, 1, "")
+
+        def run_optional(arguments):
+            return original_run_optional(arguments, run=undecodable_output)
+
+        with mock.patch.object(provision_wifi, "run_optional", side_effect=run_optional):
             self.assertIsNone(provision_wifi.resolve_current_ssid("en0"))
 
     def test_helper_subprocesses_cannot_read_inherited_key_stdin(self):

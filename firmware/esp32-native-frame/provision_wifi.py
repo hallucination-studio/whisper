@@ -67,7 +67,7 @@ def run_optional(arguments, *, run=subprocess.run):
             stderr=subprocess.DEVNULL,
             check=False,
         )
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     return result.stdout if result.returncode == 0 else None
 
