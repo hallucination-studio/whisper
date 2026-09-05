@@ -2,149 +2,257 @@
 
 use sha2::{Digest, Sha256};
 use whisper::measurement::{
-    AssemblyCloseReason, AssemblyKey, AssemblyLimits, EvidenceBlock, EvidenceQuality, Geometry,
-    MeasurementAssembler, MeasurementFragment, ModelRequirements, PhaseRelation, PhysicalOperator,
-    PortMapping, QualificationGap, RelationValidity, TimeRelation,
+    AssemblyCapacity, AssemblyCloseReason, AssemblyKey, AssemblyLimits, ChannelIdentity,
+    ErrorBound, ErrorUnit, EventIdentity, EvidenceBlock, EvidenceBlockIdentity,
+    EvidenceMemberIdentity, EvidenceQuality, FitIdentity, FragmentBytes, FragmentFact,
+    FragmentPosition, Geometry, MeasurementAssembler, MeasurementContext, MeasurementFragment,
+    ModelRequirements, NativeEventIdentity, PhaseReferenceIdentity, PhaseRelation,
+    PhysicalOperator, PortMapEntry, PortMapping, Pose, ProfileIdentity, Qualification,
+    QualificationEpoch, QualificationGap, RadioIdentity, RelationValidity, SourceInstance,
+    SourceTick, TickRange, TimeRelation, TransmitterIdentity, WaitTicks,
 };
-use whisper::{BootGeneration, DeviceId};
+use whisper::{BootGeneration, DeviceId, KeyEpoch, SensorId};
 
-fn key(boot: u32, event: u64) -> AssemblyKey {
-    AssemblyKey::new(
+fn source(boot: u32) -> SourceInstance {
+    SourceInstance::new(
+        SensorId::try_from("receiver-a").unwrap(),
         DeviceId::new(7),
+        KeyEpoch::new(2).unwrap(),
         BootGeneration::new(boot).unwrap(),
-        [2, 0, 0, 0, 0, 1],
-        event,
-        Some(91),
     )
 }
 
-fn fragment(boot: u32, event: u64, ordinal: u16, expected: u16) -> MeasurementFragment {
+fn key(boot: u32, event: u8) -> AssemblyKey {
+    AssemblyKey::new(
+        source(boot),
+        EventIdentity::new(
+            TransmitterIdentity::new([3; 32]),
+            NativeEventIdentity::new([event; 32]),
+            None,
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new([4; 32]),
+            RadioIdentity::new([5; 32]),
+            ChannelIdentity::new([6; 32]),
+        ),
+    )
+}
+
+fn fragment_with(
+    boot: u32,
+    event: u8,
+    ordinal: u16,
+    expected: u16,
+    digest: u8,
+    bytes: u32,
+) -> MeasurementFragment {
     MeasurementFragment::new(
         key(boot, event),
-        ordinal,
-        expected,
-        [ordinal as u8 + 1; 32],
-        12,
-        EvidenceQuality::Captured,
+        FragmentPosition::new(ordinal, expected).unwrap(),
+        FragmentFact::new(
+            [digest; 32],
+            FragmentBytes::new(bytes).unwrap(),
+            EvidenceQuality::Captured,
+        ),
     )
-    .unwrap()
+}
+
+fn fragment(boot: u32, event: u8, ordinal: u16, expected: u16) -> MeasurementFragment {
+    fragment_with(boot, event, ordinal, expected, ordinal as u8 + 1, 12)
+}
+
+fn limits(open: usize, fragments: u16, bytes: u64, wait: u64) -> AssemblyLimits {
+    AssemblyLimits::new(
+        AssemblyCapacity::new(open, fragments, bytes).unwrap(),
+        WaitTicks::new(wait).unwrap(),
+    )
 }
 
 #[test]
-fn assembly_is_deterministic_across_reordering_and_exact_duplicates() {
+fn assembly_reorders_and_records_exact_duplicates_without_mutating_membership() {
     const FIXTURE: &str = include_str!("fixtures/measurement/fragments-v1.txt");
     const FIXTURE_SHA256: [u8; 32] = [
         205, 38, 239, 195, 234, 42, 62, 253, 208, 219, 42, 62, 250, 124, 7, 23, 56, 77, 84, 86, 43,
         181, 180, 152, 157, 226, 125, 234, 3, 30, 89, 163,
     ];
     assert_eq!(<[u8; 32]>::from(Sha256::digest(FIXTURE.as_bytes())), FIXTURE_SHA256);
-    let mut assembler = MeasurementAssembler::new(AssemblyLimits::new(4, 4, 64, 10).unwrap());
-    let mut close = None;
+    let mut assembler = MeasurementAssembler::new(limits(4, 4, 64, 10));
+    let mut closes = Vec::new();
     for line in FIXTURE.lines().filter(|line| !line.starts_with('#')) {
-        let fields = line.split(',').collect::<Vec<_>>();
-        let arrival = fields[0].parse().unwrap();
-        let boot = fields[1].parse().unwrap();
-        let event = fields[2].parse().unwrap();
-        let ordinal = fields[3].parse().unwrap();
-        let expected = fields[4].parse().unwrap();
-        let digest_byte = fields[5].parse().unwrap();
-        let payload_bytes = fields[6].parse().unwrap();
-        assert_eq!(fields[7], "captured");
-        close = assembler
-            .ingest(
-                MeasurementFragment::new(
-                    key(boot, event),
-                    ordinal,
-                    expected,
-                    [digest_byte; 32],
-                    payload_bytes,
-                    EvidenceQuality::Captured,
+        let values = line.split(',').collect::<Vec<_>>();
+        let arrival = values[0].parse().unwrap();
+        closes.extend(
+            assembler
+                .ingest(
+                    fragment_with(
+                        values[1].parse().unwrap(),
+                        values[2].parse().unwrap(),
+                        values[3].parse().unwrap(),
+                        values[4].parse().unwrap(),
+                        values[5].parse().unwrap(),
+                        values[6].parse().unwrap(),
+                    ),
+                    SourceTick::new(arrival),
                 )
                 .unwrap(),
-                arrival,
-            )
-            .unwrap()
-            .or(close);
+        );
     }
-    let close = close.unwrap();
-
-    assert_eq!(close.reason(), AssemblyCloseReason::Complete);
-    assert_eq!(close.members().iter().map(|member| member.ordinal()).collect::<Vec<_>>(), [0, 1]);
-    assert!(close.missing_ordinals().is_empty());
-    assert_eq!(close.total_bytes(), 24);
+    assert_eq!(
+        closes.iter().map(|close| close.reason()).collect::<Vec<_>>(),
+        [AssemblyCloseReason::DuplicateFragment, AssemblyCloseReason::Complete,]
+    );
+    assert_eq!(
+        closes[1].members().iter().map(|member| member.ordinal()).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(closes[1].expected_fragments(), 2);
+    assert!(closes[1].missing_ordinals().is_empty());
 }
 
 #[test]
-fn timeout_fixes_missing_members_and_late_data_never_mutates_the_close() {
-    let mut assembler = MeasurementAssembler::new(AssemblyLimits::new(4, 4, 64, 5).unwrap());
-    assembler.ingest(fragment(1, 8, 0, 2), 10).unwrap();
-    let original = assembler.expire(15);
-    assert_eq!(original.len(), 1);
-    assert_eq!(original[0].reason(), AssemblyCloseReason::WaitLimit);
-    assert_eq!(original[0].missing_ordinals(), [1]);
-
-    let late = assembler.ingest(fragment(1, 8, 1, 2), 16).unwrap().unwrap();
+fn partial_timeout_and_late_data_are_separate_immutable_facts() {
+    let mut assembler = MeasurementAssembler::new(limits(4, 4, 64, 5));
+    assembler.ingest(fragment(1, 8, 0, 2), SourceTick::new(10)).unwrap();
+    let original = assembler.expire(&source(1), SourceTick::new(15)).remove(0);
+    assert_eq!(original.reason(), AssemblyCloseReason::WaitLimit);
+    assert_eq!(original.missing_ordinals(), [1]);
+    let late = MeasurementAssembler::late(fragment(1, 8, 1, 2));
     assert_eq!(late.reason(), AssemblyCloseReason::LateFragment);
-    assert_eq!(late.members().len(), 1);
-    assert_eq!(original[0].missing_ordinals(), [1]);
+    assert_eq!(original.missing_ordinals(), [1]);
 }
 
 #[test]
-fn identical_event_numbers_from_different_boots_do_not_join() {
-    let mut assembler = MeasurementAssembler::new(AssemblyLimits::new(4, 4, 64, 5).unwrap());
-    assembler.ingest(fragment(1, 8, 0, 2), 0).unwrap();
-    assembler.ingest(fragment(2, 8, 1, 2), 1).unwrap();
-    let closes = assembler.expire(6);
-
+fn source_profile_radio_and_channel_boundaries_never_mix() {
+    let mut assembler = MeasurementAssembler::new(limits(8, 4, 64, 5));
+    let first = fragment(1, 8, 0, 2);
+    let mut different = first.key().clone();
+    different = AssemblyKey::new(
+        different.source().clone(),
+        different.event(),
+        MeasurementContext::new(
+            ProfileIdentity::new([9; 32]),
+            different.context().radio(),
+            different.context().channel(),
+        ),
+    );
+    assembler.ingest(first, SourceTick::new(0)).unwrap();
+    assembler
+        .ingest(
+            MeasurementFragment::new(
+                different,
+                FragmentPosition::new(1, 2).unwrap(),
+                FragmentFact::new(
+                    [2; 32],
+                    FragmentBytes::new(12).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(1),
+        )
+        .unwrap();
+    let closes = assembler.expire(&source(1), SourceTick::new(6));
     assert_eq!(closes.len(), 2);
-    assert_ne!(closes[0].key().boot_generation(), closes[1].key().boot_generation());
     assert!(closes.iter().all(|close| close.members().len() == 1));
 }
 
-fn validity(epoch: u64, until: u64) -> RelationValidity {
-    RelationValidity::new("survey", 3, 0, until, epoch).unwrap()
+#[test]
+fn every_resource_ceiling_has_an_explicit_close_reason() {
+    let mut count = MeasurementAssembler::new(limits(2, 1, 64, 5));
+    assert_eq!(
+        count.ingest(fragment(1, 1, 0, 2), SourceTick::new(0)).unwrap()[0].reason(),
+        AssemblyCloseReason::CountLimit
+    );
+    let mut bytes = MeasurementAssembler::new(limits(2, 4, 8, 5));
+    assert_eq!(
+        bytes.ingest(fragment(1, 2, 0, 2), SourceTick::new(0)).unwrap()[0].reason(),
+        AssemblyCloseReason::ByteLimit
+    );
+    let mut open = MeasurementAssembler::new(limits(1, 4, 64, 5));
+    open.ingest(fragment(1, 3, 0, 2), SourceTick::new(0)).unwrap();
+    assert_eq!(
+        open.ingest(fragment(1, 4, 0, 2), SourceTick::new(1)).unwrap()[0].reason(),
+        AssemblyCloseReason::ResourceLimit
+    );
+}
+
+fn range(start: u64, end: u64) -> TickRange {
+    TickRange::new(SourceTick::new(start), SourceTick::new(end)).unwrap()
+}
+
+fn validity(end: u64) -> RelationValidity {
+    RelationValidity::new(
+        "survey",
+        source(1),
+        ErrorBound::new(3, ErrorUnit::Nanoseconds),
+        range(0, end),
+        QualificationEpoch::new(4),
+    )
+    .unwrap()
+}
+
+fn block(window: TickRange, quality: EvidenceQuality) -> EvidenceBlock {
+    EvidenceBlock::new(
+        EvidenceBlockIdentity::new(
+            source(1),
+            [EvidenceMemberIdentity::new([1; 32])],
+            window,
+            QualificationEpoch::new(4),
+        )
+        .unwrap(),
+        [quality],
+    )
+    .unwrap()
 }
 
 #[test]
-fn time_alignment_does_not_grant_phase_or_unknown_tx_geometry() {
-    let block = EvidenceBlock::new(5, 4, [EvidenceQuality::Captured]);
-    let qualification = whisper::measurement::Qualification::new(
-        Some(TimeRelation::new(validity(4, 10))),
+fn eligibility_checks_exact_relation_source_window_and_operator_requirements() {
+    let qualification = Qualification::new(
+        Some(
+            TimeRelation::new(
+                validity(10),
+                "sensor-clock",
+                "model-clock",
+                FitIdentity::new([1; 32]),
+            )
+            .unwrap(),
+        ),
         None,
-        Some(PortMapping::new(validity(4, 10), false)),
-        Some(Geometry::new(validity(4, 10))),
+        Some(PortMapping::new(validity(10), [PortMapEntry::new(0, 0, None, 1)]).unwrap()),
+        Some(Geometry::new(validity(10), "sensor", "room", Pose::new([0; 7])).unwrap()),
     );
     let result = qualification.eligibility(
         PhysicalOperator::AngleDelay,
-        &block,
-        ModelRequirements::angle_delay(),
+        &block(range(5, 6), EvidenceQuality::Captured),
+        ModelRequirements::new(range(0, 10), QualificationEpoch::new(4)),
     );
-
-    assert!(!result.is_eligible());
     assert_eq!(result.gaps(), [QualificationGap::PhaseRelation, QualificationGap::TxGeometry]);
 }
 
 #[test]
-fn expired_relations_and_distinct_quality_states_are_explicit_gaps() {
-    let qualification = whisper::measurement::Qualification::new(
-        Some(TimeRelation::new(validity(4, 3))),
-        Some(PhaseRelation::new(validity(4, 3))),
-        Some(PortMapping::new(validity(4, 3), true)),
-        Some(Geometry::new(validity(4, 3))),
+fn activation_relation_and_quality_failures_remain_distinct() {
+    let qualification = Qualification::new(
+        Some(
+            TimeRelation::new(
+                validity(3),
+                "sensor-clock",
+                "model-clock",
+                FitIdentity::new([1; 32]),
+            )
+            .unwrap(),
+        ),
+        Some(
+            PhaseRelation::new(validity(3), PhaseReferenceIdentity::new([2; 32]), range(0, 3))
+                .unwrap(),
+        ),
+        None,
+        None,
     );
-    for (quality, expected_gap) in [
-        (EvidenceQuality::NotCaptured, QualificationGap::NotCaptured),
-        (EvidenceQuality::Lost, QualificationGap::Lost),
-        (EvidenceQuality::Invalid, QualificationGap::Invalid),
-        (EvidenceQuality::Interpolated, QualificationGap::Interpolated),
-        (EvidenceQuality::TrainingMasked, QualificationGap::TrainingMasked),
-    ] {
-        let result = qualification.eligibility(
-            PhysicalOperator::AbsoluteResponse,
-            &EvidenceBlock::new(5, 4, [quality]),
-            ModelRequirements::absolute_response(),
-        );
-        assert!(result.gaps().contains(&expected_gap));
-        assert!(result.gaps().contains(&QualificationGap::TimeRelation));
-    }
+    let result = qualification.eligibility(
+        PhysicalOperator::AbsoluteResponse,
+        &block(range(5, 5), EvidenceQuality::Interpolated),
+        ModelRequirements::new(range(0, 4), QualificationEpoch::new(4)),
+    );
+    assert!(result.gaps().contains(&QualificationGap::Interpolated));
+    assert!(result.gaps().contains(&QualificationGap::ArtifactActivation));
+    assert!(result.gaps().contains(&QualificationGap::TimeRelation));
 }

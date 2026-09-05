@@ -1,153 +1,485 @@
 //! Bounded RF measurement assembly and explicit physical-input qualification.
 
 use std::backtrace::Backtrace;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::{BootGeneration, DeviceId};
+use crate::{BootGeneration, DeviceId, KeyEpoch, SensorId};
 
-/// Largest number of simultaneously open measurements accepted by one assembler.
-const MAXIMUM_OPEN_ASSEMBLIES: usize = 1_024;
-/// Largest fragment count accepted for one physical event.
-const MAXIMUM_FRAGMENTS_PER_ASSEMBLY: u16 = 1_024;
-/// Largest retained payload for one physical event, in bytes.
-const MAXIMUM_ASSEMBLY_BYTES: u64 = 16 * 1024 * 1024;
-/// Largest source label persisted with a qualification, in UTF-8 bytes.
-const MAXIMUM_RELATION_SOURCE_BYTES: usize = 256;
+const MAX_OPEN_ASSEMBLIES: usize = 1_024;
+const MAX_FRAGMENTS: u16 = 1_024;
+const MAX_ASSEMBLY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SOURCE_BYTES: usize = 256;
+const MAX_EVIDENCE_MEMBERS: usize = 1_024;
+const MAX_PORT_ENTRIES: usize = 256;
+/// Host default residence limit in source-native ticks. Changing this alters
+/// when unattended partial assemblies become eligible for explicit expiry.
+const HOST_ASSEMBLY_WAIT_TICKS: u64 = 1_000_000;
+
+macro_rules! opaque_digest {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name([u8; 32]);
+
+        impl $name {
+            /// Preserves an already established opaque identity.
+            #[must_use]
+            pub const fn new(value: [u8; 32]) -> Self {
+                Self(value)
+            }
+
+            /// Returns the preserved identity bytes.
+            #[must_use]
+            pub const fn bytes(self) -> [u8; 32] {
+                self.0
+            }
+        }
+    };
+}
+
+opaque_digest!(TransmitterIdentity, "Opaque transmitter identity in its native namespace.");
+opaque_digest!(NativeEventIdentity, "Opaque identity assigned by the native capture source.");
+opaque_digest!(RetransmissionIdentity, "Genuine native retransmission identity, when available.");
+opaque_digest!(ProfileIdentity, "Exact capture and interpretation profile identity.");
+opaque_digest!(RadioIdentity, "Exact native radio-mode identity.");
+opaque_digest!(ChannelIdentity, "Exact native channel configuration identity.");
+opaque_digest!(FitIdentity, "Identity of an independently established clock fit.");
+opaque_digest!(PhaseReferenceIdentity, "Identity of an independently established phase reference.");
+opaque_digest!(EvidenceMemberIdentity, "Identity of one immutable evidence member.");
+
+/// One exact sensor process and authenticated source generation.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceInstance {
+    sensor: SensorId,
+    device: DeviceId,
+    key_epoch: KeyEpoch,
+    boot: BootGeneration,
+}
+
+impl SourceInstance {
+    /// Groups every boundary at which a source identity may change.
+    #[must_use]
+    pub const fn new(
+        sensor: SensorId,
+        device: DeviceId,
+        key_epoch: KeyEpoch,
+        boot: BootGeneration,
+    ) -> Self {
+        Self { sensor, device, key_epoch, boot }
+    }
+
+    /// Returns the configured sensor identity.
+    #[must_use]
+    pub const fn sensor(&self) -> &SensorId {
+        &self.sensor
+    }
+    /// Returns the opaque device identity.
+    #[must_use]
+    pub const fn device(&self) -> DeviceId {
+        self.device
+    }
+    /// Returns the authentication-key epoch.
+    #[must_use]
+    pub const fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+    /// Returns the persistent boot generation.
+    #[must_use]
+    pub const fn boot(&self) -> BootGeneration {
+        self.boot
+    }
+}
+
+/// Native identities that denote one physical capture event.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventIdentity {
+    transmitter: TransmitterIdentity,
+    native_event: NativeEventIdentity,
+    retransmission: Option<RetransmissionIdentity>,
+}
+
+impl EventIdentity {
+    /// Groups a native event with genuine retransmission information only.
+    #[must_use]
+    pub const fn new(
+        transmitter: TransmitterIdentity,
+        native_event: NativeEventIdentity,
+        retransmission: Option<RetransmissionIdentity>,
+    ) -> Self {
+        Self { transmitter, native_event, retransmission }
+    }
+
+    /// Returns the transmitter identity.
+    #[must_use]
+    pub const fn transmitter(self) -> TransmitterIdentity {
+        self.transmitter
+    }
+    /// Returns the source-native event identity.
+    #[must_use]
+    pub const fn native_event(self) -> NativeEventIdentity {
+        self.native_event
+    }
+    /// Returns genuine retransmission identity, if the source supplied one.
+    #[must_use]
+    pub const fn retransmission(self) -> Option<RetransmissionIdentity> {
+        self.retransmission
+    }
+}
+
+/// Capture boundaries under which fragments may be assembled.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MeasurementContext {
+    profile: ProfileIdentity,
+    radio: RadioIdentity,
+    channel: ChannelIdentity,
+}
+
+impl MeasurementContext {
+    /// Groups exact capture profile, radio, and channel identities.
+    #[must_use]
+    pub const fn new(
+        profile: ProfileIdentity,
+        radio: RadioIdentity,
+        channel: ChannelIdentity,
+    ) -> Self {
+        Self { profile, radio, channel }
+    }
+
+    /// Returns the profile identity.
+    #[must_use]
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+    /// Returns the radio identity.
+    #[must_use]
+    pub const fn radio(self) -> RadioIdentity {
+        self.radio
+    }
+    /// Returns the channel identity.
+    #[must_use]
+    pub const fn channel(self) -> ChannelIdentity {
+        self.channel
+    }
+}
 
 /// Immutable identity shared by fragments from one native RF event.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AssemblyKey {
-    device_id: DeviceId,
-    boot_generation: BootGeneration,
-    transmitter: [u8; 6],
-    native_event: u64,
-    retransmission: Option<u64>,
+    source: SourceInstance,
+    event: EventIdentity,
+    context: MeasurementContext,
 }
 
 impl AssemblyKey {
-    /// Creates an assembly identity without interpreting its native event fields.
+    /// Joins the source, native event, and capture-boundary groups.
     #[must_use]
     pub const fn new(
-        device_id: DeviceId,
-        boot_generation: BootGeneration,
-        transmitter: [u8; 6],
-        native_event: u64,
-        retransmission: Option<u64>,
+        source: SourceInstance,
+        event: EventIdentity,
+        context: MeasurementContext,
     ) -> Self {
-        Self { device_id, boot_generation, transmitter, native_event, retransmission }
+        Self { source, event, context }
     }
 
-    /// Returns the source instance identity.
+    /// Returns the complete source instance.
     #[must_use]
-    pub const fn device_id(self) -> DeviceId {
-        self.device_id
+    pub const fn source(&self) -> &SourceInstance {
+        &self.source
     }
-
-    /// Returns the source boot generation.
+    /// Returns the native event group.
     #[must_use]
-    pub const fn boot_generation(self) -> BootGeneration {
-        self.boot_generation
+    pub const fn event(&self) -> EventIdentity {
+        self.event
     }
-
-    /// Returns the native transmitter identity.
+    /// Returns the capture-boundary group.
     #[must_use]
-    pub const fn transmitter(self) -> [u8; 6] {
-        self.transmitter
+    pub const fn context(&self) -> MeasurementContext {
+        self.context
     }
+}
 
-    /// Returns the source-native event identity.
+/// A source-native monotonic tick; ticks from different source instances never mix.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SourceTick(u64);
+
+impl SourceTick {
+    /// Preserves a source-native tick.
     #[must_use]
-    pub const fn native_event(self) -> u64 {
-        self.native_event
+    pub const fn new(value: u64) -> Self {
+        Self(value)
     }
-
-    /// Returns available retransmission identity without manufacturing one.
+    /// Returns the native value.
     #[must_use]
-    pub const fn retransmission(self) -> Option<u64> {
-        self.retransmission
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// A nonzero residence-time limit measured in source ticks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WaitTicks(u64);
+
+impl WaitTicks {
+    /// Constructs a nonzero wait bound.
+    pub fn new(value: u64) -> Result<Self, MeasurementError> {
+        (value != 0)
+            .then_some(Self(value))
+            .ok_or_else(|| MeasurementError::new("wait bound must be nonzero"))
+    }
+}
+
+/// An inclusive source-native tick interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TickRange {
+    start: SourceTick,
+    end: SourceTick,
+}
+
+impl TickRange {
+    /// Constructs an ordered inclusive interval.
+    pub fn new(start: SourceTick, end: SourceTick) -> Result<Self, MeasurementError> {
+        (start <= end)
+            .then_some(Self { start, end })
+            .ok_or_else(|| MeasurementError::new("tick range is reversed"))
+    }
+    /// Returns the first included tick.
+    #[must_use]
+    pub const fn start(self) -> SourceTick {
+        self.start
+    }
+    /// Returns the last included tick.
+    #[must_use]
+    pub const fn end(self) -> SourceTick {
+        self.end
+    }
+    fn covers(self, other: Self) -> bool {
+        self.start <= other.start && self.end >= other.end
+    }
+}
+
+/// Identity of one independently established qualification revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QualificationEpoch(u64);
+
+impl QualificationEpoch {
+    /// Preserves an external revision identity.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+    /// Returns the external value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Unit attached to a conservative relation error bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorUnit {
+    /// Nanoseconds.
+    Nanoseconds,
+    /// Milliradians.
+    Milliradians,
+    /// Millimetres.
+    Millimetres,
+    /// Parts per million.
+    PartsPerMillion,
+}
+
+/// Conservative nonnegative error with an explicit unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ErrorBound {
+    value: u64,
+    unit: ErrorUnit,
+}
+
+impl ErrorBound {
+    /// Groups the magnitude with its non-interchangeable unit.
+    #[must_use]
+    pub const fn new(value: u64, unit: ErrorUnit) -> Self {
+        Self { value, unit }
+    }
+    /// Returns the magnitude.
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.value
+    }
+    /// Returns the unit.
+    #[must_use]
+    pub const fn unit(self) -> ErrorUnit {
+        self.unit
     }
 }
 
 /// Explicit state of an observation used by quality and eligibility decisions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceQuality {
-    /// The source captured the observation and it passed source validation.
+    /// Captured and source-valid.
     Captured,
-    /// The source did not attempt to capture the observation.
+    /// Capture was not attempted.
     NotCaptured,
-    /// An expected captured observation was lost.
+    /// An expected capture was lost.
     Lost,
-    /// Bytes were present but invalid for physical evidence.
+    /// Bytes were present but invalid as physical evidence.
     Invalid,
     /// Values were interpolated rather than captured.
     Interpolated,
-    /// Training deliberately masks this observation.
+    /// Training deliberately masked this observation.
     TrainingMasked,
+}
+
+/// Ordinal and declared member count for one fragment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentPosition {
+    ordinal: u16,
+    expected: u16,
+}
+
+impl FragmentPosition {
+    /// Constructs a position inside a nonempty declared member set.
+    pub fn new(ordinal: u16, expected: u16) -> Result<Self, MeasurementError> {
+        (expected != 0 && ordinal < expected)
+            .then_some(Self { ordinal, expected })
+            .ok_or_else(|| MeasurementError::new("fragment ordinal must be inside a non-empty set"))
+    }
+    /// Returns the zero-based ordinal.
+    #[must_use]
+    pub const fn ordinal(self) -> u16 {
+        self.ordinal
+    }
+    /// Returns the declared member count.
+    #[must_use]
+    pub const fn expected(self) -> u16 {
+        self.expected
+    }
+}
+
+/// A fragment byte contribution within the finite assembly ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentBytes(u32);
+
+impl FragmentBytes {
+    /// Constructs a byte count within the finite assembly ceiling.
+    pub fn new(value: u32) -> Result<Self, MeasurementError> {
+        (u64::from(value) <= MAX_ASSEMBLY_BYTES)
+            .then_some(Self(value))
+            .ok_or_else(|| MeasurementError::new("fragment bytes exceed the assembly ceiling"))
+    }
+    /// Returns the byte count.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Immutable source-fact identity, size, and quality.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentFact {
+    digest: [u8; 32],
+    bytes: FragmentBytes,
+    quality: EvidenceQuality,
+}
+
+impl FragmentFact {
+    /// Groups the immutable source-fact properties.
+    #[must_use]
+    pub const fn new(digest: [u8; 32], bytes: FragmentBytes, quality: EvidenceQuality) -> Self {
+        Self { digest, bytes, quality }
+    }
+    /// Returns source-fact digest.
+    #[must_use]
+    pub const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+    /// Returns the declared payload size.
+    #[must_use]
+    pub const fn bytes(self) -> FragmentBytes {
+        self.bytes
+    }
+    /// Returns the explicit quality state.
+    #[must_use]
+    pub const fn quality(self) -> EvidenceQuality {
+        self.quality
+    }
 }
 
 /// One immutable fragment offered to measurement assembly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MeasurementFragment {
     key: AssemblyKey,
-    ordinal: u16,
-    expected_fragments: u16,
-    fact_digest: [u8; 32],
-    payload_bytes: u32,
-    quality: EvidenceQuality,
+    position: FragmentPosition,
+    fact: FragmentFact,
 }
 
 impl MeasurementFragment {
-    /// Creates a fragment whose ordinal lies inside a non-empty declared set.
-    pub fn new(
-        key: AssemblyKey,
-        ordinal: u16,
-        expected_fragments: u16,
-        fact_digest: [u8; 32],
-        payload_bytes: u32,
-        quality: EvidenceQuality,
-    ) -> Result<Self, MeasurementError> {
-        if expected_fragments == 0 || ordinal >= expected_fragments {
-            return Err(MeasurementError::new("fragment ordinal must be inside a non-empty set"));
-        }
-        Ok(Self { key, ordinal, expected_fragments, fact_digest, payload_bytes, quality })
+    /// Constructs a fragment from its three semantic groups.
+    #[must_use]
+    pub const fn new(key: AssemblyKey, position: FragmentPosition, fact: FragmentFact) -> Self {
+        Self { key, position, fact }
     }
-
     /// Returns the assembly identity.
     #[must_use]
-    pub const fn key(&self) -> AssemblyKey {
-        self.key
+    pub const fn key(&self) -> &AssemblyKey {
+        &self.key
+    }
+    /// Returns the fragment position.
+    #[must_use]
+    pub const fn position(&self) -> FragmentPosition {
+        self.position
+    }
+    /// Returns the fragment fact.
+    #[must_use]
+    pub const fn fact(&self) -> FragmentFact {
+        self.fact
+    }
+}
+
+/// Simultaneous-open, per-assembly fragment, and per-assembly byte ceilings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssemblyCapacity {
+    open: usize,
+    fragments: u16,
+    bytes: u64,
+}
+
+impl AssemblyCapacity {
+    /// Constructs capacity values within the implementation's finite ceilings.
+    pub fn new(open: usize, fragments: u16, bytes: u64) -> Result<Self, MeasurementError> {
+        if open == 0
+            || open > MAX_OPEN_ASSEMBLIES
+            || fragments == 0
+            || fragments > MAX_FRAGMENTS
+            || bytes == 0
+            || bytes > MAX_ASSEMBLY_BYTES
+        {
+            return Err(MeasurementError::new("assembly capacity is outside finite bounds"));
+        }
+        Ok(Self { open, fragments, bytes })
     }
 }
 
 /// Fixed resource ceilings for one in-memory assembler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AssemblyLimits {
-    maximum_open: usize,
-    maximum_fragments: u16,
-    maximum_bytes: u64,
-    maximum_wait_ticks: u64,
+    capacity: AssemblyCapacity,
+    wait: WaitTicks,
 }
 
 impl AssemblyLimits {
-    /// Creates non-zero count, byte, and wait limits.
-    pub fn new(
-        maximum_open: usize,
-        maximum_fragments: u16,
-        maximum_bytes: u64,
-        maximum_wait_ticks: u64,
-    ) -> Result<Self, MeasurementError> {
-        if maximum_open == 0
-            || maximum_fragments == 0
-            || maximum_bytes == 0
-            || maximum_wait_ticks == 0
-            || maximum_open > MAXIMUM_OPEN_ASSEMBLIES
-            || maximum_fragments > MAXIMUM_FRAGMENTS_PER_ASSEMBLY
-            || maximum_bytes > MAXIMUM_ASSEMBLY_BYTES
-        {
-            return Err(MeasurementError::new("assembly limits must all be non-zero"));
-        }
-        Ok(Self { maximum_open, maximum_fragments, maximum_bytes, maximum_wait_ticks })
+    /// Groups capacity and residence-time bounds.
+    #[must_use]
+    pub const fn new(capacity: AssemblyCapacity, wait: WaitTicks) -> Self {
+        Self { capacity, wait }
+    }
+
+    pub(crate) fn host_default() -> Self {
+        Self::new(
+            AssemblyCapacity::new(MAX_OPEN_ASSEMBLIES, MAX_FRAGMENTS, MAX_ASSEMBLY_BYTES)
+                .expect("host assembly capacity constants are valid"),
+            WaitTicks::new(HOST_ASSEMBLY_WAIT_TICKS).expect("host assembly wait constant is valid"),
+        )
     }
 }
 
@@ -156,26 +488,30 @@ impl AssemblyLimits {
 pub enum AssemblyCloseReason {
     /// Every declared fragment was present.
     Complete,
-    /// The assembly reached its maximum residence time.
+    /// Residence time reached its bound.
     WaitLimit,
-    /// The declared or observed fragment count exceeded its bound.
+    /// Declared membership exceeded its bound.
     CountLimit,
-    /// Accepted fragment bytes exceeded the assembly byte bound.
+    /// Retained member bytes exceeded their bound.
     ByteLimit,
-    /// A fragment arrived after membership for its event was fixed.
+    /// Simultaneous open assemblies reached their bound.
+    ResourceLimit,
+    /// The event already had a durable primary close.
     LateFragment,
-    /// The same ordinal named conflicting immutable facts.
+    /// The same ordinal and immutable fact were observed again.
+    DuplicateFragment,
+    /// The same ordinal named different immutable facts.
     ConflictingDuplicate,
 }
 
 /// Association confidence retained with every close decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssociationUncertainty {
-    /// Native event identity fixed association without arrival-time inference.
+    /// Native identities establish exact association.
     ExactNativeIdentity,
-    /// The fragment is known only to have arrived after an earlier close.
+    /// The fact is known only to follow a durable close.
     LateAfterClose,
-    /// Conflicting facts prevent a unique member choice.
+    /// Conflicting facts prevent unique association.
     ConflictingFacts,
 }
 
@@ -202,20 +538,17 @@ impl AssemblyMember {
     pub const fn ordinal(self) -> u16 {
         self.ordinal
     }
-
     /// Returns the source-fact digest.
     #[must_use]
     pub const fn fact_digest(self) -> [u8; 32] {
         self.fact_digest
     }
-
-    /// Returns the fragment's byte contribution.
+    /// Returns the byte contribution.
     #[must_use]
     pub const fn payload_bytes(self) -> u32 {
         self.payload_bytes
     }
-
-    /// Returns the fragment quality without collapsing missing states.
+    /// Returns the explicit quality state.
     #[must_use]
     pub const fn quality(self) -> EvidenceQuality {
         self.quality
@@ -223,12 +556,12 @@ impl AssemblyMember {
 }
 
 impl From<MeasurementFragment> for AssemblyMember {
-    fn from(fragment: MeasurementFragment) -> Self {
+    fn from(value: MeasurementFragment) -> Self {
         Self {
-            ordinal: fragment.ordinal,
-            fact_digest: fragment.fact_digest,
-            payload_bytes: fragment.payload_bytes,
-            quality: fragment.quality,
+            ordinal: value.position.ordinal,
+            fact_digest: value.fact.digest,
+            payload_bytes: value.fact.bytes.get(),
+            quality: value.fact.quality,
         }
     }
 }
@@ -237,6 +570,7 @@ impl From<MeasurementFragment> for AssemblyMember {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssemblyClose {
     key: AssemblyKey,
+    expected_fragments: u16,
     members: Box<[AssemblyMember]>,
     missing_ordinals: Box<[u16]>,
     reason: AssemblyCloseReason,
@@ -247,45 +581,54 @@ pub struct AssemblyClose {
 impl AssemblyClose {
     pub(crate) fn persisted(
         key: AssemblyKey,
+        expected_fragments: u16,
         members: Box<[AssemblyMember]>,
         missing_ordinals: Box<[u16]>,
         reason: AssemblyCloseReason,
         uncertainty: AssociationUncertainty,
         total_bytes: u64,
     ) -> Self {
-        Self { key, members, missing_ordinals, reason, uncertainty, total_bytes }
+        Self {
+            key,
+            expected_fragments,
+            members,
+            missing_ordinals,
+            reason,
+            uncertainty,
+            total_bytes,
+        }
     }
-    /// Returns the event identity whose membership was fixed.
+    /// Returns the immutable event identity.
     #[must_use]
-    pub const fn key(&self) -> AssemblyKey {
-        self.key
+    pub const fn key(&self) -> &AssemblyKey {
+        &self.key
     }
-
+    /// Returns the originally declared member count.
+    #[must_use]
+    pub const fn expected_fragments(&self) -> u16 {
+        self.expected_fragments
+    }
     /// Returns members in ordinal order.
     #[must_use]
     pub fn members(&self) -> &[AssemblyMember] {
         &self.members
     }
-
     /// Returns explicitly absent ordinals.
     #[must_use]
     pub fn missing_ordinals(&self) -> &[u16] {
         &self.missing_ordinals
     }
-
-    /// Returns why membership closed.
+    /// Returns the explicit close reason.
     #[must_use]
     pub const fn reason(&self) -> AssemblyCloseReason {
         self.reason
     }
-
-    /// Returns the association uncertainty recorded at close.
+    /// Returns association uncertainty.
     #[must_use]
     pub const fn uncertainty(&self) -> AssociationUncertainty {
         self.uncertainty
     }
-
-    /// Returns the sum of retained member payload bytes.
+    /// Returns retained bytes.
     #[must_use]
     pub const fn total_bytes(&self) -> u64 {
         self.total_bytes
@@ -294,8 +637,8 @@ impl AssemblyClose {
 
 #[derive(Debug)]
 struct OpenAssembly {
-    first_tick: u64,
-    expected_fragments: u16,
+    first_tick: SourceTick,
+    expected: u16,
     members: BTreeMap<u16, AssemblyMember>,
     total_bytes: u64,
 }
@@ -305,216 +648,432 @@ struct OpenAssembly {
 pub struct MeasurementAssembler {
     limits: AssemblyLimits,
     open: BTreeMap<AssemblyKey, OpenAssembly>,
-    closed: VecDeque<AssemblyKey>,
 }
 
 impl MeasurementAssembler {
     /// Creates an empty assembler with fixed resource bounds.
     #[must_use]
     pub fn new(limits: AssemblyLimits) -> Self {
-        Self { limits, open: BTreeMap::new(), closed: VecDeque::new() }
+        Self { limits, open: BTreeMap::new() }
     }
 
-    /// Incorporates one fragment and returns a close when membership becomes fixed.
+    /// Incorporates one fragment and emits every immutable decision caused by it.
     pub fn ingest(
         &mut self,
         fragment: MeasurementFragment,
-        arrival_tick: u64,
-    ) -> Result<Option<AssemblyClose>, MeasurementError> {
-        let key = fragment.key;
-        if self.closed.contains(&key) {
-            return Ok(Some(self.late_close(fragment)));
+        arrival: SourceTick,
+    ) -> Result<Vec<AssemblyClose>, MeasurementError> {
+        self.ingest_inner(fragment, arrival, true)
+    }
+
+    pub(crate) fn restore(
+        &mut self,
+        fragment: MeasurementFragment,
+        arrival: SourceTick,
+    ) -> Result<(), MeasurementError> {
+        let closes = self.ingest_inner(fragment, arrival, false)?;
+        if closes.is_empty() {
+            Ok(())
+        } else {
+            Err(MeasurementError::new("persisted open fragment closes during restore"))
         }
-        if !self.open.contains_key(&key) && self.open.len() == self.limits.maximum_open {
-            return Err(MeasurementError::new("open assembly count limit reached"));
+    }
+
+    fn ingest_inner(
+        &mut self,
+        fragment: MeasurementFragment,
+        arrival: SourceTick,
+        enforce_resources: bool,
+    ) -> Result<Vec<AssemblyClose>, MeasurementError> {
+        let key = fragment.key.clone();
+        if !self.open.contains_key(&key) && self.open.len() == self.limits.capacity.open {
+            return Ok(vec![Self::isolated_close(fragment, AssemblyCloseReason::ResourceLimit)]);
         }
-        let open = self.open.entry(key).or_insert_with(|| OpenAssembly {
-            first_tick: arrival_tick,
-            expected_fragments: fragment.expected_fragments,
+        let open = self.open.entry(key.clone()).or_insert_with(|| OpenAssembly {
+            first_tick: arrival,
+            expected: fragment.position.expected,
             members: BTreeMap::new(),
             total_bytes: 0,
         });
-        if open.expected_fragments != fragment.expected_fragments {
-            return Ok(Some(self.close_with(key, AssemblyCloseReason::ConflictingDuplicate)));
+        if open.expected != fragment.position.expected {
+            return Ok(vec![self.close_with(&key, AssemblyCloseReason::ConflictingDuplicate)]);
         }
-        if let Some(existing) = open.members.get(&fragment.ordinal) {
-            if existing.fact_digest == fragment.fact_digest {
-                return Ok(None);
+        if let Some(existing) = open.members.get(&fragment.position.ordinal) {
+            if existing.fact_digest == fragment.fact.digest {
+                return Ok(vec![Self::isolated_close(
+                    fragment,
+                    AssemblyCloseReason::DuplicateFragment,
+                )]);
             }
-            return Ok(Some(self.close_with(key, AssemblyCloseReason::ConflictingDuplicate)));
+            return Ok(vec![self.close_with(&key, AssemblyCloseReason::ConflictingDuplicate)]);
         }
-        let payload_bytes = u64::from(fragment.payload_bytes);
         open.total_bytes = open
             .total_bytes
-            .checked_add(payload_bytes)
+            .checked_add(u64::from(fragment.fact.bytes.get()))
             .ok_or_else(|| MeasurementError::new("assembly byte count overflowed"))?;
-        open.members.insert(fragment.ordinal, fragment.into());
-        let reason = if open.expected_fragments > self.limits.maximum_fragments
-            || open.members.len() > usize::from(self.limits.maximum_fragments)
-        {
+        open.members.insert(fragment.position.ordinal, fragment.into());
+        let reason = if enforce_resources && open.expected > self.limits.capacity.fragments {
             Some(AssemblyCloseReason::CountLimit)
-        } else if open.total_bytes > self.limits.maximum_bytes {
+        } else if enforce_resources && open.total_bytes > self.limits.capacity.bytes {
             Some(AssemblyCloseReason::ByteLimit)
-        } else if open.members.len() == usize::from(open.expected_fragments) {
+        } else if open.members.len() == usize::from(open.expected) {
             Some(AssemblyCloseReason::Complete)
         } else {
             None
         };
-        Ok(reason.map(|reason| self.close_with(key, reason)))
+        Ok(reason.map(|reason| vec![self.close_with(&key, reason)]).unwrap_or_default())
     }
 
-    /// Closes every assembly whose bounded wait has elapsed.
+    /// Closes assemblies from one source whose bounded wait elapsed.
     #[must_use]
-    pub fn expire(&mut self, now_tick: u64) -> Vec<AssemblyClose> {
+    pub fn expire(&mut self, source: &SourceInstance, now: SourceTick) -> Vec<AssemblyClose> {
         let keys = self
             .open
             .iter()
             .filter_map(|(key, open)| {
-                (now_tick.saturating_sub(open.first_tick) >= self.limits.maximum_wait_ticks)
-                    .then_some(*key)
+                (key.source() == source
+                    && now.get().saturating_sub(open.first_tick.get()) >= self.limits.wait.0)
+                    .then_some(key.clone())
             })
             .collect::<Vec<_>>();
-        keys.into_iter().map(|key| self.close_with(key, AssemblyCloseReason::WaitLimit)).collect()
+        keys.into_iter().map(|key| self.close_with(&key, AssemblyCloseReason::WaitLimit)).collect()
     }
 
-    fn close_with(&mut self, key: AssemblyKey, reason: AssemblyCloseReason) -> AssemblyClose {
-        let open = self.open.remove(&key).expect("close key must identify an open assembly");
-        let missing_ordinals = (0..open.expected_fragments)
-            .filter(|ordinal| !open.members.contains_key(ordinal))
-            .collect::<Vec<_>>();
+    /// Creates a separate late-arrival fact after durable storage proves an earlier close.
+    #[must_use]
+    pub fn late(fragment: MeasurementFragment) -> AssemblyClose {
+        Self::isolated_close(fragment, AssemblyCloseReason::LateFragment)
+    }
+
+    fn isolated_close(fragment: MeasurementFragment, reason: AssemblyCloseReason) -> AssemblyClose {
+        let expected = fragment.position.expected;
+        let ordinal = fragment.position.ordinal;
+        let total_bytes = u64::from(fragment.fact.bytes.get());
+        let uncertainty = if reason == AssemblyCloseReason::LateFragment {
+            AssociationUncertainty::LateAfterClose
+        } else {
+            AssociationUncertainty::ExactNativeIdentity
+        };
+        AssemblyClose {
+            key: fragment.key.clone(),
+            expected_fragments: expected,
+            members: vec![fragment.into()].into_boxed_slice(),
+            missing_ordinals: (0..expected).filter(|value| *value != ordinal).collect(),
+            reason,
+            uncertainty,
+            total_bytes,
+        }
+    }
+
+    fn close_with(&mut self, key: &AssemblyKey, reason: AssemblyCloseReason) -> AssemblyClose {
+        let open = self.open.remove(key).expect("close key must identify an open assembly");
+        let missing =
+            (0..open.expected).filter(|ordinal| !open.members.contains_key(ordinal)).collect();
         let uncertainty = if reason == AssemblyCloseReason::ConflictingDuplicate {
             AssociationUncertainty::ConflictingFacts
         } else {
             AssociationUncertainty::ExactNativeIdentity
         };
-        self.remember_closed(key);
         AssemblyClose {
-            key,
+            key: key.clone(),
+            expected_fragments: open.expected,
             members: open.members.into_values().collect::<Vec<_>>().into_boxed_slice(),
-            missing_ordinals: missing_ordinals.into_boxed_slice(),
+            missing_ordinals: missing,
             reason,
             uncertainty,
             total_bytes: open.total_bytes,
         }
     }
-
-    fn late_close(&self, fragment: MeasurementFragment) -> AssemblyClose {
-        let expected = fragment.expected_fragments;
-        let ordinal = fragment.ordinal;
-        let total_bytes = u64::from(fragment.payload_bytes);
-        AssemblyClose {
-            key: fragment.key,
-            members: vec![fragment.into()].into_boxed_slice(),
-            missing_ordinals: (0..expected).filter(|candidate| *candidate != ordinal).collect(),
-            reason: AssemblyCloseReason::LateFragment,
-            uncertainty: AssociationUncertainty::LateAfterClose,
-            total_bytes,
-        }
-    }
-
-    fn remember_closed(&mut self, key: AssemblyKey) {
-        if self.closed.len() == self.limits.maximum_open {
-            self.closed.pop_front();
-        }
-        self.closed.push_back(key);
-    }
 }
 
-/// Common provenance, error, validity, and epoch boundary for one relation.
+/// Common source instance, provenance, error, validity, and epoch boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationValidity {
-    source: Box<str>,
-    error_bound: u64,
-    valid_from_tick: u64,
-    valid_until_tick: u64,
-    epoch: u64,
+    provenance: Box<str>,
+    source: SourceInstance,
+    error: ErrorBound,
+    validity: TickRange,
+    epoch: QualificationEpoch,
 }
 
 impl RelationValidity {
-    /// Creates a non-empty sourced validity interval with an explicit error bound.
+    /// Constructs a bounded nonempty provenance record.
     pub fn new(
-        source: impl Into<Box<str>>,
-        error_bound: u64,
-        valid_from_tick: u64,
-        valid_until_tick: u64,
-        epoch: u64,
+        provenance: impl Into<Box<str>>,
+        source: SourceInstance,
+        error: ErrorBound,
+        validity: TickRange,
+        epoch: QualificationEpoch,
     ) -> Result<Self, MeasurementError> {
-        let source = source.into();
-        if source.is_empty()
-            || source.len() > MAXIMUM_RELATION_SOURCE_BYTES
-            || valid_from_tick > valid_until_tick
-        {
-            return Err(MeasurementError::new("relation source and validity interval are invalid"));
+        let provenance = provenance.into();
+        if provenance.is_empty() || provenance.len() > MAX_SOURCE_BYTES {
+            return Err(MeasurementError::new("relation provenance is invalid"));
         }
-        Ok(Self { source, error_bound, valid_from_tick, valid_until_tick, epoch })
+        Ok(Self { provenance, source, error, validity, epoch })
     }
-
-    /// Returns the fact or artifact source for the relation.
+    /// Returns provenance.
     #[must_use]
-    pub fn source(&self) -> &str {
+    pub fn provenance(&self) -> &str {
+        &self.provenance
+    }
+    /// Returns the scoped source instance.
+    #[must_use]
+    pub const fn source(&self) -> &SourceInstance {
         &self.source
     }
-
-    /// Returns the relation-specific conservative error bound.
+    /// Returns the conservative error.
     #[must_use]
-    pub const fn error_bound(&self) -> u64 {
-        self.error_bound
+    pub const fn error(&self) -> ErrorBound {
+        self.error
     }
-
-    /// Returns the first included native tick.
+    /// Returns the inclusive validity interval.
     #[must_use]
-    pub const fn valid_from_tick(&self) -> u64 {
-        self.valid_from_tick
+    pub const fn validity(&self) -> TickRange {
+        self.validity
     }
-
-    /// Returns the last included native tick.
-    #[must_use]
-    pub const fn valid_until_tick(&self) -> u64 {
-        self.valid_until_tick
-    }
-
     /// Returns the qualification epoch.
     #[must_use]
-    pub const fn epoch(&self) -> u64 {
+    pub const fn epoch(&self) -> QualificationEpoch {
         self.epoch
     }
+}
 
-    fn covers(&self, tick: u64, epoch: u64) -> bool {
-        self.epoch == epoch && (self.valid_from_tick..=self.valid_until_tick).contains(&tick)
+/// Explicit relation between two named clock domains and one fit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeRelation {
+    common: RelationValidity,
+    source_clock: Box<str>,
+    target_clock: Box<str>,
+    fit: FitIdentity,
+}
+
+impl TimeRelation {
+    /// Constructs a clock-domain and fit-scoped relation.
+    pub fn new(
+        common: RelationValidity,
+        source_clock: impl Into<Box<str>>,
+        target_clock: impl Into<Box<str>>,
+        fit: FitIdentity,
+    ) -> Result<Self, MeasurementError> {
+        let source_clock = source_clock.into();
+        let target_clock = target_clock.into();
+        if source_clock.is_empty()
+            || target_clock.is_empty()
+            || source_clock.len() > MAX_SOURCE_BYTES
+            || target_clock.len() > MAX_SOURCE_BYTES
+        {
+            return Err(MeasurementError::new("clock domains must be nonempty"));
+        }
+        Ok(Self { common, source_clock, target_clock, fit })
+    }
+    /// Returns common validity.
+    #[must_use]
+    pub const fn common(&self) -> &RelationValidity {
+        &self.common
+    }
+    /// Returns source clock domain.
+    #[must_use]
+    pub fn source_clock(&self) -> &str {
+        &self.source_clock
+    }
+    /// Returns target clock domain.
+    #[must_use]
+    pub fn target_clock(&self) -> &str {
+        &self.target_clock
+    }
+    /// Returns fit identity.
+    #[must_use]
+    pub const fn fit(&self) -> FitIdentity {
+        self.fit
     }
 }
 
-macro_rules! relation {
-    ($name:ident, $summary:literal) => {
-        #[doc = $summary]
-        #[derive(Clone, Debug, Eq, PartialEq)]
-        pub struct $name(RelationValidity);
-
-        impl $name {
-            /// Creates a relation from its independently sourced validity record.
-            #[must_use]
-            pub const fn new(validity: RelationValidity) -> Self {
-                Self(validity)
-            }
-
-            /// Returns provenance, error, validity, and epoch.
-            #[must_use]
-            pub const fn validity(&self) -> &RelationValidity {
-                &self.0
-            }
-        }
-    };
+/// Coherent phase relation with an explicit reference and coherence interval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhaseRelation {
+    common: RelationValidity,
+    reference: PhaseReferenceIdentity,
+    coherence: TickRange,
 }
 
-relation!(TimeRelation, "A scoped relationship between clock domains.");
-relation!(PhaseRelation, "A scoped coherent phase-reference relationship.");
-relation!(Geometry, "A scoped physical geometry relationship.");
+impl PhaseRelation {
+    /// Constructs a reference- and coherence-scoped phase relation.
+    pub fn new(
+        common: RelationValidity,
+        reference: PhaseReferenceIdentity,
+        coherence: TickRange,
+    ) -> Result<Self, MeasurementError> {
+        if !common.validity.covers(coherence) {
+            return Err(MeasurementError::new("phase coherence lies outside relation validity"));
+        }
+        Ok(Self { common, reference, coherence })
+    }
+    /// Returns common validity.
+    #[must_use]
+    pub const fn common(&self) -> &RelationValidity {
+        &self.common
+    }
+    /// Returns phase reference identity.
+    #[must_use]
+    pub const fn reference(&self) -> PhaseReferenceIdentity {
+        self.reference
+    }
+    /// Returns coherence interval.
+    #[must_use]
+    pub const fn coherence(&self) -> TickRange {
+        self.coherence
+    }
+}
 
-/// A scoped mapping from protocol streams and chains to physical ports.
+/// Explicit protocol-stream and receive-chain mapping to physical antennas.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortMapEntry {
+    tx_stream: u16,
+    rx_chain: u16,
+    tx_antenna: Option<u16>,
+    rx_antenna: u16,
+}
+
+impl PortMapEntry {
+    /// Constructs one explicit mapping. `None` records unknown transmitter precoding.
+    #[must_use]
+    pub const fn new(
+        tx_stream: u16,
+        rx_chain: u16,
+        tx_antenna: Option<u16>,
+        rx_antenna: u16,
+    ) -> Self {
+        Self { tx_stream, rx_chain, tx_antenna, rx_antenna }
+    }
+    /// Returns transmitter stream.
+    #[must_use]
+    pub const fn tx_stream(self) -> u16 {
+        self.tx_stream
+    }
+    /// Returns receive chain.
+    #[must_use]
+    pub const fn rx_chain(self) -> u16 {
+        self.rx_chain
+    }
+    /// Returns physical transmitter antenna when independently known.
+    #[must_use]
+    pub const fn tx_antenna(self) -> Option<u16> {
+        self.tx_antenna
+    }
+    /// Returns physical receive antenna.
+    #[must_use]
+    pub const fn rx_antenna(self) -> u16 {
+        self.rx_antenna
+    }
+}
+
+/// Scoped protocol-to-physical port mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortMapping {
-    validity: RelationValidity,
-    tx_geometry_known: bool,
+    common: RelationValidity,
+    entries: Box<[PortMapEntry]>,
+}
+
+impl PortMapping {
+    /// Constructs a nonempty finite mapping.
+    pub fn new(
+        common: RelationValidity,
+        entries: impl IntoIterator<Item = PortMapEntry>,
+    ) -> Result<Self, MeasurementError> {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        if entries.is_empty()
+            || entries.len() > MAX_PORT_ENTRIES
+            || entries.iter().enumerate().any(|(index, entry)| {
+                entries[..index].iter().any(|earlier| {
+                    earlier.tx_stream == entry.tx_stream && earlier.rx_chain == entry.rx_chain
+                })
+            })
+        {
+            return Err(MeasurementError::new("port mapping count is outside finite bounds"));
+        }
+        Ok(Self { common, entries: entries.into_boxed_slice() })
+    }
+    /// Returns common validity.
+    #[must_use]
+    pub const fn common(&self) -> &RelationValidity {
+        &self.common
+    }
+    /// Returns mapping entries.
+    #[must_use]
+    pub fn entries(&self) -> &[PortMapEntry] {
+        &self.entries
+    }
+    /// Reports whether every transmitter stream has a physical antenna.
+    #[must_use]
+    pub fn tx_geometry_known(&self) -> bool {
+        self.entries.iter().all(|entry| entry.tx_antenna.is_some())
+    }
+}
+
+/// Integer pose: translation millimetres followed by quaternion parts per million.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Pose([i64; 7]);
+impl Pose {
+    /// Preserves an independently established pose without inferring axes.
+    #[must_use]
+    pub const fn new(value: [i64; 7]) -> Self {
+        Self(value)
+    }
+    /// Returns the preserved components.
+    #[must_use]
+    pub const fn components(self) -> [i64; 7] {
+        self.0
+    }
+}
+
+/// Scoped physical geometry relation between named coordinate frames.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Geometry {
+    common: RelationValidity,
+    source_frame: Box<str>,
+    target_frame: Box<str>,
+    pose: Pose,
+}
+
+impl Geometry {
+    /// Constructs an explicit frame-to-frame pose.
+    pub fn new(
+        common: RelationValidity,
+        source_frame: impl Into<Box<str>>,
+        target_frame: impl Into<Box<str>>,
+        pose: Pose,
+    ) -> Result<Self, MeasurementError> {
+        let source_frame = source_frame.into();
+        let target_frame = target_frame.into();
+        if source_frame.is_empty()
+            || target_frame.is_empty()
+            || source_frame.len() > MAX_SOURCE_BYTES
+            || target_frame.len() > MAX_SOURCE_BYTES
+        {
+            return Err(MeasurementError::new("coordinate frames must be nonempty"));
+        }
+        Ok(Self { common, source_frame, target_frame, pose })
+    }
+    /// Returns common validity.
+    #[must_use]
+    pub const fn common(&self) -> &RelationValidity {
+        &self.common
+    }
+    /// Returns source coordinate frame.
+    #[must_use]
+    pub fn source_frame(&self) -> &str {
+        &self.source_frame
+    }
+    /// Returns target coordinate frame.
+    #[must_use]
+    pub fn target_frame(&self) -> &str {
+        &self.target_frame
+    }
+    /// Returns pose.
+    #[must_use]
+    pub const fn pose(&self) -> Pose {
+        self.pose
+    }
 }
 
 /// One independently persisted time, phase, port, or geometry qualification.
@@ -524,58 +1083,70 @@ pub enum QualificationRelation {
     Time(TimeRelation),
     /// A coherent phase-reference relation.
     Phase(PhaseRelation),
-    /// A protocol-to-physical port mapping.
+    /// A protocol-to-physical port relation.
     Port(PortMapping),
-    /// A physical geometry relation.
+    /// A coordinate-frame pose relation.
     Geometry(Geometry),
 }
-
 impl QualificationRelation {
-    /// Returns the independently sourced validity record.
+    /// Returns common provenance and validity.
     #[must_use]
-    pub const fn validity(&self) -> &RelationValidity {
+    pub const fn common(&self) -> &RelationValidity {
         match self {
-            Self::Time(relation) => relation.validity(),
-            Self::Phase(relation) => relation.validity(),
-            Self::Port(relation) => relation.validity(),
-            Self::Geometry(relation) => relation.validity(),
+            Self::Time(v) => v.common(),
+            Self::Phase(v) => v.common(),
+            Self::Port(v) => v.common(),
+            Self::Geometry(v) => v.common(),
         }
     }
 }
 
-impl PortMapping {
-    /// Creates a mapping and records whether transmitter precoding preserves known geometry.
-    #[must_use]
-    pub const fn new(validity: RelationValidity, tx_geometry_known: bool) -> Self {
-        Self { validity, tx_geometry_known }
-    }
+/// Identity and exact time window of one causal evidence block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceBlockIdentity {
+    source: SourceInstance,
+    members: Box<[EvidenceMemberIdentity]>,
+    window: TickRange,
+    epoch: QualificationEpoch,
+}
 
-    /// Returns provenance, error, validity, and epoch.
-    #[must_use]
-    pub const fn validity(&self) -> &RelationValidity {
-        &self.validity
-    }
-
-    /// Reports whether transmitter geometry is established rather than inferred.
-    #[must_use]
-    pub const fn tx_geometry_known(&self) -> bool {
-        self.tx_geometry_known
+impl EvidenceBlockIdentity {
+    /// Constructs a nonempty finite member set.
+    pub fn new(
+        source: SourceInstance,
+        members: impl IntoIterator<Item = EvidenceMemberIdentity>,
+        window: TickRange,
+        epoch: QualificationEpoch,
+    ) -> Result<Self, MeasurementError> {
+        let members = members.into_iter().collect::<Vec<_>>();
+        if members.is_empty()
+            || members.len() > MAX_EVIDENCE_MEMBERS
+            || members.iter().enumerate().any(|(index, member)| members[..index].contains(member))
+        {
+            return Err(MeasurementError::new("evidence member count is outside finite bounds"));
+        }
+        Ok(Self { source, members: members.into_boxed_slice(), window, epoch })
     }
 }
 
-/// One causal evidence block with independently encoded member quality.
+/// One causal evidence block with per-member quality.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvidenceBlock {
-    tick: u64,
-    epoch: u64,
+    identity: EvidenceBlockIdentity,
     quality: Box<[EvidenceQuality]>,
 }
 
 impl EvidenceBlock {
-    /// Creates an evidence block without collapsing its member-quality states.
-    #[must_use]
-    pub fn new(tick: u64, epoch: u64, quality: impl IntoIterator<Item = EvidenceQuality>) -> Self {
-        Self { tick, epoch, quality: quality.into_iter().collect() }
+    /// Constructs a block only when each named member has one quality state.
+    pub fn new(
+        identity: EvidenceBlockIdentity,
+        quality: impl IntoIterator<Item = EvidenceQuality>,
+    ) -> Result<Self, MeasurementError> {
+        let quality = quality.into_iter().collect::<Vec<_>>();
+        if quality.len() != identity.members.len() {
+            return Err(MeasurementError::new("evidence quality count does not match members"));
+        }
+        Ok(Self { identity, quality: quality.into_boxed_slice() })
     }
 }
 
@@ -590,33 +1161,18 @@ pub enum PhysicalOperator {
     AngleDelay,
 }
 
-/// Explicit relation requirements fixed by one model artifact.
+/// Artifact activation boundary used by eligibility.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelRequirements {
-    time: bool,
-    phase: bool,
-    port: bool,
-    geometry: bool,
-    tx_geometry: bool,
+    activation: TickRange,
+    epoch: QualificationEpoch,
 }
 
 impl ModelRequirements {
-    /// Requirements for the absolute-response operator.
+    /// Constructs exact artifact activation boundaries.
     #[must_use]
-    pub const fn absolute_response() -> Self {
-        Self { time: true, phase: false, port: false, geometry: false, tx_geometry: false }
-    }
-
-    /// Requirements for the coherent angle-delay operator.
-    #[must_use]
-    pub const fn angle_delay() -> Self {
-        Self { time: true, phase: true, port: true, geometry: true, tx_geometry: true }
-    }
-
-    /// Requirements for the causal fast-change operator.
-    #[must_use]
-    pub const fn fast_change() -> Self {
-        Self { time: true, phase: false, port: false, geometry: false, tx_geometry: false }
+    pub const fn new(activation: TickRange, epoch: QualificationEpoch) -> Self {
+        Self { activation, epoch }
     }
 }
 
@@ -630,7 +1186,7 @@ pub struct Qualification {
 }
 
 impl Qualification {
-    /// Creates a snapshot without deriving one relation from another.
+    /// Groups independently persisted relations without deriving any relation.
     #[must_use]
     pub const fn new(
         time: Option<TimeRelation>,
@@ -641,30 +1197,15 @@ impl Qualification {
         Self { time, phase, port, geometry }
     }
 
-    /// Evaluates one operator for one block using artifact-declared requirements.
+    /// Evaluates exact operator requirements plus artifact activation and block scope.
     #[must_use]
     pub fn eligibility(
         &self,
         operator: PhysicalOperator,
         block: &EvidenceBlock,
-        requirements: ModelRequirements,
+        artifact: ModelRequirements,
     ) -> Eligibility {
-        let mandatory = match operator {
-            PhysicalOperator::AbsoluteResponse => ModelRequirements::absolute_response(),
-            PhysicalOperator::FastChange => ModelRequirements::fast_change(),
-            PhysicalOperator::AngleDelay => ModelRequirements::angle_delay(),
-        };
-        let requirements = ModelRequirements {
-            time: requirements.time || mandatory.time,
-            phase: requirements.phase || mandatory.phase,
-            port: requirements.port || mandatory.port,
-            geometry: requirements.geometry || mandatory.geometry,
-            tx_geometry: requirements.tx_geometry || mandatory.tx_geometry,
-        };
         let mut gaps = Vec::new();
-        if block.quality.is_empty() {
-            gaps.push(QualificationGap::NotCaptured);
-        }
         for quality in &block.quality {
             let gap = match quality {
                 EvidenceQuality::Captured => None,
@@ -678,29 +1219,38 @@ impl Qualification {
                 gaps.push(gap);
             }
         }
-        if requirements.time && !covers(self.time.as_ref().map(TimeRelation::validity), block) {
-            gaps.push(QualificationGap::TimeRelation);
-        }
-        if requirements.phase && !covers(self.phase.as_ref().map(PhaseRelation::validity), block) {
-            gaps.push(QualificationGap::PhaseRelation);
-        }
-        if requirements.port && !covers(self.port.as_ref().map(PortMapping::validity), block) {
-            gaps.push(QualificationGap::PortMapping);
-        }
-        if requirements.geometry && !covers(self.geometry.as_ref().map(Geometry::validity), block) {
-            gaps.push(QualificationGap::Geometry);
-        }
-        if requirements.tx_geometry
-            && self.port.as_ref().is_some_and(|mapping| !mapping.tx_geometry_known())
+        if artifact.epoch != block.identity.epoch
+            || !artifact.activation.covers(block.identity.window)
         {
-            gaps.push(QualificationGap::TxGeometry);
+            gaps.push(QualificationGap::ArtifactActivation);
+        }
+        let mut require = |common: Option<&RelationValidity>, gap| {
+            if !common.is_some_and(|validity| {
+                validity.source == block.identity.source
+                    && validity.epoch == block.identity.epoch
+                    && validity.validity.covers(block.identity.window)
+            }) {
+                gaps.push(gap);
+            }
+        };
+        require(self.time.as_ref().map(TimeRelation::common), QualificationGap::TimeRelation);
+        if operator == PhysicalOperator::AngleDelay {
+            require(
+                self.phase.as_ref().map(PhaseRelation::common).filter(|_| {
+                    self.phase
+                        .as_ref()
+                        .is_some_and(|relation| relation.coherence.covers(block.identity.window))
+                }),
+                QualificationGap::PhaseRelation,
+            );
+            require(self.port.as_ref().map(PortMapping::common), QualificationGap::PortMapping);
+            require(self.geometry.as_ref().map(Geometry::common), QualificationGap::Geometry);
+            if self.port.as_ref().is_some_and(|mapping| !mapping.tx_geometry_known()) {
+                gaps.push(QualificationGap::TxGeometry);
+            }
         }
         Eligibility { gaps: gaps.into_boxed_slice() }
     }
-}
-
-fn covers(validity: Option<&RelationValidity>, block: &EvidenceBlock) -> bool {
-    validity.is_some_and(|validity| validity.covers(block.tick, block.epoch))
 }
 
 /// One explicit reason an operator cannot consume an evidence block.
@@ -710,66 +1260,62 @@ pub enum QualificationGap {
     NotCaptured,
     /// An expected capture was lost.
     Lost,
-    /// Captured values were invalid.
+    /// Captured bytes were invalid.
     Invalid,
     /// Values were interpolated.
     Interpolated,
     /// Training masked the values.
     TrainingMasked,
-    /// No valid time relation covers the block.
+    /// The block lies outside artifact activation or epoch.
+    ArtifactActivation,
+    /// No exactly scoped time relation covers the block.
     TimeRelation,
-    /// No valid phase relation covers the block.
+    /// No exactly scoped coherent phase relation covers the block.
     PhaseRelation,
-    /// No valid port mapping covers the block.
+    /// No exactly scoped port mapping covers the block.
     PortMapping,
-    /// No valid geometry covers the block.
+    /// No exactly scoped geometry covers the block.
     Geometry,
-    /// Transmitter geometry is unknown because precoding is not established.
+    /// Transmitter precoding leaves physical antenna geometry unknown.
     TxGeometry,
 }
 
-/// Queryable per-operator eligibility result for one evidence block.
+/// Queryable per-operator eligibility result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Eligibility {
     gaps: Box<[QualificationGap]>,
 }
-
 impl Eligibility {
     /// Reports whether the operator may produce physical evidence.
     #[must_use]
     pub fn is_eligible(&self) -> bool {
         self.gaps.is_empty()
     }
-
-    /// Returns every explicit quality or relation gap.
+    /// Returns every explicit gap.
     #[must_use]
     pub fn gaps(&self) -> &[QualificationGap] {
         &self.gaps
     }
 }
 
-/// Invalid fragment, resource limit, or relation input.
+/// Invalid fragment, resource limit, or qualification input.
 #[derive(Debug)]
 pub struct MeasurementError {
     message: &'static str,
     backtrace: Box<Backtrace>,
 }
-
 impl MeasurementError {
     fn new(message: &'static str) -> Self {
         Self { message, backtrace: Box::new(Backtrace::capture()) }
     }
-
-    /// Returns the captured failure backtrace.
+    /// Returns the captured backtrace.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
     }
 }
-
 impl fmt::Display for MeasurementError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message)
     }
 }
-
 impl std::error::Error for MeasurementError {}

@@ -159,17 +159,41 @@ const NATIVE_HEALTH_FACTS_SCHEMA: &str = "CREATE TABLE native_health_facts (
              ) STRICT";
 const MEASUREMENT_ASSEMBLIES_SCHEMA: &str = "CREATE TABLE measurement_assemblies (
                  assembly_id INTEGER PRIMARY KEY,
-                 source_fact_id INTEGER NOT NULL UNIQUE REFERENCES native_csi_facts(fact_id),
+                 sensor TEXT NOT NULL CHECK (typeof(sensor) = 'text' AND length(sensor) > 0),
                  device_id BLOB NOT NULL CHECK (typeof(device_id) = 'blob' AND length(device_id) = 8),
+                 key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
                  boot_generation BLOB NOT NULL CHECK (typeof(boot_generation) = 'blob' AND length(boot_generation) = 4),
-                 transmitter BLOB NOT NULL CHECK (typeof(transmitter) = 'blob' AND length(transmitter) = 6),
-                 native_event BLOB NOT NULL CHECK (typeof(native_event) = 'blob' AND length(native_event) = 8),
-                 retransmission BLOB CHECK (retransmission IS NULL OR (typeof(retransmission) = 'blob' AND length(retransmission) = 8)),
+                 transmitter BLOB NOT NULL CHECK (typeof(transmitter) = 'blob' AND length(transmitter) = 32),
+                 native_event BLOB NOT NULL CHECK (typeof(native_event) = 'blob' AND length(native_event) = 32),
+                 retransmission BLOB CHECK (retransmission IS NULL OR (typeof(retransmission) = 'blob' AND length(retransmission) = 32)),
+                 profile BLOB NOT NULL CHECK (typeof(profile) = 'blob' AND length(profile) = 32),
+                 radio BLOB NOT NULL CHECK (typeof(radio) = 'blob' AND length(radio) = 32),
+                 channel BLOB NOT NULL CHECK (typeof(channel) = 'blob' AND length(channel) = 32),
                  expected_fragments INTEGER NOT NULL CHECK (expected_fragments BETWEEN 1 AND 65535),
                  missing_ordinals BLOB NOT NULL CHECK (typeof(missing_ordinals) = 'blob' AND length(missing_ordinals) % 2 = 0),
-                 close_reason TEXT NOT NULL CHECK (close_reason IN ('complete', 'wait_limit', 'count_limit', 'byte_limit', 'late_fragment', 'conflicting_duplicate')),
+                 close_reason TEXT NOT NULL CHECK (close_reason IN ('complete', 'wait_limit', 'count_limit', 'byte_limit', 'resource_limit', 'late_fragment', 'duplicate_fragment', 'conflicting_duplicate')),
                  association_uncertainty TEXT NOT NULL CHECK (association_uncertainty IN ('exact_native_identity', 'late_after_close', 'conflicting_facts')),
-                 total_bytes INTEGER NOT NULL CHECK (total_bytes BETWEEN 0 AND 4294967295)
+                 total_bytes INTEGER NOT NULL CHECK (total_bytes BETWEEN 0 AND 33554432)
+             ) STRICT";
+const MEASUREMENT_FRAGMENTS_SCHEMA: &str = "CREATE TABLE measurement_fragments (
+                 fragment_id INTEGER PRIMARY KEY,
+                 sensor TEXT NOT NULL CHECK (typeof(sensor) = 'text' AND length(sensor) > 0),
+                 device_id BLOB NOT NULL CHECK (typeof(device_id) = 'blob' AND length(device_id) = 8),
+                 key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
+                 boot_generation BLOB NOT NULL CHECK (typeof(boot_generation) = 'blob' AND length(boot_generation) = 4),
+                 transmitter BLOB NOT NULL CHECK (typeof(transmitter) = 'blob' AND length(transmitter) = 32),
+                 native_event BLOB NOT NULL CHECK (typeof(native_event) = 'blob' AND length(native_event) = 32),
+                 retransmission BLOB CHECK (retransmission IS NULL OR (typeof(retransmission) = 'blob' AND length(retransmission) = 32)),
+                 profile BLOB NOT NULL CHECK (typeof(profile) = 'blob' AND length(profile) = 32),
+                 radio BLOB NOT NULL CHECK (typeof(radio) = 'blob' AND length(radio) = 32),
+                 channel BLOB NOT NULL CHECK (typeof(channel) = 'blob' AND length(channel) = 32),
+                 ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 65534),
+                 expected_fragments INTEGER NOT NULL CHECK (expected_fragments BETWEEN 1 AND 65535),
+                 fact_digest BLOB NOT NULL CHECK (typeof(fact_digest) = 'blob' AND length(fact_digest) = 32),
+                 payload_bytes INTEGER NOT NULL CHECK (payload_bytes BETWEEN 0 AND 16777216),
+                 quality TEXT NOT NULL CHECK (quality IN ('captured', 'not_captured', 'lost', 'invalid', 'interpolated', 'training_masked')),
+                 arrival_tick BLOB NOT NULL CHECK (typeof(arrival_tick) = 'blob' AND length(arrival_tick) = 8),
+                 disposition TEXT NOT NULL CHECK (disposition IN ('open', 'closed', 'duplicate', 'late', 'conflict', 'resource'))
              ) STRICT";
 const MEASUREMENT_MEMBERS_SCHEMA: &str = "CREATE TABLE measurement_members (
                  assembly_id INTEGER NOT NULL REFERENCES measurement_assemblies(assembly_id),
@@ -182,14 +206,19 @@ const MEASUREMENT_MEMBERS_SCHEMA: &str = "CREATE TABLE measurement_members (
 const QUALIFICATION_RELATIONS_SCHEMA: &str = "CREATE TABLE qualification_relations (
                  relation_id INTEGER PRIMARY KEY,
                  kind TEXT NOT NULL CHECK (kind IN ('time', 'phase', 'port', 'geometry')),
-                 source TEXT NOT NULL CHECK (typeof(source) = 'text' AND length(source) > 0),
+                 provenance TEXT NOT NULL CHECK (typeof(provenance) = 'text' AND length(provenance) > 0),
+                 sensor TEXT NOT NULL CHECK (typeof(sensor) = 'text' AND length(sensor) > 0),
+                 device_id BLOB NOT NULL CHECK (typeof(device_id) = 'blob' AND length(device_id) = 8),
+                 key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
+                 boot_generation BLOB NOT NULL CHECK (typeof(boot_generation) = 'blob' AND length(boot_generation) = 4),
                  error_bound BLOB NOT NULL CHECK (typeof(error_bound) = 'blob' AND length(error_bound) = 8),
+                 error_unit TEXT NOT NULL CHECK (error_unit IN ('nanoseconds', 'milliradians', 'millimetres', 'parts_per_million')),
                  valid_from_tick BLOB NOT NULL CHECK (typeof(valid_from_tick) = 'blob' AND length(valid_from_tick) = 8),
                  valid_until_tick BLOB NOT NULL CHECK (typeof(valid_until_tick) = 'blob' AND length(valid_until_tick) = 8),
                  epoch BLOB NOT NULL CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8),
-                 tx_geometry_known INTEGER CHECK (tx_geometry_known IS NULL OR tx_geometry_known IN (0, 1))
+                 details BLOB NOT NULL CHECK (typeof(details) = 'blob' AND length(details) BETWEEN 1 AND 65536)
              ) STRICT";
-const EXPECTED_SCHEMA: [(&str, &str); 11] = [
+const EXPECTED_SCHEMA: [(&str, &str); 12] = [
     ("store_identity", STORE_IDENTITY_SCHEMA),
     ("replay_windows", REPLAY_WINDOWS_SCHEMA),
     ("native_route_pins", NATIVE_ROUTE_PINS_SCHEMA),
@@ -199,17 +228,17 @@ const EXPECTED_SCHEMA: [(&str, &str); 11] = [
     ("native_csi_facts", NATIVE_CSI_FACTS_SCHEMA),
     ("native_health_facts", NATIVE_HEALTH_FACTS_SCHEMA),
     ("measurement_assemblies", MEASUREMENT_ASSEMBLIES_SCHEMA),
+    ("measurement_fragments", MEASUREMENT_FRAGMENTS_SCHEMA),
     ("measurement_members", MEASUREMENT_MEMBERS_SCHEMA),
     ("qualification_relations", QUALIFICATION_RELATIONS_SCHEMA),
 ];
 // SQLite owns these implicit indexes for the declared UNIQUE and composite
 // PRIMARY KEY constraints. Their exact names, owning tables, and NULL SQL are
 // part of schema generation 4; any other SQLite-owned object is unrecognized.
-const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 5] = [
+const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 4] = [
     ("sqlite_autoindex_raw_facts_1", "raw_facts"),
     ("sqlite_autoindex_replay_windows_1", "replay_windows"),
     ("sqlite_autoindex_native_route_pins_1", "native_route_pins"),
-    ("sqlite_autoindex_measurement_assemblies_1", "measurement_assemblies"),
     ("sqlite_autoindex_measurement_members_1", "measurement_members"),
 ];
 

@@ -3,8 +3,11 @@
 use super::*;
 use crate::measurement::{
     AssemblyClose, AssemblyCloseReason, AssemblyKey, AssemblyMember, AssociationUncertainty,
-    EvidenceQuality, Geometry, PhaseRelation, PortMapping, QualificationRelation, RelationValidity,
-    TimeRelation,
+    ChannelIdentity, ErrorBound, ErrorUnit, EventIdentity, EvidenceQuality, FitIdentity, Geometry,
+    MeasurementContext, NativeEventIdentity, PhaseReferenceIdentity, PhaseRelation, PortMapEntry,
+    PortMapping, Pose, ProfileIdentity, QualificationEpoch, QualificationRelation, RadioIdentity,
+    RelationValidity, RetransmissionIdentity, SourceInstance, SourceTick, TickRange, TimeRelation,
+    TransmitterIdentity,
 };
 use crate::native_csi::{
     CapabilityDescriptor, LtfBlock, LtfKind, NativeCapabilityFact, NativeCsiFact, NativeFact,
@@ -747,6 +750,26 @@ fn raw_loss_error(path: &Path, message: &'static str) -> HostError {
     HostError::message_at("decode persisted raw loss", path, message)
 }
 
+#[derive(Debug)]
+struct StoredClose {
+    id: i64,
+    sensor: String,
+    device: Vec<u8>,
+    key_epoch: Vec<u8>,
+    boot: Vec<u8>,
+    transmitter: Vec<u8>,
+    event: Vec<u8>,
+    retransmission: Option<Vec<u8>>,
+    profile: Vec<u8>,
+    radio: Vec<u8>,
+    channel: Vec<u8>,
+    expected: u16,
+    missing: Vec<u8>,
+    reason: String,
+    uncertainty: String,
+    total: u64,
+}
+
 pub(super) fn query_measurement_closes(
     path: &Path,
     limit: usize,
@@ -756,161 +779,186 @@ pub(super) fn query_measurement_closes(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| HostError::database_at(path, error))?;
-    let mut statement = connection
-        .prepare(
-            "SELECT assembly_id, source_fact_id, device_id, boot_generation, transmitter, native_event,
-                    retransmission, missing_ordinals, close_reason,
-                    association_uncertainty, total_bytes
-             FROM measurement_assemblies ORDER BY assembly_id DESC LIMIT ?1",
-        )
-        .map_err(|error| HostError::database_at(path, error))?;
+    let mut statement = connection.prepare(
+        "SELECT assembly_id,sensor,device_id,key_epoch,boot_generation,transmitter,native_event,
+                retransmission,profile,radio,channel,expected_fragments,missing_ordinals,
+                close_reason,association_uncertainty,total_bytes
+         FROM measurement_assemblies ORDER BY assembly_id DESC LIMIT ?1",
+    ).map_err(|error| HostError::database_at(path, error))?;
     let rows = statement
         .query_map([i64::try_from(limit).expect("query limit fits i64")], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, Option<Vec<u8>>>(6)?,
-                row.get::<_, Vec<u8>>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, u64>(10)?,
-            ))
+            Ok(StoredClose {
+                id: row.get(0)?,
+                sensor: row.get(1)?,
+                device: row.get(2)?,
+                key_epoch: row.get(3)?,
+                boot: row.get(4)?,
+                transmitter: row.get(5)?,
+                event: row.get(6)?,
+                retransmission: row.get(7)?,
+                profile: row.get(8)?,
+                radio: row.get(9)?,
+                channel: row.get(10)?,
+                expected: row.get(11)?,
+                missing: row.get(12)?,
+                reason: row.get(13)?,
+                uncertainty: row.get(14)?,
+                total: row.get(15)?,
+            })
         })
         .map_err(|error| HostError::database_at(path, error))?;
     let mut closes = Vec::with_capacity(limit);
     for row in rows {
-        let (
-            id,
-            source_fact_id,
-            device,
-            boot,
-            transmitter,
-            event,
-            retransmission,
-            missing,
-            reason,
-            uncertainty,
-            total,
-        ) = row.map_err(|error| HostError::database_at(path, error))?;
-        let device = decode_be_u64(path, device, "measurement device")?;
-        let boot = decode_be_u32(path, boot, "measurement boot")?;
-        let transmitter: [u8; 6] = transmitter.try_into().map_err(|_| measurement_error(path))?;
-        let event = decode_be_u64(path, event, "measurement event")?;
-        let retransmission = retransmission
-            .map(|bytes| decode_be_u64(path, bytes, "measurement retransmission"))
-            .transpose()?;
-        let missing = decode_ordinals(path, &missing)?;
-        let reason = decode_close_reason(path, &reason)?;
-        let uncertainty = decode_uncertainty(path, &uncertainty)?;
-        let members = query_assembly_members(&connection, path, id)?;
-        validate_native_assembly(
+        let row = row.map_err(|error| HostError::database_at(path, error))?;
+        let key = decode_assembly_key(path, &row)?;
+        let missing = decode_ordinals(path, &row.missing)?;
+        let members = query_assembly_members(&connection, path, row.id)?;
+        let reason = decode_close_reason(path, &row.reason)?;
+        let uncertainty = decode_uncertainty(path, &row.uncertainty)?;
+        validate_close_integrity(
             &connection,
             path,
-            source_fact_id,
-            device,
-            boot,
-            transmitter,
-            event,
-            retransmission,
-            &missing,
-            reason,
-            uncertainty,
-            total,
-            &members,
+            PersistedCloseView {
+                key: &key,
+                expected: row.expected,
+                missing: &missing,
+                members: &members,
+                reason,
+                uncertainty,
+                total: row.total,
+            },
         )?;
         closes.push(AssemblyClose::persisted(
-            AssemblyKey::new(
-                DeviceId::new(device),
-                BootGeneration::new(boot).ok_or_else(|| measurement_error(path))?,
-                transmitter,
-                event,
-                retransmission,
-            ),
+            key,
+            row.expected,
             members.into_boxed_slice(),
             missing.into_boxed_slice(),
             reason,
             uncertainty,
-            total,
+            row.total,
         ));
     }
     closes.reverse();
     Ok(closes)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "validation compares every persisted assembly field with its sole native source"
-)]
-fn validate_native_assembly(
-    connection: &Connection,
-    path: &Path,
-    source_fact_id: i64,
-    device: u64,
-    boot: u32,
-    transmitter: [u8; 6],
-    event: u64,
-    retransmission: Option<u64>,
-    missing: &[u16],
+fn decode_assembly_key(path: &Path, row: &StoredClose) -> Result<AssemblyKey, HostError> {
+    let source = SourceInstance::new(
+        SensorId::try_from(row.sensor.as_str()).map_err(|_| measurement_error(path))?,
+        DeviceId::new(decode_be_u64(path, row.device.clone(), "device")?),
+        KeyEpoch::new(decode_be_u16(path, row.key_epoch.clone())?)
+            .ok_or_else(|| measurement_error(path))?,
+        BootGeneration::new(decode_be_u32(path, row.boot.clone(), "boot")?)
+            .ok_or_else(|| measurement_error(path))?,
+    );
+    Ok(AssemblyKey::new(
+        source,
+        EventIdentity::new(
+            TransmitterIdentity::new(decode_32(path, row.transmitter.clone())?),
+            NativeEventIdentity::new(decode_32(path, row.event.clone())?),
+            row.retransmission
+                .clone()
+                .map(|value| decode_32(path, value).map(RetransmissionIdentity::new))
+                .transpose()?,
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new(decode_32(path, row.profile.clone())?),
+            RadioIdentity::new(decode_32(path, row.radio.clone())?),
+            ChannelIdentity::new(decode_32(path, row.channel.clone())?),
+        ),
+    ))
+}
+
+struct PersistedCloseView<'a> {
+    key: &'a AssemblyKey,
+    expected: u16,
+    missing: &'a [u16],
+    members: &'a [AssemblyMember],
     reason: AssemblyCloseReason,
     uncertainty: AssociationUncertainty,
     total: u64,
-    members: &[AssemblyMember],
+}
+
+fn validate_close_integrity(
+    connection: &Connection,
+    path: &Path,
+    close: PersistedCloseView<'_>,
 ) -> Result<(), HostError> {
-    let source = connection
-        .query_row(
-            "SELECT f.digest, f.device_id, f.boot_generation, f.message_sequence,
-                    c.source_mac, c.capture_sequence, c.first_invalid_bytes,
-                    c.trailing_invalid_bytes, length(c.raw_csi)
-             FROM native_csi_facts AS c
-             JOIN raw_facts AS f ON f.fact_id = c.fact_id
-             WHERE c.fact_id = ?1",
-            [source_fact_id],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                    row.get::<_, u8>(6)?,
-                    row.get::<_, u8>(7)?,
-                    row.get::<_, u64>(8)?,
-                ))
-            },
-        )
-        .map_err(|error| HostError::database_at(path, error))?;
-    let digest: [u8; 32] = source.0.try_into().map_err(|_| measurement_error(path))?;
-    let source_device = decode_be_u64(path, source.1, "source device")?;
-    let source_boot = decode_be_u32(path, source.2, "source boot")?;
-    let source_retransmission = decode_be_u64(path, source.3, "source sequence")?;
-    let source_transmitter: [u8; 6] = source.4.try_into().map_err(|_| measurement_error(path))?;
-    let source_event = decode_be_u64(path, source.5, "source event")?;
-    let source_quality = if source.6 == 0 && source.7 == 0 {
-        EvidenceQuality::Captured
-    } else {
-        EvidenceQuality::Invalid
-    };
-    if source_device != device
-        || source_boot != boot
-        || source_transmitter != transmitter
-        || source_event != event
-        || retransmission != Some(source_retransmission)
-        || !missing.is_empty()
-        || reason != AssemblyCloseReason::Complete
-        || uncertainty != AssociationUncertainty::ExactNativeIdentity
-        || total != source.8
-        || members.len() != 1
-        || members[0].ordinal() != 0
-        || members[0].fact_digest() != digest
-        || u64::from(members[0].payload_bytes()) != source.8
-        || members[0].quality() != source_quality
+    let PersistedCloseView { key, expected, missing, members, reason, uncertainty, total } = close;
+    if expected == 0
+        || members.len() + missing.len() != usize::from(expected)
+        || total != members.iter().map(|member| u64::from(member.payload_bytes())).sum::<u64>()
     {
-        return Err(measurement_error(path));
+        return Err(HostError::message_at(
+            "validate persisted measurement",
+            path,
+            "member count, missing count, or total bytes is inconsistent",
+        ));
+    }
+    let semantic_consistency = match reason {
+        AssemblyCloseReason::Complete => {
+            missing.is_empty() && uncertainty == AssociationUncertainty::ExactNativeIdentity
+        }
+        AssemblyCloseReason::LateFragment => {
+            members.len() == 1 && uncertainty == AssociationUncertainty::LateAfterClose
+        }
+        AssemblyCloseReason::ConflictingDuplicate => {
+            uncertainty == AssociationUncertainty::ConflictingFacts
+        }
+        _ => uncertainty == AssociationUncertainty::ExactNativeIdentity,
+    };
+    if !semantic_consistency {
+        return Err(HostError::message_at(
+            "validate persisted measurement",
+            path,
+            "close reason, membership, missing set, and uncertainty are inconsistent",
+        ));
+    }
+    let mut seen = vec![false; usize::from(expected)];
+    for ordinal in missing.iter().copied().chain(members.iter().map(|member| member.ordinal())) {
+        let slot = seen.get_mut(usize::from(ordinal)).ok_or_else(|| {
+            HostError::message_at(
+                "validate persisted measurement",
+                path,
+                "ordinal lies outside expected fragment count",
+            )
+        })?;
+        if *slot {
+            return Err(HostError::message_at(
+                "validate persisted measurement",
+                path,
+                "member and missing ordinals overlap",
+            ));
+        }
+        *slot = true;
+    }
+    for member in members {
+        let source = key.source();
+        let event = key.event();
+        let context = key.context();
+        let quality = match member.quality() {
+            EvidenceQuality::Captured => "captured",
+            EvidenceQuality::NotCaptured => "not_captured",
+            EvidenceQuality::Lost => "lost",
+            EvidenceQuality::Invalid => "invalid",
+            EvidenceQuality::Interpolated => "interpolated",
+            EvidenceQuality::TrainingMasked => "training_masked",
+        };
+        let count: u64 = connection.query_row(
+            "SELECT count(*) FROM measurement_fragments WHERE sensor=?1 AND device_id=?2 AND key_epoch=?3
+             AND boot_generation=?4 AND transmitter=?5 AND native_event=?6 AND retransmission IS ?7
+             AND profile=?8 AND radio=?9 AND channel=?10 AND ordinal=?11 AND expected_fragments=?12
+             AND fact_digest=?13 AND payload_bytes=?14 AND quality=?15",
+            params![source.sensor().as_str(), source.device().get().to_be_bytes(), source.key_epoch().get().to_be_bytes(), source.boot().get().to_be_bytes(), event.transmitter().bytes(), event.native_event().bytes(), event.retransmission().map(RetransmissionIdentity::bytes), context.profile().bytes(), context.radio().bytes(), context.channel().bytes(), member.ordinal(), expected, member.fact_digest(), member.payload_bytes(), quality],
+            |row| row.get(0),
+        ).map_err(|error| HostError::database_at(path, error))?;
+        if count == 0 {
+            return Err(HostError::message_at(
+                "validate persisted measurement",
+                path,
+                "member has no matching persisted fragment",
+            ));
+        }
     }
     Ok(())
 }
@@ -918,16 +966,12 @@ fn validate_native_assembly(
 fn query_assembly_members(
     connection: &Connection,
     path: &Path,
-    assembly_id: i64,
+    id: i64,
 ) -> Result<Vec<AssemblyMember>, HostError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT ordinal, fact_digest, payload_bytes, quality
-             FROM measurement_members WHERE assembly_id = ?1 ORDER BY ordinal",
-        )
+    let mut statement = connection.prepare("SELECT ordinal,fact_digest,payload_bytes,quality FROM measurement_members WHERE assembly_id=?1 ORDER BY ordinal")
         .map_err(|error| HostError::database_at(path, error))?;
-    let rows = statement
-        .query_map([assembly_id], |row| {
+    statement
+        .query_map([id], |row| {
             Ok((
                 row.get::<_, u16>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -935,14 +979,34 @@ fn query_assembly_members(
                 row.get::<_, String>(3)?,
             ))
         })
-        .map_err(|error| HostError::database_at(path, error))?;
-    rows.map(|row| {
-        let (ordinal, digest, bytes, quality) =
-            row.map_err(|error| HostError::database_at(path, error))?;
-        let digest = digest.try_into().map_err(|_| measurement_error(path))?;
-        Ok(AssemblyMember::persisted(ordinal, digest, bytes, decode_quality(path, &quality)?))
-    })
-    .collect()
+        .map_err(|error| HostError::database_at(path, error))?
+        .map(|row| {
+            let (ordinal, digest, bytes, quality) =
+                row.map_err(|error| HostError::database_at(path, error))?;
+            Ok(AssemblyMember::persisted(
+                ordinal,
+                decode_32(path, digest)?,
+                bytes,
+                decode_quality(path, &quality)?,
+            ))
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct StoredRelation {
+    kind: String,
+    provenance: String,
+    sensor: String,
+    device: Vec<u8>,
+    key_epoch: Vec<u8>,
+    boot: Vec<u8>,
+    error: Vec<u8>,
+    unit: String,
+    from: Vec<u8>,
+    until: Vec<u8>,
+    epoch: Vec<u8>,
+    details: Vec<u8>,
 }
 
 pub(super) fn query_qualifications(
@@ -954,50 +1018,197 @@ pub(super) fn query_qualifications(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| HostError::database_at(path, error))?;
-    let mut statement = connection
-        .prepare(
-            "SELECT kind, source, error_bound, valid_from_tick, valid_until_tick,
-                    epoch, tx_geometry_known
-             FROM qualification_relations ORDER BY relation_id DESC LIMIT ?1",
-        )
-        .map_err(|error| HostError::database_at(path, error))?;
+    let mut statement = connection.prepare(
+        "SELECT kind,provenance,sensor,device_id,key_epoch,boot_generation,error_bound,error_unit,
+                valid_from_tick,valid_until_tick,epoch,details
+         FROM qualification_relations ORDER BY relation_id DESC LIMIT ?1",
+    ).map_err(|error| HostError::database_at(path, error))?;
     let rows = statement
         .query_map([i64::try_from(limit).expect("query limit fits i64")], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, Option<u8>>(6)?,
-            ))
+            Ok(StoredRelation {
+                kind: row.get(0)?,
+                provenance: row.get(1)?,
+                sensor: row.get(2)?,
+                device: row.get(3)?,
+                key_epoch: row.get(4)?,
+                boot: row.get(5)?,
+                error: row.get(6)?,
+                unit: row.get(7)?,
+                from: row.get(8)?,
+                until: row.get(9)?,
+                epoch: row.get(10)?,
+                details: row.get(11)?,
+            })
         })
         .map_err(|error| HostError::database_at(path, error))?;
     let mut relations = Vec::with_capacity(limit);
     for row in rows {
-        let (kind, source, error, from, until, epoch, tx_geometry) =
-            row.map_err(|error| HostError::database_at(path, error))?;
+        let row = row.map_err(|error| HostError::database_at(path, error))?;
+        let source = SourceInstance::new(
+            SensorId::try_from(row.sensor.as_str()).map_err(|_| measurement_error(path))?,
+            DeviceId::new(decode_be_u64(path, row.device, "relation device")?),
+            KeyEpoch::new(decode_be_u16(path, row.key_epoch)?)
+                .ok_or_else(|| measurement_error(path))?,
+            BootGeneration::new(decode_be_u32(path, row.boot, "relation boot")?)
+                .ok_or_else(|| measurement_error(path))?,
+        );
         let validity = RelationValidity::new(
+            row.provenance,
             source,
-            decode_be_u64(path, error, "relation error")?,
-            decode_be_u64(path, from, "relation start")?,
-            decode_be_u64(path, until, "relation end")?,
-            decode_be_u64(path, epoch, "relation epoch")?,
+            ErrorBound::new(
+                decode_be_u64(path, row.error, "relation error")?,
+                decode_error_unit(path, &row.unit)?,
+            ),
+            TickRange::new(
+                SourceTick::new(decode_be_u64(path, row.from, "relation start")?),
+                SourceTick::new(decode_be_u64(path, row.until, "relation end")?),
+            )
+            .map_err(|_| measurement_error(path))?,
+            QualificationEpoch::new(decode_be_u64(path, row.epoch, "relation epoch")?),
         )
         .map_err(|_| measurement_error(path))?;
-        relations.push(match (kind.as_str(), tx_geometry) {
-            ("time", None) => QualificationRelation::Time(TimeRelation::new(validity)),
-            ("phase", None) => QualificationRelation::Phase(PhaseRelation::new(validity)),
-            ("port", Some(known @ 0..=1)) => {
-                QualificationRelation::Port(PortMapping::new(validity, known == 1))
-            }
-            ("geometry", None) => QualificationRelation::Geometry(Geometry::new(validity)),
-            _ => return Err(measurement_error(path)),
-        });
+        relations.push(decode_relation_details(path, &row.kind, validity, &row.details)?);
     }
     relations.reverse();
     Ok(relations)
+}
+
+struct DetailCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+impl<'a> DetailCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(count)?;
+        let value = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        Some(value)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn text(&mut self) -> Option<Box<str>> {
+        let size = usize::from(self.u16()?);
+        std::str::from_utf8(self.take(size)?).ok().map(Into::into)
+    }
+    fn done(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+fn decode_relation_details(
+    path: &Path,
+    kind: &str,
+    validity: RelationValidity,
+    details: &[u8],
+) -> Result<QualificationRelation, HostError> {
+    let mut cursor = DetailCursor::new(details);
+    let relation = match kind {
+        "time" => {
+            let source = cursor.text().ok_or_else(|| measurement_error(path))?;
+            let target = cursor.text().ok_or_else(|| measurement_error(path))?;
+            let fit = FitIdentity::new(
+                cursor
+                    .take(32)
+                    .ok_or_else(|| measurement_error(path))?
+                    .try_into()
+                    .map_err(|_| measurement_error(path))?,
+            );
+            QualificationRelation::Time(
+                TimeRelation::new(validity, source, target, fit)
+                    .map_err(|_| measurement_error(path))?,
+            )
+        }
+        "phase" => {
+            let reference = PhaseReferenceIdentity::new(
+                cursor
+                    .take(32)
+                    .ok_or_else(|| measurement_error(path))?
+                    .try_into()
+                    .map_err(|_| measurement_error(path))?,
+            );
+            let coherence = TickRange::new(
+                SourceTick::new(cursor.u64().ok_or_else(|| measurement_error(path))?),
+                SourceTick::new(cursor.u64().ok_or_else(|| measurement_error(path))?),
+            )
+            .map_err(|_| measurement_error(path))?;
+            QualificationRelation::Phase(
+                PhaseRelation::new(validity, reference, coherence)
+                    .map_err(|_| measurement_error(path))?,
+            )
+        }
+        "port" => {
+            let count = cursor.u16().ok_or_else(|| measurement_error(path))?;
+            let mut entries = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                let tx = cursor.u16().ok_or_else(|| measurement_error(path))?;
+                let rx = cursor.u16().ok_or_else(|| measurement_error(path))?;
+                let marker = *cursor
+                    .take(1)
+                    .and_then(|value| value.first())
+                    .ok_or_else(|| measurement_error(path))?;
+                let antenna = cursor.u16().ok_or_else(|| measurement_error(path))?;
+                let tx_antenna = match marker {
+                    0 if antenna == 0 => None,
+                    1 => Some(antenna),
+                    _ => return Err(measurement_error(path)),
+                };
+                entries.push(PortMapEntry::new(
+                    tx,
+                    rx,
+                    tx_antenna,
+                    cursor.u16().ok_or_else(|| measurement_error(path))?,
+                ));
+            }
+            QualificationRelation::Port(
+                PortMapping::new(validity, entries).map_err(|_| measurement_error(path))?,
+            )
+        }
+        "geometry" => {
+            let source = cursor.text().ok_or_else(|| measurement_error(path))?;
+            let target = cursor.text().ok_or_else(|| measurement_error(path))?;
+            let mut pose = [0; 7];
+            for component in &mut pose {
+                *component = cursor.i64().ok_or_else(|| measurement_error(path))?;
+            }
+            QualificationRelation::Geometry(
+                Geometry::new(validity, source, target, Pose::new(pose))
+                    .map_err(|_| measurement_error(path))?,
+            )
+        }
+        _ => return Err(measurement_error(path)),
+    };
+    if !cursor.done() {
+        return Err(measurement_error(path));
+    }
+    Ok(relation)
+}
+
+fn decode_error_unit(path: &Path, value: &str) -> Result<ErrorUnit, HostError> {
+    match value {
+        "nanoseconds" => Ok(ErrorUnit::Nanoseconds),
+        "milliradians" => Ok(ErrorUnit::Milliradians),
+        "millimetres" => Ok(ErrorUnit::Millimetres),
+        "parts_per_million" => Ok(ErrorUnit::PartsPerMillion),
+        _ => Err(measurement_error(path)),
+    }
+}
+
+fn decode_be_u16(path: &Path, bytes: Vec<u8>) -> Result<u16, HostError> {
+    Ok(u16::from_be_bytes(bytes.try_into().map_err(|_| measurement_error(path))?))
+}
+
+fn decode_32(path: &Path, bytes: Vec<u8>) -> Result<[u8; 32], HostError> {
+    bytes.try_into().map_err(|_| measurement_error(path))
 }
 
 fn decode_be_u64(path: &Path, bytes: Vec<u8>, _field: &'static str) -> Result<u64, HostError> {
@@ -1023,7 +1234,9 @@ fn decode_close_reason(path: &Path, value: &str) -> Result<AssemblyCloseReason, 
         "wait_limit" => Ok(AssemblyCloseReason::WaitLimit),
         "count_limit" => Ok(AssemblyCloseReason::CountLimit),
         "byte_limit" => Ok(AssemblyCloseReason::ByteLimit),
+        "resource_limit" => Ok(AssemblyCloseReason::ResourceLimit),
         "late_fragment" => Ok(AssemblyCloseReason::LateFragment),
+        "duplicate_fragment" => Ok(AssemblyCloseReason::DuplicateFragment),
         "conflicting_duplicate" => Ok(AssemblyCloseReason::ConflictingDuplicate),
         _ => Err(measurement_error(path)),
     }
