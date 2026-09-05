@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use sha2::{Digest as _, Sha256};
 use whisper::model_worker::{
     Checkpoint, ContentDigest, DispatchDecision, DispatchQueue, ExecutionClass, InputManifest,
     MIN_FRAME_BYTES, ModelRequest, ModelResponse, ModelRun, ModelRunId, NumericContract,
@@ -250,12 +251,35 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         thread::sleep(Duration::from_millis(5));
     }
     assert!(temporary.exists(), "Python worker did not create its socket");
-    let model_request =
-        request("python-request-1", [1.5_f32.to_le_bytes(), (-2.0_f32).to_le_bytes()].concat());
+    let tensor = [1.5_f32.to_le_bytes(), (-2.0_f32).to_le_bytes()].concat();
+    let model_request = request("python-request-1", tensor.clone());
+    let expected_identity = model_request.identity().clone();
     let response = WorkerClient::new(WorkerLimits::default(), Duration::from_secs(2))
         .execute(&temporary, &model_request)
         .unwrap();
     assert_eq!(response.status(), ResponseStatus::Success);
+    assert_eq!(response.identity(), &expected_identity);
+    assert_eq!(response.detail(), "");
+    let expected_candidate = [3.0_f32.to_le_bytes(), (-4.0_f32).to_le_bytes()].concat();
+    assert_eq!(response.candidate_bytes(), expected_candidate);
+    let expected_successor = Sha256::digest(
+        [b"successor-v1".as_slice(), b"checkpoint-v1".as_slice(), tensor.as_slice()].concat(),
+    );
+    assert_eq!(response.successor_checkpoint(), expected_successor.as_slice());
+    assert_eq!(response.output_shape(), [2]);
+    assert_eq!(response.input_tensor_digest(), Some(ContentDigest::of(&tensor)));
+    assert_eq!(response.output_numeric_digest(), Some(ContentDigest::of(&expected_candidate)));
+    let expected_payload = [expected_candidate.as_slice(), expected_successor.as_slice()].concat();
+    assert_eq!(response.return_payload_digest(), Some(ContentDigest::of(&expected_payload)));
+    let expected_qualification = NumericContract::new(
+        ExecutionClass::CpuBaseline,
+        true,
+        0.0,
+        0.0,
+        "rust-test-f32".to_owned(),
+    )
+    .unwrap();
+    assert_eq!(response.numeric_qualification(), Some(&expected_qualification));
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     std::fs::remove_file(temporary).unwrap();

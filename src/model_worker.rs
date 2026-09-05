@@ -1049,6 +1049,60 @@ impl ModelResponse {
         self.status
     }
 
+    /// Returns the request identity repeated by the worker.
+    #[must_use]
+    pub const fn identity(&self) -> &RequestIdentity {
+        &self.identity
+    }
+
+    /// Returns the bounded human-readable outcome detail.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// Returns the exact packed candidate bytes, empty for failures.
+    #[must_use]
+    pub fn candidate_bytes(&self) -> &[u8] {
+        &self.candidate_hex
+    }
+
+    /// Returns the exact self-contained successor-checkpoint material, empty for failures.
+    #[must_use]
+    pub fn successor_checkpoint(&self) -> &[u8] {
+        &self.successor_hex
+    }
+
+    /// Returns the exact worker-observed output shape, empty for failures.
+    #[must_use]
+    pub fn output_shape(&self) -> &[u32] {
+        &self.output_shape
+    }
+
+    /// Returns the input tensor digest repeated by a successful worker response.
+    #[must_use]
+    pub const fn input_tensor_digest(&self) -> Option<ContentDigest> {
+        self.input_tensor_digest
+    }
+
+    /// Returns the digest of the numerical candidate bytes on success.
+    #[must_use]
+    pub const fn output_numeric_digest(&self) -> Option<ContentDigest> {
+        self.output_numeric_digest
+    }
+
+    /// Returns the digest of candidate plus successor-checkpoint bytes on success.
+    #[must_use]
+    pub const fn return_payload_digest(&self) -> Option<ContentDigest> {
+        self.return_payload_digest
+    }
+
+    /// Returns the numerical qualification repeated by a successful response.
+    #[must_use]
+    pub const fn numeric_qualification(&self) -> Option<&NumericContract> {
+        self.numeric_qualification.as_ref()
+    }
+
     /// Encodes one bounded response frame.
     ///
     /// # Errors
