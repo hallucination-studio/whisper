@@ -5,6 +5,7 @@ use std::net::UdpSocket;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,14 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
 };
 use sha2::{Digest, Sha256};
+use whisper::measurement::{
+    AssemblyCapacity, AssemblyCloseReason, AssemblyKey, AssemblyLimits, ChannelIdentity,
+    ErrorBound, ErrorUnit, EventIdentity, EvidenceQuality, FitIdentity, FragmentBytes,
+    FragmentFact, FragmentPosition, MeasurementContext, MeasurementFragment, NativeEventIdentity,
+    PhaseReferenceIdentity, PhaseRelation, PortMapEntry, PortMapping, Pose, ProfileIdentity,
+    QualificationEpoch, QualificationRelation, RadioIdentity, RelationValidity, SourceInstance,
+    SourceTick, TickRange, TimeRelation, TransmitterIdentity, WaitTicks,
+};
 use whisper::native_csi::{
     CapabilityIdentity, ChannelPolicy, CsiPath, FirmwareBuildIdentity, NativeFact, RadioRxS3,
     S3BandwidthKind, S3PhyKind, S3SecondaryKind, SampleAxis, SourceMac,
@@ -35,6 +44,850 @@ const CAPABILITY_DIGEST: [u8; 32] = [
     0x34, 0x93, 0x9e, 0x35, 0xea, 0xbe, 0x30, 0x4c, 0xa5, 0x66, 0x14, 0x4f, 0x25, 0x8c, 0x1e, 0x52,
     0x2c, 0x88, 0x7f, 0x1e, 0xc5, 0x39, 0x5e, 0xdb, 0xbc, 0x22, 0x68, 0xe1, 0xfc, 0x54, 0x08, 0x43,
 ];
+
+#[test]
+fn native_csi_closes_one_persisted_measurement_and_relations_round_trip() {
+    let parent = temporary_directory("host-measurement-close");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let host =
+        start_host(Store::initialize(parent.join("world-store")).unwrap(), &sender, &secret_root);
+    sender
+        .send_to(
+            &hex_fixture(include_str!("fixtures/native-frame/capabilities-v1.hex")),
+            host.local_addr(),
+        )
+        .unwrap();
+    sender
+        .send_to(
+            &hex_fixture(include_str!("fixtures/native-frame/csi-non-ht-3-pairs.hex")),
+            host.local_addr(),
+        )
+        .unwrap();
+    wait_for_fact_count(&host, 2);
+
+    let closes = host.query_measurement_closes(4).unwrap();
+    assert_eq!(closes.len(), 1);
+    assert_eq!(closes[0].reason(), AssemblyCloseReason::Complete);
+    assert_eq!(closes[0].members().len(), 1);
+    assert_eq!(
+        closes[0].members()[0].fact_digest(),
+        *host.query_native_csi(1).unwrap()[0].provenance().provenance_digest()
+    );
+
+    let relation_source = SourceInstance::new(
+        SensorId::try_from("hall-west").unwrap(),
+        DeviceId::new(DEVICE_ID),
+        KeyEpoch::new(KEY_EPOCH).unwrap(),
+        BootGeneration::new(1).unwrap(),
+    );
+    let validity = |unit| {
+        RelationValidity::new(
+            "survey-7",
+            relation_source.clone(),
+            ErrorBound::new(30, unit),
+            TickRange::new(SourceTick::new(40), SourceTick::new(50)).unwrap(),
+            QualificationEpoch::new(6),
+        )
+        .unwrap()
+    };
+    let relations = vec![
+        QualificationRelation::Time(
+            TimeRelation::new(
+                validity(ErrorUnit::Nanoseconds),
+                "esp-timer",
+                "host-monotonic",
+                FitIdentity::new([7; 32]),
+            )
+            .unwrap(),
+        ),
+        QualificationRelation::Phase(
+            PhaseRelation::new(
+                validity(ErrorUnit::Milliradians),
+                PhaseReferenceIdentity::new([8; 32]),
+                TickRange::new(SourceTick::new(42), SourceTick::new(48)).unwrap(),
+            )
+            .unwrap(),
+        ),
+        QualificationRelation::Port(
+            PortMapping::new(
+                validity(ErrorUnit::PartsPerMillion),
+                [PortMapEntry::new(0, 1, Some(2), 3)],
+            )
+            .unwrap(),
+        ),
+        QualificationRelation::Geometry(
+            whisper::measurement::Geometry::new(
+                validity(ErrorUnit::Millimetres),
+                "sensor-frame",
+                "room-frame",
+                Pose::new([1, 2, 3, 0, 0, 0, 1_000_000]),
+            )
+            .unwrap(),
+        ),
+    ];
+    for relation in &relations {
+        host.persist_qualification(relation.clone()).unwrap();
+    }
+    let persisted = host.query_qualifications(4).unwrap();
+    assert_eq!(persisted, relations);
+
+    host.shutdown().unwrap();
+    let reopened =
+        start_host(Store::open(parent.join("world-store")).unwrap(), &sender, &secret_root);
+    assert_eq!(reopened.query_measurement_closes(4).unwrap().len(), 1);
+    assert_eq!(reopened.query_qualifications(4).unwrap(), relations);
+    reopened.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn heterogeneous_restart_and_exact_duplicate_at_wait_boundary_preserve_closes() {
+    let parent = temporary_directory("host-general-measurement");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let store_root = parent.join("world-store");
+    let source = SourceInstance::new(
+        SensorId::try_from("heterogeneous-rx").unwrap(),
+        DeviceId::new(91),
+        KeyEpoch::new(3).unwrap(),
+        BootGeneration::new(8).unwrap(),
+    );
+    let key = AssemblyKey::new(
+        source.clone(),
+        EventIdentity::new(
+            TransmitterIdentity::new([1; 32]),
+            NativeEventIdentity::new([2; 32]),
+            None,
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new([3; 32]),
+            RadioIdentity::new([4; 32]),
+            ChannelIdentity::new([5; 32]),
+        ),
+    );
+    let make_fragment = |ordinal, digest| {
+        MeasurementFragment::new(
+            key.clone(),
+            FragmentPosition::new(ordinal, 2).unwrap(),
+            FragmentFact::new(
+                [digest; 32],
+                FragmentBytes::new(11).unwrap(),
+                EvidenceQuality::Captured,
+            ),
+        )
+    };
+
+    let host = start_host(Store::initialize(&store_root).unwrap(), &sender, &secret_root);
+    assert!(
+        host.persist_measurement_fragment(make_fragment(1, 8), SourceTick::new(10))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        host.persist_measurement_fragment(make_fragment(1, 8), SourceTick::new(11)).unwrap()[0]
+            .reason(),
+        AssemblyCloseReason::DuplicateFragment,
+    );
+    host.shutdown().unwrap();
+
+    let reopened = start_host(Store::open(&store_root).unwrap(), &sender, &secret_root);
+    let completed =
+        reopened.persist_measurement_fragment(make_fragment(0, 7), SourceTick::new(12)).unwrap();
+    assert_eq!(completed[0].reason(), AssemblyCloseReason::Complete);
+    assert_eq!(
+        completed[0].members().iter().map(|member| member.ordinal()).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    reopened.shutdown().unwrap();
+
+    let reopened = start_host(Store::open(&store_root).unwrap(), &sender, &secret_root);
+    let late =
+        reopened.persist_measurement_fragment(make_fragment(0, 9), SourceTick::new(13)).unwrap();
+    assert_eq!(late[0].reason(), AssemblyCloseReason::LateFragment);
+    let closes = reopened.query_measurement_closes(8).unwrap();
+    let complete =
+        closes.iter().find(|close| close.reason() == AssemblyCloseReason::Complete).unwrap();
+    assert_eq!(
+        complete.members().iter().map(|member| member.fact_digest()).collect::<Vec<_>>(),
+        [[7; 32], [8; 32]]
+    );
+    let timeout_key = AssemblyKey::new(
+        source.clone(),
+        EventIdentity::new(
+            TransmitterIdentity::new([1; 32]),
+            NativeEventIdentity::new([6; 32]),
+            None,
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new([3; 32]),
+            RadioIdentity::new([4; 32]),
+            ChannelIdentity::new([5; 32]),
+        ),
+    );
+    reopened
+        .persist_measurement_fragment(
+            MeasurementFragment::new(
+                timeout_key,
+                FragmentPosition::new(0, 2).unwrap(),
+                FragmentFact::new(
+                    [6; 32],
+                    FragmentBytes::new(10).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(1),
+        )
+        .unwrap();
+    let expired = reopened.expire_measurements(source.clone(), SourceTick::new(1_000_001)).unwrap();
+    assert_eq!(expired[0].reason(), AssemblyCloseReason::WaitLimit);
+    assert_eq!(expired[0].missing_ordinals(), [1]);
+    let key_for_event = |event| {
+        AssemblyKey::new(
+            source.clone(),
+            EventIdentity::new(
+                TransmitterIdentity::new([1; 32]),
+                NativeEventIdentity::new([event; 32]),
+                None,
+            ),
+            MeasurementContext::new(
+                ProfileIdentity::new([3; 32]),
+                RadioIdentity::new([4; 32]),
+                ChannelIdentity::new([5; 32]),
+            ),
+        )
+    };
+    let count = reopened
+        .persist_measurement_fragment(
+            MeasurementFragment::new(
+                key_for_event(7),
+                FragmentPosition::new(0, 1_025).unwrap(),
+                FragmentFact::new(
+                    [7; 32],
+                    FragmentBytes::new(1).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(2),
+        )
+        .unwrap();
+    assert_eq!(count[0].reason(), AssemblyCloseReason::CountLimit);
+    let large = FragmentBytes::new(9 * 1024 * 1024).unwrap();
+    assert!(
+        reopened
+            .persist_measurement_fragment(
+                MeasurementFragment::new(
+                    key_for_event(8),
+                    FragmentPosition::new(0, 2).unwrap(),
+                    FragmentFact::new([8; 32], large, EvidenceQuality::Captured),
+                ),
+                SourceTick::new(2),
+            )
+            .unwrap()
+            .is_empty()
+    );
+    let bytes = reopened
+        .persist_measurement_fragment(
+            MeasurementFragment::new(
+                key_for_event(8),
+                FragmentPosition::new(1, 2).unwrap(),
+                FragmentFact::new([9; 32], large, EvidenceQuality::Captured),
+            ),
+            SourceTick::new(3),
+        )
+        .unwrap();
+    assert_eq!(bytes[0].reason(), AssemblyCloseReason::ByteLimit);
+    reopened
+        .persist_measurement_fragment(
+            MeasurementFragment::new(
+                key_for_event(9),
+                FragmentPosition::new(0, 2).unwrap(),
+                FragmentFact::new(
+                    [10; 32],
+                    FragmentBytes::new(1).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(4),
+        )
+        .unwrap();
+    let conflict = reopened
+        .persist_measurement_fragment(
+            MeasurementFragment::new(
+                key_for_event(9),
+                FragmentPosition::new(0, 2).unwrap(),
+                FragmentFact::new(
+                    [11; 32],
+                    FragmentBytes::new(1).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(5),
+        )
+        .unwrap();
+    assert_eq!(conflict[0].reason(), AssemblyCloseReason::ConflictingDuplicate);
+    let waited_key = key_for_event(10);
+    reopened
+        .persist_measurement_fragment(
+            MeasurementFragment::new(
+                waited_key.clone(),
+                FragmentPosition::new(0, 2).unwrap(),
+                FragmentFact::new(
+                    [12; 32],
+                    FragmentBytes::new(1).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(20),
+        )
+        .unwrap();
+    let after_deadline = reopened
+        .persist_measurement_fragment(
+            MeasurementFragment::new(
+                waited_key.clone(),
+                FragmentPosition::new(0, 2).unwrap(),
+                FragmentFact::new(
+                    [12; 32],
+                    FragmentBytes::new(1).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(1_000_020),
+        )
+        .unwrap();
+    assert_eq!(
+        after_deadline.iter().map(|close| close.reason()).collect::<Vec<_>>(),
+        [AssemblyCloseReason::WaitLimit, AssemblyCloseReason::LateFragment]
+    );
+    assert!(!after_deadline.iter().any(|close| close.reason() == AssemblyCloseReason::Complete));
+    assert_eq!(after_deadline[0].missing_ordinals(), [1]);
+    assert_eq!(after_deadline[0].members()[0].fact_digest(), [12; 32]);
+    let persisted_closes = reopened.query_measurement_closes(16).unwrap();
+    let waited_closes =
+        persisted_closes.iter().filter(|close| close.key() == &waited_key).collect::<Vec<_>>();
+    assert_eq!(waited_closes.len(), 2);
+    let persisted_wait = waited_closes
+        .iter()
+        .find(|close| close.reason() == AssemblyCloseReason::WaitLimit)
+        .unwrap();
+    assert_eq!(persisted_wait.missing_ordinals(), [1]);
+    assert_eq!(persisted_wait.members()[0].fact_digest(), [12; 32]);
+    let reasons = persisted_closes.into_iter().map(|close| close.reason()).collect::<Vec<_>>();
+    for reason in [
+        AssemblyCloseReason::WaitLimit,
+        AssemblyCloseReason::CountLimit,
+        AssemblyCloseReason::ByteLimit,
+        AssemblyCloseReason::ConflictingDuplicate,
+    ] {
+        assert!(reasons.contains(&reason));
+    }
+    reopened.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn measurement_query_rejects_same_width_tampering_for_every_close_reason() {
+    let parent = temporary_directory("host-measurement-tamper");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let store_root = parent.join("world-store");
+    let source = SourceInstance::new(
+        SensorId::try_from("tamper-rx").unwrap(),
+        DeviceId::new(92),
+        KeyEpoch::new(3).unwrap(),
+        BootGeneration::new(8).unwrap(),
+    );
+    let key_for_event = |event| {
+        AssemblyKey::new(
+            source.clone(),
+            EventIdentity::new(
+                TransmitterIdentity::new([1; 32]),
+                NativeEventIdentity::new([event; 32]),
+                None,
+            ),
+            MeasurementContext::new(
+                ProfileIdentity::new([3; 32]),
+                RadioIdentity::new([4; 32]),
+                ChannelIdentity::new([5; 32]),
+            ),
+        )
+    };
+    let fragment = |event, ordinal, expected, digest, bytes| {
+        MeasurementFragment::new(
+            key_for_event(event),
+            FragmentPosition::new(ordinal, expected).unwrap(),
+            FragmentFact::new(
+                [digest; 32],
+                FragmentBytes::new(bytes).unwrap(),
+                EvidenceQuality::Captured,
+            ),
+        )
+    };
+    let limits =
+        AssemblyLimits::new(AssemblyCapacity::new(2, 2, 8).unwrap(), WaitTicks::new(5).unwrap());
+    let host = start_host_with_measurement_limits(
+        Store::initialize(&store_root).unwrap(),
+        &sender,
+        &secret_root,
+        limits,
+    );
+    host.persist_measurement_fragment(fragment(1, 0, 1, 1, 1), SourceTick::new(0)).unwrap();
+    host.persist_measurement_fragment(fragment(2, 0, 2, 2, 1), SourceTick::new(0)).unwrap();
+    host.expire_measurements(source.clone(), SourceTick::new(5)).unwrap();
+    host.persist_measurement_fragment(fragment(3, 0, 3, 3, 1), SourceTick::new(5)).unwrap();
+    host.persist_measurement_fragment(fragment(4, 0, 2, 4, 5), SourceTick::new(5)).unwrap();
+    host.persist_measurement_fragment(fragment(4, 1, 2, 5, 5), SourceTick::new(6)).unwrap();
+    host.persist_measurement_fragment(fragment(5, 0, 2, 6, 1), SourceTick::new(6)).unwrap();
+    host.persist_measurement_fragment(fragment(6, 0, 2, 7, 1), SourceTick::new(6)).unwrap();
+    host.persist_measurement_fragment(fragment(7, 0, 2, 8, 1), SourceTick::new(6)).unwrap();
+    host.persist_measurement_fragment(fragment(5, 1, 2, 9, 1), SourceTick::new(7)).unwrap();
+    host.persist_measurement_fragment(fragment(6, 1, 2, 10, 1), SourceTick::new(7)).unwrap();
+    host.persist_measurement_fragment(fragment(8, 0, 2, 11, 1), SourceTick::new(7)).unwrap();
+    host.persist_measurement_fragment(fragment(8, 0, 2, 11, 1), SourceTick::new(8)).unwrap();
+    host.persist_measurement_fragment(fragment(9, 0, 2, 12, 1), SourceTick::new(8)).unwrap();
+    host.persist_measurement_fragment(fragment(9, 0, 3, 13, 1), SourceTick::new(9)).unwrap();
+    host.persist_measurement_fragment(fragment(1, 0, 1, 14, 1), SourceTick::new(9)).unwrap();
+    let closes = host.query_measurement_closes(32).unwrap();
+    assert_eq!(closes.len(), 10);
+    let declared_count_conflict = closes
+        .iter()
+        .find(|close| {
+            close.key() == &key_for_event(9)
+                && close.reason() == AssemblyCloseReason::ConflictingDuplicate
+        })
+        .unwrap();
+    assert_eq!(declared_count_conflict.expected_fragments(), 2);
+    assert_eq!(declared_count_conflict.members().len(), 1);
+    assert_eq!(declared_count_conflict.missing_ordinals(), [1]);
+    host.shutdown().unwrap();
+
+    let mutations = [
+        ("complete", "attempted_fragments", "attempted_fragments + 1"),
+        ("wait_limit", "close_tick", "first_tick"),
+        ("count_limit", "attempted_fragments", "attempted_fragments + 1"),
+        ("byte_limit", "attempted_bytes", "limit_bytes"),
+        ("resource_limit", "open_assemblies", "open_assemblies - 1"),
+        ("late_fragment", "attempted_fragments", "attempted_fragments + 1"),
+        ("duplicate_fragment", "attempted_fragments", "1"),
+        ("conflicting_duplicate", "attempted_bytes", "total_bytes"),
+    ];
+    let database_path = store_root.join("facts.sqlite3");
+    for (reason, column, expression) in mutations {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        let id: i64 = database
+            .query_row(
+                "SELECT assembly_id FROM measurement_assemblies WHERE close_reason=?1 LIMIT 1",
+                [reason],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original: rusqlite::types::Value = database
+            .query_row(
+                &format!("SELECT {column} FROM measurement_assemblies WHERE assembly_id=?1"),
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        database
+            .execute(
+                &format!(
+                    "UPDATE measurement_assemblies SET {column}={expression} WHERE assembly_id=?1"
+                ),
+                [id],
+            )
+            .unwrap();
+        drop(database);
+        let reopened = start_host_with_measurement_limits(
+            Store::open(&store_root).unwrap(),
+            &sender,
+            &secret_root,
+            limits,
+        );
+        assert!(reopened.query_measurement_closes(32).is_err(), "accepted {reason} tamper");
+        reopened.shutdown().unwrap();
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                &format!("UPDATE measurement_assemblies SET {column}=?1 WHERE assembly_id=?2"),
+                rusqlite::params![original, id],
+            )
+            .unwrap();
+    }
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn resource_limit_close_remains_closed_across_restart() {
+    let parent = temporary_directory("host-measurement-resource-restart");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let store_root = parent.join("world-store");
+    let source = SourceInstance::new(
+        SensorId::try_from("resource-rx").unwrap(),
+        DeviceId::new(93),
+        KeyEpoch::new(3).unwrap(),
+        BootGeneration::new(8).unwrap(),
+    );
+    let key_for_event = |event: u16| {
+        let mut identity = [0_u8; 32];
+        identity[..2].copy_from_slice(&event.to_be_bytes());
+        AssemblyKey::new(
+            source.clone(),
+            EventIdentity::new(
+                TransmitterIdentity::new([1; 32]),
+                NativeEventIdentity::new(identity),
+                None,
+            ),
+            MeasurementContext::new(
+                ProfileIdentity::new([3; 32]),
+                RadioIdentity::new([4; 32]),
+                ChannelIdentity::new([5; 32]),
+            ),
+        )
+    };
+    let fragment_for = |event| {
+        MeasurementFragment::new(
+            key_for_event(event),
+            FragmentPosition::new(0, 2).unwrap(),
+            FragmentFact::new(
+                [event as u8; 32],
+                FragmentBytes::new(1).unwrap(),
+                EvidenceQuality::Captured,
+            ),
+        )
+    };
+
+    let limits = AssemblyLimits::new(
+        AssemblyCapacity::new(4, 1_024, 16 * 1024 * 1024).unwrap(),
+        WaitTicks::new(1_000_000).unwrap(),
+    );
+    let host = start_host_with_measurement_limits(
+        Store::initialize(&store_root).unwrap(),
+        &sender,
+        &secret_root,
+        limits,
+    );
+    for event in 0..4 {
+        assert!(
+            host.persist_measurement_fragment(
+                fragment_for(event),
+                SourceTick::new(u64::from(event))
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+    let resource = host.persist_measurement_fragment(fragment_for(4), SourceTick::new(4)).unwrap();
+    assert_eq!(resource[0].reason(), AssemblyCloseReason::ResourceLimit);
+    host.shutdown().unwrap();
+
+    let reopened = start_host_with_measurement_limits(
+        Store::open(&store_root).unwrap(),
+        &sender,
+        &secret_root,
+        limits,
+    );
+    let late = reopened.persist_measurement_fragment(fragment_for(4), SourceTick::new(5)).unwrap();
+    assert_eq!(late[0].reason(), AssemblyCloseReason::LateFragment);
+    let closes = reopened.query_measurement_closes(4).unwrap();
+    assert!(closes.iter().any(|close| close.reason() == AssemblyCloseReason::ResourceLimit));
+    assert!(closes.iter().any(|close| close.reason() == AssemblyCloseReason::LateFragment));
+    reopened.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn repeated_exact_duplicates_round_trip_with_per_attempt_metrics() {
+    let parent = temporary_directory("host-repeated-measurement-duplicates");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let store_root = parent.join("world-store");
+    let key = AssemblyKey::new(
+        SourceInstance::new(
+            SensorId::try_from("duplicate-rx").unwrap(),
+            DeviceId::new(95),
+            KeyEpoch::new(3).unwrap(),
+            BootGeneration::new(8).unwrap(),
+        ),
+        EventIdentity::new(
+            TransmitterIdentity::new([1; 32]),
+            NativeEventIdentity::new([2; 32]),
+            None,
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new([3; 32]),
+            RadioIdentity::new([4; 32]),
+            ChannelIdentity::new([5; 32]),
+        ),
+    );
+    let fragment = || {
+        MeasurementFragment::new(
+            key.clone(),
+            FragmentPosition::new(0, 2).unwrap(),
+            FragmentFact::new([6; 32], FragmentBytes::new(5).unwrap(), EvidenceQuality::Captured),
+        )
+    };
+    let host = start_host(Store::initialize(&store_root).unwrap(), &sender, &secret_root);
+    assert!(host.persist_measurement_fragment(fragment(), SourceTick::new(1)).unwrap().is_empty());
+    for tick in [2, 3] {
+        let closes = host.persist_measurement_fragment(fragment(), SourceTick::new(tick)).unwrap();
+        assert_eq!(closes[0].reason(), AssemblyCloseReason::DuplicateFragment);
+        assert_eq!(closes[0].metrics().attempted_fragments(), 2);
+        assert_eq!(closes[0].metrics().attempted_bytes(), 10);
+    }
+    let duplicates = host
+        .query_measurement_closes(4)
+        .unwrap()
+        .into_iter()
+        .filter(|close| close.reason() == AssemblyCloseReason::DuplicateFragment)
+        .collect::<Vec<_>>();
+    assert_eq!(duplicates.len(), 2);
+    host.shutdown().unwrap();
+
+    let reopened = start_host(Store::open(&store_root).unwrap(), &sender, &secret_root);
+    assert_eq!(reopened.query_measurement_closes(4).unwrap().len(), 2);
+    reopened.shutdown().unwrap();
+    let database = rusqlite::Connection::open(store_root.join("facts.sqlite3")).unwrap();
+    database
+        .execute(
+            "UPDATE measurement_fragments SET quality='invalid'
+             WHERE fragment_id=(SELECT min(fragment_id) FROM measurement_fragments)",
+            [],
+        )
+        .unwrap();
+    drop(database);
+    let tampered = start_host(Store::open(&store_root).unwrap(), &sender, &secret_root);
+    assert!(tampered.query_measurement_closes(4).is_err());
+    tampered.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn measurement_query_rejects_non_null_wait_limit_trigger() {
+    let parent = temporary_directory("host-wait-trigger-tamper");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let store_root = parent.join("world-store");
+    let source = SourceInstance::new(
+        SensorId::try_from("wait-rx").unwrap(),
+        DeviceId::new(96),
+        KeyEpoch::new(3).unwrap(),
+        BootGeneration::new(8).unwrap(),
+    );
+    let key = AssemblyKey::new(
+        source.clone(),
+        EventIdentity::new(
+            TransmitterIdentity::new([1; 32]),
+            NativeEventIdentity::new([2; 32]),
+            None,
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new([3; 32]),
+            RadioIdentity::new([4; 32]),
+            ChannelIdentity::new([5; 32]),
+        ),
+    );
+    let fragment = |ordinal, digest| {
+        MeasurementFragment::new(
+            key.clone(),
+            FragmentPosition::new(ordinal, 2).unwrap(),
+            FragmentFact::new(
+                [digest; 32],
+                FragmentBytes::new(1).unwrap(),
+                EvidenceQuality::Captured,
+            ),
+        )
+    };
+    let host = start_host(Store::initialize(&store_root).unwrap(), &sender, &secret_root);
+    host.persist_measurement_fragment(fragment(0, 6), SourceTick::new(1)).unwrap();
+    host.expire_measurements(source, SourceTick::new(1_000_001)).unwrap();
+    host.persist_measurement_fragment(fragment(1, 7), SourceTick::new(1_000_002)).unwrap();
+    host.shutdown().unwrap();
+
+    let database = rusqlite::Connection::open(store_root.join("facts.sqlite3")).unwrap();
+    database
+        .execute(
+            "UPDATE measurement_assemblies
+             SET trigger_fragment_id=(SELECT max(fragment_id) FROM measurement_fragments)
+             WHERE close_reason='wait_limit'",
+            [],
+        )
+        .unwrap();
+    drop(database);
+    let reopened = start_host(Store::open(&store_root).unwrap(), &sender, &secret_root);
+    assert!(reopened.query_measurement_closes(4).is_err());
+    reopened.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn restart_rejects_open_fragment_count_or_byte_limit_tampering() {
+    for (label, mutation) in [
+        ("count", "UPDATE measurement_fragments SET expected_fragments=5"),
+        ("bytes", "UPDATE measurement_fragments SET payload_bytes=5 WHERE ordinal=1"),
+    ] {
+        let parent = temporary_directory(&format!("host-open-assembly-{label}-tamper"));
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+        let secret_root = create_secret_root(&parent);
+        let store_root = parent.join("world-store");
+        let limits = AssemblyLimits::new(
+            AssemblyCapacity::new(2, 4, 8).unwrap(),
+            WaitTicks::new(5).unwrap(),
+        );
+        let host = start_host_with_measurement_limits(
+            Store::initialize(&store_root).unwrap(),
+            &sender,
+            &secret_root,
+            limits,
+        );
+        let key = AssemblyKey::new(
+            SourceInstance::new(
+                SensorId::try_from("restore-rx").unwrap(),
+                DeviceId::new(94),
+                KeyEpoch::new(3).unwrap(),
+                BootGeneration::new(8).unwrap(),
+            ),
+            EventIdentity::new(
+                TransmitterIdentity::new([1; 32]),
+                NativeEventIdentity::new([2; 32]),
+                None,
+            ),
+            MeasurementContext::new(
+                ProfileIdentity::new([3; 32]),
+                RadioIdentity::new([4; 32]),
+                ChannelIdentity::new([5; 32]),
+            ),
+        );
+        host.persist_measurement_fragment(
+            MeasurementFragment::new(
+                key,
+                FragmentPosition::new(0, if label == "bytes" { 3 } else { 2 }).unwrap(),
+                FragmentFact::new(
+                    [6; 32],
+                    FragmentBytes::new(4).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(1),
+        )
+        .unwrap();
+        if label == "bytes" {
+            host.persist_measurement_fragment(
+                MeasurementFragment::new(
+                    AssemblyKey::new(
+                        SourceInstance::new(
+                            SensorId::try_from("restore-rx").unwrap(),
+                            DeviceId::new(94),
+                            KeyEpoch::new(3).unwrap(),
+                            BootGeneration::new(8).unwrap(),
+                        ),
+                        EventIdentity::new(
+                            TransmitterIdentity::new([1; 32]),
+                            NativeEventIdentity::new([2; 32]),
+                            None,
+                        ),
+                        MeasurementContext::new(
+                            ProfileIdentity::new([3; 32]),
+                            RadioIdentity::new([4; 32]),
+                            ChannelIdentity::new([5; 32]),
+                        ),
+                    ),
+                    FragmentPosition::new(1, 3).unwrap(),
+                    FragmentFact::new(
+                        [7; 32],
+                        FragmentBytes::new(4).unwrap(),
+                        EvidenceQuality::Captured,
+                    ),
+                ),
+                SourceTick::new(2),
+            )
+            .unwrap();
+        }
+        host.shutdown().unwrap();
+        let database = rusqlite::Connection::open(store_root.join("facts.sqlite3")).unwrap();
+        database.execute(mutation, []).unwrap();
+        drop(database);
+        let route = NativeFrameRoute::load(
+            sender.local_addr().unwrap().ip(),
+            device_id(),
+            key_epoch(),
+            admission_limits(1_000),
+            decoded_route(non_ht_radio()),
+            &secret_root,
+        )
+        .unwrap();
+        Host::builder(
+            Store::open(&store_root).unwrap(),
+            deployment("lab"),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .route(route)
+        .measurement_limits(limits)
+        .start()
+        .expect_err("tampered open assembly must fail closed during restore");
+        fs::remove_dir_all(parent).unwrap();
+    }
+}
+
+#[test]
+fn saturated_control_refill_rotates_to_udp_ingress() {
+    const CONCURRENT_COMMANDS: usize = 96;
+    let parent = temporary_directory("host-writer-fairness");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let host = Arc::new(start_host(
+        Store::initialize(parent.join("world-store")).unwrap(),
+        &sender,
+        &secret_root,
+    ));
+    let barrier = Arc::new(Barrier::new(CONCURRENT_COMMANDS + 1));
+    let mut workers = Vec::new();
+    for worker in 0..CONCURRENT_COMMANDS {
+        let host = Arc::clone(&host);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            let source = SourceInstance::new(
+                SensorId::try_from("fairness-rx").unwrap(),
+                DeviceId::new(120),
+                KeyEpoch::new(4).unwrap(),
+                BootGeneration::new(9).unwrap(),
+            );
+            let common = RelationValidity::new(
+                "fairness-fit",
+                source,
+                ErrorBound::new(1, ErrorUnit::Nanoseconds),
+                TickRange::new(SourceTick::new(0), SourceTick::new(100)).unwrap(),
+                QualificationEpoch::new(worker as u64),
+            )
+            .unwrap();
+            host.persist_qualification(QualificationRelation::Time(
+                TimeRelation::new(common, "source", "target", FitIdentity::new([worker as u8; 32]))
+                    .unwrap(),
+            ))
+        }));
+    }
+    barrier.wait();
+    let ingress_started = Instant::now();
+    sender
+        .send_to(
+            &hex_fixture(include_str!("fixtures/native-frame/capabilities-v1.hex")),
+            host.local_addr(),
+        )
+        .unwrap();
+    wait_for_fact_count(&host, 1);
+    assert!(ingress_started.elapsed() < Duration::from_secs(3));
+    for worker in workers {
+        if let Err(error) = worker.join().unwrap() {
+            assert!(
+                error.to_string().contains("control queue count deadline elapsed"),
+                "unexpected saturated-control result: {error}"
+            );
+        }
+    }
+    Arc::try_unwrap(host).expect("workers released host").shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
 
 #[test]
 fn route_budget_carries_every_supported_native_frame_v1_message() {
@@ -1177,6 +2030,28 @@ fn start_host_with_radio(
     .expect("exact route is valid");
     Host::builder(store, deployment("lab"), "127.0.0.1:0".parse().unwrap())
         .route(route)
+        .start()
+        .expect("Host starts")
+}
+
+fn start_host_with_measurement_limits(
+    store: Store,
+    sender: &UdpSocket,
+    secret_root: &std::path::Path,
+    limits: AssemblyLimits,
+) -> whisper::HostRuntime {
+    let route = NativeFrameRoute::load(
+        sender.local_addr().unwrap().ip(),
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
+        decoded_route(non_ht_radio()),
+        secret_root,
+    )
+    .expect("exact route is valid");
+    Host::builder(store, deployment("lab"), "127.0.0.1:0".parse().unwrap())
+        .route(route)
+        .measurement_limits(limits)
         .start()
         .expect("Host starts")
 }

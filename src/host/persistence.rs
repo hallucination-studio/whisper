@@ -1,6 +1,12 @@
 //! Sole-writer transaction A and durable replay-state persistence.
 
 use super::*;
+use crate::measurement::{
+    AssemblyCloseReason, AssemblyKey, AssociationUncertainty, ChannelIdentity, EventIdentity,
+    EvidenceQuality, FragmentBytes, FragmentFact, FragmentPosition, MeasurementAssembler,
+    MeasurementContext, NativeEventIdentity, ProfileIdentity, QualificationRelation, RadioIdentity,
+    RetransmissionIdentity, TransmitterIdentity,
+};
 use crate::native_frame::{
     LTF_BLOCK_BYTES, LtfBlock, LtfKind, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
 };
@@ -46,12 +52,12 @@ impl NativeRoutePin {
 
 pub(super) fn writer_loop(
     config: WriterConfig,
-    ingress: mpsc::Receiver<AdmittedDatagram>,
-    artifacts: mpsc::Receiver<ArtifactCommand>,
+    channels: WriterChannels,
     overflow: &OverflowSummary,
     rejections: &Mutex<VecDeque<RejectedDatagram>>,
     ready: mpsc::SyncSender<Result<(), HostError>>,
 ) -> Result<(), HostError> {
+    let WriterChannels { ingress, artifacts, controls, control_bytes } = channels;
     let startup = match load_replay_states_from_path(
         config.replay_snapshot.database_path(),
         &config.database_path,
@@ -91,6 +97,8 @@ pub(super) fn writer_loop(
         return Ok(());
     }
     let mut replay = startup.states;
+    let mut assembler = MeasurementAssembler::new(config.measurement_limits);
+    restore_open_fragments(&connection, &config.database_path, &mut assembler)?;
     if ready.send(Ok(())).is_err() {
         return Ok(());
     }
@@ -103,12 +111,29 @@ pub(super) fn writer_loop(
             }
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
         }
+        // A fixed batch guarantees rotation to ingress even while controls refill concurrently.
+        for _ in 0..CONTROL_BATCH_PER_TURN {
+            match controls.try_recv() {
+                Ok(command) => {
+                    control_bytes.fetch_sub(command.queued_bytes(), Ordering::AcqRel);
+                    process_control(
+                        &mut connection,
+                        &config.database_path,
+                        &mut assembler,
+                        command,
+                    )?;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
         match ingress.recv_timeout(SOCKET_POLL_INTERVAL) {
             Ok(item) => persist_admitted(
                 &mut connection,
                 &config.database_path,
                 &config.routes,
                 &mut replay,
+                &mut assembler,
                 rejections,
                 item,
             )?,
@@ -249,6 +274,577 @@ fn persist_artifact_inner(
             ))
         }
         Err(error) => Err(ArtifactImportError::database("insert artifact", path, error)),
+    }
+}
+
+fn persist_qualification(
+    connection: &Connection,
+    path: &Path,
+    relation: &QualificationRelation,
+) -> Result<(), HostError> {
+    let validity = relation.common();
+    let (kind, details) = encode_relation_details(relation)?;
+    connection
+        .execute(
+            "INSERT INTO qualification_relations (
+                 kind, provenance, sensor, device_id, key_epoch, boot_generation,
+                 error_bound, error_unit, valid_from_tick, valid_until_tick, epoch, details
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                kind,
+                validity.provenance(),
+                validity.source().sensor().as_str(),
+                validity.source().device().get().to_be_bytes(),
+                validity.source().key_epoch().get().to_be_bytes(),
+                validity.source().boot().get().to_be_bytes(),
+                validity.error().value().to_be_bytes(),
+                encode_error_unit(validity.error().unit()),
+                validity.validity().start().get().to_be_bytes(),
+                validity.validity().end().get().to_be_bytes(),
+                validity.epoch().get().to_be_bytes(),
+                details,
+            ],
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    Ok(())
+}
+
+fn process_control(
+    connection: &mut Connection,
+    path: &Path,
+    assembler: &mut MeasurementAssembler,
+    command: ControlCommand,
+) -> Result<(), HostError> {
+    match command {
+        ControlCommand::Qualification { relation, reply, .. } => {
+            let result = persist_qualification(connection, path, &relation);
+            let failed = result.is_err();
+            let _ = reply.send(result);
+            if failed {
+                return Err(HostError::message_at(
+                    "persist qualification",
+                    path,
+                    "qualification persistence failed",
+                ));
+            }
+        }
+        ControlCommand::Fragment { fragment, arrival, reply, .. } => {
+            let result =
+                persist_measurement_fragment(connection, path, assembler, fragment, arrival);
+            let failed = result.is_err();
+            let _ = reply.send(result);
+            if failed {
+                return Err(HostError::message_at(
+                    "persist measurement fragment",
+                    path,
+                    "measurement persistence failed",
+                ));
+            }
+        }
+        ControlCommand::Expire { source, now, reply, .. } => {
+            let result = persist_expired(connection, path, assembler, &source, now);
+            let failed = result.is_err();
+            let _ = reply.send(result);
+            if failed {
+                return Err(HostError::message_at(
+                    "expire measurements",
+                    path,
+                    "measurement expiry persistence failed",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_error_unit(unit: crate::measurement::ErrorUnit) -> &'static str {
+    use crate::measurement::ErrorUnit;
+    match unit {
+        ErrorUnit::Nanoseconds => "nanoseconds",
+        ErrorUnit::Milliradians => "milliradians",
+        ErrorUnit::Millimetres => "millimetres",
+        ErrorUnit::PartsPerMillion => "parts_per_million",
+    }
+}
+
+fn push_text(bytes: &mut Vec<u8>, value: &str) -> Result<(), HostError> {
+    let length = u16::try_from(value.len()).map_err(|_| {
+        HostError::message_during("encode qualification", "qualification label is too long")
+    })?;
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn encode_relation_details(
+    relation: &QualificationRelation,
+) -> Result<(&'static str, Vec<u8>), HostError> {
+    let mut bytes = Vec::new();
+    let kind = match relation {
+        QualificationRelation::Time(value) => {
+            push_text(&mut bytes, value.source_clock())?;
+            push_text(&mut bytes, value.target_clock())?;
+            bytes.extend_from_slice(&value.fit().bytes());
+            "time"
+        }
+        QualificationRelation::Phase(value) => {
+            bytes.extend_from_slice(&value.reference().bytes());
+            bytes.extend_from_slice(&value.coherence().start().get().to_be_bytes());
+            bytes.extend_from_slice(&value.coherence().end().get().to_be_bytes());
+            "phase"
+        }
+        QualificationRelation::Port(value) => {
+            bytes.extend_from_slice(
+                &u16::try_from(value.entries().len())
+                    .expect("port mapping constructor bounds the count")
+                    .to_be_bytes(),
+            );
+            for entry in value.entries() {
+                bytes.extend_from_slice(&entry.tx_stream().to_be_bytes());
+                bytes.extend_from_slice(&entry.rx_chain().to_be_bytes());
+                match entry.tx_antenna() {
+                    Some(antenna) => {
+                        bytes.push(1);
+                        bytes.extend_from_slice(&antenna.to_be_bytes());
+                    }
+                    None => bytes.extend_from_slice(&[0, 0, 0]),
+                }
+                bytes.extend_from_slice(&entry.rx_antenna().to_be_bytes());
+            }
+            "port"
+        }
+        QualificationRelation::Geometry(value) => {
+            push_text(&mut bytes, value.source_frame())?;
+            push_text(&mut bytes, value.target_frame())?;
+            for component in value.pose().components() {
+                bytes.extend_from_slice(&component.to_be_bytes());
+            }
+            "geometry"
+        }
+    };
+    Ok((kind, bytes))
+}
+
+fn persist_measurement_fragment(
+    connection: &mut Connection,
+    path: &Path,
+    assembler: &mut MeasurementAssembler,
+    fragment: MeasurementFragment,
+    arrival: SourceTick,
+) -> Result<Vec<AssemblyClose>, HostError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| HostError::database_at(path, error))?;
+    let closes = persist_fragment_in_transaction(&transaction, path, assembler, fragment, arrival)?;
+    transaction.commit().map_err(|error| HostError::database_at(path, error))?;
+    Ok(closes)
+}
+
+fn persist_fragment_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &Path,
+    assembler: &mut MeasurementAssembler,
+    fragment: MeasurementFragment,
+    arrival: SourceTick,
+) -> Result<Vec<AssemblyClose>, HostError> {
+    insert_measurement_fragment(transaction, path, &fragment, arrival)?;
+    let fragment_id = transaction.last_insert_rowid();
+    let trigger_key = fragment.key().clone();
+    let closes = if has_durable_primary_close(transaction, path, fragment.key())? {
+        vec![assembler.late(fragment, arrival)]
+    } else {
+        assembler.ingest(fragment, arrival).map_err(|_| measurement_persistence_error(path))?
+    };
+    for close in &closes {
+        let disposition = match close.reason() {
+            AssemblyCloseReason::LateFragment => "late",
+            AssemblyCloseReason::DuplicateFragment => "duplicate",
+            AssemblyCloseReason::ResourceLimit => "resource",
+            AssemblyCloseReason::ConflictingDuplicate => "conflict",
+            _ => "closed",
+        };
+        if matches!(
+            close.reason(),
+            AssemblyCloseReason::LateFragment
+                | AssemblyCloseReason::DuplicateFragment
+                | AssemblyCloseReason::ResourceLimit
+        ) {
+            transaction
+                .execute(
+                    "UPDATE measurement_fragments SET disposition = ?1 WHERE fragment_id = ?2",
+                    params![disposition, fragment_id],
+                )
+                .map_err(|error| HostError::database_at(path, error))?;
+        } else {
+            mark_open_fragments(transaction, path, close.key(), disposition)?;
+        }
+        let trigger = (close.key() == &trigger_key
+            && close.reason() != AssemblyCloseReason::WaitLimit)
+            .then_some(fragment_id);
+        persist_close(transaction, path, close, trigger)?;
+    }
+    Ok(closes)
+}
+
+fn identity_from_parts(label: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(label);
+    for part in parts {
+        digest.update(part);
+    }
+    digest.finalize().into()
+}
+
+fn persist_expired(
+    connection: &mut Connection,
+    path: &Path,
+    assembler: &mut MeasurementAssembler,
+    source: &SourceInstance,
+    now: SourceTick,
+) -> Result<Vec<AssemblyClose>, HostError> {
+    let closes = assembler.expire(source, now);
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| HostError::database_at(path, error))?;
+    for close in &closes {
+        mark_open_fragments(&transaction, path, close.key(), "closed")?;
+        persist_close(&transaction, path, close, None)?;
+    }
+    transaction.commit().map_err(|error| HostError::database_at(path, error))?;
+    Ok(closes)
+}
+
+fn insert_measurement_fragment(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &Path,
+    fragment: &MeasurementFragment,
+    arrival: SourceTick,
+) -> Result<(), HostError> {
+    let key = fragment.key();
+    let source = key.source();
+    let event = key.event();
+    let context = key.context();
+    transaction
+        .execute(
+            "INSERT INTO measurement_fragments (
+             sensor, device_id, key_epoch, boot_generation, transmitter, native_event,
+             retransmission, profile, radio, channel, ordinal, expected_fragments,
+             fact_digest, payload_bytes, quality, arrival_tick, disposition
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                   ?13, ?14, ?15, ?16, 'open')",
+            params![
+                source.sensor().as_str(),
+                source.device().get().to_be_bytes(),
+                source.key_epoch().get().to_be_bytes(),
+                source.boot().get().to_be_bytes(),
+                event.transmitter().bytes(),
+                event.native_event().bytes(),
+                event.retransmission().map(RetransmissionIdentity::bytes),
+                context.profile().bytes(),
+                context.radio().bytes(),
+                context.channel().bytes(),
+                fragment.position().ordinal(),
+                fragment.position().expected(),
+                fragment.fact().digest(),
+                fragment.fact().bytes().get(),
+                encode_quality(fragment.fact().quality()),
+                arrival.get().to_be_bytes(),
+            ],
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    Ok(())
+}
+
+fn has_durable_primary_close(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &Path,
+    key: &AssemblyKey,
+) -> Result<bool, HostError> {
+    let source = key.source();
+    let event = key.event();
+    let context = key.context();
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM measurement_assemblies
+         WHERE sensor=?1 AND device_id=?2 AND key_epoch=?3 AND boot_generation=?4
+           AND transmitter=?5 AND native_event=?6 AND retransmission IS ?7
+           AND profile=?8 AND radio=?9 AND channel=?10
+           AND close_reason NOT IN ('late_fragment','duplicate_fragment'))",
+            params![
+                source.sensor().as_str(),
+                source.device().get().to_be_bytes(),
+                source.key_epoch().get().to_be_bytes(),
+                source.boot().get().to_be_bytes(),
+                event.transmitter().bytes(),
+                event.native_event().bytes(),
+                event.retransmission().map(RetransmissionIdentity::bytes),
+                context.profile().bytes(),
+                context.radio().bytes(),
+                context.channel().bytes()
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| HostError::database_at(path, error))
+}
+
+fn mark_open_fragments(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &Path,
+    key: &AssemblyKey,
+    disposition: &str,
+) -> Result<(), HostError> {
+    let source = key.source();
+    let event = key.event();
+    let context = key.context();
+    transaction
+        .execute(
+            "UPDATE measurement_fragments SET disposition=?1
+         WHERE sensor=?2 AND device_id=?3 AND key_epoch=?4 AND boot_generation=?5
+           AND transmitter=?6 AND native_event=?7 AND retransmission IS ?8
+           AND profile=?9 AND radio=?10 AND channel=?11 AND disposition='open'",
+            params![
+                disposition,
+                source.sensor().as_str(),
+                source.device().get().to_be_bytes(),
+                source.key_epoch().get().to_be_bytes(),
+                source.boot().get().to_be_bytes(),
+                event.transmitter().bytes(),
+                event.native_event().bytes(),
+                event.retransmission().map(RetransmissionIdentity::bytes),
+                context.profile().bytes(),
+                context.radio().bytes(),
+                context.channel().bytes()
+            ],
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    Ok(())
+}
+
+fn persist_close(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &Path,
+    close: &AssemblyClose,
+    trigger_fragment_id: Option<i64>,
+) -> Result<(), HostError> {
+    let key = close.key();
+    let source = key.source();
+    let event = key.event();
+    let context = key.context();
+    let metrics = close.metrics();
+    let limits = metrics.limits();
+    let missing = close
+        .missing_ordinals()
+        .iter()
+        .flat_map(|ordinal| ordinal.to_be_bytes())
+        .collect::<Vec<_>>();
+    transaction
+        .execute(
+            "INSERT INTO measurement_assemblies (
+             trigger_fragment_id, sensor, device_id, key_epoch, boot_generation, transmitter, native_event,
+             retransmission, profile, radio, channel, expected_fragments, missing_ordinals,
+             close_reason, association_uncertainty, total_bytes, first_tick, close_tick,
+             limit_open, limit_fragments, limit_bytes, limit_wait, attempted_fragments,
+             attempted_bytes, open_assemblies
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
+                   ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+            params![
+                trigger_fragment_id,
+                source.sensor().as_str(),
+                source.device().get().to_be_bytes(),
+                source.key_epoch().get().to_be_bytes(),
+                source.boot().get().to_be_bytes(),
+                event.transmitter().bytes(),
+                event.native_event().bytes(),
+                event.retransmission().map(RetransmissionIdentity::bytes),
+                context.profile().bytes(),
+                context.radio().bytes(),
+                context.channel().bytes(),
+                close.expected_fragments(),
+                missing,
+                encode_close_reason(close.reason()),
+                encode_uncertainty(close.uncertainty()),
+                close.total_bytes(),
+                metrics.first_tick().get().to_be_bytes(),
+                metrics.close_tick().get().to_be_bytes(),
+                limits.capacity().open(),
+                limits.capacity().fragments(),
+                limits.capacity().bytes(),
+                limits.wait().get().to_be_bytes(),
+                metrics.attempted_fragments(),
+                metrics.attempted_bytes(),
+                metrics.open_assemblies(),
+            ],
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    let id = transaction.last_insert_rowid();
+    for member in close.members() {
+        transaction.execute(
+            "INSERT INTO measurement_members (assembly_id,ordinal,fact_digest,payload_bytes,quality) VALUES (?1,?2,?3,?4,?5)",
+            params![id, member.ordinal(), member.fact_digest(), member.payload_bytes(), encode_quality(member.quality())],
+        ).map_err(|error| HostError::database_at(path, error))?;
+    }
+    Ok(())
+}
+
+fn encode_quality(value: EvidenceQuality) -> &'static str {
+    match value {
+        EvidenceQuality::Captured => "captured",
+        EvidenceQuality::NotCaptured => "not_captured",
+        EvidenceQuality::Lost => "lost",
+        EvidenceQuality::Invalid => "invalid",
+        EvidenceQuality::Interpolated => "interpolated",
+        EvidenceQuality::TrainingMasked => "training_masked",
+    }
+}
+
+fn encode_close_reason(value: AssemblyCloseReason) -> &'static str {
+    match value {
+        AssemblyCloseReason::Complete => "complete",
+        AssemblyCloseReason::WaitLimit => "wait_limit",
+        AssemblyCloseReason::CountLimit => "count_limit",
+        AssemblyCloseReason::ByteLimit => "byte_limit",
+        AssemblyCloseReason::ResourceLimit => "resource_limit",
+        AssemblyCloseReason::LateFragment => "late_fragment",
+        AssemblyCloseReason::DuplicateFragment => "duplicate_fragment",
+        AssemblyCloseReason::ConflictingDuplicate => "conflicting_duplicate",
+    }
+}
+
+fn encode_uncertainty(value: AssociationUncertainty) -> &'static str {
+    match value {
+        AssociationUncertainty::ExactNativeIdentity => "exact_native_identity",
+        AssociationUncertainty::LateAfterClose => "late_after_close",
+        AssociationUncertainty::ConflictingFacts => "conflicting_facts",
+    }
+}
+
+fn measurement_persistence_error(path: &Path) -> HostError {
+    HostError::message_at("persist measurement", path, "measurement assembly invariant failed")
+}
+
+#[derive(Debug)]
+struct StoredOpenFragment {
+    sensor: String,
+    device: Vec<u8>,
+    key_epoch: Vec<u8>,
+    boot: Vec<u8>,
+    transmitter: Vec<u8>,
+    event: Vec<u8>,
+    retransmission: Option<Vec<u8>>,
+    profile: Vec<u8>,
+    radio: Vec<u8>,
+    channel: Vec<u8>,
+    ordinal: u16,
+    expected: u16,
+    digest: Vec<u8>,
+    bytes: u32,
+    quality: String,
+    arrival: Vec<u8>,
+}
+
+fn restore_open_fragments(
+    connection: &Connection,
+    path: &Path,
+    assembler: &mut MeasurementAssembler,
+) -> Result<(), HostError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sensor,device_id,key_epoch,boot_generation,transmitter,native_event,
+                retransmission,profile,radio,channel,ordinal,expected_fragments,
+                fact_digest,payload_bytes,quality,arrival_tick
+         FROM measurement_fragments WHERE disposition='open' ORDER BY fragment_id",
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(StoredOpenFragment {
+                sensor: row.get(0)?,
+                device: row.get(1)?,
+                key_epoch: row.get(2)?,
+                boot: row.get(3)?,
+                transmitter: row.get(4)?,
+                event: row.get(5)?,
+                retransmission: row.get(6)?,
+                profile: row.get(7)?,
+                radio: row.get(8)?,
+                channel: row.get(9)?,
+                ordinal: row.get(10)?,
+                expected: row.get(11)?,
+                digest: row.get(12)?,
+                bytes: row.get(13)?,
+                quality: row.get(14)?,
+                arrival: row.get(15)?,
+            })
+        })
+        .map_err(|error| HostError::database_at(path, error))?;
+    for row in rows {
+        let row = row.map_err(|error| HostError::database_at(path, error))?;
+        let source = SourceInstance::new(
+            SensorId::try_from(row.sensor.as_str())
+                .map_err(|_| measurement_persistence_error(path))?,
+            DeviceId::new(decode_fixed_u64(path, row.device)?),
+            KeyEpoch::new(decode_fixed_u16(path, row.key_epoch)?)
+                .ok_or_else(|| measurement_persistence_error(path))?,
+            BootGeneration::new(decode_fixed_u32(path, row.boot)?)
+                .ok_or_else(|| measurement_persistence_error(path))?,
+        );
+        let key = AssemblyKey::new(
+            source,
+            EventIdentity::new(
+                TransmitterIdentity::new(decode_digest(path, row.transmitter)?),
+                NativeEventIdentity::new(decode_digest(path, row.event)?),
+                row.retransmission
+                    .map(|value| decode_digest(path, value).map(RetransmissionIdentity::new))
+                    .transpose()?,
+            ),
+            MeasurementContext::new(
+                ProfileIdentity::new(decode_digest(path, row.profile)?),
+                RadioIdentity::new(decode_digest(path, row.radio)?),
+                ChannelIdentity::new(decode_digest(path, row.channel)?),
+            ),
+        );
+        let fragment = MeasurementFragment::new(
+            key,
+            FragmentPosition::new(row.ordinal, row.expected)
+                .map_err(|_| measurement_persistence_error(path))?,
+            FragmentFact::new(
+                decode_digest(path, row.digest)?,
+                FragmentBytes::new(row.bytes).map_err(|_| measurement_persistence_error(path))?,
+                decode_stored_quality(path, &row.quality)?,
+            ),
+        );
+        assembler
+            .restore(fragment, SourceTick::new(decode_fixed_u64(path, row.arrival)?))
+            .map_err(|_| measurement_persistence_error(path))?;
+    }
+    Ok(())
+}
+
+fn decode_digest(path: &Path, value: Vec<u8>) -> Result<[u8; 32], HostError> {
+    value.try_into().map_err(|_| measurement_persistence_error(path))
+}
+
+fn decode_fixed_u64(path: &Path, value: Vec<u8>) -> Result<u64, HostError> {
+    Ok(u64::from_be_bytes(value.try_into().map_err(|_| measurement_persistence_error(path))?))
+}
+
+fn decode_fixed_u32(path: &Path, value: Vec<u8>) -> Result<u32, HostError> {
+    Ok(u32::from_be_bytes(value.try_into().map_err(|_| measurement_persistence_error(path))?))
+}
+
+fn decode_fixed_u16(path: &Path, value: Vec<u8>) -> Result<u16, HostError> {
+    Ok(u16::from_be_bytes(value.try_into().map_err(|_| measurement_persistence_error(path))?))
+}
+
+fn decode_stored_quality(path: &Path, value: &str) -> Result<EvidenceQuality, HostError> {
+    match value {
+        "captured" => Ok(EvidenceQuality::Captured),
+        "not_captured" => Ok(EvidenceQuality::NotCaptured),
+        "lost" => Ok(EvidenceQuality::Lost),
+        "invalid" => Ok(EvidenceQuality::Invalid),
+        "interpolated" => Ok(EvidenceQuality::Interpolated),
+        "training_masked" => Ok(EvidenceQuality::TrainingMasked),
+        _ => Err(measurement_persistence_error(path)),
     }
 }
 
@@ -618,6 +1214,7 @@ fn persist_admitted(
     path: &Path,
     routes: &[NativeFrameRoute],
     replay: &mut [ReplayWriterState],
+    assembler: &mut MeasurementAssembler,
     rejections: &Mutex<VecDeque<RejectedDatagram>>,
     item: AdmittedDatagram,
 ) -> Result<(), HostError> {
@@ -660,9 +1257,16 @@ fn persist_admitted(
         .map_err(|error| HostError::database_at(path, error))?;
     let fact_id = transaction.last_insert_rowid();
     let semantic_rejection = match decode_authenticated(&item.authenticated) {
-        Ok(decoded) => {
-            persist_typed_fact(&transaction, path, fact_id, route, &item, decoded.message())?
-        }
+        Ok(decoded) => persist_typed_fact(
+            &transaction,
+            path,
+            fact_id,
+            digest,
+            route,
+            &item,
+            decoded.message(),
+            assembler,
+        )?,
         Err(error) => Some(match error {
             crate::native_frame::WireError::UnknownKind { .. } => RejectReason::UnknownKind,
             crate::native_frame::WireError::MalformedBody { .. } => RejectReason::MalformedBody,
@@ -697,13 +1301,19 @@ fn persist_admitted(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "transaction-A validation keeps the immutable admitted datagram context explicit"
+)]
 fn persist_typed_fact(
     transaction: &rusqlite::Transaction<'_>,
     path: &Path,
     fact_id: i64,
+    fact_digest: [u8; 32],
     route: &NativeFrameRoute,
     item: &AdmittedDatagram,
     message: &Message,
+    assembler: &mut MeasurementAssembler,
 ) -> Result<Option<RejectReason>, HostError> {
     if let Some(reason) = route.semantic_rejection(message) {
         return Ok(Some(reason));
@@ -791,6 +1401,75 @@ fn persist_typed_fact(
                     ],
                 )
                 .map_err(|error| HostError::database_at(path, error))?;
+            let quality = if data.first_invalid_bytes() == 0 && data.trailing_invalid_bytes() == 0 {
+                EvidenceQuality::Captured
+            } else {
+                EvidenceQuality::Invalid
+            };
+            let transmitter =
+                identity_from_parts(b"esp32-s3-transmitter-v1", &[&data.source_mac()]);
+            let event = identity_from_parts(
+                b"esp32-s3-capture-sequence-v1",
+                &[&data.capture_sequence().to_be_bytes()],
+            );
+            let radio = identity_from_parts(
+                b"esp32-s3-radio-v1",
+                &[&[
+                    phy_byte(data.radio().phy()),
+                    bandwidth_byte(data.radio().bandwidth()),
+                    secondary_byte(data.radio().secondary()),
+                    u8::from(data.radio().stbc()),
+                    data.radio().rate(),
+                    data.radio().mcs(),
+                    data.radio().rx_antenna(),
+                ]],
+            );
+            let channel = identity_from_parts(
+                b"esp32-s3-channel-v1",
+                &[&[
+                    data.radio().channel(),
+                    secondary_byte(data.radio().secondary()),
+                    bandwidth_byte(data.radio().bandwidth()),
+                ]],
+            );
+            let fragment = MeasurementFragment::new(
+                AssemblyKey::new(
+                    SourceInstance::new(
+                        route.decoded().sensor().clone(),
+                        DeviceId::new(item.header.device_id()),
+                        KeyEpoch::new(item.header.key_epoch())
+                            .expect("authenticated key epoch is nonzero"),
+                        BootGeneration::new(item.header.boot_generation())
+                            .expect("authenticated boot generation is nonzero"),
+                    ),
+                    EventIdentity::new(
+                        TransmitterIdentity::new(transmitter),
+                        NativeEventIdentity::new(event),
+                        None,
+                    ),
+                    MeasurementContext::new(
+                        ProfileIdentity::new(data.capability_digest()),
+                        RadioIdentity::new(radio),
+                        ChannelIdentity::new(channel),
+                    ),
+                ),
+                FragmentPosition::new(0, 1).expect("ESP native CSI is one fragment"),
+                FragmentFact::new(
+                    fact_digest,
+                    FragmentBytes::new(
+                        u32::try_from(data.raw_csi().len()).expect("native CSI limit fits u32"),
+                    )
+                    .expect("native CSI is within the fragment byte ceiling"),
+                    quality,
+                ),
+            );
+            persist_fragment_in_transaction(
+                transaction,
+                path,
+                assembler,
+                fragment,
+                SourceTick::new(data.callback_tick_us()),
+            )?;
             Ok(None)
         }
         Message::Health(health) => {

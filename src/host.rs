@@ -26,6 +26,10 @@ use crate::companion::{
     SystemCompanionEntropy, UploadProgress,
 };
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
+use crate::measurement::{
+    AssemblyClose, AssemblyLimits, MeasurementFragment, QualificationRelation, SourceInstance,
+    SourceTick,
+};
 use crate::native_csi::{
     CapabilityIdentity, ChannelPolicy, FirmwareBuildIdentity, NativeCapabilityFact, NativeCsiFact,
     NativeFact, NativeHealthFact, RadioRxS3, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
@@ -55,6 +59,18 @@ const MAXIMUM_RAW_QUERY_FACTS: usize = 1_024;
 /// fixed ceiling prevents hostile traffic from creating an unbounded side log.
 /// Changing it alters only diagnostic retention, never authoritative facts.
 const REJECTION_DIAGNOSTIC_CAPACITY: usize = 64;
+/// Independently established qualification revisions awaiting the sole writer.
+/// This count bound limits control-plane memory and each pre-ingress writer batch.
+const CONTROL_QUEUE_CAPACITY: usize = 64;
+/// Total estimated command bytes allowed in the bounded writer control queue.
+const CONTROL_QUEUE_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum time a caller waits for count and byte capacity in the control queue.
+const CONTROL_ENQUEUE_DEADLINE: Duration = Duration::from_millis(100);
+/// Maximum time a caller waits for the sole writer's persistence response.
+const CONTROL_RESPONSE_DEADLINE: Duration = Duration::from_millis(500);
+/// Maximum control commands processed before the writer rotates to ingress.
+/// Increasing it improves control throughput but increases ingress latency.
+const CONTROL_BATCH_PER_TURN: usize = 8;
 /// Worker stop/error polling period in milliseconds. The value keeps shutdown
 /// latency interactive while avoiding a busy loop; changing it affects both
 /// idle wakeups and worst-case cooperative shutdown latency.
@@ -521,6 +537,7 @@ impl Host {
             ingress_capacity: DEFAULT_INGRESS_CAPACITY,
             artifact_limits: ArtifactLimits::default(),
             known_rf_identities: BTreeSet::new(),
+            measurement_limits: AssemblyLimits::host_default(),
             network: Arc::new(SystemNetwork),
             threads: Arc::new(SystemThreads),
             clock: Arc::new(SystemClock),
@@ -538,6 +555,7 @@ pub struct HostBuilder {
     ingress_capacity: usize,
     artifact_limits: ArtifactLimits,
     known_rf_identities: BTreeSet<String>,
+    measurement_limits: AssemblyLimits,
     network: Arc<dyn Network>,
     threads: Arc<dyn Threads>,
     clock: Arc<dyn Clock>,
@@ -556,6 +574,7 @@ impl fmt::Debug for HostBuilder {
             .field("artifact_limits", &self.artifact_limits)
             .field("known_rf_identities", &self.known_rf_identities)
             .field("companion_entropy", &"cryptographic entropy capability")
+            .field("measurement_limits", &self.measurement_limits)
             .finish_non_exhaustive()
     }
 }
@@ -593,6 +612,13 @@ impl HostBuilder {
     #[must_use]
     pub fn companion_entropy(mut self, entropy: impl CompanionEntropy + 'static) -> Self {
         self.companion_entropy = Arc::new(entropy);
+        self
+    }
+
+    /// Sets fixed assembly count, byte, and wait ceilings for the sole writer.
+    #[must_use]
+    pub fn measurement_limits(mut self, limits: AssemblyLimits) -> Self {
+        self.measurement_limits = limits;
         self
     }
 
@@ -635,6 +661,9 @@ impl HostBuilder {
         let known_rf_identities = self.known_rf_identities.clone();
         let runtime_clock = Arc::clone(&self.clock);
         let companion_entropy = Arc::clone(&self.companion_entropy);
+        let (control_sender, control_receiver) = mpsc::sync_channel(CONTROL_QUEUE_CAPACITY);
+        let control_bytes = Arc::new(AtomicU64::new(0));
+        let supervisor_control_bytes = Arc::clone(&control_bytes);
         let supervisor_stop = Arc::clone(&stop);
         let supervisor_completion = Arc::clone(&completion);
         let supervisor_rejections = Arc::clone(&rejections);
@@ -656,6 +685,8 @@ impl HostBuilder {
                             rejections: supervisor_rejections,
                             ready_sender,
                             artifact_receiver,
+                            control_receiver,
+                            control_bytes: supervisor_control_bytes,
                         },
                     );
                 }),
@@ -687,6 +718,8 @@ impl HostBuilder {
             companion: Arc::new(Mutex::new(CompanionState::new(companion_signing_seed))),
             companion_entropy,
             companion_monotonic_origin: Mutex::new(None),
+            control_sender: Some(control_sender),
+            control_bytes,
         })
     }
 }
@@ -706,6 +739,8 @@ pub struct HostRuntime {
     companion: Arc<Mutex<CompanionState>>,
     companion_entropy: Arc<dyn CompanionEntropy>,
     companion_monotonic_origin: Mutex<Option<Instant>>,
+    control_sender: Option<mpsc::SyncSender<ControlCommand>>,
+    control_bytes: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for HostRuntime {
@@ -1050,6 +1085,174 @@ impl HostRuntime {
         self.upload_companion_chunk(chunk)
     }
 
+    /// Persists one independently established physical-input qualification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sole Store writer is unavailable or persistence fails.
+    pub fn persist_qualification(&self, relation: QualificationRelation) -> Result<(), HostError> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        let bytes = relation_command_bytes(&relation)?;
+        self.enqueue_control(
+            ControlCommand::Qualification { relation, reply: reply_sender, queued_bytes: 0 },
+            bytes,
+            "persist qualification",
+        )?;
+        reply_receiver.recv_timeout(CONTROL_RESPONSE_DEADLINE).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => HostError::message_during(
+                "persist qualification",
+                "Store writer response deadline elapsed",
+            ),
+            mpsc::RecvTimeoutError::Disconnected => {
+                HostError::message_during("persist qualification", "Store writer exited")
+            }
+        })?
+    }
+
+    /// Persists and assembles one heterogeneous measurement fragment through the sole writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when finite queue limits or response deadlines elapse, or persistence fails.
+    pub fn persist_measurement_fragment(
+        &self,
+        fragment: MeasurementFragment,
+        arrival: SourceTick,
+    ) -> Result<Vec<AssemblyClose>, HostError> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        let bytes = u64::from(fragment.fact().bytes().get()).saturating_add(512);
+        self.enqueue_control(
+            ControlCommand::Fragment { fragment, arrival, reply: reply_sender, queued_bytes: 0 },
+            bytes,
+            "persist measurement fragment",
+        )?;
+        reply_receiver.recv_timeout(CONTROL_RESPONSE_DEADLINE).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => HostError::message_during(
+                "persist measurement fragment",
+                "Store writer response deadline elapsed",
+            ),
+            mpsc::RecvTimeoutError::Disconnected => {
+                HostError::message_during("persist measurement fragment", "Store writer exited")
+            }
+        })?
+    }
+
+    /// Persists wait-limit closes for one source at an explicit source-native tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when finite queue limits or response deadlines elapse, or persistence fails.
+    pub fn expire_measurements(
+        &self,
+        source: SourceInstance,
+        now: SourceTick,
+    ) -> Result<Vec<AssemblyClose>, HostError> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        self.enqueue_control(
+            ControlCommand::Expire { source, now, reply: reply_sender, queued_bytes: 0 },
+            512,
+            "expire measurements",
+        )?;
+        reply_receiver.recv_timeout(CONTROL_RESPONSE_DEADLINE).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => HostError::message_during(
+                "expire measurements",
+                "Store writer response deadline elapsed",
+            ),
+            mpsc::RecvTimeoutError::Disconnected => {
+                HostError::message_during("expire measurements", "Store writer exited")
+            }
+        })?
+    }
+
+    fn enqueue_control(
+        &self,
+        mut command: ControlCommand,
+        bytes: u64,
+        operation: &'static str,
+    ) -> Result<(), HostError> {
+        if bytes > CONTROL_QUEUE_BYTES {
+            return Err(HostError::message_during(
+                operation,
+                "command exceeds the control byte ceiling",
+            ));
+        }
+        let sender = self
+            .control_sender
+            .as_ref()
+            .ok_or_else(|| HostError::message_during(operation, "Host is shutting down"))?;
+        let deadline = Instant::now() + CONTROL_ENQUEUE_DEADLINE;
+        loop {
+            let current = self.control_bytes.load(Ordering::Acquire);
+            if current <= CONTROL_QUEUE_BYTES - bytes
+                && self
+                    .control_bytes
+                    .compare_exchange_weak(
+                        current,
+                        current + bytes,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(HostError::message_during(
+                    operation,
+                    "control queue byte deadline elapsed",
+                ));
+            }
+            thread::yield_now();
+        }
+        command.set_queued_bytes(bytes);
+        loop {
+            match sender.try_send(command) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(returned)) if Instant::now() < deadline => {
+                    command = returned;
+                    thread::yield_now();
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    self.control_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    return Err(HostError::message_during(
+                        operation,
+                        "control queue count deadline elapsed",
+                    ));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.control_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    return Err(HostError::message_during(
+                        operation,
+                        "Store writer is unavailable",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Queries a bounded newest suffix of immutable assembly closes.
+    ///
+    /// # Errors
+    ///
+    /// The limit must be between one and 1,024, and the Store must remain readable.
+    pub fn query_measurement_closes(&self, limit: usize) -> Result<Vec<AssemblyClose>, HostError> {
+        validate_native_query_limit(limit)?;
+        query_measurement_closes(&self.database_path, limit)
+    }
+
+    /// Queries a bounded newest suffix of persisted qualification relations.
+    ///
+    /// # Errors
+    ///
+    /// The limit must be between one and 1,024, and the Store must remain readable.
+    pub fn query_qualifications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<QualificationRelation>, HostError> {
+        validate_native_query_limit(limit)?;
+        query_qualifications(&self.database_path, limit)
+    }
+
     /// Returns a bounded newest suffix of non-authoritative rejection diagnostics.
     ///
     /// # Errors
@@ -1079,8 +1282,9 @@ impl HostRuntime {
     /// # Errors
     ///
     /// Returns the first fatal reader or writer failure observed by the supervisor.
-    pub fn shutdown(self) -> Result<(), HostError> {
+    pub fn shutdown(mut self) -> Result<(), HostError> {
         self.stop.store(true, Ordering::Release);
+        self.control_sender.take();
         wait_for_completion(&self.completion)
     }
 }
@@ -1476,6 +1680,7 @@ struct WriterConfig {
     deployment: DeploymentId,
     routes: Arc<Vec<NativeFrameRoute>>,
     clock: Arc<dyn Clock>,
+    measurement_limits: AssemblyLimits,
 }
 
 struct ReaderConfig {
@@ -1495,6 +1700,15 @@ struct SupervisorContext {
     rejections: Arc<Mutex<VecDeque<RejectedDatagram>>>,
     ready_sender: mpsc::SyncSender<Result<(), HostError>>,
     artifact_receiver: mpsc::Receiver<ArtifactCommand>,
+    control_receiver: mpsc::Receiver<ControlCommand>,
+    control_bytes: Arc<AtomicU64>,
+}
+
+struct WriterChannels {
+    ingress: mpsc::Receiver<AdmittedDatagram>,
+    artifacts: mpsc::Receiver<ArtifactCommand>,
+    controls: mpsc::Receiver<ControlCommand>,
+    control_bytes: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -1505,6 +1719,61 @@ struct ArtifactCommand {
     origin: ArtifactOrigin,
     limits: ArtifactLimits,
     reply: mpsc::SyncSender<Result<ImportedArtifact, ArtifactImportError>>,
+}
+
+#[derive(Debug)]
+enum ControlCommand {
+    Qualification {
+        relation: QualificationRelation,
+        reply: mpsc::SyncSender<Result<(), HostError>>,
+        queued_bytes: u64,
+    },
+    Fragment {
+        fragment: MeasurementFragment,
+        arrival: SourceTick,
+        reply: mpsc::SyncSender<Result<Vec<AssemblyClose>, HostError>>,
+        queued_bytes: u64,
+    },
+    Expire {
+        source: SourceInstance,
+        now: SourceTick,
+        reply: mpsc::SyncSender<Result<Vec<AssemblyClose>, HostError>>,
+        queued_bytes: u64,
+    },
+}
+
+fn relation_command_bytes(relation: &QualificationRelation) -> Result<u64, HostError> {
+    let details = match relation {
+        QualificationRelation::Time(value) => {
+            value.source_clock().len() + value.target_clock().len() + 32
+        }
+        QualificationRelation::Phase(_) => 48,
+        QualificationRelation::Port(value) => value.entries().len().saturating_mul(9),
+        QualificationRelation::Geometry(value) => {
+            value.source_frame().len() + value.target_frame().len() + 56
+        }
+    };
+    u64::try_from(relation.common().provenance().len().saturating_add(details).saturating_add(512))
+        .map_err(|_| {
+            HostError::message_during("persist qualification", "qualification size overflowed")
+        })
+}
+
+impl ControlCommand {
+    fn set_queued_bytes(&mut self, bytes: u64) {
+        match self {
+            Self::Qualification { queued_bytes, .. }
+            | Self::Fragment { queued_bytes, .. }
+            | Self::Expire { queued_bytes, .. } => *queued_bytes = bytes,
+        }
+    }
+    const fn queued_bytes(&self) -> u64 {
+        match self {
+            Self::Qualification { queued_bytes, .. }
+            | Self::Fragment { queued_bytes, .. }
+            | Self::Expire { queued_bytes, .. } => *queued_bytes,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1602,8 +1871,9 @@ mod persistence;
 use persistence::{validate_native_route_pins, writer_loop};
 mod query;
 use query::{
-    query_artifact, query_artifact_receipt, query_native_capabilities, query_native_csi,
-    query_native_facts, query_native_health, query_raw, query_raw_losses,
+    query_artifact, query_artifact_receipt, query_measurement_closes, query_native_capabilities,
+    query_native_csi, query_native_facts, query_native_health, query_qualifications, query_raw,
+    query_raw_losses,
 };
 
 fn validate_native_query_limit(limit: usize) -> Result<(), HostError> {

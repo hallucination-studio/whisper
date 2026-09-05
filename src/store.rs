@@ -21,9 +21,9 @@ const COMPANION_SIGNING_SEED_NAME: &str = ".whisper.companion-signing-seed";
 /// it makes all existing Stores intentionally unrecognizable.
 const STORE_APPLICATION_ID: u32 = 0x5752_4631;
 /// Exact SQLite schema generation. Incrementing it requires an explicitly
-/// scoped migration. Generation 4 combines native typed facts and immutable
-/// spatial artifacts; earlier independent generations are deliberately rejected.
-const STORE_SCHEMA_VERSION: u32 = 4;
+/// scoped migration. Generation 5 combines native typed facts, immutable
+/// spatial artifacts, and measurement assembly and qualification facts.
+const STORE_SCHEMA_VERSION: u32 = 5;
 /// SQLite's fixed database header size in bytes. Changing this file-format
 /// value would shift every recognition offset and misclassify database bytes.
 const SQLITE_HEADER_BYTES: usize = 100;
@@ -171,7 +171,78 @@ const SPATIAL_ARTIFACTS_SCHEMA: &str = "CREATE TABLE spatial_artifacts (
                  sealed_bytes BLOB NOT NULL CHECK (typeof(sealed_bytes) = 'blob'),
                  UNIQUE (kind, artifact_id, revision)
              ) STRICT";
-const EXPECTED_SCHEMA: [(&str, &str); 9] = [
+const MEASUREMENT_ASSEMBLIES_SCHEMA: &str = "CREATE TABLE measurement_assemblies (
+                 assembly_id INTEGER PRIMARY KEY,
+                 trigger_fragment_id INTEGER REFERENCES measurement_fragments(fragment_id),
+                 sensor TEXT NOT NULL CHECK (typeof(sensor) = 'text' AND length(sensor) > 0),
+                 device_id BLOB NOT NULL CHECK (typeof(device_id) = 'blob' AND length(device_id) = 8),
+                 key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
+                 boot_generation BLOB NOT NULL CHECK (typeof(boot_generation) = 'blob' AND length(boot_generation) = 4),
+                 transmitter BLOB NOT NULL CHECK (typeof(transmitter) = 'blob' AND length(transmitter) = 32),
+                 native_event BLOB NOT NULL CHECK (typeof(native_event) = 'blob' AND length(native_event) = 32),
+                 retransmission BLOB CHECK (retransmission IS NULL OR (typeof(retransmission) = 'blob' AND length(retransmission) = 32)),
+                 profile BLOB NOT NULL CHECK (typeof(profile) = 'blob' AND length(profile) = 32),
+                 radio BLOB NOT NULL CHECK (typeof(radio) = 'blob' AND length(radio) = 32),
+                 channel BLOB NOT NULL CHECK (typeof(channel) = 'blob' AND length(channel) = 32),
+                 expected_fragments INTEGER NOT NULL CHECK (expected_fragments BETWEEN 1 AND 65535),
+                 missing_ordinals BLOB NOT NULL CHECK (typeof(missing_ordinals) = 'blob' AND length(missing_ordinals) % 2 = 0),
+                 close_reason TEXT NOT NULL CHECK (close_reason IN ('complete', 'wait_limit', 'count_limit', 'byte_limit', 'resource_limit', 'late_fragment', 'duplicate_fragment', 'conflicting_duplicate')),
+                 association_uncertainty TEXT NOT NULL CHECK (association_uncertainty IN ('exact_native_identity', 'late_after_close', 'conflicting_facts')),
+                 total_bytes INTEGER NOT NULL CHECK (total_bytes BETWEEN 0 AND 33554432),
+                 first_tick BLOB NOT NULL CHECK (typeof(first_tick) = 'blob' AND length(first_tick) = 8),
+                 close_tick BLOB NOT NULL CHECK (typeof(close_tick) = 'blob' AND length(close_tick) = 8),
+                 limit_open INTEGER NOT NULL CHECK (limit_open BETWEEN 1 AND 1024),
+                 limit_fragments INTEGER NOT NULL CHECK (limit_fragments BETWEEN 1 AND 1024),
+                 limit_bytes INTEGER NOT NULL CHECK (limit_bytes BETWEEN 1 AND 16777216),
+                 limit_wait BLOB NOT NULL CHECK (typeof(limit_wait) = 'blob' AND length(limit_wait) = 8),
+                 attempted_fragments INTEGER NOT NULL CHECK (attempted_fragments BETWEEN 1 AND 65536),
+                 attempted_bytes INTEGER NOT NULL CHECK (attempted_bytes BETWEEN 0 AND 33554432),
+                 open_assemblies INTEGER NOT NULL CHECK (open_assemblies BETWEEN 0 AND 1024)
+             ) STRICT";
+const MEASUREMENT_FRAGMENTS_SCHEMA: &str = "CREATE TABLE measurement_fragments (
+                 fragment_id INTEGER PRIMARY KEY,
+                 sensor TEXT NOT NULL CHECK (typeof(sensor) = 'text' AND length(sensor) > 0),
+                 device_id BLOB NOT NULL CHECK (typeof(device_id) = 'blob' AND length(device_id) = 8),
+                 key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
+                 boot_generation BLOB NOT NULL CHECK (typeof(boot_generation) = 'blob' AND length(boot_generation) = 4),
+                 transmitter BLOB NOT NULL CHECK (typeof(transmitter) = 'blob' AND length(transmitter) = 32),
+                 native_event BLOB NOT NULL CHECK (typeof(native_event) = 'blob' AND length(native_event) = 32),
+                 retransmission BLOB CHECK (retransmission IS NULL OR (typeof(retransmission) = 'blob' AND length(retransmission) = 32)),
+                 profile BLOB NOT NULL CHECK (typeof(profile) = 'blob' AND length(profile) = 32),
+                 radio BLOB NOT NULL CHECK (typeof(radio) = 'blob' AND length(radio) = 32),
+                 channel BLOB NOT NULL CHECK (typeof(channel) = 'blob' AND length(channel) = 32),
+                 ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 65534),
+                 expected_fragments INTEGER NOT NULL CHECK (expected_fragments BETWEEN 1 AND 65535),
+                 fact_digest BLOB NOT NULL CHECK (typeof(fact_digest) = 'blob' AND length(fact_digest) = 32),
+                 payload_bytes INTEGER NOT NULL CHECK (payload_bytes BETWEEN 0 AND 16777216),
+                 quality TEXT NOT NULL CHECK (quality IN ('captured', 'not_captured', 'lost', 'invalid', 'interpolated', 'training_masked')),
+                 arrival_tick BLOB NOT NULL CHECK (typeof(arrival_tick) = 'blob' AND length(arrival_tick) = 8),
+                 disposition TEXT NOT NULL CHECK (disposition IN ('open', 'closed', 'duplicate', 'late', 'conflict', 'resource'))
+             ) STRICT";
+const MEASUREMENT_MEMBERS_SCHEMA: &str = "CREATE TABLE measurement_members (
+                 assembly_id INTEGER NOT NULL REFERENCES measurement_assemblies(assembly_id),
+                 ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 65534),
+                 fact_digest BLOB NOT NULL CHECK (typeof(fact_digest) = 'blob' AND length(fact_digest) = 32),
+                 payload_bytes INTEGER NOT NULL CHECK (payload_bytes BETWEEN 0 AND 4294967295),
+                 quality TEXT NOT NULL CHECK (quality IN ('captured', 'not_captured', 'lost', 'invalid', 'interpolated', 'training_masked')),
+                 PRIMARY KEY (assembly_id, ordinal)
+             ) STRICT";
+const QUALIFICATION_RELATIONS_SCHEMA: &str = "CREATE TABLE qualification_relations (
+                 relation_id INTEGER PRIMARY KEY,
+                 kind TEXT NOT NULL CHECK (kind IN ('time', 'phase', 'port', 'geometry')),
+                 provenance TEXT NOT NULL CHECK (typeof(provenance) = 'text' AND length(provenance) > 0),
+                 sensor TEXT NOT NULL CHECK (typeof(sensor) = 'text' AND length(sensor) > 0),
+                 device_id BLOB NOT NULL CHECK (typeof(device_id) = 'blob' AND length(device_id) = 8),
+                 key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
+                 boot_generation BLOB NOT NULL CHECK (typeof(boot_generation) = 'blob' AND length(boot_generation) = 4),
+                 error_bound BLOB NOT NULL CHECK (typeof(error_bound) = 'blob' AND length(error_bound) = 8),
+                 error_unit TEXT NOT NULL CHECK (error_unit IN ('nanoseconds', 'milliradians', 'millimetres', 'parts_per_million')),
+                 valid_from_tick BLOB NOT NULL CHECK (typeof(valid_from_tick) = 'blob' AND length(valid_from_tick) = 8),
+                 valid_until_tick BLOB NOT NULL CHECK (typeof(valid_until_tick) = 'blob' AND length(valid_until_tick) = 8),
+                 epoch BLOB NOT NULL CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8),
+                 details BLOB NOT NULL CHECK (typeof(details) = 'blob' AND length(details) BETWEEN 1 AND 65536)
+             ) STRICT";
+const EXPECTED_SCHEMA: [(&str, &str); 13] = [
     ("store_identity", STORE_IDENTITY_SCHEMA),
     ("replay_windows", REPLAY_WINDOWS_SCHEMA),
     ("native_route_pins", NATIVE_ROUTE_PINS_SCHEMA),
@@ -181,17 +252,51 @@ const EXPECTED_SCHEMA: [(&str, &str); 9] = [
     ("native_csi_facts", NATIVE_CSI_FACTS_SCHEMA),
     ("native_health_facts", NATIVE_HEALTH_FACTS_SCHEMA),
     ("spatial_artifacts", SPATIAL_ARTIFACTS_SCHEMA),
+    ("measurement_assemblies", MEASUREMENT_ASSEMBLIES_SCHEMA),
+    ("measurement_fragments", MEASUREMENT_FRAGMENTS_SCHEMA),
+    ("measurement_members", MEASUREMENT_MEMBERS_SCHEMA),
+    ("qualification_relations", QUALIFICATION_RELATIONS_SCHEMA),
 ];
 // SQLite owns these implicit indexes for the declared UNIQUE and composite
 // PRIMARY KEY constraints. Their exact names, owning tables, and NULL SQL are
-// part of schema generation 4; any other SQLite-owned object is unrecognized.
-const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 5] = [
+// part of schema generation 5; any other SQLite-owned object is unrecognized.
+const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 6] = [
     ("sqlite_autoindex_raw_facts_1", "raw_facts"),
     ("sqlite_autoindex_replay_windows_1", "replay_windows"),
     ("sqlite_autoindex_native_route_pins_1", "native_route_pins"),
     ("sqlite_autoindex_spatial_artifacts_1", "spatial_artifacts"),
     ("sqlite_autoindex_spatial_artifacts_2", "spatial_artifacts"),
+    ("sqlite_autoindex_measurement_members_1", "measurement_members"),
 ];
+const NATIVE_SCHEMA: [(&str, &str); 8] = [
+    ("store_identity", STORE_IDENTITY_SCHEMA),
+    ("replay_windows", REPLAY_WINDOWS_SCHEMA),
+    ("native_route_pins", NATIVE_ROUTE_PINS_SCHEMA),
+    ("raw_facts", RAW_FACTS_SCHEMA),
+    ("raw_losses", RAW_LOSSES_SCHEMA),
+    ("native_capability_facts", NATIVE_CAPABILITY_FACTS_SCHEMA),
+    ("native_csi_facts", NATIVE_CSI_FACTS_SCHEMA),
+    ("native_health_facts", NATIVE_HEALTH_FACTS_SCHEMA),
+];
+const NATIVE_SQLITE_AUTO_INDEXES: [(&str, &str); 3] = [
+    ("sqlite_autoindex_raw_facts_1", "raw_facts"),
+    ("sqlite_autoindex_replay_windows_1", "replay_windows"),
+    ("sqlite_autoindex_native_route_pins_1", "native_route_pins"),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoreGeneration {
+    Native3,
+    Artifact4,
+    Measurement4,
+    Combined5,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecognizedDatabase {
+    id: StoreId,
+    generation: StoreGeneration,
+}
 
 trait Entropy {
     fn source_path(&self) -> &Path;
@@ -509,7 +614,6 @@ impl Store {
             validate_root(root)?;
             let database_path = root.join(DATABASE_NAME);
             recognize_database_header(&database_path)?;
-            let companion_signing_seed = read_companion_signing_seed(root)?;
             let lease = acquire_lease(root, false)?;
             let wal_path = database_path.with_extension("sqlite3-wal");
             let shm_path = database_path.with_extension("sqlite3-shm");
@@ -517,10 +621,29 @@ impl Store {
             validate_optional_regular_file(&shm_path)?;
             validate_wal_shape(&wal_path)?;
             validate_shm_shape(&shm_path, wal_path.exists())?;
-            let id = validate_database_snapshot(&database_path, &wal_path, &shm_path, entropy)?;
+            let recognized =
+                validate_database_snapshot(&database_path, &wal_path, &shm_path, entropy)?;
+            let (companion_signing_seed, created_seed) = match recognized.generation {
+                StoreGeneration::Artifact4 | StoreGeneration::Combined5 => {
+                    (read_companion_signing_seed(root)?, false)
+                }
+                StoreGeneration::Native3 | StoreGeneration::Measurement4 => {
+                    let seed = random_companion_signing_seed(entropy)?;
+                    write_companion_signing_seed(root, &seed)?;
+                    (seed, true)
+                }
+            };
+            if recognized.generation != StoreGeneration::Combined5
+                && let Err(error) = migrate_database(&database_path, recognized.generation)
+            {
+                if created_seed {
+                    let _ = fs::remove_file(root.join(COMPANION_SIGNING_SEED_NAME));
+                }
+                return Err(error);
+            }
             Ok(Self {
                 root: root.to_owned(),
-                id,
+                id: recognized.id,
                 companion_signing_seed: Some(companion_signing_seed),
                 lease,
             })
@@ -612,14 +735,43 @@ fn initialize_database(path: &Path, id: StoreId) -> Result<(), StoreError> {
     File::open(path).and_then(|file| file.sync_all()).map_err(|source| io_error(path, source))
 }
 
+fn migrate_database(path: &Path, generation: StoreGeneration) -> Result<(), StoreError> {
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(database_error)?;
+    let transaction = connection.transaction().map_err(database_error)?;
+    if generation == StoreGeneration::Native3 || generation == StoreGeneration::Measurement4 {
+        transaction.execute_batch(SPATIAL_ARTIFACTS_SCHEMA).map_err(database_error)?;
+    }
+    if generation == StoreGeneration::Native3 || generation == StoreGeneration::Artifact4 {
+        for schema in [
+            MEASUREMENT_ASSEMBLIES_SCHEMA,
+            MEASUREMENT_FRAGMENTS_SCHEMA,
+            MEASUREMENT_MEMBERS_SCHEMA,
+            QUALIFICATION_RELATIONS_SCHEMA,
+        ] {
+            transaction.execute_batch(schema).map_err(database_error)?;
+        }
+    }
+    transaction
+        .execute_batch(&format!("PRAGMA user_version = {STORE_SCHEMA_VERSION};"))
+        .map_err(database_error)?;
+    transaction.commit().map_err(database_error)?;
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").map_err(database_error)?;
+    drop(connection);
+    File::open(path).and_then(|file| file.sync_all()).map_err(|source| io_error(path, source))
+}
+
 fn recognize_database_header(path: &Path) -> Result<(), StoreError> {
     validate_regular_file(path)?;
     let mut header = [0_u8; SQLITE_HEADER_BYTES];
     let mut file = File::open(path).map_err(|source| io_error(path, source))?;
     file.read_exact(&mut header).map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+    let user_version = u32::from_be_bytes(header[60..64].try_into().expect("fixed header offsets"));
     if &header[..SQLITE_MAGIC.len()] != SQLITE_MAGIC
-        || u32::from_be_bytes(header[60..64].try_into().expect("fixed header offsets"))
-            != STORE_SCHEMA_VERSION
+        || ![3, 4, STORE_SCHEMA_VERSION].contains(&user_version)
         || u32::from_be_bytes(header[68..72].try_into().expect("fixed header offsets"))
             != STORE_APPLICATION_ID
     {
@@ -628,7 +780,7 @@ fn recognize_database_header(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
+fn validate_database_read_only(path: &Path) -> Result<RecognizedDatabase, StoreError> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -646,16 +798,64 @@ fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
     let user_version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-    if application_id != STORE_APPLICATION_ID || user_version != STORE_SCHEMA_VERSION {
+    if application_id != STORE_APPLICATION_ID {
         return Err(StoreErrorKind::Unrecognized.into());
     }
+    let generation = match user_version {
+        3 if schema_matches(&connection, &NATIVE_SCHEMA, &NATIVE_SQLITE_AUTO_INDEXES)? => {
+            StoreGeneration::Native3
+        }
+        4 => {
+            let mut artifact_schema = NATIVE_SCHEMA.to_vec();
+            artifact_schema.push(("spatial_artifacts", SPATIAL_ARTIFACTS_SCHEMA));
+            let mut artifact_indexes = NATIVE_SQLITE_AUTO_INDEXES.to_vec();
+            artifact_indexes.extend([
+                ("sqlite_autoindex_spatial_artifacts_1", "spatial_artifacts"),
+                ("sqlite_autoindex_spatial_artifacts_2", "spatial_artifacts"),
+            ]);
+            let mut measurement_schema = NATIVE_SCHEMA.to_vec();
+            measurement_schema.extend([
+                ("measurement_assemblies", MEASUREMENT_ASSEMBLIES_SCHEMA),
+                ("measurement_fragments", MEASUREMENT_FRAGMENTS_SCHEMA),
+                ("measurement_members", MEASUREMENT_MEMBERS_SCHEMA),
+                ("qualification_relations", QUALIFICATION_RELATIONS_SCHEMA),
+            ]);
+            let mut measurement_indexes = NATIVE_SQLITE_AUTO_INDEXES.to_vec();
+            measurement_indexes
+                .push(("sqlite_autoindex_measurement_members_1", "measurement_members"));
+            if schema_matches(&connection, &artifact_schema, &artifact_indexes)? {
+                StoreGeneration::Artifact4
+            } else if schema_matches(&connection, &measurement_schema, &measurement_indexes)? {
+                StoreGeneration::Measurement4
+            } else {
+                return Err(StoreErrorKind::Unrecognized.into());
+            }
+        }
+        5 if schema_matches(&connection, &EXPECTED_SCHEMA, &EXPECTED_SQLITE_AUTO_INDEXES)? => {
+            StoreGeneration::Combined5
+        }
+        _ => return Err(StoreErrorKind::Unrecognized.into()),
+    };
+    let bytes: Vec<u8> = connection
+        .query_row("SELECT store_id FROM store_identity WHERE singleton = 1", [], |row| row.get(0))
+        .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+    let bytes: [u8; STORE_ID_BYTES] =
+        bytes.try_into().map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+    Ok(RecognizedDatabase { id: StoreId(bytes), generation })
+}
+
+fn schema_matches(
+    connection: &Connection,
+    expected_schema: &[(&str, &str)],
+    expected_indexes: &[(&str, &str)],
+) -> Result<bool, StoreError> {
     let total_schema_objects: u32 = connection
         .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
         .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-    if total_schema_objects != (EXPECTED_SCHEMA.len() + EXPECTED_SQLITE_AUTO_INDEXES.len()) as u32 {
-        return Err(StoreErrorKind::Unrecognized.into());
+    if total_schema_objects != (expected_schema.len() + expected_indexes.len()) as u32 {
+        return Ok(false);
     }
-    for (name, expected_sql) in EXPECTED_SCHEMA {
+    for (name, expected_sql) in expected_schema {
         let (object_type, owning_table, actual_sql): (String, String, Option<String>) = connection
             .query_row(
                 "SELECT type, tbl_name, sql FROM sqlite_schema WHERE name = ?1",
@@ -664,13 +864,13 @@ fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
             )
             .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
         if object_type != "table"
-            || owning_table != name
-            || actual_sql.as_deref() != Some(expected_sql)
+            || owning_table != *name
+            || actual_sql.as_deref() != Some(*expected_sql)
         {
-            return Err(StoreErrorKind::Unrecognized.into());
+            return Ok(false);
         }
     }
-    for (name, expected_table) in EXPECTED_SQLITE_AUTO_INDEXES {
+    for (name, expected_table) in expected_indexes {
         let (object_type, owning_table, actual_sql): (String, String, Option<String>) = connection
             .query_row(
                 "SELECT type, tbl_name, sql FROM sqlite_schema WHERE name = ?1",
@@ -678,16 +878,11 @@ fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-        if object_type != "index" || owning_table != expected_table || actual_sql.is_some() {
-            return Err(StoreErrorKind::Unrecognized.into());
+        if object_type != "index" || owning_table != *expected_table || actual_sql.is_some() {
+            return Ok(false);
         }
     }
-    let bytes: Vec<u8> = connection
-        .query_row("SELECT store_id FROM store_identity WHERE singleton = 1", [], |row| row.get(0))
-        .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-    let bytes: [u8; STORE_ID_BYTES] =
-        bytes.try_into().map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-    Ok(StoreId(bytes))
+    Ok(true)
 }
 
 fn validate_database_snapshot(
@@ -695,7 +890,7 @@ fn validate_database_snapshot(
     wal: &Path,
     shm: &Path,
     entropy: &dyn Entropy,
-) -> Result<StoreId, StoreError> {
+) -> Result<RecognizedDatabase, StoreError> {
     let nonce = random_bytes::<16>(entropy)?;
     let name = nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     let root = std::env::temp_dir().join(format!("whisper-store-validation-{name}"));
@@ -995,6 +1190,77 @@ mod tests {
         assert!(store_source.source().is_some());
         assert_eq!(fs::read(database).unwrap(), before);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn supported_native_and_independent_generation_four_stores_upgrade_to_generation_five() {
+        for (label, version, drops, remove_seed) in [
+            (
+                "native-3",
+                3,
+                &[
+                    "measurement_members",
+                    "measurement_assemblies",
+                    "measurement_fragments",
+                    "qualification_relations",
+                    "spatial_artifacts",
+                ][..],
+                true,
+            ),
+            (
+                "artifact-4",
+                4,
+                &[
+                    "measurement_members",
+                    "measurement_assemblies",
+                    "measurement_fragments",
+                    "qualification_relations",
+                ][..],
+                false,
+            ),
+            ("measurement-4", 4, &["spatial_artifacts"][..], true),
+        ] {
+            let root = root(label);
+            let original = Store::initialize_with_entropy(&root, &FixedEntropy(Ok(0x5a))).unwrap();
+            let id = original.id();
+            drop(original);
+            let database_path = root.join(DATABASE_NAME);
+            let connection = Connection::open(&database_path).unwrap();
+            connection
+                .execute("INSERT INTO raw_losses (observed_utc_ns, kind, count) VALUES (1, 'upgrade', 1)", [])
+                .unwrap();
+            for table in drops {
+                connection.execute_batch(&format!("DROP TABLE {table};")).unwrap();
+            }
+            connection.execute_batch(&format!("PRAGMA user_version = {version};")).unwrap();
+            drop(connection);
+            if remove_seed {
+                fs::remove_file(root.join(COMPANION_SIGNING_SEED_NAME)).unwrap();
+            }
+
+            let upgraded = Store::open_with_entropy(&root, &FixedEntropy(Ok(0x6b))).expect(label);
+            assert_eq!(upgraded.id(), id);
+            let connection = Connection::open(upgraded.database_path()).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                STORE_SCHEMA_VERSION
+            );
+            assert!(
+                schema_matches(&connection, &EXPECTED_SCHEMA, &EXPECTED_SQLITE_AUTO_INDEXES)
+                    .unwrap()
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM raw_losses", [], |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                1
+            );
+            drop(connection);
+            drop(upgraded);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

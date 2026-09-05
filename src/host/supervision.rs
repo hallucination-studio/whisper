@@ -12,6 +12,8 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
         rejections,
         ready_sender: ready,
         artifact_receiver,
+        control_receiver,
+        control_bytes,
     } = context;
     let overflow = Arc::new(OverflowSummary { count: AtomicU64::new(0) });
     let (ingress_sender, ingress_receiver) = mpsc::sync_channel(builder.ingress_capacity);
@@ -27,6 +29,7 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
         deployment: builder.deployment.clone(),
         routes: Arc::clone(&routes),
         clock: Arc::clone(&builder.clock),
+        measurement_limits: builder.measurement_limits,
     };
     let writer = threads.spawn(
         "whisper-fact-writer",
@@ -34,8 +37,12 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
             let mut exit = WorkerExitNotifier::new("writer", writer_exit);
             let result = writer_loop(
                 writer_config,
-                ingress_receiver,
-                artifact_receiver,
+                WriterChannels {
+                    ingress: ingress_receiver,
+                    artifacts: artifact_receiver,
+                    controls: control_receiver,
+                    control_bytes,
+                },
                 &writer_overflow,
                 &writer_rejections,
                 writer_ready_sender,
