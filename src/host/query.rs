@@ -1,0 +1,1617 @@
+//! Restricted local queries over committed raw facts and loss facts.
+
+use super::*;
+use crate::measurement::{
+    AssemblyCapacity, AssemblyClose, AssemblyCloseMetrics, AssemblyCloseReason, AssemblyKey,
+    AssemblyLimits, AssemblyMember, AssociationUncertainty, ChannelIdentity, ErrorBound, ErrorUnit,
+    EventIdentity, EvidenceQuality, FitIdentity, Geometry, MeasurementContext, NativeEventIdentity,
+    PersistedAssemblyClose, PhaseReferenceIdentity, PhaseRelation, PortMapEntry, PortMapping, Pose,
+    ProfileIdentity, QualificationEpoch, QualificationRelation, RadioIdentity, RelationValidity,
+    RetransmissionIdentity, SourceInstance, SourceTick, TickRange, TimeRelation,
+    TransmitterIdentity, WaitTicks,
+};
+use crate::native_csi::{
+    CapabilityDescriptor, LtfBlock, LtfKind, NativeCapabilityFact, NativeCsiFact, NativeFact,
+    NativeFactProvenance, NativeHealthFact, RadioRxS3, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
+};
+use crate::native_frame::{
+    CapabilitiesV1, CsiDataV1, HealthV1, LTF_BLOCK_BYTES, Message, MessageKind,
+    authenticate_datagram, decode_authenticated,
+};
+use rusqlite::{Row, types::FromSql};
+
+pub(super) fn query_artifact(
+    path: &Path,
+    digest: ArtifactDigest,
+) -> Result<Option<SealedArtifact>, HostError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))?;
+    let bytes: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT sealed_bytes FROM spatial_artifacts WHERE digest = ?1",
+            [digest.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))?;
+    bytes
+        .map(|bytes| {
+            SealedArtifact::parse(bytes).map_err(|_| {
+                HostError::message_at(
+                    "decode persisted spatial artifact",
+                    path,
+                    "persisted artifact bytes are invalid",
+                )
+            })
+        })
+        .transpose()
+}
+
+pub(super) fn query_artifact_receipt(
+    path: &Path,
+    digest: ArtifactDigest,
+) -> Result<Option<ImportedArtifact>, ArtifactImportError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| ArtifactImportError::database("open artifact receipt query", path, error))?;
+    let row: Option<(u8, String, u32, String)> = connection
+        .query_row(
+            "SELECT kind, artifact_id, revision, origin FROM spatial_artifacts WHERE digest = ?1",
+            [digest.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| ArtifactImportError::database("query artifact receipt", path, error))?;
+    row.map(|(kind, artifact_id, revision, origin)| {
+        let kind = ArtifactKind::from_code(kind).ok_or_else(|| {
+            ArtifactImportError::new(
+                ArtifactRejectReason::Persistence,
+                "persisted artifact kind is invalid",
+            )
+        })?;
+        let origin = match origin.as_str() {
+            "local" => ArtifactOrigin::Local,
+            "companion" => ArtifactOrigin::Companion,
+            _ => {
+                return Err(ArtifactImportError::new(
+                    ArtifactRejectReason::Persistence,
+                    "persisted artifact origin is invalid",
+                ));
+            }
+        };
+        Ok(ImportedArtifact::from_parts(digest, kind, artifact_id, revision, origin))
+    })
+    .transpose()
+}
+
+pub(super) fn query_raw(path: &Path, limit: usize) -> Result<Vec<RawFact>, HostError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT digest, peer, received_utc_ns, device_id, key_epoch,
+                    boot_generation, message_sequence, kind, datagram
+             FROM raw_facts
+             ORDER BY fact_id DESC LIMIT ?1",
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    let rows = statement
+        .query_map([i64::try_from(limit).expect("query limit fits i64")], |row| {
+            let digest: Vec<u8> = row.get(0)?;
+            let peer: String = row.get(1)?;
+            let received_utc_ns: i64 = row.get(2)?;
+            let device_id: Vec<u8> = row.get(3)?;
+            let key_epoch: Vec<u8> = row.get(4)?;
+            let boot_generation: Vec<u8> = row.get(5)?;
+            let message_sequence: Vec<u8> = row.get(6)?;
+            let kind_byte: u8 = row.get(7)?;
+            let datagram: Vec<u8> = row.get(8)?;
+            Ok((
+                digest,
+                peer,
+                received_utc_ns,
+                device_id,
+                key_epoch,
+                boot_generation,
+                message_sequence,
+                kind_byte,
+                datagram,
+            ))
+        })
+        .map_err(|error| HostError::database_at(path, error))?;
+    let mut facts = Vec::with_capacity(limit);
+    for row in rows {
+        let (
+            digest,
+            peer,
+            received_utc_ns,
+            device_id,
+            key_epoch,
+            boot_generation,
+            message_sequence,
+            kind_byte,
+            datagram,
+        ) = row.map_err(|error| HostError::database_at(path, error))?;
+        let digest = digest
+            .try_into()
+            .map_err(|_| raw_fact_error(path, "persisted raw digest is invalid"))?;
+        let peer =
+            peer.parse().map_err(|_| raw_fact_error(path, "persisted raw peer is invalid"))?;
+        let received_utc_ns = u64::try_from(received_utc_ns)
+            .map_err(|_| raw_fact_error(path, "persisted receive time is invalid"))?;
+        let received_at = UNIX_EPOCH
+            .checked_add(Duration::from_nanos(received_utc_ns))
+            .ok_or_else(|| raw_fact_error(path, "persisted receive time is out of range"))?;
+        let device_id = u64::from_be_bytes(
+            device_id
+                .try_into()
+                .map_err(|_| raw_fact_error(path, "persisted device identity is invalid"))?,
+        );
+        let key_epoch = u16::from_be_bytes(
+            key_epoch
+                .try_into()
+                .map_err(|_| raw_fact_error(path, "persisted key epoch is invalid"))?,
+        );
+        let boot_generation = u32::from_be_bytes(
+            boot_generation
+                .try_into()
+                .map_err(|_| raw_fact_error(path, "persisted boot generation is invalid"))?,
+        );
+        let message_sequence = u64::from_be_bytes(
+            message_sequence
+                .try_into()
+                .map_err(|_| raw_fact_error(path, "persisted message sequence is invalid"))?,
+        );
+        facts.push(RawFact {
+            digest,
+            peer,
+            received_at,
+            device_id: DeviceId::new(device_id),
+            key_epoch: KeyEpoch::new(key_epoch)
+                .ok_or_else(|| raw_fact_error(path, "persisted key epoch is invalid"))?,
+            boot_generation: BootGeneration::new(boot_generation)
+                .ok_or_else(|| raw_fact_error(path, "persisted boot generation is invalid"))?,
+            message_sequence: MessageSequence::new(message_sequence)
+                .ok_or_else(|| raw_fact_error(path, "persisted message sequence is invalid"))?,
+            kind: NativeFrameKind::new(kind_byte),
+            datagram: datagram.into_boxed_slice(),
+        });
+    }
+    facts.reverse();
+    Ok(facts)
+}
+
+pub(super) fn query_native_facts(
+    path: &Path,
+    routes: &[NativeFrameRoute],
+    limit: usize,
+) -> Result<Vec<NativeFact>, HostError> {
+    let connection = read_only_connection(path)?;
+    validate_native_route_pins(&connection, path, routes)?;
+    let mut rows = query_capability_rows(&connection, path, routes, limit)?;
+    rows.extend(query_csi_rows(&connection, path, routes, limit)?);
+    rows.extend(query_health_rows(&connection, path, routes, limit)?);
+    rows.sort_by_key(|(fact_id, _)| *fact_id);
+    Ok(rows
+        .into_iter()
+        .rev()
+        .take(limit)
+        .map(|(_, fact)| fact)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect())
+}
+
+pub(super) fn query_native_capabilities(
+    path: &Path,
+    routes: &[NativeFrameRoute],
+    limit: usize,
+) -> Result<Vec<NativeCapabilityFact>, HostError> {
+    let connection = read_only_connection(path)?;
+    validate_native_route_pins(&connection, path, routes)?;
+    let rows = query_capability_rows(&connection, path, routes, limit)?;
+    let mut facts = rows
+        .into_iter()
+        .filter_map(|(_, fact)| match fact {
+            NativeFact::Capabilities(fact) => Some(fact),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    facts.reverse();
+    Ok(facts)
+}
+
+pub(super) fn query_native_csi(
+    path: &Path,
+    routes: &[NativeFrameRoute],
+    limit: usize,
+) -> Result<Vec<NativeCsiFact>, HostError> {
+    let connection = read_only_connection(path)?;
+    validate_native_route_pins(&connection, path, routes)?;
+    let rows = query_csi_rows(&connection, path, routes, limit)?;
+    let mut facts = rows
+        .into_iter()
+        .filter_map(|(_, fact)| match fact {
+            NativeFact::Csi(fact) => Some(fact),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    facts.reverse();
+    Ok(facts)
+}
+
+pub(super) fn query_native_health(
+    path: &Path,
+    routes: &[NativeFrameRoute],
+    limit: usize,
+) -> Result<Vec<NativeHealthFact>, HostError> {
+    let connection = read_only_connection(path)?;
+    validate_native_route_pins(&connection, path, routes)?;
+    let rows = query_health_rows(&connection, path, routes, limit)?;
+    let mut facts = rows
+        .into_iter()
+        .filter_map(|(_, fact)| match fact {
+            NativeFact::Health(fact) => Some(fact),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    facts.reverse();
+    Ok(facts)
+}
+
+fn read_only_connection(path: &Path) -> Result<Connection, HostError> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))
+}
+
+fn query_capability_rows(
+    connection: &Connection,
+    path: &Path,
+    routes: &[NativeFrameRoute],
+    limit: usize,
+) -> Result<Vec<(i64, NativeFact)>, HostError> {
+    query_native_rows(
+        connection,
+        path,
+        routes,
+        limit,
+        MessageKind::Capabilities,
+        "SELECT f.fact_id, f.digest, f.peer, f.received_utc_ns, f.device_id,
+                f.key_epoch, f.boot_generation, f.message_sequence, f.kind, f.datagram,
+                c.capability_digest, c.firmware_build_digest,
+                c.idf_wifi_abi_digest, c.datagram_budget_bytes
+         FROM native_capability_facts AS c
+         JOIN raw_facts AS f ON f.fact_id = c.fact_id
+         ORDER BY f.fact_id DESC LIMIT ?1",
+        |row, provenance, decoded| {
+            let capability_digest =
+                decode_fixed::<32>(path, row_value(row, 10, path)?, "capability digest")?;
+            let firmware_build_digest =
+                decode_fixed::<32>(path, row_value(row, 11, path)?, "firmware build digest")?;
+            let idf_wifi_abi_digest =
+                decode_fixed::<32>(path, row_value(row, 12, path)?, "Wi-Fi ABI digest")?;
+            let datagram_budget_bytes: u16 = row_value(row, 13, path)?;
+            let descriptor = CapabilityDescriptor::try_new(
+                firmware_build_digest,
+                idf_wifi_abi_digest,
+                datagram_budget_bytes,
+            )
+            .map_err(|_| native_fact_error(path, "persisted capability descriptor is invalid"))?;
+            let body = CapabilitiesV1::new(descriptor);
+            if body.capability_digest() != capability_digest {
+                return Err(native_fact_error(
+                    path,
+                    "persisted capability digest does not match descriptor",
+                ));
+            }
+            let fact = NativeCapabilityFact::from_body(provenance.clone(), &body);
+            let Message::Capabilities(expected) = decoded else {
+                return Err(native_fact_error(
+                    path,
+                    "persisted capability row is not bound to a capability datagram",
+                ));
+            };
+            if fact != NativeCapabilityFact::from_body(provenance, expected) {
+                return Err(native_fact_error(
+                    path,
+                    "persisted capability row does not match its authenticated raw datagram",
+                ));
+            }
+            Ok(NativeFact::Capabilities(fact))
+        },
+    )
+}
+
+fn query_csi_rows(
+    connection: &Connection,
+    path: &Path,
+    routes: &[NativeFrameRoute],
+    limit: usize,
+) -> Result<Vec<(i64, NativeFact)>, HostError> {
+    query_native_rows(
+        connection,
+        path,
+        routes,
+        limit,
+        MessageKind::CsiData,
+        "SELECT f.fact_id, f.digest, f.peer, f.received_utc_ns, f.device_id,
+                f.key_epoch, f.boot_generation, f.message_sequence, f.kind, f.datagram,
+                c.capability_digest, c.capture_sequence,
+                c.driver_rx_timestamp_us, c.callback_tick_us, c.source_mac,
+                c.channel, c.secondary, c.phy, c.bandwidth, c.stbc,
+                c.rssi_dbm, c.noise_floor_dbm, c.rate, c.mcs, c.rx_antenna,
+                c.first_invalid_bytes, c.trailing_invalid_bytes,
+                c.complex_sample_count, c.blocks, c.raw_csi
+         FROM native_csi_facts AS c
+         JOIN raw_facts AS f ON f.fact_id = c.fact_id
+         ORDER BY f.fact_id DESC LIMIT ?1",
+        |row, provenance, decoded| {
+            let capability_digest =
+                decode_fixed::<32>(path, row_value(row, 10, path)?, "capability digest")?;
+            let capture_sequence = decode_u64(path, row_value(row, 11, path)?, "capture sequence")?;
+            let driver_rx_timestamp_us: u32 = row_value(row, 12, path)?;
+            let callback_tick_us = decode_u64(path, row_value(row, 13, path)?, "callback tick")?;
+            let source_mac = decode_fixed::<6>(path, row_value(row, 14, path)?, "source MAC")?;
+            let channel: u8 = row_value(row, 15, path)?;
+            let secondary = decode_secondary(path, row_value(row, 16, path)?)?;
+            let phy = decode_phy(path, row_value(row, 17, path)?)?;
+            let bandwidth = decode_bandwidth(path, row_value(row, 18, path)?)?;
+            let stbc: u8 = row_value(row, 19, path)?;
+            if stbc > 1 {
+                return Err(native_fact_error(path, "persisted native CSI STBC value is invalid"));
+            }
+            let rssi_dbm: i8 = row_value(row, 20, path)?;
+            let noise_floor_dbm: i8 = row_value(row, 21, path)?;
+            let rate: u8 = row_value(row, 22, path)?;
+            let mcs: u8 = row_value(row, 23, path)?;
+            let rx_antenna: u8 = row_value(row, 24, path)?;
+            let first_invalid_bytes: u8 = row_value(row, 25, path)?;
+            let trailing_invalid_bytes: u8 = row_value(row, 26, path)?;
+            let complex_sample_count: u16 = row_value(row, 27, path)?;
+            let blocks = decode_blocks(path, row_value(row, 28, path)?)?;
+            let raw_csi: Vec<u8> = row_value(row, 29, path)?;
+            let radio = RadioRxS3::try_new(
+                channel,
+                secondary,
+                phy,
+                bandwidth,
+                stbc != 0,
+                rssi_dbm,
+                noise_floor_dbm,
+                rate,
+                mcs,
+                rx_antenna,
+            )
+            .map_err(|_| native_fact_error(path, "persisted native radio facts are invalid"))?;
+            let body = CsiDataV1::try_new(
+                capability_digest,
+                capture_sequence,
+                driver_rx_timestamp_us,
+                callback_tick_us,
+                source_mac,
+                radio,
+                first_invalid_bytes,
+                trailing_invalid_bytes,
+                blocks,
+                raw_csi,
+            )
+            .map_err(|_| native_fact_error(path, "persisted native CSI facts are invalid"))?;
+            if body.complex_sample_count() != complex_sample_count {
+                return Err(native_fact_error(
+                    path,
+                    "persisted native CSI sample count is invalid",
+                ));
+            }
+            let fact = NativeCsiFact::from_body(provenance.clone(), &body);
+            let Message::CsiData(expected) = decoded else {
+                return Err(native_fact_error(
+                    path,
+                    "persisted CSI row is not bound to a CSI datagram",
+                ));
+            };
+            if fact != NativeCsiFact::from_body(provenance, expected) {
+                return Err(native_fact_error(
+                    path,
+                    "persisted CSI row does not match its authenticated raw datagram",
+                ));
+            }
+            Ok(NativeFact::Csi(fact))
+        },
+    )
+}
+
+fn query_health_rows(
+    connection: &Connection,
+    path: &Path,
+    routes: &[NativeFrameRoute],
+    limit: usize,
+) -> Result<Vec<(i64, NativeFact)>, HostError> {
+    query_native_rows(
+        connection,
+        path,
+        routes,
+        limit,
+        MessageKind::Health,
+        "SELECT f.fact_id, f.digest, f.peer, f.received_utc_ns, f.device_id,
+                f.key_epoch, f.boot_generation, f.message_sequence, f.kind, f.datagram,
+                h.capability_digest, h.callback_tick_us, h.capture_seen,
+                h.queue_drop_no_slot, h.queue_drop_full, h.oversize_reject,
+                h.encode_reject, h.send_failure, h.pool_high_water_slots,
+                h.callback_max_us, h.encoder_max_us
+         FROM native_health_facts AS h
+         JOIN raw_facts AS f ON f.fact_id = h.fact_id
+         ORDER BY f.fact_id DESC LIMIT ?1",
+        |row, provenance, decoded| {
+            let capability_digest =
+                decode_fixed::<32>(path, row_value(row, 10, path)?, "capability digest")?;
+            let callback_tick_us =
+                decode_u64(path, row_value(row, 11, path)?, "health callback tick")?;
+            let capture_seen = decode_u64(path, row_value(row, 12, path)?, "capture count")?;
+            let queue_drop_no_slot =
+                decode_u64(path, row_value(row, 13, path)?, "no-slot drop count")?;
+            let queue_drop_full =
+                decode_u64(path, row_value(row, 14, path)?, "full-queue drop count")?;
+            let oversize_reject =
+                decode_u64(path, row_value(row, 15, path)?, "oversize reject count")?;
+            let encode_reject = decode_u64(path, row_value(row, 16, path)?, "encode reject count")?;
+            let send_failure = decode_u64(path, row_value(row, 17, path)?, "send failure count")?;
+            let pool_high_water_slots: u16 = row_value(row, 18, path)?;
+            let callback_max_us: u32 = row_value(row, 19, path)?;
+            let encoder_max_us: u32 = row_value(row, 20, path)?;
+            let health = HealthV1::new(
+                capability_digest,
+                callback_tick_us,
+                capture_seen,
+                queue_drop_no_slot,
+                queue_drop_full,
+                oversize_reject,
+                encode_reject,
+                send_failure,
+                pool_high_water_slots,
+                callback_max_us,
+                encoder_max_us,
+            );
+            let fact = NativeHealthFact::from_body(provenance.clone(), &health);
+            let Message::Health(expected) = decoded else {
+                return Err(native_fact_error(
+                    path,
+                    "persisted health row is not bound to a health datagram",
+                ));
+            };
+            if fact != NativeHealthFact::from_body(provenance, expected) {
+                return Err(native_fact_error(
+                    path,
+                    "persisted health row does not match its authenticated raw datagram",
+                ));
+            }
+            Ok(NativeFact::Health(fact))
+        },
+    )
+}
+
+struct NativeRawRow {
+    provenance: NativeFactProvenance,
+    decoded: crate::native_frame::DecodedDatagram,
+}
+
+fn query_native_rows<T>(
+    connection: &Connection,
+    path: &Path,
+    routes: &[NativeFrameRoute],
+    limit: usize,
+    expected_kind: MessageKind,
+    sql: &str,
+    mut decode: impl FnMut(&Row<'_>, NativeFactProvenance, &Message) -> Result<T, HostError>,
+) -> Result<Vec<(i64, T)>, HostError> {
+    let mut statement =
+        connection.prepare(sql).map_err(|error| HostError::database_at(path, error))?;
+    let limit = i64::try_from(limit)
+        .map_err(|_| native_fact_error(path, "native query limit exceeds SQLite range"))?;
+    let mut rows = statement.query([limit]).map_err(|error| HostError::database_at(path, error))?;
+    let mut facts = Vec::with_capacity(usize::try_from(limit).unwrap_or(0));
+    while let Some(row) = rows.next().map_err(|error| HostError::database_at(path, error))? {
+        let fact_id: i64 = row_value(row, 0, path)?;
+        let raw = decode_native_raw_row(row, path, routes, expected_kind)?;
+        let fact = decode(row, raw.provenance, raw.decoded.message())?;
+        facts.push((fact_id, fact));
+    }
+    facts.reverse();
+    Ok(facts)
+}
+
+fn decode_native_raw_row(
+    row: &Row<'_>,
+    path: &Path,
+    routes: &[NativeFrameRoute],
+    expected_kind: MessageKind,
+) -> Result<NativeRawRow, HostError> {
+    let digest: Vec<u8> = row_value(row, 1, path)?;
+    let peer: String = row_value(row, 2, path)?;
+    let received_utc_ns: i64 = row_value(row, 3, path)?;
+    let device_id: Vec<u8> = row_value(row, 4, path)?;
+    let key_epoch: Vec<u8> = row_value(row, 5, path)?;
+    let boot_generation: Vec<u8> = row_value(row, 6, path)?;
+    let message_sequence: Vec<u8> = row_value(row, 7, path)?;
+    let kind: u8 = row_value(row, 8, path)?;
+    let datagram: Vec<u8> = row_value(row, 9, path)?;
+    let peer_address = peer
+        .parse::<SocketAddr>()
+        .map_err(|_| native_fact_error(path, "persisted native-fact peer is invalid"))?;
+    let device_id =
+        DeviceId::new(u64::from_be_bytes(decode_fixed::<8>(path, device_id, "device identity")?));
+    let key_epoch =
+        KeyEpoch::new(u16::from_be_bytes(decode_fixed::<2>(path, key_epoch, "key epoch")?))
+            .ok_or_else(|| native_fact_error(path, "persisted native-fact key epoch is invalid"))?;
+    let boot_generation = BootGeneration::new(u32::from_be_bytes(decode_fixed::<4>(
+        path,
+        boot_generation,
+        "boot generation",
+    )?))
+    .ok_or_else(|| native_fact_error(path, "persisted native-fact boot generation is invalid"))?;
+    let message_sequence = MessageSequence::new(u64::from_be_bytes(decode_fixed::<8>(
+        path,
+        message_sequence,
+        "message sequence",
+    )?))
+    .ok_or_else(|| native_fact_error(path, "persisted native-fact message sequence is invalid"))?;
+    let digest = decode_fixed::<32>(path, digest, "provenance digest")?;
+    let computed_digest: [u8; 32] = Sha256::digest(&datagram).into();
+    if digest != computed_digest {
+        return Err(native_fact_error(
+            path,
+            "persisted raw datagram does not match its provenance digest",
+        ));
+    }
+    let route = routes
+        .iter()
+        .find(|route| {
+            route.peer == peer_address.ip()
+                && route.device_id == device_id
+                && route.key_epoch == key_epoch
+        })
+        .ok_or_else(|| native_fact_error(path, "persisted native fact has no configured route"))?;
+    let authenticated = authenticate_datagram(route.key.as_bytes(), &datagram).map_err(|_| {
+        native_fact_error(path, "persisted raw datagram failed canonical authentication")
+    })?;
+    let header = authenticated.header();
+    if header.kind() != Some(expected_kind)
+        || header.kind_byte() != kind
+        || header.device_id() != device_id.get()
+        || header.key_epoch() != key_epoch.get()
+        || header.boot_generation() != boot_generation.get()
+        || header.message_seq() != message_sequence.get()
+    {
+        return Err(native_fact_error(
+            path,
+            "persisted native-fact provenance does not match its authenticated header",
+        ));
+    }
+    let decoded = decode_authenticated(&authenticated).map_err(|_| {
+        native_fact_error(path, "persisted raw datagram failed canonical native decoding")
+    })?;
+    if route.semantic_rejection(decoded.message()).is_some() {
+        return Err(native_fact_error(
+            path,
+            "persisted native fact no longer satisfies the configured decoded route",
+        ));
+    }
+    let provenance = NativeFactProvenance::new(
+        digest,
+        route.decoded.sensor().clone(),
+        peer_address,
+        UNIX_EPOCH
+            .checked_add(Duration::from_nanos(u64::try_from(received_utc_ns).map_err(|_| {
+                native_fact_error(path, "persisted native-fact receive time is invalid")
+            })?))
+            .ok_or_else(|| {
+                native_fact_error(path, "persisted native-fact receive time is out of range")
+            })?,
+        device_id,
+        key_epoch,
+        boot_generation,
+        message_sequence,
+    );
+    Ok(NativeRawRow { provenance, decoded })
+}
+
+fn row_value<T: FromSql>(row: &Row<'_>, index: usize, path: &Path) -> Result<T, HostError> {
+    row.get(index).map_err(|error| HostError::database_at(path, error))
+}
+
+fn decode_fixed<const N: usize>(
+    path: &Path,
+    bytes: Vec<u8>,
+    name: &'static str,
+) -> Result<[u8; N], HostError> {
+    bytes.try_into().map_err(|_| native_fact_error(path, name))
+}
+
+fn decode_u64(path: &Path, bytes: Vec<u8>, name: &'static str) -> Result<u64, HostError> {
+    Ok(u64::from_be_bytes(decode_fixed::<8>(path, bytes, name)?))
+}
+
+fn decode_blocks(path: &Path, bytes: Vec<u8>) -> Result<Box<[LtfBlock]>, HostError> {
+    if bytes.len() < LTF_BLOCK_BYTES
+        || bytes.len() > 3 * LTF_BLOCK_BYTES
+        || !bytes.len().is_multiple_of(LTF_BLOCK_BYTES)
+    {
+        return Err(native_fact_error(path, "persisted native CSI block encoding is invalid"));
+    }
+    let mut blocks = Vec::with_capacity(bytes.len() / LTF_BLOCK_BYTES);
+    for chunk in bytes.chunks_exact(LTF_BLOCK_BYTES) {
+        if chunk[1] != 0 {
+            return Err(native_fact_error(
+                path,
+                "persisted native CSI block reserved byte is invalid",
+            ));
+        }
+        let kind = match chunk[0] {
+            1 => LtfKind::Lltf,
+            2 => LtfKind::HtLtf,
+            3 => LtfKind::StbcHtLtf,
+            _ => return Err(native_fact_error(path, "persisted native CSI block kind is invalid")),
+        };
+        blocks.push(LtfBlock::new(
+            kind,
+            u16::from_le_bytes([chunk[2], chunk[3]]),
+            u16::from_le_bytes([chunk[4], chunk[5]]),
+        ));
+    }
+    Ok(blocks.into_boxed_slice())
+}
+
+fn decode_secondary(path: &Path, value: u8) -> Result<S3SecondaryKind, HostError> {
+    match value {
+        0 => Ok(S3SecondaryKind::None),
+        1 => Ok(S3SecondaryKind::Above),
+        2 => Ok(S3SecondaryKind::Below),
+        _ => Err(native_fact_error(path, "persisted native CSI secondary is invalid")),
+    }
+}
+
+fn decode_phy(path: &Path, value: u8) -> Result<S3PhyKind, HostError> {
+    match value {
+        1 => Ok(S3PhyKind::NonHt),
+        2 => Ok(S3PhyKind::Ht),
+        _ => Err(native_fact_error(path, "persisted native CSI PHY is invalid")),
+    }
+}
+
+fn decode_bandwidth(path: &Path, value: u8) -> Result<S3BandwidthKind, HostError> {
+    match value {
+        1 => Ok(S3BandwidthKind::TwentyMhz),
+        2 => Ok(S3BandwidthKind::FortyMhz),
+        _ => Err(native_fact_error(path, "persisted native CSI bandwidth is invalid")),
+    }
+}
+
+pub(super) fn query_raw_losses(path: &Path, limit: usize) -> Result<Vec<RawLoss>, HostError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT kind, count, observed_utc_ns, device_id, boot_generation,
+                    first_sequence, last_sequence
+             FROM raw_losses
+             ORDER BY loss_id DESC LIMIT ?1",
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    let rows = statement
+        .query_map([i64::try_from(limit).expect("query limit fits i64")], |row| {
+            let kind: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            let observed_utc_ns: i64 = row.get(2)?;
+            let device_id: Option<Vec<u8>> = row.get(3)?;
+            let boot_generation: Option<Vec<u8>> = row.get(4)?;
+            let first: Option<Vec<u8>> = row.get(5)?;
+            let last: Option<Vec<u8>> = row.get(6)?;
+            Ok((kind, count, observed_utc_ns, device_id, boot_generation, first, last))
+        })
+        .map_err(|error| HostError::database_at(path, error))?;
+    let mut losses = Vec::with_capacity(limit);
+    for row in rows {
+        let (kind, count, observed_utc_ns, device_id, boot_generation, first, last) =
+            row.map_err(|error| HostError::database_at(path, error))?;
+        let kind = match kind.as_str() {
+            "sequence_gap_observed" => RawLossKind::SequenceGapObserved,
+            "reordered_arrival" => RawLossKind::ReorderedArrival,
+            "ingress_queue_overflow" => RawLossKind::IngressQueueOverflow,
+            _ => return Err(raw_loss_error(path, "persisted raw-loss kind is invalid")),
+        };
+        let count = u64::try_from(count)
+            .map_err(|_| raw_loss_error(path, "persisted loss count is invalid"))?;
+        let observed_utc_ns = u64::try_from(observed_utc_ns)
+            .map_err(|_| raw_loss_error(path, "persisted loss time is invalid"))?;
+        let observed_at = UNIX_EPOCH
+            .checked_add(Duration::from_nanos(observed_utc_ns))
+            .ok_or_else(|| raw_loss_error(path, "persisted loss time is out of range"))?;
+        losses.push(RawLoss {
+            kind,
+            count,
+            observed_at,
+            device_id: decode_optional_u64(path, device_id, "persisted loss device is invalid")?
+                .map(DeviceId::new),
+            boot_generation: decode_optional_u32(
+                path,
+                boot_generation,
+                "persisted loss boot is invalid",
+            )?
+            .map(|boot| {
+                BootGeneration::new(boot)
+                    .ok_or_else(|| raw_loss_error(path, "persisted loss boot is invalid"))
+            })
+            .transpose()?,
+            first_sequence: decode_optional_sequence(path, first)?.map(|sequence| {
+                MessageSequence::new(sequence).expect("decoded sequence is nonzero")
+            }),
+            last_sequence: decode_optional_sequence(path, last)?.map(|sequence| {
+                MessageSequence::new(sequence).expect("decoded sequence is nonzero")
+            }),
+        });
+    }
+    losses.reverse();
+    Ok(losses)
+}
+
+fn decode_optional_u64(
+    path: &Path,
+    bytes: Option<Vec<u8>>,
+    invalid: &'static str,
+) -> Result<Option<u64>, HostError> {
+    bytes
+        .map(|bytes| {
+            let bytes: [u8; 8] = bytes.try_into().map_err(|_| raw_loss_error(path, invalid))?;
+            Ok(u64::from_be_bytes(bytes))
+        })
+        .transpose()
+}
+
+fn decode_optional_u32(
+    path: &Path,
+    bytes: Option<Vec<u8>>,
+    invalid: &'static str,
+) -> Result<Option<u32>, HostError> {
+    bytes
+        .map(|bytes| {
+            let bytes: [u8; 4] = bytes.try_into().map_err(|_| raw_loss_error(path, invalid))?;
+            Ok(u32::from_be_bytes(bytes))
+        })
+        .transpose()
+}
+
+fn decode_optional_sequence(path: &Path, bytes: Option<Vec<u8>>) -> Result<Option<u64>, HostError> {
+    bytes
+        .map(|bytes| {
+            let bytes: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| raw_loss_error(path, "persisted loss sequence is invalid"))?;
+            let sequence = u64::from_be_bytes(bytes);
+            if sequence == 0 {
+                return Err(raw_loss_error(path, "persisted loss sequence is invalid"));
+            }
+            Ok(sequence)
+        })
+        .transpose()
+}
+
+fn raw_fact_error(path: &Path, message: &'static str) -> HostError {
+    HostError::message_at("decode persisted raw fact", path, message)
+}
+
+fn native_fact_error(path: &Path, message: &'static str) -> HostError {
+    HostError::message_at("decode persisted native fact", path, message)
+}
+
+fn raw_loss_error(path: &Path, message: &'static str) -> HostError {
+    HostError::message_at("decode persisted raw loss", path, message)
+}
+
+#[derive(Debug)]
+struct StoredClose {
+    id: i64,
+    trigger_fragment_id: Option<i64>,
+    sensor: String,
+    device: Vec<u8>,
+    key_epoch: Vec<u8>,
+    boot: Vec<u8>,
+    transmitter: Vec<u8>,
+    event: Vec<u8>,
+    retransmission: Option<Vec<u8>>,
+    profile: Vec<u8>,
+    radio: Vec<u8>,
+    channel: Vec<u8>,
+    expected: u16,
+    missing: Vec<u8>,
+    reason: String,
+    uncertainty: String,
+    total: u64,
+    first_tick: Vec<u8>,
+    close_tick: Vec<u8>,
+    limit_open: usize,
+    limit_fragments: u16,
+    limit_bytes: u64,
+    limit_wait: Vec<u8>,
+    attempted_fragments: u32,
+    attempted_bytes: u64,
+    open_assemblies: u32,
+}
+
+pub(super) fn query_measurement_closes(
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<AssemblyClose>, HostError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))?;
+    let mut statement = connection.prepare(
+        "SELECT assembly_id,trigger_fragment_id,sensor,device_id,key_epoch,boot_generation,transmitter,native_event,
+                retransmission,profile,radio,channel,expected_fragments,missing_ordinals,
+                close_reason,association_uncertainty,total_bytes,first_tick,close_tick,
+                limit_open,limit_fragments,limit_bytes,limit_wait,attempted_fragments,
+                attempted_bytes,open_assemblies
+         FROM measurement_assemblies ORDER BY assembly_id DESC LIMIT ?1",
+    ).map_err(|error| HostError::database_at(path, error))?;
+    let rows = statement
+        .query_map([i64::try_from(limit).expect("query limit fits i64")], |row| {
+            Ok(StoredClose {
+                id: row.get(0)?,
+                trigger_fragment_id: row.get(1)?,
+                sensor: row.get(2)?,
+                device: row.get(3)?,
+                key_epoch: row.get(4)?,
+                boot: row.get(5)?,
+                transmitter: row.get(6)?,
+                event: row.get(7)?,
+                retransmission: row.get(8)?,
+                profile: row.get(9)?,
+                radio: row.get(10)?,
+                channel: row.get(11)?,
+                expected: row.get(12)?,
+                missing: row.get(13)?,
+                reason: row.get(14)?,
+                uncertainty: row.get(15)?,
+                total: row.get(16)?,
+                first_tick: row.get(17)?,
+                close_tick: row.get(18)?,
+                limit_open: row.get(19)?,
+                limit_fragments: row.get(20)?,
+                limit_bytes: row.get(21)?,
+                limit_wait: row.get(22)?,
+                attempted_fragments: row.get(23)?,
+                attempted_bytes: row.get(24)?,
+                open_assemblies: row.get(25)?,
+            })
+        })
+        .map_err(|error| HostError::database_at(path, error))?;
+    let mut closes = Vec::with_capacity(limit);
+    for row in rows {
+        let row = row.map_err(|error| HostError::database_at(path, error))?;
+        let key = decode_assembly_key(path, &row)?;
+        let missing = decode_ordinals(path, &row.missing)?;
+        let members = query_assembly_members(&connection, path, row.id)?;
+        let reason = decode_close_reason(path, &row.reason)?;
+        let uncertainty = decode_uncertainty(path, &row.uncertainty)?;
+        let metrics = AssemblyCloseMetrics::new(
+            SourceTick::new(decode_be_u64(path, row.first_tick.clone(), "first tick")?),
+            SourceTick::new(decode_be_u64(path, row.close_tick.clone(), "close tick")?),
+            AssemblyLimits::new(
+                AssemblyCapacity::new(row.limit_open, row.limit_fragments, row.limit_bytes)
+                    .map_err(|_| measurement_error(path))?,
+                WaitTicks::new(decode_be_u64(path, row.limit_wait.clone(), "wait limit")?)
+                    .map_err(|_| measurement_error(path))?,
+            ),
+            row.attempted_fragments,
+            row.attempted_bytes,
+            row.open_assemblies,
+        );
+        validate_close_integrity(
+            &connection,
+            path,
+            PersistedCloseView {
+                key: &key,
+                expected: row.expected,
+                missing: &missing,
+                members: &members,
+                reason,
+                uncertainty,
+                total: row.total,
+                metrics,
+                assembly_id: row.id,
+                trigger_fragment_id: row.trigger_fragment_id,
+            },
+        )?;
+        closes.push(AssemblyClose::persisted(PersistedAssemblyClose {
+            key,
+            expected_fragments: row.expected,
+            members: members.into_boxed_slice(),
+            missing_ordinals: missing.into_boxed_slice(),
+            reason,
+            uncertainty,
+            total_bytes: row.total,
+            metrics,
+        }));
+    }
+    closes.reverse();
+    Ok(closes)
+}
+
+fn decode_assembly_key(path: &Path, row: &StoredClose) -> Result<AssemblyKey, HostError> {
+    let source = SourceInstance::new(
+        SensorId::try_from(row.sensor.as_str()).map_err(|_| measurement_error(path))?,
+        DeviceId::new(decode_be_u64(path, row.device.clone(), "device")?),
+        KeyEpoch::new(decode_be_u16(path, row.key_epoch.clone())?)
+            .ok_or_else(|| measurement_error(path))?,
+        BootGeneration::new(decode_be_u32(path, row.boot.clone(), "boot")?)
+            .ok_or_else(|| measurement_error(path))?,
+    );
+    Ok(AssemblyKey::new(
+        source,
+        EventIdentity::new(
+            TransmitterIdentity::new(decode_32(path, row.transmitter.clone())?),
+            NativeEventIdentity::new(decode_32(path, row.event.clone())?),
+            row.retransmission
+                .clone()
+                .map(|value| decode_32(path, value).map(RetransmissionIdentity::new))
+                .transpose()?,
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new(decode_32(path, row.profile.clone())?),
+            RadioIdentity::new(decode_32(path, row.radio.clone())?),
+            ChannelIdentity::new(decode_32(path, row.channel.clone())?),
+        ),
+    ))
+}
+
+struct PersistedCloseView<'a> {
+    key: &'a AssemblyKey,
+    expected: u16,
+    missing: &'a [u16],
+    members: &'a [AssemblyMember],
+    reason: AssemblyCloseReason,
+    uncertainty: AssociationUncertainty,
+    total: u64,
+    metrics: AssemblyCloseMetrics,
+    assembly_id: i64,
+    trigger_fragment_id: Option<i64>,
+}
+
+fn validate_close_integrity(
+    connection: &Connection,
+    path: &Path,
+    close: PersistedCloseView<'_>,
+) -> Result<(), HostError> {
+    let PersistedCloseView {
+        key,
+        expected,
+        missing,
+        members,
+        reason,
+        uncertainty,
+        total,
+        metrics,
+        assembly_id,
+        trigger_fragment_id,
+    } = close;
+    if expected == 0
+        || members.len() + missing.len() != usize::from(expected)
+        || total != members.iter().map(|member| u64::from(member.payload_bytes())).sum::<u64>()
+    {
+        return Err(HostError::message_at(
+            "validate persisted measurement",
+            path,
+            "member count, missing count, or total bytes is inconsistent",
+        ));
+    }
+    let limits = metrics.limits();
+    let isolated = members.len() == 1 && missing.len() + 1 == usize::from(expected);
+    let elapsed = metrics.close_tick().get().saturating_sub(metrics.first_tick().get());
+    let trigger = trigger_fragment_id
+        .map(|id| query_trigger_fragment(connection, path, key, id))
+        .transpose()?;
+    if trigger.as_ref().is_some_and(|fact| fact.arrival != metrics.close_tick()) {
+        return Err(measurement_error(path));
+    }
+    let trigger_is_member = trigger.as_ref().is_some_and(|fact| {
+        fact.expected == expected
+            && members.iter().any(|member| {
+                member.ordinal() == fact.ordinal
+                    && member.fact_digest() == fact.digest
+                    && member.payload_bytes() == fact.bytes
+                    && member.quality() == fact.quality
+            })
+    });
+    let semantic_consistency = match reason {
+        AssemblyCloseReason::Complete => {
+            missing.is_empty()
+                && uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.attempted_fragments() == u32::from(expected)
+                && metrics.attempted_bytes() == total
+                && elapsed < limits.wait().get()
+                && trigger_is_member
+        }
+        AssemblyCloseReason::WaitLimit => {
+            !missing.is_empty()
+                && uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.attempted_fragments() == u32::try_from(members.len()).unwrap_or(u32::MAX)
+                && metrics.attempted_bytes() == total
+                && elapsed >= limits.wait().get()
+                && trigger.is_none()
+        }
+        AssemblyCloseReason::CountLimit => {
+            uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && expected > limits.capacity().fragments()
+                && metrics.attempted_fragments() == u32::try_from(members.len()).unwrap_or(u32::MAX)
+                && metrics.attempted_bytes() == total
+                && trigger_is_member
+        }
+        AssemblyCloseReason::ByteLimit => {
+            uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.attempted_bytes() > limits.capacity().bytes()
+                && metrics.attempted_bytes() == total
+                && metrics.attempted_fragments() == u32::try_from(members.len()).unwrap_or(u32::MAX)
+                && trigger_is_member
+        }
+        AssemblyCloseReason::ResourceLimit => {
+            isolated
+                && uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.open_assemblies()
+                    == u32::try_from(limits.capacity().open()).unwrap_or(u32::MAX)
+                && metrics.first_tick() == metrics.close_tick()
+                && metrics.attempted_fragments() == 1
+                && metrics.attempted_bytes() == total
+                && trigger_is_member
+        }
+        AssemblyCloseReason::LateFragment => {
+            isolated
+                && uncertainty == AssociationUncertainty::LateAfterClose
+                && metrics.first_tick() == metrics.close_tick()
+                && metrics.attempted_fragments() == 1
+                && metrics.attempted_bytes() == total
+                && trigger_is_member
+        }
+        AssemblyCloseReason::DuplicateFragment => {
+            isolated
+                && uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.attempted_fragments() >= 2
+                && trigger_is_member
+        }
+        AssemblyCloseReason::ConflictingDuplicate => {
+            uncertainty == AssociationUncertainty::ConflictingFacts
+                && metrics.attempted_fragments()
+                    == u32::try_from(members.len()).unwrap_or(u32::MAX).saturating_add(1)
+                && trigger.as_ref().is_some_and(|fact| {
+                    (fact.expected != expected
+                        || members.iter().any(|member| {
+                            member.ordinal() == fact.ordinal
+                                && (member.fact_digest() != fact.digest
+                                    || member.payload_bytes() != fact.bytes
+                                    || member.quality() != fact.quality)
+                        }))
+                        && metrics.attempted_bytes() == total.saturating_add(u64::from(fact.bytes))
+                })
+        }
+    };
+    if !semantic_consistency {
+        return Err(HostError::message_at(
+            "validate persisted measurement",
+            path,
+            "close reason, membership, missing set, and uncertainty are inconsistent",
+        ));
+    }
+    if reason == AssemblyCloseReason::DuplicateFragment {
+        let trigger = trigger_fragment_id.expect("duplicate consistency requires a trigger");
+        let member = members[0];
+        let member_quality = match member.quality() {
+            EvidenceQuality::Captured => "captured",
+            EvidenceQuality::NotCaptured => "not_captured",
+            EvidenceQuality::Lost => "lost",
+            EvidenceQuality::Invalid => "invalid",
+            EvidenceQuality::Interpolated => "interpolated",
+            EvidenceQuality::TrainingMasked => "training_masked",
+        };
+        let (prior_count, prior_bytes, matching): (u32, u64, u32) = connection
+            .query_row(
+                "WITH prior AS (
+                     SELECT fragment_id,ordinal,fact_digest,payload_bytes,quality
+                     FROM measurement_fragments
+                     WHERE fragment_id < ?1 AND sensor=?4 AND device_id=?5 AND key_epoch=?6
+                       AND boot_generation=?7 AND transmitter=?8 AND native_event=?9
+                       AND retransmission IS ?10 AND profile=?11 AND radio=?12 AND channel=?13
+                 )
+                 SELECT count(*),coalesce(sum(payload_bytes),0),
+                        coalesce(sum(ordinal=?2 AND fact_digest=?3
+                                     AND payload_bytes=?14 AND quality=?15),0)
+                 FROM prior AS candidate
+                 WHERE fragment_id=(
+                     SELECT min(fragment_id) FROM prior AS earlier
+                     WHERE earlier.ordinal=candidate.ordinal
+                 )",
+                params![
+                    trigger,
+                    member.ordinal(),
+                    member.fact_digest(),
+                    key.source().sensor().as_str(),
+                    key.source().device().get().to_be_bytes(),
+                    key.source().key_epoch().get().to_be_bytes(),
+                    key.source().boot().get().to_be_bytes(),
+                    key.event().transmitter().bytes(),
+                    key.event().native_event().bytes(),
+                    key.event().retransmission().map(RetransmissionIdentity::bytes),
+                    key.context().profile().bytes(),
+                    key.context().radio().bytes(),
+                    key.context().channel().bytes(),
+                    member.payload_bytes(),
+                    member_quality
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| HostError::database_at(path, error))?;
+        if matching == 0
+            || metrics.attempted_fragments() != prior_count.saturating_add(1)
+            || metrics.attempted_bytes()
+                != prior_bytes.saturating_add(u64::from(member.payload_bytes()))
+        {
+            return Err(measurement_error(path));
+        }
+    }
+    if reason == AssemblyCloseReason::LateFragment {
+        let prior: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM measurement_assemblies
+             WHERE assembly_id < ?1 AND sensor=?2 AND device_id=?3 AND key_epoch=?4
+               AND boot_generation=?5 AND transmitter=?6 AND native_event=?7
+               AND retransmission IS ?8 AND profile=?9 AND radio=?10 AND channel=?11
+               AND close_reason NOT IN ('late_fragment','duplicate_fragment')",
+                params![
+                    assembly_id,
+                    key.source().sensor().as_str(),
+                    key.source().device().get().to_be_bytes(),
+                    key.source().key_epoch().get().to_be_bytes(),
+                    key.source().boot().get().to_be_bytes(),
+                    key.event().transmitter().bytes(),
+                    key.event().native_event().bytes(),
+                    key.event().retransmission().map(RetransmissionIdentity::bytes),
+                    key.context().profile().bytes(),
+                    key.context().radio().bytes(),
+                    key.context().channel().bytes()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| HostError::database_at(path, error))?;
+        if prior == 0 {
+            return Err(measurement_error(path));
+        }
+    }
+    let mut seen = vec![false; usize::from(expected)];
+    for ordinal in missing.iter().copied().chain(members.iter().map(|member| member.ordinal())) {
+        let slot = seen.get_mut(usize::from(ordinal)).ok_or_else(|| {
+            HostError::message_at(
+                "validate persisted measurement",
+                path,
+                "ordinal lies outside expected fragment count",
+            )
+        })?;
+        if *slot {
+            return Err(HostError::message_at(
+                "validate persisted measurement",
+                path,
+                "member and missing ordinals overlap",
+            ));
+        }
+        *slot = true;
+    }
+    for member in members {
+        let source = key.source();
+        let event = key.event();
+        let context = key.context();
+        let quality = match member.quality() {
+            EvidenceQuality::Captured => "captured",
+            EvidenceQuality::NotCaptured => "not_captured",
+            EvidenceQuality::Lost => "lost",
+            EvidenceQuality::Invalid => "invalid",
+            EvidenceQuality::Interpolated => "interpolated",
+            EvidenceQuality::TrainingMasked => "training_masked",
+        };
+        let count: u64 = connection.query_row(
+            "SELECT count(*) FROM measurement_fragments WHERE sensor=?1 AND device_id=?2 AND key_epoch=?3
+             AND boot_generation=?4 AND transmitter=?5 AND native_event=?6 AND retransmission IS ?7
+             AND profile=?8 AND radio=?9 AND channel=?10 AND ordinal=?11 AND expected_fragments=?12
+             AND fact_digest=?13 AND payload_bytes=?14 AND quality=?15
+             AND (?16 IS NULL OR fragment_id <= ?16)",
+            params![source.sensor().as_str(), source.device().get().to_be_bytes(), source.key_epoch().get().to_be_bytes(), source.boot().get().to_be_bytes(), event.transmitter().bytes(), event.native_event().bytes(), event.retransmission().map(RetransmissionIdentity::bytes), context.profile().bytes(), context.radio().bytes(), context.channel().bytes(), member.ordinal(), expected, member.fact_digest(), member.payload_bytes(), quality, trigger_fragment_id],
+            |row| row.get(0),
+        ).map_err(|error| HostError::database_at(path, error))?;
+        if count == 0 {
+            return Err(HostError::message_at(
+                "validate persisted measurement",
+                path,
+                "member has no matching persisted fragment",
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct StoredTriggerFragment {
+    ordinal: u16,
+    expected: u16,
+    digest: [u8; 32],
+    bytes: u32,
+    quality: EvidenceQuality,
+    arrival: SourceTick,
+}
+
+fn query_trigger_fragment(
+    connection: &Connection,
+    path: &Path,
+    key: &AssemblyKey,
+    trigger: i64,
+) -> Result<StoredTriggerFragment, HostError> {
+    connection
+        .query_row(
+            "SELECT ordinal,expected_fragments,fact_digest,payload_bytes,quality,arrival_tick
+             FROM measurement_fragments
+         WHERE fragment_id=?1 AND sensor=?2 AND device_id=?3 AND key_epoch=?4
+           AND boot_generation=?5 AND transmitter=?6 AND native_event=?7
+           AND retransmission IS ?8 AND profile=?9 AND radio=?10 AND channel=?11",
+            params![
+                trigger,
+                key.source().sensor().as_str(),
+                key.source().device().get().to_be_bytes(),
+                key.source().key_epoch().get().to_be_bytes(),
+                key.source().boot().get().to_be_bytes(),
+                key.event().transmitter().bytes(),
+                key.event().native_event().bytes(),
+                key.event().retransmission().map(RetransmissionIdentity::bytes),
+                key.context().profile().bytes(),
+                key.context().radio().bytes(),
+                key.context().channel().bytes()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, u16>(0)?,
+                    row.get::<_, u16>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .map_err(|error| HostError::database_at(path, error))
+        .and_then(|(ordinal, expected, digest, bytes, quality, arrival)| {
+            Ok(StoredTriggerFragment {
+                ordinal,
+                expected,
+                digest: decode_32(path, digest)?,
+                bytes,
+                quality: decode_quality(path, &quality)?,
+                arrival: SourceTick::new(decode_be_u64(path, arrival, "arrival tick")?),
+            })
+        })
+}
+
+fn query_assembly_members(
+    connection: &Connection,
+    path: &Path,
+    id: i64,
+) -> Result<Vec<AssemblyMember>, HostError> {
+    let mut statement = connection.prepare("SELECT ordinal,fact_digest,payload_bytes,quality FROM measurement_members WHERE assembly_id=?1 ORDER BY ordinal")
+        .map_err(|error| HostError::database_at(path, error))?;
+    statement
+        .query_map([id], |row| {
+            Ok((
+                row.get::<_, u16>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| HostError::database_at(path, error))?
+        .map(|row| {
+            let (ordinal, digest, bytes, quality) =
+                row.map_err(|error| HostError::database_at(path, error))?;
+            Ok(AssemblyMember::persisted(
+                ordinal,
+                decode_32(path, digest)?,
+                bytes,
+                decode_quality(path, &quality)?,
+            ))
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct StoredRelation {
+    kind: String,
+    provenance: String,
+    sensor: String,
+    device: Vec<u8>,
+    key_epoch: Vec<u8>,
+    boot: Vec<u8>,
+    error: Vec<u8>,
+    unit: String,
+    from: Vec<u8>,
+    until: Vec<u8>,
+    epoch: Vec<u8>,
+    details: Vec<u8>,
+}
+
+pub(super) fn query_qualifications(
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<QualificationRelation>, HostError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))?;
+    let mut statement = connection.prepare(
+        "SELECT kind,provenance,sensor,device_id,key_epoch,boot_generation,error_bound,error_unit,
+                valid_from_tick,valid_until_tick,epoch,details
+         FROM qualification_relations ORDER BY relation_id DESC LIMIT ?1",
+    ).map_err(|error| HostError::database_at(path, error))?;
+    let rows = statement
+        .query_map([i64::try_from(limit).expect("query limit fits i64")], |row| {
+            Ok(StoredRelation {
+                kind: row.get(0)?,
+                provenance: row.get(1)?,
+                sensor: row.get(2)?,
+                device: row.get(3)?,
+                key_epoch: row.get(4)?,
+                boot: row.get(5)?,
+                error: row.get(6)?,
+                unit: row.get(7)?,
+                from: row.get(8)?,
+                until: row.get(9)?,
+                epoch: row.get(10)?,
+                details: row.get(11)?,
+            })
+        })
+        .map_err(|error| HostError::database_at(path, error))?;
+    let mut relations = Vec::with_capacity(limit);
+    for row in rows {
+        let row = row.map_err(|error| HostError::database_at(path, error))?;
+        let source = SourceInstance::new(
+            SensorId::try_from(row.sensor.as_str()).map_err(|_| measurement_error(path))?,
+            DeviceId::new(decode_be_u64(path, row.device, "relation device")?),
+            KeyEpoch::new(decode_be_u16(path, row.key_epoch)?)
+                .ok_or_else(|| measurement_error(path))?,
+            BootGeneration::new(decode_be_u32(path, row.boot, "relation boot")?)
+                .ok_or_else(|| measurement_error(path))?,
+        );
+        let validity = RelationValidity::new(
+            row.provenance,
+            source,
+            ErrorBound::new(
+                decode_be_u64(path, row.error, "relation error")?,
+                decode_error_unit(path, &row.unit)?,
+            ),
+            TickRange::new(
+                SourceTick::new(decode_be_u64(path, row.from, "relation start")?),
+                SourceTick::new(decode_be_u64(path, row.until, "relation end")?),
+            )
+            .map_err(|_| measurement_error(path))?,
+            QualificationEpoch::new(decode_be_u64(path, row.epoch, "relation epoch")?),
+        )
+        .map_err(|_| measurement_error(path))?;
+        relations.push(decode_relation_details(path, &row.kind, validity, &row.details)?);
+    }
+    relations.reverse();
+    Ok(relations)
+}
+
+struct DetailCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+impl<'a> DetailCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(count)?;
+        let value = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        Some(value)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn text(&mut self) -> Option<Box<str>> {
+        let size = usize::from(self.u16()?);
+        std::str::from_utf8(self.take(size)?).ok().map(Into::into)
+    }
+    fn done(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+fn decode_relation_details(
+    path: &Path,
+    kind: &str,
+    validity: RelationValidity,
+    details: &[u8],
+) -> Result<QualificationRelation, HostError> {
+    let mut cursor = DetailCursor::new(details);
+    let relation = match kind {
+        "time" => {
+            let source = cursor.text().ok_or_else(|| measurement_error(path))?;
+            let target = cursor.text().ok_or_else(|| measurement_error(path))?;
+            let fit = FitIdentity::new(
+                cursor
+                    .take(32)
+                    .ok_or_else(|| measurement_error(path))?
+                    .try_into()
+                    .map_err(|_| measurement_error(path))?,
+            );
+            QualificationRelation::Time(
+                TimeRelation::new(validity, source, target, fit)
+                    .map_err(|_| measurement_error(path))?,
+            )
+        }
+        "phase" => {
+            let reference = PhaseReferenceIdentity::new(
+                cursor
+                    .take(32)
+                    .ok_or_else(|| measurement_error(path))?
+                    .try_into()
+                    .map_err(|_| measurement_error(path))?,
+            );
+            let coherence = TickRange::new(
+                SourceTick::new(cursor.u64().ok_or_else(|| measurement_error(path))?),
+                SourceTick::new(cursor.u64().ok_or_else(|| measurement_error(path))?),
+            )
+            .map_err(|_| measurement_error(path))?;
+            QualificationRelation::Phase(
+                PhaseRelation::new(validity, reference, coherence)
+                    .map_err(|_| measurement_error(path))?,
+            )
+        }
+        "port" => {
+            let count = cursor.u16().ok_or_else(|| measurement_error(path))?;
+            let mut entries = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                let tx = cursor.u16().ok_or_else(|| measurement_error(path))?;
+                let rx = cursor.u16().ok_or_else(|| measurement_error(path))?;
+                let marker = *cursor
+                    .take(1)
+                    .and_then(|value| value.first())
+                    .ok_or_else(|| measurement_error(path))?;
+                let antenna = cursor.u16().ok_or_else(|| measurement_error(path))?;
+                let tx_antenna = match marker {
+                    0 if antenna == 0 => None,
+                    1 => Some(antenna),
+                    _ => return Err(measurement_error(path)),
+                };
+                entries.push(PortMapEntry::new(
+                    tx,
+                    rx,
+                    tx_antenna,
+                    cursor.u16().ok_or_else(|| measurement_error(path))?,
+                ));
+            }
+            QualificationRelation::Port(
+                PortMapping::new(validity, entries).map_err(|_| measurement_error(path))?,
+            )
+        }
+        "geometry" => {
+            let source = cursor.text().ok_or_else(|| measurement_error(path))?;
+            let target = cursor.text().ok_or_else(|| measurement_error(path))?;
+            let mut pose = [0; 7];
+            for component in &mut pose {
+                *component = cursor.i64().ok_or_else(|| measurement_error(path))?;
+            }
+            QualificationRelation::Geometry(
+                Geometry::new(validity, source, target, Pose::new(pose))
+                    .map_err(|_| measurement_error(path))?,
+            )
+        }
+        _ => return Err(measurement_error(path)),
+    };
+    if !cursor.done() {
+        return Err(measurement_error(path));
+    }
+    Ok(relation)
+}
+
+fn decode_error_unit(path: &Path, value: &str) -> Result<ErrorUnit, HostError> {
+    match value {
+        "nanoseconds" => Ok(ErrorUnit::Nanoseconds),
+        "milliradians" => Ok(ErrorUnit::Milliradians),
+        "millimetres" => Ok(ErrorUnit::Millimetres),
+        "parts_per_million" => Ok(ErrorUnit::PartsPerMillion),
+        _ => Err(measurement_error(path)),
+    }
+}
+
+fn decode_be_u16(path: &Path, bytes: Vec<u8>) -> Result<u16, HostError> {
+    Ok(u16::from_be_bytes(bytes.try_into().map_err(|_| measurement_error(path))?))
+}
+
+fn decode_32(path: &Path, bytes: Vec<u8>) -> Result<[u8; 32], HostError> {
+    bytes.try_into().map_err(|_| measurement_error(path))
+}
+
+fn decode_be_u64(path: &Path, bytes: Vec<u8>, _field: &'static str) -> Result<u64, HostError> {
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| measurement_error(path))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn decode_be_u32(path: &Path, bytes: Vec<u8>, _field: &'static str) -> Result<u32, HostError> {
+    let bytes: [u8; 4] = bytes.try_into().map_err(|_| measurement_error(path))?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn decode_ordinals(path: &Path, bytes: &[u8]) -> Result<Vec<u16>, HostError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(measurement_error(path));
+    }
+    Ok(bytes.chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])).collect())
+}
+
+fn decode_close_reason(path: &Path, value: &str) -> Result<AssemblyCloseReason, HostError> {
+    match value {
+        "complete" => Ok(AssemblyCloseReason::Complete),
+        "wait_limit" => Ok(AssemblyCloseReason::WaitLimit),
+        "count_limit" => Ok(AssemblyCloseReason::CountLimit),
+        "byte_limit" => Ok(AssemblyCloseReason::ByteLimit),
+        "resource_limit" => Ok(AssemblyCloseReason::ResourceLimit),
+        "late_fragment" => Ok(AssemblyCloseReason::LateFragment),
+        "duplicate_fragment" => Ok(AssemblyCloseReason::DuplicateFragment),
+        "conflicting_duplicate" => Ok(AssemblyCloseReason::ConflictingDuplicate),
+        _ => Err(measurement_error(path)),
+    }
+}
+
+fn decode_uncertainty(path: &Path, value: &str) -> Result<AssociationUncertainty, HostError> {
+    match value {
+        "exact_native_identity" => Ok(AssociationUncertainty::ExactNativeIdentity),
+        "late_after_close" => Ok(AssociationUncertainty::LateAfterClose),
+        "conflicting_facts" => Ok(AssociationUncertainty::ConflictingFacts),
+        _ => Err(measurement_error(path)),
+    }
+}
+
+fn decode_quality(path: &Path, value: &str) -> Result<EvidenceQuality, HostError> {
+    match value {
+        "captured" => Ok(EvidenceQuality::Captured),
+        "not_captured" => Ok(EvidenceQuality::NotCaptured),
+        "lost" => Ok(EvidenceQuality::Lost),
+        "invalid" => Ok(EvidenceQuality::Invalid),
+        "interpolated" => Ok(EvidenceQuality::Interpolated),
+        "training_masked" => Ok(EvidenceQuality::TrainingMasked),
+        _ => Err(measurement_error(path)),
+    }
+}
+
+fn measurement_error(path: &Path) -> HostError {
+    HostError::message_at(
+        "decode persisted measurement",
+        path,
+        "persisted measurement or qualification is invalid",
+    )
+}

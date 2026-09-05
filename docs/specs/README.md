@@ -1,15 +1,17 @@
-# Versioned specifications
+# Accepted specifications
 
-Load a specification for accepted byte, schema, API, or behavior contracts.
-Every listed document is an accepted target, not proof of implementation or
-execution.
+Specifications define accepted behavior, not proof of implementation. There are
+two operative scopes; all other former Host target specifications are removed.
 
-| Trigger | Owner |
+| Scope | Owner |
 | --- | --- |
-| Store, per-serve Capture Session, atomic capture ingest, topology/signals/live subset, polling fallback, or demo-smoke | [Demo Slice v2](demo-slice-v2.md), first-applicable for the bounded delivery path |
-| Native-frame bytes, authentication, capability, provisioning, CSI validity, sender behavior, or host admission | [Native-frame v1](native-frame-v1.md) |
-| Shared host configuration identity, Managed store lifecycle, or deferred Semantic Session SQLite, recovery, retention, and faithful replay input | [Host persistence v1](persistence-v1.md); the Demo imports only the named shared subset |
-| Capture Profile identity, native-coordinate `CsiObservation`, or deferred time, sequence, windows, conditioning, statistical baseline, world aggregation, Engine, and semantic replay | [Temporal world v1](temporal-world-v1.md); the Demo imports only the named Profile and observation subset |
-| Deferred calibration, data splits, leakage, semantic evaluation, or runtime evaluation | [Temporal world evaluation v1](evaluation-v1.md) |
-| Full query projections, HTTP, WebSocket, SignalView, JSON DTOs, or diagnostic UI | [Query, API, WebSocket, and diagnostic UI v1](api-ui-v1.md) and its [JSON Schema 2020-12 artifact](schemas/api-ui-v1.schema.json); the Demo imports only its named subset |
-| Deferred Semantic Program / Program 1 fixture cardinality, corpus input lineage, typed executed-claim ancestry, E2E classification, or composed physical-to-browser acceptance | [Single-sensor development E2E v1](development-e2e-v1.md) and its [Program 1 JSON Schema 2020-12 artifact](schemas/development-e2e-v1.schema.json) |
+| Fixed ESP firmware, authenticated UDP, capability, native CSI and provisioning input | [Native-frame v1](native-frame-v1.md) |
+| Phone calibration, heterogeneous RF, selected joint model, A/B/C, history, runtime and acceptance | [RF world-model v1](rf-world-model-v1.md) |
+| Canonical locally coherent array-capture bytes and qualified path-adapter behavior | [Array capture v1](array-capture-v1.md) |
+| Versioned local Python worker and Rust numerical-client boundary | [Model worker protocol v1](model-worker-v1.md) |
+
+The RF specification is the accepted direct-rebuild target. Its implementations
+and any narrower byte/schema artifacts are owned by the new
+[issue graph](https://github.com/hallucination-studio/whisper/issues/163).
+No old Store or API migration is supported. An old database must be rejected
+before mutation; hard-deleting code does not authorize runtime data erasure.

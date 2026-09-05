@@ -4,6 +4,8 @@ status: accepted
 
 # Give Host cleanup to an independent supervisor
 
+Current applicability: Only independent supervision and final cleanup ownership remain applicable. Former CaptureRuntime, pinned QueryStore, handle names and bounded-delivery seams below describe the historical implementation and do not constrain the rebuilt Host. Model-worker failure isolation follows the RF world-model contract. See [ADR 0020](0020-rf-world-model-hard-rebuild.md).
+
 The bounded delivery path must release its Managed store lease even when a
 shutdown future is cancelled, the public runtime handle is dropped, or an
 async task panics, while SQLite close and writer join must never block a Tokio

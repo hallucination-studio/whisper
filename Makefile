@@ -4,12 +4,27 @@ PROVISION_TOOLS_DIRECTORY := $(FIRMWARE_DIRECTORY)/build/provision-tools
 NVS_PARTITION_TOOL_DIRECTORY := $(PROVISION_TOOLS_DIRECTORY)/nvs-partition-tool
 PROVISION_PYTHON := $(PROVISION_TOOLS_DIRECTORY)/venv/bin/python
 
-.PHONY: esp32-native-frame esp32-native-frame-development-config esp32-native-frame-firmware esp32-native-frame-host esp32-native-frame-provision-tools
+.PHONY: check check-firmware check-policy check-python check-rust esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
 
-esp32-native-frame: esp32-native-frame-development-config esp32-native-frame-host
+check: check-policy check-python check-rust check-firmware
 
-esp32-native-frame-development-config: esp32-native-frame-firmware esp32-native-frame-provision-tools
-	"$(PROVISION_PYTHON)" "$(FIRMWARE_DIRECTORY)/prepare_development_config.py"
+check-firmware: esp32-native-frame-firmware
+
+check-policy:
+	python3 scripts/check_repository.py
+
+check-python:
+	python3 -m unittest discover -s tests -p 'test_*.py'
+	python3 -m unittest discover -s firmware/esp32-native-frame/tests -p 'test_*.py'
+
+check-rust:
+	cargo fmt --all -- --check
+	cargo check --workspace --all-targets --all-features
+	cargo test --workspace --all-features
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo doc --workspace --all-features --no-deps
+
+esp32-native-frame: esp32-native-frame-firmware
 
 esp32-native-frame-firmware:
 	docker run --rm \
@@ -17,9 +32,6 @@ esp32-native-frame-firmware:
 		--workdir /project/firmware/esp32-native-frame \
 		"$(IDF_IMAGE)" \
 		bash -lc 'idf.py set-target esp32s3 && idf.py build'
-
-esp32-native-frame-host:
-	cargo build --release --features development-fixture
 
 esp32-native-frame-provision-tools:
 	mkdir -p "$(NVS_PARTITION_TOOL_DIRECTORY)"

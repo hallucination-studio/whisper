@@ -4,10 +4,12 @@ status: accepted
 
 # Trust the Program 1 local store namespace
 
+Current applicability: Only the trusted local namespace, cooperative lease and no-replace principles remain applicable where reused privately. Former Program 1/Demo Store schema, handles and lifecycle below do not constrain the new Store. Old-format rejection and explicit new-directory initialization follow the RF world-model contract. See [ADR 0020](0020-rf-world-model-hard-rebuild.md).
+
 Scope: this decision governs the shared local namespace and cooperative
 lifecycle used by the bounded Store and deferred Semantic Store. The bounded
 delivery path has its own schema, Capture Session, and ingest contract in
-[Demo Slice v2](../specs/demo-slice-v2.md), while storage qualification and its
+[Demo Slice v2](https://github.com/hallucination-studio/whisper/blob/671b39d4d518c3b6bbbc173352712b7af32ee7ad/docs/specs/demo-slice-v2.md), while storage qualification and its
 classification remain deferred to the Semantic Program.
 
 ## Context
@@ -32,7 +34,7 @@ bounded current-Mac storage qualification instead of adding hostile
 same-credential namespace isolation or a custom storage boundary before the
 sensing path has been demonstrated. Exact root, permission, lifecycle,
 publication, SQLite, recovery, and qualification behavior is owned by the
-[host persistence v1 specification](../specs/persistence-v1.md).
+[host persistence v1 specification](https://github.com/hallucination-studio/whisper/blob/671b39d4d518c3b6bbbc173352712b7af32ee7ad/docs/specs/persistence-v1.md).
 
 ## Consequences
 

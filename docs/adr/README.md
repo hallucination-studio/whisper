@@ -7,15 +7,15 @@ the linked specification owns operative behavior.
 | Decision question | ADR |
 | --- | --- |
 | Why use a custom authenticated protocol instead of legacy wire compatibility? | [ADR 0001](0001-native-frame-authentication.md) |
-| Why keep one sequential Engine writer? | [ADR 0002](0002-engine-single-writer.md) |
-| Why use SQLite as the authoritative session store? | [ADR 0003](0003-sqlite-authoritative-session-store.md) |
-| Why require evidence before research changes production semantics? | [ADR 0004](0004-research-promotion-evidence.md) |
-| Why rotate by logical session facts instead of physical SQLite size? | [ADR 0005](0005-logical-session-fact-bytes.md) |
 | Why bind replay admission identity to the epoch key? | [ADR 0006](0006-bind-replay-admission-to-epoch-key.md) |
 | Why trust the Program 1 local store namespace instead of building hostile same-credential isolation? | [ADR 0013](0013-trust-program-1-local-store-namespace.md) |
-| Why can only a verified typed claim graph issue an execution classification? | [ADR 0014](0014-derive-execution-classification-from-claim-graph.md) |
-| Why does a compatible Host restart continue the active session instead of rotating it? | [ADR 0015](0015-keep-compatible-host-restart-in-active-session.md) |
-| Why does every Demo `serve` create another non-semantic Capture Session? | [ADR 0016](0016-new-capture-session-per-serve.md) |
-| Why does capture ingest commit replay, packet, optional CSI, cursor, and watermark together? | [ADR 0017](0017-atomic-capture-ingest.md) |
 | Why does an independent thread own Host cleanup and lease release? | [ADR 0018](0018-independent-host-supervisor.md) |
 | Why must production compatibility identities use domain rather than delivery-maturity terminology? | [ADR 0019](0019-maturity-neutral-compatibility-identities.md) |
+| Why hard-rebuild the Host world model while preserving the existing firmware UDP input? | [ADR 0020](0020-rf-world-model-hard-rebuild.md) |
+
+[ADR 0020](0020-rf-world-model-hard-rebuild.md) is first-applicable for the RF
+world-model rebuild. It links the removed ADRs in fixed Git history and
+identifies the exact post-admission scope it supersedes. That history does not
+define a migration route, compatibility requirement, or parallel authority.
+Native-frame authentication and replay-admission decisions remain applicable
+only at the preserved firmware UDP input boundary as stated there.
