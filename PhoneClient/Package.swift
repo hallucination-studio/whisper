@@ -13,16 +13,27 @@ let package = Package(
             name: "WhisperPhoneClient",
             targets: ["WhisperPhoneClient"]
         ),
+        .executable(
+            name: "WhisperPhoneClientApp",
+            targets: ["WhisperPhoneClientApp"]
+        ),
     ],
     targets: [
         .target(
             name: "WhisperPhoneClient",
             path: "Sources/WhisperPhoneClient"
         ),
+        .executableTarget(
+            name: "WhisperPhoneClientApp",
+            dependencies: ["WhisperPhoneClient"],
+            path: "Sources/WhisperPhoneClientApp",
+            resources: [.process("Resources")]
+        ),
         .testTarget(
             name: "WhisperPhoneClientTests",
             dependencies: ["WhisperPhoneClient"],
-            path: "Tests/WhisperPhoneClientTests"
+            path: "Tests/WhisperPhoneClientTests",
+            resources: [.copy("Fixtures")]
         ),
     ]
 )

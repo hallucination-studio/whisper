@@ -9,12 +9,14 @@ public enum PhoneClientError: Error, Equatable, Sendable, LocalizedError {
     case trackingResetRequiresRelocalization
     case transformError(String)
     case timeRelationError(String)
+    case invitationExpired
     case unknownRFIdentity(String)
     case errorBudgetExceeded
     case malformedWire(String)
     case serverIdentityMismatch
     case authenticationFailed(String)
     case uploadConflict
+    case uploadRejected(String)
     case uploadUnavailable
     case persistence(String)
     case unsupportedPlatform(String)
@@ -29,12 +31,14 @@ public enum PhoneClientError: Error, Equatable, Sendable, LocalizedError {
             return "tracking reset requires relocalization before capture can resume"
         case let .transformError(message): return "coordinate transform error: \(message)"
         case let .timeRelationError(message): return "time relation error: \(message)"
+        case .invitationExpired: return "companion invitation has expired"
         case let .unknownRFIdentity(identity): return "unknown RF identity: \(identity)"
         case .errorBudgetExceeded: return "spatial and time uncertainty exceeds the position budget"
         case let .malformedWire(message): return "malformed companion wire data: \(message)"
         case .serverIdentityMismatch: return "companion server identity does not match the pin"
         case let .authenticationFailed(message): return "companion authentication failed: \(message)"
         case .uploadConflict: return "companion upload conflicts with retained content"
+        case let .uploadRejected(message): return "companion upload was rejected: \(message)"
         case .uploadUnavailable: return "companion upload is unavailable"
         case let .persistence(message): return "phone artifact persistence failed: \(message)"
         case let .unsupportedPlatform(message): return "unsupported phone platform: \(message)"

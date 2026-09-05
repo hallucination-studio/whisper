@@ -10,6 +10,7 @@ __pycache__/
 
 # Swift package build artifacts
 /PhoneClient/.build/
+/PhoneClient/.build-xcode/
 
 # Browser acceptance artifacts
 /node_modules/

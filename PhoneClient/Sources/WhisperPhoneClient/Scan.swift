@@ -115,6 +115,61 @@ public struct MapCoverageRanges: Codable, Equatable, Sendable {
     }
 }
 
+/// A normalized floor-plan point used by the coverage renderer and behavior tests.
+/// `x` is the world X coordinate and `y` is the world Z coordinate; the world Y
+/// height is intentionally ignored because coverage is shown in a top-down map.
+public struct CoverageMapPoint: Codable, Equatable, Sendable {
+    public let x: Double
+    public let y: Double
+    public let covered: Bool
+
+    public init(x: Double, y: Double, covered: Bool) {
+        self.x = x
+        self.y = y
+        self.covered = covered
+    }
+}
+
+/// Coverage summary with spatial positions retained for each independently
+/// qualified visual, RF-expected, and field-calibration range.
+public struct CoverageMapSummary: Codable, Equatable, Sendable {
+    public let title: String
+    public let points: [CoverageMapPoint]
+    public let coveredCount: Int
+    public let totalCount: Int
+
+    public init(title: String, cells: [CoverageCell]) {
+        let validCells = cells.filter { cell in
+            cell.positionM.count == 3 && cell.positionM.allSatisfy(\.isFinite)
+        }
+        self.title = title
+        self.totalCount = validCells.count
+        self.coveredCount = validCells.filter(\.covered).count
+        guard !validCells.isEmpty else {
+            self.points = []
+            return
+        }
+        let xValues = validCells.map { $0.positionM[0] }
+        let zValues = validCells.map { $0.positionM[2] }
+        let minX = xValues.min() ?? 0
+        let maxX = xValues.max() ?? minX
+        let minZ = zValues.min() ?? 0
+        let maxZ = zValues.max() ?? minZ
+        let spanX = maxX - minX
+        let spanZ = maxZ - minZ
+        self.points = validCells.map { cell in
+            CoverageMapPoint(
+                x: spanX > 0 ? (cell.positionM[0] - minX) / spanX : 0.5,
+                y: spanZ > 0 ? (cell.positionM[2] - minZ) / spanZ : 0.5,
+                covered: cell.covered
+            )
+        }
+    }
+
+    /// Alias retained for the SwiftUI renderer's point-oriented vocabulary.
+    public var normalizedPoints: [CoverageMapPoint] { points }
+}
+
 /// Human-readable label row data retaining source, quality, visibility, scope, and uncertainty.
 public struct LabelRow: Codable, Equatable, Sendable {
     public let source: SourceIdentity
@@ -177,8 +232,8 @@ public struct RoomScanCoordinator: Sendable {
     }
 
     public mutating func accept(frame: ScanFrame) throws {
-        guard phase == .scanning || phase == .awaitingDimensionConfirmation || phase == .awaitingDoorConfirmation else {
-            throw PhoneClientError.invalidState("RoomPlan frames are only accepted during scanning")
+        guard phase == .scanning || phase == .awaitingDimensionConfirmation || phase == .awaitingDoorConfirmation || phase == .registeringRF || phase == .readyToCapture || phase == .capturingSupervision else {
+            throw PhoneClientError.invalidState("RoomPlan frames are not accepted in the current workflow phase")
         }
         try frame.validate()
         guard !requiresRelocalization else { throw PhoneClientError.trackingResetRequiresRelocalization }
@@ -248,6 +303,9 @@ public struct RoomScanCoordinator: Sendable {
         }
         guard frame.trackingEpoch == trackingEpoch else {
             throw PhoneClientError.invalidState("relocalized frame belongs to a different tracking epoch")
+        }
+        guard frame.trackingQuality == .normal else {
+            throw PhoneClientError.trackingResetRequiresRelocalization
         }
         try frame.validate()
         guard let prior = currentFrame, prior.worldCoordinateSystem == frame.worldCoordinateSystem else {
@@ -360,41 +418,54 @@ public struct SupervisionCapture: Sendable {
     }
 }
 
-// MARK: - Apple session adapter
+/// One adapter-produced observation sharing the RoomPlan/ARKit world coordinate system.
+public struct PhoneCaptureObservation: Codable, Equatable, Sendable {
+    public let scanFrame: ScanFrame
+    public let keyframe: CameraKeyframe
+    public let cameraIntrinsics: [Double]
+    public let media: [CaptureMedia]
 
-#if os(iOS) && canImport(ARKit)
-import ARKit
-
-/// ARWorldTracking session retained after RoomPlan capture for aligned RGB/depth/pose samples.
-@available(iOS 16.0, *)
-public final class ARKitSessionController: NSObject, ARSessionDelegate {
-    public let session: ARSession
-
-    public override init() {
-        session = ARSession()
-        super.init()
-        session.delegate = self
-    }
-
-    /// Starts world tracking with scene-depth capture when the device supports it.
-    public func start() {
-        let configuration = ARWorldTrackingConfiguration()
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            configuration.frameSemantics.insert(.sceneDepth)
+    public init(scanFrame: ScanFrame, keyframe: CameraKeyframe, cameraIntrinsics: [Double], media: [CaptureMedia]) throws {
+        guard cameraIntrinsics.count == 9,
+              cameraIntrinsics.allSatisfy(\.isFinite),
+              media.contains(where: { $0.kind == .rgb }),
+              Set(media.map(\.reference)).count == media.count else {
+            throw PhoneClientError.invalidInput("a capture observation requires unique camera intrinsics and RGB media")
         }
-        session.run(configuration)
-    }
-
-    /// Pauses capture without discarding the retained ARSession or world-coordinate identity.
-    public func pause() {
-        session.pause()
-    }
-
-    public func session(_ session: ARSession, didFailWithError error: Error) {
-        _ = (session, error)
+        try scanFrame.validate()
+        try keyframe.validate(worldCoordinateSystem: scanFrame.worldCoordinateSystem)
+        guard keyframe.trackingEpoch == scanFrame.trackingEpoch else {
+            throw PhoneClientError.invalidInput("camera keyframe and scan frame tracking epochs differ")
+        }
+        self.scanFrame = scanFrame
+        self.keyframe = keyframe
+        self.cameraIntrinsics = cameraIntrinsics
+        self.media = media
     }
 }
-#endif
+
+/// Human-entered supervision intent converted by the adapter into a canonical sample.
+public struct SupervisionLabelInput: Codable, Equatable, Sendable {
+    public let scope: LabelScope
+    public let visibility: [Double]
+    public let label: JointLabel
+    public let jointErrorM: Double
+
+    public init(scope: LabelScope, visibility: [Double], label: JointLabel, jointErrorM: Double) throws {
+        self.scope = scope
+        self.visibility = visibility
+        self.label = label
+        self.jointErrorM = jointErrorM
+        for value in visibility { try requireUnitInterval(value, field: "person visibility") }
+        try requireNonnegativeFinite(jointErrorM, field: "joint sample error")
+    }
+
+    public static func unknown(jointErrorM: Double = 0) throws -> SupervisionLabelInput {
+        try SupervisionLabelInput(scope: .locallyVisible, visibility: [], label: .unknown, jointErrorM: jointErrorM)
+    }
+}
+
+// MARK: - Apple session adapter
 
 #if canImport(SwiftUI)
 import SwiftUI
@@ -410,20 +481,37 @@ public struct CoverageMapView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            coverageRow("Visual scan", ranges.visualScan)
-            coverageRow("RF expected", ranges.rfExpectedObservable)
-            coverageRow("Field calibration", ranges.fieldCalibration)
+            coverageRow("Visual scan", ranges.visualScan, color: .blue)
+            coverageRow("RF expected", ranges.rfExpectedObservable, color: .orange)
+            coverageRow("Field calibration", ranges.fieldCalibration, color: .green)
         }
         .accessibilityElement(children: .contain)
     }
 
     @ViewBuilder
-    private func coverageRow(_ title: String, _ cells: [CoverageCell]) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            Text("\(cells.filter(\.covered).count)/\(cells.count)")
-                .monospacedDigit()
+    private func coverageRow(_ title: String, _ cells: [CoverageCell], color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text("\(cells.filter(\.covered).count)/\(cells.count)")
+                    .monospacedDigit()
+            }
+            GeometryReader { geometry in
+                let points = CoverageMapSummary(title: title, cells: cells).normalizedPoints
+                Canvas { context, size in
+                    for point in points {
+                        let x = point.x * max(size.width - 12, 1) + 6
+                        let y = (1 - point.y) * max(size.height - 12, 1) + 6
+                        let radius: CGFloat = 5
+                        let rect = CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2)
+                        context.fill(Path(ellipseIn: rect), with: .color(point.covered ? color : color.opacity(0.2)))
+                    }
+                }
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .accessibilityLabel("\(title) spatial coverage")
+            }
+            .frame(height: 64)
         }
     }
 }
@@ -459,25 +547,302 @@ public struct SupervisionLabelListView: View {
 }
 #endif
 
-#if os(iOS) && canImport(RoomPlan)
+#if os(iOS) && canImport(ARKit) && canImport(RoomPlan)
+import ARKit
 import RoomPlan
+import CoreVideo
+import simd
 
-/// RoomPlan capture adapter that deliberately keeps the AR session alive after stopping capture.
+/// RoomPlan/ARKit adapter that owns one shared session and turns delegate frames into artifacts.
 @available(iOS 16.0, *)
-public final class RoomPlanCaptureController {
+@MainActor
+public final class RoomPlanCaptureController: NSObject, RoomCaptureSessionDelegate, ARSessionDelegate {
+    /// The one AR session supplied to RoomPlan and retained for RGB/depth/pose capture.
+    public let session: ARSession
+    /// RoomPlan uses `session`; no second ARSession is created for supervision.
     public let captureSession: RoomCaptureSession
+    public private(set) var coordinator = RoomScanCoordinator()
+    public private(set) var latestSceneFrame: ScanFrame?
+    public private(set) var latestScene: SceneSnapshot?
+    public private(set) var latestObservation: PhoneCaptureObservation?
+    public private(set) var observations: [PhoneCaptureObservation] = []
+    public private(set) var usdzData: Data?
+    public var onObservation: ((PhoneCaptureObservation) -> Void)?
+    public var onError: ((Error) -> Void)?
+    private var latestRoom: CapturedRoom?
+    private var trackingEpoch: UInt32 = 1
+    private var wasTrackingNormally = false
+    private let worldCoordinateSystem = "roomplan-arkit-world"
 
     public init() {
-        captureSession = RoomCaptureSession()
+        let session = ARSession()
+        self.session = session
+        captureSession = RoomCaptureSession(arSession: session)
+        super.init()
+        captureSession.delegate = self
+        session.delegate = self
     }
 
-    public func start() {
+    /// Starts the complete scan workflow and retains the same AR session afterward.
+    public func start() throws {
+        try coordinator.startScan()
         captureSession.run(configuration: RoomCaptureSession.Configuration())
     }
 
-    /// Stops RoomPlan extraction while retaining AR tracking for RGB/depth/pose supervision.
+    /// Requests RoomPlan to process the current scan while keeping AR tracking alive.
     public func stopWithoutPausingARSession() {
         captureSession.stop(pauseARSession: false)
+    }
+
+    /// Pauses supervision while retaining the shared session and checkpoint.
+    public func pause() throws {
+        try coordinator.pause()
+        session.pause()
+    }
+
+    /// Resumes RoomPlan and AR sampling after a user-confirmed pause.
+    public func resume() throws {
+        try coordinator.resume()
+        captureSession.run(configuration: RoomCaptureSession.Configuration())
+    }
+
+    public func requestDimensionConfirmation() throws { try coordinator.requestConfirmation() }
+    public func confirmDimensions() throws { try coordinator.confirmDimensions() }
+    public func confirmDoors() throws { try coordinator.confirmDoors() }
+    public func registerRF(_ registration: RFDeviceRegistration) throws { try coordinator.registerRF(registration) }
+    public func confirmPhoneFixed() throws { try coordinator.confirmPhoneFixed() }
+
+    /// Completes a tracking reset only after ARKit reports a normal camera state.
+    public func relocalize() throws {
+        guard let frame = latestSceneFrame else { throw PhoneClientError.invalidState("no relocalized AR frame is available") }
+        guard frame.trackingQuality == .normal else { throw PhoneClientError.trackingResetRequiresRelocalization }
+        try coordinator.relocalized(frame: frame)
+    }
+
+    /// Converts one captured observation into a canonical supervision sample.
+    public func makeSupervisionSample(input: SupervisionLabelInput, timeRelation: PhoneTimeRelation) throws -> SupervisionSample {
+        guard let observation = latestObservation else { throw PhoneClientError.invalidState("no RGB/depth/pose observation is available") }
+        let timestamp = observation.keyframe.phoneTime
+        guard let rgb = observation.media.first(where: { $0.kind == .rgb }) else {
+            throw PhoneClientError.invalidArtifact("capture observation has no RGB media")
+        }
+        let depthReference = observation.media.first(where: { $0.kind == .depth })?.reference
+        let depthTime = observation.media.first(where: { $0.kind == .depth })?.phoneTime ?? timestamp
+        return SupervisionSample(
+            rgbReference: rgb.reference,
+            depthReference: depthReference,
+            poseReference: observation.keyframe.reference,
+            rgbTime: timestamp,
+            depthTime: depthTime,
+            poseTime: timestamp,
+            maximumTimeError: 0,
+            trackingEpoch: observation.keyframe.trackingEpoch,
+            relocalized: observation.keyframe.trackingQuality == .normal,
+            trackingQuality: observation.keyframe.trackingQuality,
+            depthQuality: depthReference == nil ? .missing : .measured,
+            scope: input.scope,
+            personVisibility: input.visibility,
+            label: input.label,
+            cameraToWorld: observation.keyframe.pose,
+            sampleSource: SourceIdentity(namespace: "phone-arkit", identity: observation.keyframe.reference),
+            jointErrorM: input.jointErrorM
+        )
+    }
+
+    // MARK: RoomCaptureSessionDelegate
+
+    public func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
+        guard session === captureSession else { return }
+        latestRoom = room
+        if let frame = session.arSession.currentFrame {
+            emitObservation(room: room, frame: frame)
+        }
+    }
+
+    public func captureSession(_ session: RoomCaptureSession, didEndWith data: CapturedRoomData, error: Error?) {
+        guard session === captureSession else { return }
+        if let error {
+            onError?(error)
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let room = try await RoomBuilder(options: []).capturedRoom(from: data)
+                self.latestRoom = room
+                self.latestScene = try self.makeScene(room: room)
+                self.usdzData = try self.exportUSDZ(room)
+                if let frame = self.session.currentFrame {
+                    self.emitObservation(room: room, frame: frame)
+                }
+            } catch {
+                self.onError?(error)
+            }
+        }
+    }
+
+    // MARK: ARSessionDelegate
+
+    public func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        guard session === self.session, let room = latestRoom else { return }
+        emitObservation(room: room, frame: frame)
+    }
+
+    public func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
+        guard session === self.session else { return }
+        let normal: Bool
+        switch camera.trackingState {
+        case .normal: normal = true
+        case .limited, .notAvailable: normal = false
+        }
+        if wasTrackingNormally && !normal {
+            trackingEpoch &+= 1
+            try? coordinator.trackingDidReset(to: trackingEpoch)
+        }
+        wasTrackingNormally = normal
+    }
+
+    public func session(_ session: ARSession, didFailWithError error: Error) {
+        guard session === self.session else { return }
+        onError?(error)
+    }
+
+    private func emitObservation(room: CapturedRoom, frame: ARFrame) {
+        let trackingQuality: TrackingQuality
+        switch frame.camera.trackingState {
+        case .normal: trackingQuality = .normal
+        case .limited, .notAvailable: trackingQuality = .limited
+        }
+        guard let rgb = try? CaptureMedia(reference: "rgb-\(frameNanoseconds(frame))", kind: .rgb, phoneTime: frameNanoseconds(frame), bytes: copyPixelBuffer(frame.capturedImage)) else { return }
+        let depth: CaptureMedia?
+        if let depthMap = frame.sceneDepth?.depthMap {
+            depth = try? CaptureMedia(reference: "depth-\(frameNanoseconds(frame))", kind: .depth, phoneTime: frameNanoseconds(frame), bytes: copyPixelBuffer(depthMap))
+        } else {
+            depth = nil
+        }
+        guard let scanFrame = try? makeScanFrame(room: room, frame: frame, trackingQuality: trackingQuality),
+              let pose = try? transform(frame.camera.transform, source: "camera", target: worldCoordinateSystem, error: trackingQuality == .normal ? 0.1 : 0.75) else { return }
+        let timestamp = frameNanoseconds(frame)
+        let keyframe = CameraKeyframe(reference: "pose-\(timestamp)", phoneTime: timestamp, pose: pose, trackingEpoch: trackingEpoch, trackingQuality: trackingQuality, depthQuality: depth == nil ? .missing : .measured)
+        let media = [rgb] + (depth.map { [$0] } ?? [])
+        guard let observation = try? PhoneCaptureObservation(scanFrame: scanFrame, keyframe: keyframe, cameraIntrinsics: intrinsicValues(frame.camera.intrinsics), media: media) else { return }
+        guard coordinatorAccepts(scanFrame) else {
+            // Keep the newest frame available for the explicit relocalize action;
+            // it is not emitted as a supervision observation until that gate succeeds.
+            if coordinator.requiresRelocalization {
+                latestSceneFrame = scanFrame
+                latestObservation = observation
+            }
+            return
+        }
+        latestSceneFrame = scanFrame
+        latestObservation = observation
+        observations.append(observation)
+        if observations.count > 100_000 { observations.removeFirst(observations.count - 100_000) }
+        onObservation?(observation)
+    }
+
+    private func coordinatorAccepts(_ frame: ScanFrame) -> Bool {
+        do {
+            try coordinator.accept(frame: frame)
+            return true
+        } catch {
+            if case .trackingResetRequiresRelocalization = error as? PhoneClientError {
+                return false
+            }
+            onError?(error)
+            return false
+        }
+    }
+
+    private func makeScanFrame(room: CapturedRoom, frame: ARFrame, trackingQuality: TrackingQuality) throws -> ScanFrame {
+        let elements = roomGeometry(room)
+        guard !elements.isEmpty else { throw PhoneClientError.invalidArtifact("RoomPlan did not produce structured geometry") }
+        let pose = try transform(frame.camera.transform, source: "camera", target: worldCoordinateSystem, error: trackingQuality == .normal ? 0.1 : 0.75)
+        let cells = elements.map { CoverageCell(positionM: $0.verticesM[0], covered: true) }
+        let validity = elements.map { $0.1 }
+        let geometry = elements.map { $0.0 }
+        return ScanFrame(worldCoordinateSystem: worldCoordinateSystem, geometry: geometry, geometryValidityMask: validity, coverageMask: cells, scanCoverage: Double(cells.filter(\.covered).count) / Double(cells.count), mapErrorM: trackingQuality == .normal ? 0.1 : 0.75, cameraToWorld: pose, trackingEpoch: trackingEpoch, trackingQuality: trackingQuality, depthQuality: frame.sceneDepth == nil ? .missing : .measured)
+    }
+
+    private func makeScene(room: CapturedRoom) throws -> SceneSnapshot {
+        let elements = roomGeometry(room)
+        guard !elements.isEmpty else { throw PhoneClientError.invalidArtifact("RoomPlan did not produce structured geometry") }
+        let geometry = elements.map { $0.0 }
+        let cells = geometry.map { CoverageCell(positionM: $0.verticesM[0], covered: true) }
+        let scene = SceneSnapshot(metadata: ArtifactMetadata(artifactID: "room-\(room.identifier.uuidString)", revision: 1, provenance: [SourceIdentity(namespace: "roomplan", identity: room.identifier.uuidString)]), worldCoordinateSystem: worldCoordinateSystem, geometry: geometry, geometryValidityMask: elements.map { $0.1 }, coverageMask: cells, scanCoverage: 1, mapErrorM: 0.1, usdzDisplayReference: "Room.usdz")
+        try scene.validate()
+        return scene
+    }
+
+    private func exportUSDZ(_ room: CapturedRoom) throws -> Data {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("Room.usdz")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try room.export(to: url, exportOptions: .mesh)
+        return try Data(contentsOf: url)
+    }
+}
+
+private func frameNanoseconds(_ frame: ARFrame) -> UInt64 {
+    UInt64(max(0, frame.timestamp * 1_000_000_000))
+}
+
+private func intrinsicValues(_ matrix: simd_float3x3) -> [Double] {
+    (0..<3).flatMap { row in (0..<3).map { column in Double(matrix[column][row]) } }
+}
+
+private func transform(_ matrix: simd_float4x4, source: String, target: String, error: Double) throws -> CoordinateTransform {
+    let values = (0..<4).flatMap { row in (0..<4).map { column in Double(matrix[column][row]) } }
+    let transform = CoordinateTransform(sourceCoordinateSystem: source, targetCoordinateSystem: target, matrix: values, maxErrorM: error)
+    try transform.validate()
+    return transform
+}
+
+private func copyPixelBuffer(_ buffer: CVPixelBuffer) -> Data {
+    CVPixelBufferLockBaseAddress(buffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+    var output = Data()
+    let planeCount = CVPixelBufferGetPlaneCount(buffer)
+    if planeCount == 0 {
+        if let address = CVPixelBufferGetBaseAddress(buffer) {
+            output.append(Data(bytes: address, count: CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer)))
+        }
+    } else {
+        for plane in 0..<planeCount {
+            if let address = CVPixelBufferGetBaseAddressOfPlane(buffer, plane) {
+                output.append(Data(bytes: address, count: CVPixelBufferGetBytesPerRowOfPlane(buffer, plane) * CVPixelBufferGetHeightOfPlane(buffer, plane)))
+            }
+        }
+    }
+    return output
+}
+
+private func roomGeometry(_ room: CapturedRoom) -> [(GeometryElement, Bool)] {
+    var result = [(GeometryElement, Bool)]()
+    let surfaces = room.floors + room.walls + room.doors + room.openings + room.windows
+    for surface in surfaces {
+        let kind: GeometryKind
+        switch surface.category {
+        case .door: kind = .door
+        default: kind = .wall
+        }
+        result.append((GeometryElement(kind: kind, verticesM: boxVertices(transform: surface.transform, dimensions: surface.dimensions)), surface.confidence != .low))
+    }
+    for object in room.objects {
+        result.append((GeometryElement(kind: .furniture, verticesM: boxVertices(transform: object.transform, dimensions: object.dimensions)), object.confidence != .low))
+    }
+    return result
+}
+
+private func boxVertices(transform: simd_float4x4, dimensions: simd_float3) -> [[Double]] {
+    let half = dimensions * 0.5
+    let corners: [simd_float3] = [
+        [-half.x, -half.y, -half.z], [half.x, -half.y, -half.z], [half.x, half.y, -half.z], [-half.x, half.y, -half.z],
+        [-half.x, -half.y, half.z], [half.x, -half.y, half.z], [half.x, half.y, half.z], [-half.x, half.y, half.z],
+    ]
+    return corners.map { corner in
+        let point = transform * SIMD4<Float>(corner.x, corner.y, corner.z, 1)
+        return [Double(point.x), Double(point.y), Double(point.z)]
     }
 }
 #endif

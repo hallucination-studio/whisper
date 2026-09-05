@@ -1,5 +1,29 @@
 import Foundation
 
+/// A bounded RGB or depth payload referenced by a supervision sample.
+public struct CaptureMedia: Codable, Equatable, Sendable {
+    public let reference: String
+    public let kind: CaptureMediaKind
+    public let phoneTime: UInt64
+    public let bytes: Data
+
+    public init(reference: String, kind: CaptureMediaKind, phoneTime: UInt64, bytes: Data) throws {
+        guard !reference.isEmpty, !bytes.isEmpty, bytes.count <= 8 * 1024 * 1024 else {
+            throw PhoneClientError.invalidInput("capture media reference or bounded payload is invalid")
+        }
+        self.reference = reference
+        self.kind = kind
+        self.phoneTime = phoneTime
+        self.bytes = bytes
+    }
+}
+
+/// Media kind retained for one aligned camera observation.
+public enum CaptureMediaKind: UInt8, Codable, Equatable, Sendable {
+    case rgb = 1
+    case depth = 2
+}
+
 /// A retained camera keyframe needed to replay scene-coordinate supervision.
 public struct CameraKeyframe: Codable, Equatable, Sendable {
     public let reference: String
@@ -32,8 +56,10 @@ public struct PhoneCapturePackage: Equatable, Sendable {
     public let scene: SceneSnapshot
     public let calibration: CalibrationBundle
     public let supervision: SupervisionSegment
-    /// Optional display-only USDZ bytes; structured scene geometry remains authoritative.
-    public let usdzData: Data?
+    /// Required RoomPlan USDZ bytes; structured scene geometry remains authoritative.
+    public let usdzData: Data
+    /// Bounded RGB/depth payloads referenced by supervision samples.
+    public let media: [CaptureMedia]
     public let keyframes: [CameraKeyframe]
     public let limits: ArtifactLimits
 
@@ -41,8 +67,9 @@ public struct PhoneCapturePackage: Equatable, Sendable {
         scene: SceneSnapshot,
         calibration: CalibrationBundle,
         supervision: SupervisionSegment,
-        usdzData: Data?,
+        usdzData: Data,
         keyframes: [CameraKeyframe],
+        media: [CaptureMedia],
         limits: ArtifactLimits = ArtifactLimits(),
         knownRFIdentities: Set<String>
     ) throws {
@@ -50,9 +77,10 @@ public struct PhoneCapturePackage: Equatable, Sendable {
         self.calibration = calibration
         self.supervision = supervision
         self.usdzData = usdzData
+        self.media = media
         self.keyframes = keyframes
         self.limits = limits
-        try validatePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, limits: limits, knownRFIdentities: knownRFIdentities)
+        try validatePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, limits: limits, knownRFIdentities: knownRFIdentities)
     }
 
     /// Returns the exact three WSA1 artifacts to upload or import through the Host.
@@ -71,19 +99,16 @@ public struct PhoneCapturePackage: Equatable, Sendable {
             payload.appendUInt32LE(UInt32(artifact.bytes.count))
             payload.append(artifact.bytes)
         }
-        if let usdzData {
-            guard usdzData.count <= limits.maxArtifactBytes else {
-                throw PhoneClientError.limitExceeded("USDZ display asset exceeds the package byte limit")
-            }
-            guard usdzData.count <= UInt32.max else {
-                throw PhoneClientError.limitExceeded("USDZ display asset length exceeds the package format")
-            }
-            payload.append(1)
-            payload.appendUInt32LE(UInt32(usdzData.count))
-            payload.append(usdzData)
-        } else {
-            payload.append(0)
-            payload.appendUInt32LE(0)
+        guard usdzData.count <= limits.maxArtifactBytes, usdzData.count <= UInt32.max else {
+            throw PhoneClientError.limitExceeded("USDZ display asset exceeds the package byte limit")
+        }
+        payload.append(1)
+        payload.appendUInt32LE(UInt32(usdzData.count))
+        payload.append(usdzData)
+        guard media.count <= 100_000 else { throw PhoneClientError.limitExceeded("capture media count exceeds the package limit") }
+        payload.appendUInt32LE(UInt32(media.count))
+        for item in media {
+            try encodeMedia(&payload, item, limits: limits)
         }
         guard keyframes.count <= 100_000 else { throw PhoneClientError.limitExceeded("camera keyframe limit exceeded") }
         guard payload.count <= UInt32.max else {
@@ -94,7 +119,7 @@ public struct PhoneCapturePackage: Equatable, Sendable {
             try encodeKeyframe(&payload, keyframe)
         }
         var archive = Data("WSP1".utf8)
-        archive.appendUInt16LE(1)
+        archive.appendUInt16LE(2)
         archive.appendUInt16LE(0)
         archive.appendUInt32LE(UInt32(payload.count))
         archive.append(payload)
@@ -113,7 +138,7 @@ public struct PhoneCapturePackage: Equatable, Sendable {
     /// Parses an archive and validates all embedded artifact relationships.
     public static func parse(_ archive: Data, knownRFIdentities: Set<String>, limits: ArtifactLimits = ArtifactLimits()) throws -> PhoneCapturePackage {
         try limits.validate()
-        guard archive.count >= 20, archive.count <= limits.maxArtifactBytes, archive.prefix(4) == Data("WSP1".utf8), archive.readUInt16LE(at: 4) == 1, archive.readUInt16LE(at: 6) == 0 else {
+        guard archive.count >= 20, archive.count <= limits.maxArtifactBytes, archive.prefix(4) == Data("WSP1".utf8), archive.readUInt16LE(at: 4) == 2, archive.readUInt16LE(at: 6) == 0 else {
             throw PhoneClientError.invalidArtifact("phone export archive header is invalid")
         }
         let payloadLength = Int(archive.readUInt32LE(at: 8))
@@ -133,16 +158,19 @@ public struct PhoneCapturePackage: Equatable, Sendable {
         }
         let hasUSDZ = try reader.u8()
         let usdzLength = Int(try reader.u32())
-        let usdzData: Data?
+        let usdzData: Data
         switch hasUSDZ {
-        case 0:
-            guard usdzLength == 0 else { throw PhoneClientError.invalidArtifact("USDZ marker and length differ") }
-            usdzData = nil
         case 1:
-            guard usdzLength <= limits.maxArtifactBytes else { throw PhoneClientError.limitExceeded("USDZ display asset exceeds the byte limit") }
+            guard usdzLength > 0, usdzLength <= limits.maxArtifactBytes else { throw PhoneClientError.limitExceeded("USDZ display asset exceeds the byte limit") }
             usdzData = try reader.take(usdzLength)
         default:
-            throw PhoneClientError.invalidArtifact("USDZ marker is invalid")
+            throw PhoneClientError.invalidArtifact("USDZ asset is required")
+        }
+        let mediaCount = try reader.count()
+        var media = [CaptureMedia]()
+        media.reserveCapacity(mediaCount)
+        for _ in 0..<mediaCount {
+            media.append(try decodeMedia(&reader, limits: limits))
         }
         let keyframeCount = try reader.count()
         var keyframes = [CameraKeyframe]()
@@ -155,7 +183,7 @@ public struct PhoneCapturePackage: Equatable, Sendable {
               case let .supervision(supervision) = try artifacts[2].decode() else {
             throw PhoneClientError.invalidArtifact("phone export artifacts are not scene/calibration/supervision")
         }
-        return try PhoneCapturePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, limits: limits, knownRFIdentities: knownRFIdentities)
+        return try PhoneCapturePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, limits: limits, knownRFIdentities: knownRFIdentities)
     }
 }
 
@@ -170,12 +198,12 @@ public struct PhoneArtifactExporter: Sendable {
         self.knownRFIdentities = knownRFIdentities
     }
 
-    public func makePackage(scene: SceneSnapshot, calibration: CalibrationBundle, supervision: SupervisionSegment, usdzData: Data? = nil, keyframes: [CameraKeyframe] = []) throws -> PhoneCapturePackage {
-        try PhoneCapturePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, limits: limits, knownRFIdentities: knownRFIdentities)
+    public func makePackage(scene: SceneSnapshot, calibration: CalibrationBundle, supervision: SupervisionSegment, usdzData: Data, keyframes: [CameraKeyframe], media: [CaptureMedia]) throws -> PhoneCapturePackage {
+        try PhoneCapturePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, limits: limits, knownRFIdentities: knownRFIdentities)
     }
 }
 
-private func validatePackage(scene: SceneSnapshot, calibration: CalibrationBundle, supervision: SupervisionSegment, usdzData: Data?, keyframes: [CameraKeyframe], limits: ArtifactLimits, knownRFIdentities: Set<String>) throws {
+private func validatePackage(scene: SceneSnapshot, calibration: CalibrationBundle, supervision: SupervisionSegment, usdzData: Data, keyframes: [CameraKeyframe], media: [CaptureMedia], limits: ArtifactLimits, knownRFIdentities: Set<String>) throws {
     try limits.validate()
     try scene.validate()
     try calibration.validate()
@@ -218,13 +246,81 @@ private func validatePackage(scene: SceneSnapshot, calibration: CalibrationBundl
         let total = scene.mapErrorM + supervision.sharedPositionErrorM + sample.cameraToWorld.maxErrorM + sample.jointErrorM + individualError + temporalErrorM
         guard total <= limits.maxPositionErrorM else { throw PhoneClientError.errorBudgetExceeded }
     }
-    if let usdzData, usdzData.count > limits.maxArtifactBytes { throw PhoneClientError.limitExceeded("USDZ display asset exceeds the package byte limit") }
+    guard !usdzData.isEmpty, usdzData.count <= limits.maxArtifactBytes else {
+        throw PhoneClientError.limitExceeded("USDZ display asset is required and bounded")
+    }
+    guard scene.usdzDisplayReference?.isEmpty == false else {
+        throw PhoneClientError.invalidArtifact("scene must name the required USDZ asset")
+    }
+    guard !keyframes.isEmpty else { throw PhoneClientError.invalidArtifact("supervision requires camera keyframes") }
+    guard !media.isEmpty else { throw PhoneClientError.invalidArtifact("supervision requires bounded RGB/depth media") }
+    var mediaByReference = [String: CaptureMedia]()
+    var mediaBytes = 0
+    for item in media {
+        guard mediaByReference.updateValue(item, forKey: item.reference) == nil else {
+            throw PhoneClientError.invalidArtifact("capture media references must be unique")
+        }
+        guard item.bytes.count <= limits.maxMediaBytes,
+              mediaBytes <= limits.maxMediaBytes - item.bytes.count else {
+            throw PhoneClientError.limitExceeded("referenced capture media exceeds its byte budget")
+        }
+        mediaBytes += item.bytes.count
+    }
     var previousTime: UInt64?
+    var keyframesByReference = [String: CameraKeyframe]()
     for keyframe in keyframes {
         try keyframe.validate(worldCoordinateSystem: scene.worldCoordinateSystem)
+        guard keyframesByReference.updateValue(keyframe, forKey: keyframe.reference) == nil else {
+            throw PhoneClientError.invalidArtifact("camera keyframe references must be unique")
+        }
         if let previousTime, keyframe.phoneTime < previousTime { throw PhoneClientError.invalidArtifact("camera keyframes are not time ordered") }
         previousTime = keyframe.phoneTime
     }
+    var referencedMedia = Set<String>()
+    var referencedKeyframes = Set<String>()
+    for sample in supervision.samples {
+        guard let rgb = mediaByReference[sample.rgbReference], rgb.kind == .rgb, rgb.phoneTime == sample.rgbTime else {
+            throw PhoneClientError.invalidArtifact("supervision RGB reference is incomplete")
+        }
+        referencedMedia.insert(sample.rgbReference)
+        if let depthReference = sample.depthReference {
+            guard let depth = mediaByReference[depthReference], depth.kind == .depth, depth.phoneTime == sample.depthTime else {
+                throw PhoneClientError.invalidArtifact("supervision depth reference is incomplete")
+            }
+            referencedMedia.insert(depthReference)
+        }
+        guard let keyframe = keyframesByReference[sample.poseReference], keyframe.phoneTime == sample.poseTime, keyframe.trackingEpoch == sample.trackingEpoch else {
+            throw PhoneClientError.invalidArtifact("supervision pose keyframe reference is incomplete")
+        }
+        referencedKeyframes.insert(sample.poseReference)
+    }
+    guard referencedMedia == Set(mediaByReference.keys), referencedKeyframes == Set(keyframesByReference.keys) else {
+        throw PhoneClientError.invalidArtifact("package contains unreferenced media or keyframes")
+    }
+}
+
+private func encodeMedia(_ output: inout Data, _ media: CaptureMedia, limits: ArtifactLimits) throws {
+    let reference = Data(media.reference.utf8)
+    guard reference.count <= 100_000, media.bytes.count <= limits.maxMediaBytes, media.bytes.count <= UInt32.max else {
+        throw PhoneClientError.limitExceeded("capture media reference or bytes exceed the package limit")
+    }
+    output.append(media.kind.rawValue)
+    output.appendUInt32LE(UInt32(reference.count))
+    output.append(reference)
+    output.appendUInt64LE(media.phoneTime)
+    output.appendUInt32LE(UInt32(media.bytes.count))
+    output.append(media.bytes)
+}
+
+private func decodeMedia(_ reader: inout BinaryReader, limits: ArtifactLimits) throws -> CaptureMedia {
+    guard let kind = CaptureMediaKind(rawValue: try reader.u8()) else {
+        throw PhoneClientError.invalidArtifact("capture media kind is unsupported")
+    }
+    let reference = try reader.string()
+    let phoneTime = try reader.u64()
+    let length = Int(try reader.u32())
+    guard length <= limits.maxMediaBytes else { throw PhoneClientError.limitExceeded("capture media exceeds the package limit") }
+    return try CaptureMedia(reference: reference, kind: kind, phoneTime: phoneTime, bytes: reader.take(length))
 }
 
 private func encodeKeyframe(_ output: inout Data, _ keyframe: CameraKeyframe) throws {

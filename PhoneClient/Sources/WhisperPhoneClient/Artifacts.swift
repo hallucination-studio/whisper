@@ -841,6 +841,8 @@ public enum Artifact: Equatable, Sendable {
 /// Import/resource limits shared by the phone exporter and Host contract.
 public struct ArtifactLimits: Equatable, Sendable {
     public var maxArtifactBytes: Int
+    /// Maximum aggregate RGB/depth bytes retained by one local phone package.
+    public var maxMediaBytes: Int
     public var maxGeometryElements: Int
     public var maxSupervisionSamples: Int
     public var maxPositionErrorM: Double
@@ -848,12 +850,14 @@ public struct ArtifactLimits: Equatable, Sendable {
 
     public init(
         maxArtifactBytes: Int = 16 * 1024 * 1024,
+        maxMediaBytes: Int = 8 * 1024 * 1024,
         maxGeometryElements: Int = 100_000,
         maxSupervisionSamples: Int = 100_000,
         maxPositionErrorM: Double = 0.75,
         minimumPersonVelocityMPS: Double = 12
     ) {
         self.maxArtifactBytes = maxArtifactBytes
+        self.maxMediaBytes = maxMediaBytes
         self.maxGeometryElements = maxGeometryElements
         self.maxSupervisionSamples = maxSupervisionSamples
         self.maxPositionErrorM = maxPositionErrorM
@@ -861,7 +865,7 @@ public struct ArtifactLimits: Equatable, Sendable {
     }
 
     public func validate() throws {
-        guard maxArtifactBytes > 0, maxGeometryElements > 0, maxSupervisionSamples > 0 else {
+        guard maxArtifactBytes > 0, maxMediaBytes > 0, maxMediaBytes <= maxArtifactBytes, maxGeometryElements > 0, maxSupervisionSamples > 0 else {
             throw PhoneClientError.limitExceeded("artifact limits must be non-zero")
         }
         try requireNonnegativeFinite(maxPositionErrorM, field: "position error limit")

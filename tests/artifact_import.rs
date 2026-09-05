@@ -705,6 +705,36 @@ fn scene() -> SceneSnapshot {
     }
 }
 
+#[test]
+fn rust_and_swift_scene_fixtures_round_trip_through_rust_wsa1_codec() {
+    for (fixture, artifact_id) in [
+        (include_str!("fixtures/phone-client-171/rust-scene-wsa1.hex"), "room-a"),
+        (include_str!("fixtures/phone-client-171/swift-scene-wsa1.hex"), "swift-room-b"),
+    ] {
+        let bytes = decode_hex_fixture(fixture);
+        let sealed = SealedArtifact::parse(&bytes).unwrap();
+        let artifact = sealed.decode().unwrap();
+        assert!(
+            matches!(&artifact, Artifact::Scene(scene) if scene.metadata.artifact_id == artifact_id)
+        );
+        assert_eq!(SealedArtifact::seal(artifact).unwrap().bytes(), bytes.as_slice());
+    }
+}
+
+fn decode_hex_fixture(hex: &str) -> Vec<u8> {
+    let compact: String = hex.chars().filter(|character| !character.is_whitespace()).collect();
+    assert_eq!(compact.len() % 2, 0, "fixture hex has odd length");
+    compact
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).expect("fixture high nibble");
+            let low = (pair[1] as char).to_digit(16).expect("fixture low nibble");
+            ((high << 4) | low) as u8
+        })
+        .collect()
+}
+
 fn pair_companion(
     host: &whisper::HostRuntime,
     displayed_offer: &whisper::companion::PairingOffer,

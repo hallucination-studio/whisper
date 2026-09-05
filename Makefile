@@ -4,12 +4,22 @@ PROVISION_TOOLS_DIRECTORY := $(FIRMWARE_DIRECTORY)/build/provision-tools
 NVS_PARTITION_TOOL_DIRECTORY := $(PROVISION_TOOLS_DIRECTORY)/nvs-partition-tool
 PROVISION_PYTHON := $(PROVISION_TOOLS_DIRECTORY)/venv/bin/python
 
-.PHONY: check check-firmware check-phone check-policy check-python check-rust esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
+PHONE_XCODE_SCHEME ?= WhisperPhoneClient-Package
+PHONE_XCODE_DESTINATION ?= platform=iOS Simulator,name=iPhone 16,OS=18.5
+PHONE_XCODE_DERIVED_DATA ?= .build-xcode
+
+.PHONY: check check-firmware check-phone check-phone-source check-phone-xcode check-policy check-python check-rust esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
 
 check: check-policy check-python check-rust check-phone check-firmware
 
 check-phone:
 	swift test --package-path PhoneClient
+
+check-phone-source:
+	phone_build_dir=$$(mktemp -d /tmp/whisper-phone-source.XXXXXX) && swiftc -swift-version 5 -parse-as-library -emit-module -emit-module-path "$$phone_build_dir/WhisperPhoneClient.swiftmodule" -module-name WhisperPhoneClient PhoneClient/Sources/WhisperPhoneClient/*.swift && swiftc -swift-version 5 -parse-as-library -typecheck -I "$$phone_build_dir" PhoneClient/Sources/WhisperPhoneClientApp/WhisperPhoneClientApp.swift
+
+check-phone-xcode:
+	cd PhoneClient && xcodebuild -scheme "$(PHONE_XCODE_SCHEME)" -destination "$(PHONE_XCODE_DESTINATION)" -derivedDataPath "$(PHONE_XCODE_DERIVED_DATA)" test
 
 check-firmware: esp32-native-frame-firmware
 

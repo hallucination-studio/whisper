@@ -12,6 +12,21 @@ private let chunkNonceDomain = Data("whisper companion chunk nonce v2\0".utf8)
 private let uploadKeyDomain = Data("whisper companion AES-256-GCM per-content-layout upload key v3\0".utf8)
 private let chunkAADDomain = Data("whisper companion chunk v2\0".utf8)
 
+/// Wall-clock capability used to enforce authenticated invitation and session expiry.
+public protocol CompanionWallClock: Sendable {
+    /// Returns UTC nanoseconds since the Unix epoch, matching `expiresAtUTC`.
+    func nowUTC() -> UInt64
+}
+
+/// Production UTC clock for companion lifetime checks.
+public struct SystemCompanionWallClock: CompanionWallClock, Sendable {
+    public init() {}
+
+    public func nowUTC() -> UInt64 {
+        UInt64(max(0, Date().timeIntervalSince1970 * 1_000_000_000))
+    }
+}
+
 /// Stable public Ed25519 identity pinned by the phone before it accepts Host data.
 public struct CompanionServerIdentity: Codable, Equatable, Hashable, Sendable, CustomStringConvertible {
     public let bytes: Data
@@ -119,7 +134,8 @@ public struct CompanionInvitation: Equatable, Sendable {
     public static func fromWire(
         _ wire: Data,
         pinnedServerIdentity: CompanionServerIdentity,
-        crypto: any CompanionCrypto = SystemCompanionCrypto()
+        crypto: any CompanionCrypto = SystemCompanionCrypto(),
+        wallClock: any CompanionWallClock = SystemCompanionWallClock()
     ) throws -> CompanionInvitation {
         guard wire.count == 156, wire.prefix(4) == Data("WSO1".utf8) else {
             throw PhoneClientError.malformedWire("pairing invitation has the wrong length or magic")
@@ -139,6 +155,7 @@ public struct CompanionInvitation: Equatable, Sendable {
             message: invitation.signatureTranscript,
             signature: invitation.serverProof
         )
+        try invitation.validateFresh(atUTC: wallClock.nowUTC())
         return invitation
     }
 
@@ -159,8 +176,10 @@ public struct CompanionInvitation: Equatable, Sendable {
         clientNonce: ClientNonce,
         clientEphemeralSecret: ClientEphemeralSecret,
         clockResponses: [ClockSampleResponse],
-        crypto: any CompanionCrypto = SystemCompanionCrypto()
+        crypto: any CompanionCrypto = SystemCompanionCrypto(),
+        wallClock: any CompanionWallClock = SystemCompanionWallClock()
     ) throws -> (request: CompanionHandshakeRequest, pending: PendingCompanionConnection) {
+        try validateFresh(atUTC: wallClock.nowUTC())
         guard (3...8).contains(clockResponses.count) else {
             throw PhoneClientError.timeRelationError("three to eight clock responses are required")
         }
@@ -196,9 +215,15 @@ public struct CompanionInvitation: Equatable, Sendable {
                 pairingCode: pairingCode,
                 sharedSecret: sharedSecret,
                 clientEphemeralPublicKey: clientPublicKey,
+                expiresAtUTC: expiresAtUTC,
                 crypto: crypto
             )
         )
+    }
+
+    /// Rejects an invitation at or after its authenticated expiry boundary.
+    public func validateFresh(atUTC nowUTC: UInt64) throws {
+        guard nowUTC < expiresAtUTC else { throw PhoneClientError.invitationExpired }
     }
 
     private var signatureTranscript: Data {
@@ -413,20 +438,23 @@ public struct PendingCompanionConnection: Sendable {
     fileprivate let pairingCode: PairingCode
     fileprivate let sharedSecret: Data
     fileprivate let clientEphemeralPublicKey: Data
+    fileprivate let expiresAtUTC: UInt64
     fileprivate let crypto: any CompanionCrypto
 
-    fileprivate init(pairingID: PairingID, serverIdentity: CompanionServerIdentity, clientNonce: ClientNonce, pairingCode: PairingCode, sharedSecret: Data, clientEphemeralPublicKey: Data, crypto: any CompanionCrypto) {
+    fileprivate init(pairingID: PairingID, serverIdentity: CompanionServerIdentity, clientNonce: ClientNonce, pairingCode: PairingCode, sharedSecret: Data, clientEphemeralPublicKey: Data, expiresAtUTC: UInt64, crypto: any CompanionCrypto) {
         self.pairingID = pairingID
         self.serverIdentity = serverIdentity
         self.clientNonce = clientNonce
         self.pairingCode = pairingCode
         self.sharedSecret = sharedSecret
         self.clientEphemeralPublicKey = clientEphemeralPublicKey
+        self.expiresAtUTC = expiresAtUTC
         self.crypto = crypto
     }
 
     /// Verifies the pinned Host response and constructs an encrypted phone session.
-    public func complete(_ response: CompanionHandshakeResponse) throws -> CompanionConnection {
+    public func complete(_ response: CompanionHandshakeResponse, wallClock: any CompanionWallClock = SystemCompanionWallClock()) throws -> CompanionConnection {
+        guard wallClock.nowUTC() < expiresAtUTC else { throw PhoneClientError.invitationExpired }
         let transcript = connectionTranscript(server: serverIdentity, pairingID: pairingID, sessionID: response.sessionID, clientNonce: clientNonce, clientEphemeralPublicKey: clientEphemeralPublicKey, relation: response.clockRelation)
         try crypto.verifyEd25519(publicKey: serverIdentity.bytes, message: transcript, signature: response.serverProof)
         var info = sessionKeyDomain
@@ -437,7 +465,7 @@ public struct PendingCompanionConnection: Sendable {
         info.append(clientNonce.bytes)
         info.append(encodePhoneRelation(response.clockRelation))
         let key = try hkdfSHA256(inputKeyMaterial: sharedSecret, salt: pairingCode.bytes, info: info, outputByteCount: 32)
-        return CompanionConnection(pairingID: pairingID, sessionID: response.sessionID, key: key, serverIdentity: serverIdentity, clockRelation: response.clockRelation, clientNonce: clientNonce, clientEphemeralPublicKey: clientEphemeralPublicKey, serverProof: response.serverProof, crypto: crypto)
+        return CompanionConnection(pairingID: pairingID, sessionID: response.sessionID, key: key, serverIdentity: serverIdentity, clockRelation: response.clockRelation, clientNonce: clientNonce, clientEphemeralPublicKey: clientEphemeralPublicKey, serverProof: response.serverProof, expiresAtUTC: expiresAtUTC, crypto: crypto)
     }
 }
 
@@ -451,9 +479,10 @@ public struct CompanionConnection: Sendable {
     fileprivate let clientNonce: ClientNonce
     fileprivate let clientEphemeralPublicKey: Data
     fileprivate let serverProof: Data
+    fileprivate let expiresAtUTC: UInt64
     fileprivate let crypto: any CompanionCrypto
 
-    fileprivate init(pairingID: PairingID, sessionID: Data, key: Data, serverIdentity: CompanionServerIdentity, clockRelation: PhoneTimeRelation, clientNonce: ClientNonce, clientEphemeralPublicKey: Data, serverProof: Data, crypto: any CompanionCrypto) {
+    fileprivate init(pairingID: PairingID, sessionID: Data, key: Data, serverIdentity: CompanionServerIdentity, clockRelation: PhoneTimeRelation, clientNonce: ClientNonce, clientEphemeralPublicKey: Data, serverProof: Data, expiresAtUTC: UInt64, crypto: any CompanionCrypto) {
         self.pairingID = pairingID
         self.sessionID = sessionID
         self.key = key
@@ -462,6 +491,7 @@ public struct CompanionConnection: Sendable {
         self.clientNonce = clientNonce
         self.clientEphemeralPublicKey = clientEphemeralPublicKey
         self.serverProof = serverProof
+        self.expiresAtUTC = expiresAtUTC
         self.crypto = crypto
     }
 
@@ -569,17 +599,329 @@ public struct CompanionChunk: Equatable, Sendable {
     }
 }
 
+/// Host disposition for one accepted companion chunk.
+public enum CompanionUploadReplyStatus: UInt8, Codable, Equatable, Sendable {
+    case pending = 1
+    case committed = 2
+    case rejected = 3
+}
+
+/// Bounded rejection code returned by the Host upload endpoint.
+public enum CompanionUploadRejectReason: UInt8, Codable, Equatable, Sendable, CustomStringConvertible {
+    case pairingUnavailable = 1
+    case serverIdentityMismatch = 2
+    case invalidClockRelation = 3
+    case sessionUnavailable = 4
+    case authenticationFailed = 5
+    case limitExceeded = 6
+    case uploadConflict = 7
+    case artifactRejected = 8
+
+    public var description: String {
+        switch self {
+        case .pairingUnavailable: return "pairing unavailable"
+        case .serverIdentityMismatch: return "server identity mismatch"
+        case .invalidClockRelation: return "invalid clock relation"
+        case .sessionUnavailable: return "session unavailable"
+        case .authenticationFailed: return "authentication failed"
+        case .limitExceeded: return "upload limit exceeded"
+        case .uploadConflict: return "upload conflict"
+        case .artifactRejected: return "artifact rejected"
+        }
+    }
+}
+
+/// Cumulative Host progress bound to one exact encrypted upload layout.
+public struct CompanionUploadProgress: Equatable, Sendable {
+    public let sessionID: Data
+    public let uploadID: UploadID
+    public let chunkCount: UInt32
+    public let chunkPlaintextBytes: UInt32
+    public let totalBytes: UInt64
+    public let fullDigest: Data
+    public let receivedIndices: [UInt32]
+
+    public init(
+        sessionID: Data,
+        uploadID: UploadID,
+        chunkCount: UInt32,
+        chunkPlaintextBytes: UInt32,
+        totalBytes: UInt64,
+        fullDigest: Data,
+        receivedIndices: [UInt32]
+    ) throws {
+        let unique = Set(receivedIndices)
+        guard sessionID.count == 16,
+              fullDigest.count == 32,
+              (1...1_024).contains(chunkCount),
+              (1...(64 * 1024)).contains(chunkPlaintextBytes),
+              totalBytes > 0,
+              totalBytes <= 16 * 1024 * 1024,
+              UInt64(chunkCount) == (totalBytes + UInt64(chunkPlaintextBytes) - 1) / UInt64(chunkPlaintextBytes),
+              unique.count == receivedIndices.count,
+              receivedIndices.allSatisfy({ $0 < chunkCount }) else {
+            throw PhoneClientError.malformedWire("companion upload progress layout is invalid")
+        }
+        self.sessionID = sessionID
+        self.uploadID = uploadID
+        self.chunkCount = chunkCount
+        self.chunkPlaintextBytes = chunkPlaintextBytes
+        self.totalBytes = totalBytes
+        self.fullDigest = fullDigest
+        self.receivedIndices = receivedIndices.sorted()
+    }
+
+    fileprivate var allIndices: [UInt32] { Array(0..<chunkCount) }
+}
+
+/// Host receipt for an artifact committed after all chunks were assembled.
+public struct CompanionUploadReceipt: Equatable, Sendable {
+    public let progress: CompanionUploadProgress
+    public let artifactDigest: ArtifactDigest
+    public let artifactKind: UInt8
+    public let artifactID: String
+    public let revision: UInt32
+    /// `1` denotes the authenticated companion import path.
+    public let origin: UInt8
+
+    public init(
+        progress: CompanionUploadProgress,
+        artifactDigest: ArtifactDigest,
+        artifactKind: UInt8,
+        artifactID: String,
+        revision: UInt32,
+        origin: UInt8 = 1
+    ) throws {
+        guard progress.receivedIndices == progress.allIndices,
+              (1...3).contains(artifactKind),
+              artifactDigest.bytes == progress.fullDigest,
+              !artifactID.isEmpty,
+              artifactID.utf8.count <= 100_000,
+              origin == 1 else {
+            throw PhoneClientError.uploadConflict
+        }
+        self.progress = progress
+        self.artifactDigest = artifactDigest
+        self.artifactKind = artifactKind
+        self.artifactID = artifactID
+        self.revision = revision
+        self.origin = origin
+    }
+}
+
+/// Authenticated Host response; a sent frame is not considered acknowledged until this parses.
+public enum CompanionUploadReply: Equatable, Sendable {
+    case pending(CompanionUploadProgress)
+    case committed(CompanionUploadReceipt)
+    case rejected(progress: CompanionUploadProgress, reason: CompanionUploadRejectReason)
+
+    /// Decodes the bounded `WSU1` committed-progress/receipt response.
+    public static func fromWire(_ wire: Data) throws -> CompanionUploadReply {
+        guard wire.count >= 132, wire.prefix(4) == Data("WSU1".utf8) else {
+            throw PhoneClientError.malformedWire("companion upload response header is invalid")
+        }
+        guard let status = CompanionUploadReplyStatus(rawValue: wire[4]) else {
+            throw PhoneClientError.malformedWire("companion upload response status is unsupported")
+        }
+        let reason = wire[5]
+        let artifactKind = wire[6]
+        let origin = wire[7]
+        let sessionID = Data(wire[8..<24])
+        let uploadID = try UploadID(bytes: Data(wire[24..<40]))
+        let chunkCount = wire.readUInt32LE(at: 40)
+        let chunkPlaintextBytes = wire.readUInt32LE(at: 44)
+        let totalBytes = wire.readUInt64LE(at: 48)
+        let fullDigest = Data(wire[56..<88])
+        let receivedCount = Int(wire.readUInt32LE(at: 88))
+        guard receivedCount <= 1_024,
+              92 + receivedCount * 4 + 40 <= wire.count else {
+            throw PhoneClientError.malformedWire("companion upload response progress is out of bounds")
+        }
+        var received = [UInt32]()
+        received.reserveCapacity(receivedCount)
+        for index in 0..<receivedCount {
+            received.append(wire.readUInt32LE(at: 92 + index * 4))
+        }
+        let suffix = 92 + receivedCount * 4
+        let artifactDigest = Data(wire[suffix..<(suffix + 32)])
+        let revision = wire.readUInt32LE(at: suffix + 32)
+        let artifactIDLength = Int(wire.readUInt32LE(at: suffix + 36))
+        guard artifactIDLength <= 100_000,
+              suffix + 40 + artifactIDLength == wire.count else {
+            throw PhoneClientError.malformedWire("companion upload response receipt is out of bounds")
+        }
+        guard let artifactID = String(data: Data(wire[(suffix + 40)..<wire.count]), encoding: .utf8),
+              artifactID.utf8.count == artifactIDLength else {
+            throw PhoneClientError.malformedWire("companion upload response artifact ID is not UTF-8")
+        }
+        let progress = try CompanionUploadProgress(
+            sessionID: sessionID,
+            uploadID: uploadID,
+            chunkCount: chunkCount,
+            chunkPlaintextBytes: chunkPlaintextBytes,
+            totalBytes: totalBytes,
+            fullDigest: fullDigest,
+            receivedIndices: received
+        )
+        switch status {
+        case .pending:
+            guard reason == 0, artifactKind == 0, origin == 0, artifactDigest.allSatisfy({ $0 == 0 }), revision == 0, artifactID.isEmpty else {
+                throw PhoneClientError.malformedWire("pending response carries a receipt")
+            }
+            return .pending(progress)
+        case .committed:
+            guard reason == 0, origin == 1, artifactIDLength > 0 else {
+                throw PhoneClientError.malformedWire("committed response is missing its receipt")
+            }
+            guard let digest = try? ArtifactDigest(bytes: artifactDigest) else {
+                throw PhoneClientError.malformedWire("committed response digest is invalid")
+            }
+            return .committed(try CompanionUploadReceipt(progress: progress, artifactDigest: digest, artifactKind: artifactKind, artifactID: artifactID, revision: revision, origin: origin))
+        case .rejected:
+            guard let rejection = CompanionUploadRejectReason(rawValue: reason), artifactKind == 0, origin == 0, artifactDigest.allSatisfy({ $0 == 0 }), revision == 0, artifactID.isEmpty else {
+                throw PhoneClientError.malformedWire("rejected response carries invalid receipt fields")
+            }
+            return .rejected(progress: progress, reason: rejection)
+        }
+    }
+
+    /// Encodes a deterministic response fixture for transports and integration tests.
+    public func toWire() -> Data {
+        let progress: CompanionUploadProgress
+        let status: CompanionUploadReplyStatus
+        let reason: UInt8
+        let artifactKind: UInt8
+        let origin: UInt8
+        let artifactDigest: Data
+        let revision: UInt32
+        let artifactID: Data
+        switch self {
+        case let .pending(value):
+            progress = value
+            status = .pending
+            reason = 0
+            artifactKind = 0
+            origin = 0
+            artifactDigest = Data(repeating: 0, count: 32)
+            revision = 0
+            artifactID = Data()
+        case let .committed(value):
+            progress = value.progress
+            status = .committed
+            reason = 0
+            artifactKind = value.artifactKind
+            origin = value.origin
+            artifactDigest = value.artifactDigest.bytes
+            revision = value.revision
+            artifactID = Data(value.artifactID.utf8)
+        case let .rejected(value, rejection):
+            progress = value
+            status = .rejected
+            reason = rejection.rawValue
+            artifactKind = 0
+            origin = 0
+            artifactDigest = Data(repeating: 0, count: 32)
+            revision = 0
+            artifactID = Data()
+        }
+        var wire = Data("WSU1".utf8)
+        wire.append(status.rawValue)
+        wire.append(reason)
+        wire.append(artifactKind)
+        wire.append(origin)
+        wire.append(progress.sessionID)
+        wire.append(progress.uploadID.bytes)
+        wire.appendUInt32LE(progress.chunkCount)
+        wire.appendUInt32LE(progress.chunkPlaintextBytes)
+        wire.appendUInt64LE(progress.totalBytes)
+        wire.append(progress.fullDigest)
+        wire.appendUInt32LE(UInt32(progress.receivedIndices.count))
+        for index in progress.receivedIndices { wire.appendUInt32LE(index) }
+        wire.append(artifactDigest)
+        wire.appendUInt32LE(revision)
+        wire.appendUInt32LE(UInt32(artifactID.count))
+        wire.append(artifactID)
+        return wire
+    }
+
+    fileprivate func apply(to plan: inout ResumableUpload) throws {
+        let progress: CompanionUploadProgress
+        let rejection: CompanionUploadRejectReason?
+        switch self {
+        case let .pending(value):
+            progress = value
+            rejection = nil
+        case let .committed(value):
+            progress = value.progress
+            rejection = nil
+        case let .rejected(value, reason):
+            progress = value
+            rejection = reason
+        }
+        guard progress.sessionID == plan.sessionID,
+              progress.uploadID == plan.uploadID,
+              progress.chunkCount == plan.chunkCount,
+              progress.chunkPlaintextBytes == plan.chunkPlaintextBytes,
+              progress.totalBytes == plan.totalBytes,
+              progress.fullDigest == plan.fullDigest else {
+            throw PhoneClientError.uploadConflict
+        }
+        if let rejection {
+            throw PhoneClientError.uploadRejected(rejection.description)
+        }
+        let before = plan.acknowledgedIndices
+        try plan.acknowledge(indices: progress.receivedIndices)
+        switch self {
+        case .committed:
+            guard plan.isComplete else { throw PhoneClientError.uploadConflict }
+        case .pending:
+            guard plan.isComplete || plan.acknowledgedIndices != before else {
+                throw PhoneClientError.uploadConflict
+            }
+        case .rejected:
+            break
+        }
+    }
+}
+
 /// A resumable upload plan whose acknowledged chunks can be persisted independently of transport.
 public struct ResumableUpload: Sendable {
     public let uploadID: UploadID
     public let chunks: [CompanionChunk]
     private var acknowledged: Set<UInt32>
 
-    public init(uploadID: UploadID, chunks: [CompanionChunk], acknowledged: Set<UInt32> = []) {
+    public init(uploadID: UploadID, chunks: [CompanionChunk], acknowledged: Set<UInt32> = []) throws {
+        guard !chunks.isEmpty else { throw PhoneClientError.uploadConflict }
+        guard let first = chunks.first,
+              first.uploadID == uploadID,
+              chunks.count == Int(first.chunkCount) else {
+            throw PhoneClientError.uploadConflict
+        }
+        let indexes = chunks.map(\.index)
+        guard Set(indexes).count == chunks.count,
+              Set(indexes) == Set(0..<first.chunkCount),
+              chunks.allSatisfy({ chunk in
+                  chunk.uploadID == uploadID &&
+                  chunk.sessionID == first.sessionID &&
+                  chunk.chunkCount == first.chunkCount &&
+                  chunk.chunkPlaintextBytes == first.chunkPlaintextBytes &&
+                  chunk.totalBytes == first.totalBytes &&
+                  chunk.fullDigest == first.fullDigest
+              }),
+              acknowledged.isSubset(of: Set(indexes)) else {
+            throw PhoneClientError.uploadConflict
+        }
         self.uploadID = uploadID
-        self.chunks = chunks
+        self.chunks = chunks.sorted { $0.index < $1.index }
         self.acknowledged = acknowledged
     }
+
+    public var sessionID: Data { chunks[0].sessionID }
+    public var chunkCount: UInt32 { chunks[0].chunkCount }
+    public var chunkPlaintextBytes: UInt32 { chunks[0].chunkPlaintextBytes }
+    public var totalBytes: UInt64 { chunks[0].totalBytes }
+    public var fullDigest: Data { chunks[0].fullDigest }
+    public var acknowledgedIndices: Set<UInt32> { acknowledged }
 
     public var pendingChunks: [CompanionChunk] {
         chunks.filter { !acknowledged.contains($0.index) }
@@ -593,6 +935,10 @@ public struct ResumableUpload: Sendable {
         }
         acknowledged.insert(index)
     }
+
+    fileprivate mutating func acknowledge(indices: [UInt32]) throws {
+        for index in indices { try acknowledge(index: index) }
+    }
 }
 
 /// Minimal transport boundary used by the upload coordinator.
@@ -604,11 +950,25 @@ public protocol CompanionByteTransport: Sendable {
 public struct CompanionUploadCoordinator: Sendable {
     public init() {}
 
-    public func upload(_ plan: inout ResumableUpload, through transport: any CompanionByteTransport) async throws {
-        for chunk in plan.pendingChunks {
-            _ = try await transport.send(chunk.toWire())
-            try plan.acknowledge(index: chunk.index)
+    public func upload(_ plan: inout ResumableUpload, through transport: any CompanionByteTransport, cache: FileUploadCache? = nil) async throws {
+        if let cache { try await cache.save(plan) }
+        while !plan.isComplete {
+            guard let chunk = plan.pendingChunks.first else { throw PhoneClientError.uploadConflict }
+            let reply = try CompanionUploadReply.fromWire(try await transport.send(chunk.toWire()))
+            try reply.apply(to: &plan)
+            if let cache { try await cache.save(plan) }
         }
+    }
+}
+
+/// Durable upload progress written alongside encrypted chunk files for restart recovery.
+public struct ResumableUploadCheckpoint: Codable, Equatable, Sendable {
+    public let uploadID: UploadID
+    public let acknowledgedIndices: [UInt32]
+
+    public init(uploadID: UploadID, acknowledgedIndices: Set<UInt32>) {
+        self.uploadID = uploadID
+        self.acknowledgedIndices = acknowledgedIndices.sorted()
     }
 }
 
@@ -637,6 +997,14 @@ public actor FileUploadCache {
         #endif
     }
 
+    /// Persists every chunk and the cumulative Host progress for restart-safe resume.
+    public func save(_ plan: ResumableUpload) throws {
+        for chunk in plan.chunks { try store(chunk) }
+        let checkpoint = ResumableUploadCheckpoint(uploadID: plan.uploadID, acknowledgedIndices: plan.acknowledgedIndices)
+        let bytes = try JSONEncoder().encode(checkpoint)
+        try bytes.write(to: checkpointURL(uploadID: plan.uploadID), options: [.atomic])
+    }
+
     /// Reads all cached chunks for one upload in index order.
     public func load(uploadID: UploadID, maxArtifactBytes: Int = 16 * 1024 * 1024) throws -> [CompanionChunk] {
         let prefix = "\(uploadID.bytes.map { String(format: "%02x", $0) }.joined())-"
@@ -653,17 +1021,44 @@ public actor FileUploadCache {
         return chunks.sorted { $0.index < $1.index }
     }
 
+    /// Restores a complete upload plan and its acknowledged-index set after process restart.
+    public func loadPlan(uploadID: UploadID, maxArtifactBytes: Int = 16 * 1024 * 1024) throws -> ResumableUpload {
+        let chunks = try load(uploadID: uploadID, maxArtifactBytes: maxArtifactBytes)
+        let checkpointURL = checkpointURL(uploadID: uploadID)
+        let acknowledged: Set<UInt32>
+        if FileManager.default.fileExists(atPath: checkpointURL.path) {
+            let checkpoint = try JSONDecoder().decode(ResumableUploadCheckpoint.self, from: Data(contentsOf: checkpointURL))
+            guard checkpoint.uploadID == uploadID,
+                  Set(checkpoint.acknowledgedIndices).count == checkpoint.acknowledgedIndices.count else {
+                throw PhoneClientError.uploadConflict
+            }
+            acknowledged = Set(checkpoint.acknowledgedIndices)
+        } else {
+            acknowledged = []
+        }
+        return try ResumableUpload(uploadID: uploadID, chunks: chunks, acknowledged: acknowledged)
+    }
+
     /// Removes one upload's cached encrypted chunks after a committed receipt.
     public func remove(uploadID: UploadID) throws {
         let prefix = "\(uploadID.bytes.map { String(format: "%02x", $0) }.joined())-"
         for name in try FileManager.default.contentsOfDirectory(atPath: directory.path) where name.hasPrefix(prefix) && name.hasSuffix(".wsc1") {
             try FileManager.default.removeItem(at: directory.appendingPathComponent(name))
         }
+        let checkpointURL = checkpointURL(uploadID: uploadID)
+        if FileManager.default.fileExists(atPath: checkpointURL.path) {
+            try FileManager.default.removeItem(at: checkpointURL)
+        }
     }
 
     private func fileURL(uploadID: UploadID, index: UInt32) -> URL {
         let identifier = uploadID.bytes.map { String(format: "%02x", $0) }.joined()
         return directory.appendingPathComponent("\(identifier)-\(index).wsc1", isDirectory: false)
+    }
+
+    private func checkpointURL(uploadID: UploadID) -> URL {
+        let identifier = uploadID.bytes.map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent("\(identifier).json", isDirectory: false)
     }
 }
 

@@ -1,0 +1,35 @@
+name: Phone client iOS
+
+on:
+  pull_request:
+    paths:
+      - "PhoneClient/**"
+      - "Makefile"
+      - "docs/operations/phone-client.md"
+      - ".github/workflows/phone-client-ios.yml"
+  push:
+    paths:
+      - "PhoneClient/**"
+      - "Makefile"
+      - "docs/operations/phone-client.md"
+      - ".github/workflows/phone-client-ios.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  xcode-simulator:
+    name: Xcode iOS simulator package gate
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - name: Select the pinned Xcode toolchain
+        run: sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Verify the fixed simulator destination is available
+        run: |
+          xcodebuild -version
+          xcrun simctl list runtimes
+      - name: Run the iOS-only adapter and UI test gate
+        run: make check-phone-xcode

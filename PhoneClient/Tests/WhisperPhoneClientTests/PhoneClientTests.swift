@@ -28,7 +28,27 @@ final class PhoneClientTests: XCTestCase {
         XCTAssertThrowsError(try coordinator.resume()) { error in
             XCTAssertEqual(error as? PhoneClientError, .trackingResetRequiresRelocalization)
         }
+        XCTAssertThrowsError(try coordinator.relocalized(frame: makeFrame(epoch: 2, trackingQuality: .limited))) { error in
+            XCTAssertEqual(error as? PhoneClientError, .trackingResetRequiresRelocalization)
+        }
         try coordinator.relocalized(frame: makeFrame(epoch: 2))
+        XCTAssertEqual(coordinator.phase, .capturingSupervision)
+    }
+
+    func testSupervisionPauseResumeKeepsAcceptingSharedRoomPlanFrames() throws {
+        var coordinator = RoomScanCoordinator()
+        try coordinator.startScan()
+        try coordinator.accept(frame: makeFrame(epoch: 1))
+        try coordinator.requestConfirmation()
+        try coordinator.confirmDimensions()
+        try coordinator.confirmDoors()
+        try coordinator.registerRF(makeRegistration())
+        try coordinator.confirmPhoneFixed()
+        try coordinator.accept(frame: makeFrame(epoch: 1))
+        try coordinator.pause()
+        XCTAssertEqual(coordinator.phase, .paused)
+        try coordinator.resume()
+        try coordinator.accept(frame: makeFrame(epoch: 1))
         XCTAssertEqual(coordinator.phase, .capturingSupervision)
     }
 
@@ -97,9 +117,12 @@ final class PhoneClientTests: XCTestCase {
         let scene = makeScene()
         let sceneDigest = try SealedArtifact.seal(.scene(scene)).digest
         let calibration = makeCalibration(sceneDigest: sceneDigest)
-        let supervision = makeSupervision(sceneDigest: sceneDigest)
+        let supervision = makeSupervision(sceneDigest: sceneDigest, depthReference: "depth/1")
+        let usdzData = Data([0x55, 0x53, 0x44, 0x5a])
+        let keyframes = [CameraKeyframe(reference: "pose/1", phoneTime: 500, pose: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: 1, trackingQuality: .normal, depthQuality: .missing)]
+        let media = [try makeRGBMedia(), try makeDepthMedia()]
         let unknownExporter = try PhoneArtifactExporter(knownRFIdentities: ["other-rf"])
-        XCTAssertThrowsError(try unknownExporter.makePackage(scene: scene, calibration: calibration, supervision: supervision)) { error in
+        XCTAssertThrowsError(try unknownExporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media)) { error in
             XCTAssertEqual(error as? PhoneClientError, .unknownRFIdentity("rf-1"))
         }
 
@@ -108,8 +131,9 @@ final class PhoneClientTests: XCTestCase {
             scene: scene,
             calibration: calibration,
             supervision: supervision,
-            usdzData: Data([0x55, 0x53, 0x44, 0x5a]),
-            keyframes: [CameraKeyframe(reference: "pose/1", phoneTime: 500, pose: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: 1, trackingQuality: .normal, depthQuality: .missing)]
+            usdzData: usdzData,
+            keyframes: keyframes,
+            media: media
         )
         let archive = try package.encoded()
         let restored = try PhoneCapturePackage.parse(archive, knownRFIdentities: ["rf-1"])
@@ -128,7 +152,8 @@ final class PhoneClientTests: XCTestCase {
             serverEphemeralPublicKey: Data(repeating: 3, count: 32),
             serverProof: Data(repeating: 4, count: 64)
         )
-        let parsedInvitation = try CompanionInvitation.fromWire(invitation.toWire(), pinnedServerIdentity: identity, crypto: crypto)
+        let wallClock = FixedWallClock(value: 9_999)
+        let parsedInvitation = try CompanionInvitation.fromWire(invitation.toWire(), pinnedServerIdentity: identity, crypto: crypto, wallClock: wallClock)
         let nonce = try ClientNonce(bytes: Data(repeating: 5, count: 32))
         var challenges = [ClockSampleChallenge]()
         for index in 0..<3 {
@@ -144,18 +169,28 @@ final class PhoneClientTests: XCTestCase {
         let responses = challenges.map { ClockSampleResponse(challenge: $0, clientReceive: $0.clientSend + 20) }
         let code = try PairingCode(bytes: Data(repeating: 7, count: 16))
         let secret = try ClientEphemeralSecret(bytes: Data(repeating: 8, count: 32))
-        let (request, pending) = try parsedInvitation.beginHandshake(pairingCode: code, clientNonce: nonce, clientEphemeralSecret: secret, clockResponses: responses, crypto: crypto)
+        let (request, pending) = try parsedInvitation.beginHandshake(pairingCode: code, clientNonce: nonce, clientEphemeralSecret: secret, clockResponses: responses, crypto: crypto, wallClock: wallClock)
         XCTAssertEqual(request.toWire().count, 152 + 3 * 152)
         let decodedRequest = try CompanionHandshakeRequest.fromWire(request.toWire(), crypto: crypto)
         let relation = try makePhoneRelation()
         let handshake = try CompanionHandshakeResponse(sessionID: Data(repeating: 9, count: 16), clockRelation: relation, serverProof: Data(repeating: 10, count: 64))
-        let connection = try pending.complete(try CompanionHandshakeResponse.fromWire(handshake.toWire()))
+        let handshakeResponse = try CompanionHandshakeResponse.fromWire(handshake.toWire())
+        let connection = try pending.complete(handshakeResponse, wallClock: wallClock)
+        XCTAssertThrowsError(try pending.complete(handshakeResponse, wallClock: FixedWallClock(value: 10_000))) { error in
+            XCTAssertEqual(error as? PhoneClientError, .invitationExpired)
+        }
         let uploadID = try UploadID(bytes: Data(repeating: 11, count: 16))
         let chunks = try connection.sealUpload(uploadID: uploadID, sealedBytes: Data(repeating: 12, count: 10), chunkBytes: 4)
         XCTAssertEqual(chunks.count, 3)
         XCTAssertEqual(try CompanionHandshakeRequest.fromWire(decodedRequest.toWire(), crypto: crypto), decodedRequest)
         for chunk in chunks {
             XCTAssertEqual(try CompanionChunk.fromWire(chunk.toWire()), chunk)
+        }
+        XCTAssertThrowsError(try CompanionInvitation.fromWire(invitation.toWire(), pinnedServerIdentity: identity, crypto: crypto, wallClock: FixedWallClock(value: 10_000))) { error in
+            XCTAssertEqual(error as? PhoneClientError, .invitationExpired)
+        }
+        XCTAssertThrowsError(try parsedInvitation.beginHandshake(pairingCode: code, clientNonce: nonce, clientEphemeralSecret: secret, clockResponses: responses, crypto: crypto, wallClock: FixedWallClock(value: 10_000))) { error in
+            XCTAssertEqual(error as? PhoneClientError, .invitationExpired)
         }
     }
 
@@ -165,7 +200,7 @@ final class PhoneClientTests: XCTestCase {
             let plaintextBytes = index == 2 ? 2 : 4
             return try CompanionChunk(sessionID: Data(repeating: 1, count: 16), uploadID: uploadID, index: UInt32(index), chunkCount: 3, chunkPlaintextBytes: 4, totalBytes: 10, fullDigest: Data(repeating: 2, count: 32), ciphertext: Data(repeating: UInt8(index), count: plaintextBytes + 16))
         }
-        var plan = ResumableUpload(uploadID: uploadID, chunks: chunks)
+        var plan = try ResumableUpload(uploadID: uploadID, chunks: chunks)
         try plan.acknowledge(index: 0)
         XCTAssertEqual(plan.pendingChunks.map(\.index), [1, 2])
         try plan.acknowledge(index: 1)
@@ -177,58 +212,166 @@ final class PhoneClientTests: XCTestCase {
 
     func testOfflineCacheAndTransportRetryPreserveExactChunks() async throws {
         let uploadID = try UploadID(bytes: Data(repeating: 8, count: 16))
-        let chunks = try (0..<3).map { index in
-            let plaintextBytes = index == 2 ? 2 : 4
-            return try CompanionChunk(
-                sessionID: Data(repeating: 3, count: 16),
-                uploadID: uploadID,
-                index: UInt32(index),
-                chunkCount: 3,
-                chunkPlaintextBytes: 4,
-                totalBytes: 10,
-                fullDigest: Data(repeating: 4, count: 32),
-                ciphertext: Data(repeating: UInt8(index), count: plaintextBytes + 16)
-            )
-        }
+        let chunks = try makeChunks(uploadID: uploadID, sessionByte: 3, digestByte: 4)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let cache = try FileUploadCache(directory: directory)
         defer { try? FileManager.default.removeItem(at: directory) }
-        for chunk in chunks { try await cache.store(chunk) }
-        XCTAssertEqual(try await cache.load(uploadID: uploadID), chunks)
-
-        var plan = ResumableUpload(uploadID: uploadID, chunks: chunks)
+        var plan = try ResumableUpload(uploadID: uploadID, chunks: chunks)
         try plan.acknowledge(index: 0)
+        try await cache.save(plan)
+        var restoredPlan = try await cache.loadPlan(uploadID: uploadID)
+        XCTAssertEqual(restoredPlan.acknowledgedIndices, Set<UInt32>([0]))
+        XCTAssertEqual(restoredPlan.chunks, chunks)
+
         let transport = RetryTransport()
         do {
-            try await CompanionUploadCoordinator().upload(&plan, through: transport)
+            try await CompanionUploadCoordinator().upload(&restoredPlan, through: transport, cache: cache)
             XCTFail("the first transport attempt should fail")
         } catch {
             XCTAssertEqual(error as? PhoneClientError, .uploadUnavailable)
         }
         await transport.allowSends()
-        try await CompanionUploadCoordinator().upload(&plan, through: transport)
-        XCTAssertTrue(plan.isComplete)
+        try await CompanionUploadCoordinator().upload(&restoredPlan, through: transport, cache: cache)
+        XCTAssertTrue(restoredPlan.isComplete)
         let frames = await transport.frames()
         XCTAssertEqual(frames.count, 3)
+        XCTAssertEqual(try frames.map { try CompanionChunk.fromWire($0).index }, [1, 1, 2])
         for frame in frames {
-            XCTAssertEqual(try CompanionChunk.fromWire(frame), chunks[Int(frame.readUInt32LE(at: 36))])
+            let chunk = try CompanionChunk.fromWire(frame)
+            XCTAssertEqual(chunk, chunks[Int(chunk.index)])
         }
+        let completedPlan = try await cache.loadPlan(uploadID: uploadID)
+        XCTAssertTrue(completedPlan.isComplete)
         try await cache.remove(uploadID: uploadID)
         let cachedAfterRemove = try await cache.load(uploadID: uploadID)
         XCTAssertTrue(cachedAfterRemove.isEmpty)
     }
+
+    func testResumableUploadRejectsInvalidLayoutsAndHostReceipts() throws {
+        let uploadID = try UploadID(bytes: Data(repeating: 21, count: 16))
+        let chunks = try makeChunks(uploadID: uploadID, sessionByte: 22, digestByte: 23)
+        XCTAssertThrowsError(try ResumableUpload(uploadID: uploadID, chunks: [chunks[0], chunks[0], chunks[2]]))
+        XCTAssertThrowsError(try ResumableUpload(uploadID: uploadID, chunks: Array(chunks.dropLast())))
+        var mixed = chunks
+        mixed[1] = try CompanionChunk(sessionID: Data(repeating: 24, count: 16), uploadID: uploadID, index: 1, chunkCount: 3, chunkPlaintextBytes: 4, totalBytes: 10, fullDigest: Data(repeating: 23, count: 32), ciphertext: Data(repeating: 1, count: 20))
+        XCTAssertThrowsError(try ResumableUpload(uploadID: uploadID, chunks: mixed))
+        XCTAssertThrowsError(try ResumableUpload(uploadID: uploadID, chunks: chunks, acknowledged: [99]))
+        XCTAssertThrowsError(try CompanionUploadProgress(sessionID: Data(repeating: 22, count: 16), uploadID: uploadID, chunkCount: 3, chunkPlaintextBytes: 4, totalBytes: 10, fullDigest: Data(repeating: 23, count: 32), receivedIndices: [1, 1]))
+        let pendingProgress = try CompanionUploadProgress(sessionID: Data(repeating: 22, count: 16), uploadID: uploadID, chunkCount: 3, chunkPlaintextBytes: 4, totalBytes: 10, fullDigest: Data(repeating: 23, count: 32), receivedIndices: [0])
+        let pending = CompanionUploadReply.pending(pendingProgress)
+        XCTAssertEqual(try CompanionUploadReply.fromWire(pending.toWire()), pending)
+        XCTAssertThrowsError(try CompanionUploadReceipt(progress: pendingProgress, artifactDigest: try ArtifactDigest(bytes: Data(repeating: 23, count: 32)), artifactKind: 1, artifactID: "scene-a", revision: 1))
+        let completeProgress = try CompanionUploadProgress(sessionID: Data(repeating: 22, count: 16), uploadID: uploadID, chunkCount: 3, chunkPlaintextBytes: 4, totalBytes: 10, fullDigest: Data(repeating: 23, count: 32), receivedIndices: [0, 1, 2])
+        let receipt = try CompanionUploadReceipt(progress: completeProgress, artifactDigest: try ArtifactDigest(bytes: Data(repeating: 23, count: 32)), artifactKind: 1, artifactID: "scene-a", revision: 1)
+        XCTAssertEqual(try CompanionUploadReply.fromWire(CompanionUploadReply.committed(receipt).toWire()), .committed(receipt))
+    }
+
+    func testUploadCoordinatorRejectsHostResponseWithoutAcknowledging() async throws {
+        let uploadID = try UploadID(bytes: Data(repeating: 31, count: 16))
+        let chunks = try makeChunks(uploadID: uploadID, sessionByte: 32, digestByte: 33)
+        var plan = try ResumableUpload(uploadID: uploadID, chunks: chunks)
+        let progress = try CompanionUploadProgress(sessionID: Data(repeating: 32, count: 16), uploadID: uploadID, chunkCount: 3, chunkPlaintextBytes: 4, totalBytes: 10, fullDigest: Data(repeating: 33, count: 32), receivedIndices: [])
+        let rejection = CompanionUploadReply.rejected(progress: progress, reason: .artifactRejected)
+        XCTAssertEqual(try CompanionUploadReply.fromWire(rejection.toWire()), rejection)
+        do {
+            try await CompanionUploadCoordinator().upload(&plan, through: RejectingTransport(response: rejection.toWire()))
+            XCTFail("the Host rejection must stop the upload")
+        } catch {
+            XCTAssertEqual(error as? PhoneClientError, .uploadRejected("artifact rejected"))
+        }
+        XCTAssertTrue(plan.acknowledgedIndices.isEmpty)
+    }
+
+    func testCoverageSummaryUsesWorldPositionsAndKeepsRangesSeparate() {
+        let visual = [CoverageCell(positionM: [10, 0, 20], covered: true), CoverageCell(positionM: [12, 0, 22], covered: false)]
+        let rf = [CoverageCell(positionM: [30, 0, 40], covered: true)]
+        let calibration = [CoverageCell(positionM: [50, 0, 60], covered: false)]
+        let ranges = MapCoverageRanges(visualScan: visual, rfExpectedObservable: rf, fieldCalibration: calibration)
+        let summaries = [
+            CoverageMapSummary(title: "Visual scan", cells: ranges.visualScan),
+            CoverageMapSummary(title: "RF expected", cells: ranges.rfExpectedObservable),
+            CoverageMapSummary(title: "Field calibration", cells: ranges.fieldCalibration),
+        ]
+        XCTAssertEqual(summaries.map(\.title), ["Visual scan", "RF expected", "Field calibration"])
+        XCTAssertEqual(summaries.map(\.coveredCount), [1, 1, 0])
+        XCTAssertEqual(summaries[0].points, [CoverageMapPoint(x: 0, y: 0, covered: true), CoverageMapPoint(x: 1, y: 1, covered: false)])
+        XCTAssertNotEqual(summaries[0].points, summaries[1].points)
+    }
+
+    func testRustAndSwiftSceneFixturesRoundTripThroughTheSameWSA1Codec() throws {
+        for fixtureName in ["rust-scene-wsa1", "swift-scene-wsa1"] {
+            let bytes = try fixture(named: fixtureName)
+            let sealed = try SealedArtifact.parse(bytes)
+            guard case let .scene(scene) = try sealed.decode() else {
+                XCTFail("fixture must contain a scene artifact")
+                continue
+            }
+            XCTAssertEqual(try SealedArtifact.seal(.scene(scene)).bytes, bytes)
+            XCTAssertEqual(scene.metadata.artifactID, fixtureName == "rust-scene-wsa1" ? "room-a" : "swift-room-b")
+            XCTAssertEqual(scene.worldCoordinateSystem, "arkit-world-42")
+        }
+    }
+
+    func testPackageRejectsMissingOrUnreferencedCaptureAssets() throws {
+        let scene = makeScene()
+        let sceneDigest = try SealedArtifact.seal(.scene(scene)).digest
+        let calibration = makeCalibration(sceneDigest: sceneDigest)
+        let supervision = makeSupervision(sceneDigest: sceneDigest, depthReference: "depth/1")
+        let usdz = Data([0x55, 0x53, 0x44, 0x5a])
+        let keyframe = CameraKeyframe(reference: "pose/1", phoneTime: 500, pose: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: 1, trackingQuality: .normal, depthQuality: .missing)
+        let media = [try makeRGBMedia()]
+        let exporter = try PhoneArtifactExporter(knownRFIdentities: ["rf-1"])
+        XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: Data(), keyframes: [keyframe], media: media))
+        XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdz, keyframes: [], media: media))
+        XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdz, keyframes: [keyframe], media: []))
+        XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: makeSupervision(sceneDigest: sceneDigest, depthReference: "depth/1"), usdzData: usdz, keyframes: [keyframe], media: [try makeRGBMedia()]))
+        XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: makeSupervision(sceneDigest: sceneDigest, rgbReference: "missing-rgb"), usdzData: usdz, keyframes: [keyframe], media: media))
+        XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdz, keyframes: [keyframe], media: media + [try CaptureMedia(reference: "unreferenced", kind: .rgb, phoneTime: 500, bytes: Data([9]))]))
+    }
+}
+
+private func fixture(named name: String) throws -> Data {
+    #if SWIFT_PACKAGE
+    guard let url = Bundle.module.url(forResource: name, withExtension: "hex", subdirectory: "Fixtures") else {
+        throw PhoneClientError.persistence("fixture \(name) is missing")
+    }
+    #else
+    let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Fixtures").appendingPathComponent("\(name).hex")
+    #endif
+    let hex = try String(contentsOf: url, encoding: .utf8)
+        .filter { !$0.isWhitespace }
+    guard hex.count.isMultiple(of: 2) else { throw PhoneClientError.malformedWire("fixture hex has odd length") }
+    var bytes = Data(capacity: hex.count / 2)
+    var index = hex.startIndex
+    while index < hex.endIndex {
+        let end = hex.index(index, offsetBy: 2)
+        guard let byte = UInt8(hex[index..<end], radix: 16) else {
+            throw PhoneClientError.malformedWire("fixture hex contains a non-byte")
+        }
+        bytes.append(byte)
+        index = end
+    }
+    return bytes
 }
 
 private actor RetryTransport: CompanionByteTransport {
     private var shouldFail = true
     private var sentFrames: [Data] = []
+    private var acceptedIndices = Set<UInt32>()
 
     func send(_ frame: Data) async throws -> Data {
         sentFrames.append(frame)
+        let chunk = try CompanionChunk.fromWire(frame)
+        acceptedIndices.insert(chunk.index)
         if shouldFail {
             throw PhoneClientError.uploadUnavailable
         }
-        return Data()
+        let progress = try CompanionUploadProgress(sessionID: chunk.sessionID, uploadID: chunk.uploadID, chunkCount: chunk.chunkCount, chunkPlaintextBytes: chunk.chunkPlaintextBytes, totalBytes: chunk.totalBytes, fullDigest: chunk.fullDigest, receivedIndices: Array(acceptedIndices))
+        if acceptedIndices.count == Int(chunk.chunkCount) {
+            let receipt = try CompanionUploadReceipt(progress: progress, artifactDigest: try ArtifactDigest(bytes: chunk.fullDigest), artifactKind: 1, artifactID: "scene-a", revision: 1)
+            return CompanionUploadReply.committed(receipt).toWire()
+        }
+        return CompanionUploadReply.pending(progress).toWire()
     }
 
     func allowSends() {
@@ -237,6 +380,21 @@ private actor RetryTransport: CompanionByteTransport {
 
     func frames() -> [Data] {
         sentFrames
+    }
+}
+
+private struct FixedWallClock: CompanionWallClock {
+    let value: UInt64
+
+    func nowUTC() -> UInt64 { value }
+}
+
+private struct RejectingTransport: CompanionByteTransport {
+    let response: Data
+
+    func send(_ frame: Data) async throws -> Data {
+        _ = frame
+        return response
     }
 }
 
@@ -276,12 +434,36 @@ private func makeScene() -> SceneSnapshot {
     )
 }
 
+private func makeChunks(uploadID: UploadID, sessionByte: UInt8, digestByte: UInt8) throws -> [CompanionChunk] {
+    try (0..<3).map { index in
+        let plaintextBytes = index == 2 ? 2 : 4
+        return try CompanionChunk(
+            sessionID: Data(repeating: sessionByte, count: 16),
+            uploadID: uploadID,
+            index: UInt32(index),
+            chunkCount: 3,
+            chunkPlaintextBytes: 4,
+            totalBytes: 10,
+            fullDigest: Data(repeating: digestByte, count: 32),
+            ciphertext: Data(repeating: UInt8(index), count: plaintextBytes + 16)
+        )
+    }
+}
+
+private func makeRGBMedia() throws -> CaptureMedia {
+    try CaptureMedia(reference: "rgb/1", kind: .rgb, phoneTime: 500, bytes: Data([1, 2, 3]))
+}
+
+private func makeDepthMedia() throws -> CaptureMedia {
+    try CaptureMedia(reference: "depth/1", kind: .depth, phoneTime: 500, bytes: Data([4, 5, 6]))
+}
+
 private func makeTransform(source: String, target: String, error: Double) -> CoordinateTransform {
     CoordinateTransform(sourceCoordinateSystem: source, targetCoordinateSystem: target, matrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], maxErrorM: error)
 }
 
-private func makeFrame(epoch: UInt32) -> ScanFrame {
-    ScanFrame(worldCoordinateSystem: "arkit-world", geometry: makeScene().geometry, geometryValidityMask: [true], coverageMask: makeScene().coverageMask, scanCoverage: 0.96, mapErrorM: 0.1, cameraToWorld: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: epoch, trackingQuality: .normal, depthQuality: .measured)
+private func makeFrame(epoch: UInt32, trackingQuality: TrackingQuality = .normal) -> ScanFrame {
+    ScanFrame(worldCoordinateSystem: "arkit-world", geometry: makeScene().geometry, geometryValidityMask: [true], coverageMask: makeScene().coverageMask, scanCoverage: 0.96, mapErrorM: 0.1, cameraToWorld: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: epoch, trackingQuality: trackingQuality, depthQuality: .measured)
 }
 
 private func makeRegistration() -> RFDeviceRegistration {
@@ -310,12 +492,12 @@ private func makeCalibration(sceneDigest: ArtifactDigest) -> CalibrationBundle {
     )
 }
 
-private func makeSupervision(sceneDigest: ArtifactDigest) -> SupervisionSegment {
+private func makeSupervision(sceneDigest: ArtifactDigest, rgbReference: String = "rgb/1", depthReference: String? = nil, poseReference: String = "pose/1") -> SupervisionSegment {
     SupervisionSegment(
         metadata: ArtifactMetadata(artifactID: "labels-a", revision: 1, provenance: [SourceIdentity(namespace: "phone", identity: "labels")]),
         sceneDigest: sceneDigest,
         cameraIntrinsics: [1, 0, 0, 0, 1, 0, 0, 0, 1],
-        samples: [SupervisionSample(rgbReference: "rgb/1", depthReference: nil, poseReference: "pose/1", rgbTime: 500, depthTime: 500, poseTime: 500, maximumTimeError: 5, trackingEpoch: 1, relocalized: true, trackingQuality: .normal, depthQuality: .missing, scope: .locallyVisible, personVisibility: [0.8], label: .visibleSet([PersonLabel(station: "station-a", pose: "standing", positionM: [1, 1, 0], maxErrorM: 0.05)]), cameraToWorld: makeTransform(source: "camera", target: "arkit-world", error: 0.01), sampleSource: SourceIdentity(namespace: "phone", identity: "capture-1"), jointErrorM: 0.01)],
+        samples: [SupervisionSample(rgbReference: rgbReference, depthReference: depthReference, poseReference: poseReference, rgbTime: 500, depthTime: 500, poseTime: 500, maximumTimeError: 5, trackingEpoch: 1, relocalized: true, trackingQuality: .normal, depthQuality: depthReference == nil ? .missing : .measured, scope: .locallyVisible, personVisibility: [0.8], label: .visibleSet([PersonLabel(station: "station-a", pose: "standing", positionM: [1, 1, 0], maxErrorM: 0.05)]), cameraToWorld: makeTransform(source: "camera", target: "arkit-world", error: 0.01), sampleSource: SourceIdentity(namespace: "phone", identity: "capture-1"), jointErrorM: 0.01)],
         sharedPositionErrorM: 0.02,
         timeRelation: try! makePhoneRelation(),
         maximumPersonVelocityMPS: 12
