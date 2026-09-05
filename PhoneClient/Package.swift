@@ -26,8 +26,7 @@ let package = Package(
         .executableTarget(
             name: "WhisperPhoneClientApp",
             dependencies: ["WhisperPhoneClient"],
-            path: "Sources/WhisperPhoneClientApp",
-            resources: [.process("Resources")]
+            path: "Sources/WhisperPhoneClientApp"
         ),
         .testTarget(
             name: "WhisperPhoneClientTests",
