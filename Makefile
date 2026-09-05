@@ -4,7 +4,23 @@ PROVISION_TOOLS_DIRECTORY := $(FIRMWARE_DIRECTORY)/build/provision-tools
 NVS_PARTITION_TOOL_DIRECTORY := $(PROVISION_TOOLS_DIRECTORY)/nvs-partition-tool
 PROVISION_PYTHON := $(PROVISION_TOOLS_DIRECTORY)/venv/bin/python
 
-.PHONY: esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
+.PHONY: check check-policy check-python check-rust esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
+
+check: check-policy check-python check-rust
+
+check-policy:
+	python3 scripts/check_repository.py
+
+check-python:
+	python3 -m unittest discover -s tests -p 'test_*.py'
+	python3 -m unittest discover -s firmware/esp32-native-frame/tests -p 'test_*.py'
+
+check-rust:
+	cargo fmt --all -- --check
+	cargo check --workspace --all-targets --all-features
+	cargo test --workspace --all-features
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo doc --workspace --all-features --no-deps
 
 esp32-native-frame: esp32-native-frame-firmware
 
