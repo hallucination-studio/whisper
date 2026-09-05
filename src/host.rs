@@ -1,7 +1,7 @@
 //! Supervised authenticated UDP admission and restricted local raw-fact queries.
 
 use std::backtrace::Backtrace;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -15,6 +15,16 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use sha2::{Digest, Sha256};
 
 use crate::admission::AdmissionLimits;
+use crate::artifact::{
+    Artifact, ArtifactDigest, ArtifactImportError, ArtifactKind, ArtifactLimits, ArtifactOrigin,
+    ArtifactRejectReason, ImportedArtifact, SealedArtifact,
+};
+use crate::companion::{
+    ClockChallengeMeasurement, ClockSampleChallenge, CompanionChunk, CompanionEntropy,
+    CompanionError, CompanionHandshakeRequest, CompanionHandshakeResponse, CompanionRejectReason,
+    CompanionServerIdentity, CompanionState, PairingCode, PairingId, PairingOffer,
+    SystemCompanionEntropy, UploadProgress,
+};
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
 use crate::native_csi::{
     CapabilityIdentity, ChannelPolicy, FirmwareBuildIdentity, NativeCapabilityFact, NativeCsiFact,
@@ -53,6 +63,11 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// periods because the configured units are per second. Changing it changes
 /// admission semantics and requires renaming those units.
 const RATE_PERIOD: Duration = Duration::from_secs(1);
+/// Maximum lifetime of a displayed one-time pairing offer.
+const MAX_PAIRING_LIFETIME: Duration = Duration::from_secs(10 * 60);
+/// Maximum time an import caller waits for the sole writer response. This
+/// bounds API latency without claiming that an interrupted transaction committed.
+const ARTIFACT_IMPORT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 trait Network: Send + Sync {
     fn bind(&self, address: SocketAddr) -> io::Result<Box<dyn DatagramSocket>>;
@@ -504,9 +519,12 @@ impl Host {
             bind,
             routes: Vec::new(),
             ingress_capacity: DEFAULT_INGRESS_CAPACITY,
+            artifact_limits: ArtifactLimits::default(),
+            known_rf_identities: BTreeSet::new(),
             network: Arc::new(SystemNetwork),
             threads: Arc::new(SystemThreads),
             clock: Arc::new(SystemClock),
+            companion_entropy: Arc::new(SystemCompanionEntropy),
         }
     }
 }
@@ -518,9 +536,12 @@ pub struct HostBuilder {
     bind: SocketAddr,
     routes: Vec<NativeFrameRoute>,
     ingress_capacity: usize,
+    artifact_limits: ArtifactLimits,
+    known_rf_identities: BTreeSet<String>,
     network: Arc<dyn Network>,
     threads: Arc<dyn Threads>,
     clock: Arc<dyn Clock>,
+    companion_entropy: Arc<dyn CompanionEntropy>,
 }
 
 impl fmt::Debug for HostBuilder {
@@ -532,6 +553,9 @@ impl fmt::Debug for HostBuilder {
             .field("bind", &self.bind)
             .field("routes", &self.routes)
             .field("ingress_capacity", &self.ingress_capacity)
+            .field("artifact_limits", &self.artifact_limits)
+            .field("known_rf_identities", &self.known_rf_identities)
+            .field("companion_entropy", &"cryptographic entropy capability")
             .finish_non_exhaustive()
     }
 }
@@ -551,15 +575,37 @@ impl HostBuilder {
         self
     }
 
+    /// Sets bounded artifact validation and Store-capacity limits.
+    #[must_use]
+    pub fn artifact_limits(mut self, limits: ArtifactLimits) -> Self {
+        self.artifact_limits = limits;
+        self
+    }
+
+    /// Registers one RF identity that calibration artifacts may reference.
+    #[must_use]
+    pub fn known_rf_identity(mut self, identity: impl Into<String>) -> Self {
+        self.known_rf_identities.insert(identity.into());
+        self
+    }
+
+    /// Replaces the companion cryptographic entropy capability.
+    #[must_use]
+    pub fn companion_entropy(mut self, entropy: impl CompanionEntropy + 'static) -> Self {
+        self.companion_entropy = Arc::new(entropy);
+        self
+    }
+
     /// Starts the UDP reader, sole writer, and independent lifecycle supervisor.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid limits, duplicate or missing routes, socket
     /// startup failure, or failure to open the Store writer.
-    pub fn start(self) -> Result<HostRuntime, HostError> {
+    pub fn start(mut self) -> Result<HostRuntime, HostError> {
         validate_builder(&self)?;
         let query_routes = Arc::new(self.routes.clone());
+        let companion_signing_seed = self.store.take_companion_signing_seed();
         let database_path = self.store.database_path();
         let replay_snapshot = self.store.database_snapshot().map_err(|source| {
             HostError::io_during(
@@ -584,6 +630,11 @@ impl HostBuilder {
         let rejections =
             Arc::new(Mutex::new(VecDeque::with_capacity(REJECTION_DIAGNOSTIC_CAPACITY)));
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (artifact_sender, artifact_receiver) = mpsc::sync_channel(8);
+        let artifact_limits = self.artifact_limits;
+        let known_rf_identities = self.known_rf_identities.clone();
+        let runtime_clock = Arc::clone(&self.clock);
+        let companion_entropy = Arc::clone(&self.companion_entropy);
         let supervisor_stop = Arc::clone(&stop);
         let supervisor_completion = Arc::clone(&completion);
         let supervisor_rejections = Arc::clone(&rejections);
@@ -604,6 +655,7 @@ impl HostBuilder {
                             completion: supervisor_completion,
                             rejections: supervisor_rejections,
                             ready_sender,
+                            artifact_receiver,
                         },
                     );
                 }),
@@ -628,12 +680,18 @@ impl HostBuilder {
             stop,
             completion,
             rejections,
+            artifact_sender,
+            artifact_limits,
+            known_rf_identities,
+            clock: runtime_clock,
+            companion: Arc::new(Mutex::new(CompanionState::new(companion_signing_seed))),
+            companion_entropy,
+            companion_monotonic_origin: Mutex::new(None),
         })
     }
 }
 
 /// A running Host handle with the only raw query entry point.
-#[derive(Debug)]
 pub struct HostRuntime {
     local_addr: SocketAddr,
     database_path: PathBuf,
@@ -641,6 +699,26 @@ pub struct HostRuntime {
     stop: Arc<AtomicBool>,
     completion: Arc<(Mutex<Completion>, Condvar)>,
     rejections: Arc<Mutex<VecDeque<RejectedDatagram>>>,
+    artifact_sender: mpsc::SyncSender<ArtifactCommand>,
+    artifact_limits: ArtifactLimits,
+    known_rf_identities: BTreeSet<String>,
+    clock: Arc<dyn Clock>,
+    companion: Arc<Mutex<CompanionState>>,
+    companion_entropy: Arc<dyn CompanionEntropy>,
+    companion_monotonic_origin: Mutex<Option<Instant>>,
+}
+
+impl fmt::Debug for HostRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostRuntime")
+            .field("local_addr", &self.local_addr)
+            .field("database_path", &self.database_path)
+            .field("artifact_limits", &self.artifact_limits)
+            .field("known_rf_identities", &self.known_rf_identities)
+            .field("companion", &"paired encrypted artifact entry")
+            .finish_non_exhaustive()
+    }
 }
 
 impl HostRuntime {
@@ -733,6 +811,243 @@ impl HostRuntime {
     pub fn query_native_health(&self, limit: usize) -> Result<Vec<NativeHealthFact>, HostError> {
         validate_native_query_limit(limit)?;
         query_native_health(&self.database_path, &self.routes, limit)
+    }
+
+    /// Validates and commits a sealed artifact through the sole Store writer.
+    ///
+    /// Exact retries return the original receipt. This entry can create only
+    /// immutable candidate artifacts; it has no activation or world-state authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed error for invalid, unsupported, oversized,
+    /// incompatible, expired, conflicting, or unpersistable content.
+    pub fn import_artifact(
+        &self,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<ImportedArtifact, ArtifactImportError> {
+        self.import_artifact_from(bytes.as_ref(), ArtifactOrigin::Local)
+    }
+
+    fn import_artifact_from(
+        &self,
+        bytes: &[u8],
+        origin: ArtifactOrigin,
+    ) -> Result<ImportedArtifact, ArtifactImportError> {
+        if bytes.len() > self.artifact_limits.max_artifact_bytes() {
+            return Err(ArtifactImportError::new(
+                ArtifactRejectReason::LimitExceeded,
+                "sealed artifact byte limit exceeded",
+            ));
+        }
+        let sealed = SealedArtifact::parse(bytes).map_err(ArtifactImportError::invalid_artifact)?;
+        if let Some(receipt) = query_artifact_receipt(&self.database_path, sealed.digest())? {
+            return Ok(receipt);
+        }
+        let artifact = sealed.decode().map_err(ArtifactImportError::invalid_artifact)?;
+        let imported_utc_ns = utc_now_ns(self.clock.as_ref()).map_err(|_| {
+            ArtifactImportError::new(
+                ArtifactRejectReason::Persistence,
+                "Host clock cannot represent artifact import time",
+            )
+        })?;
+        artifact.validate_import(
+            self.artifact_limits,
+            &self.known_rf_identities,
+            imported_utc_ns,
+        )?;
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        self.artifact_sender
+            .try_send(ArtifactCommand {
+                sealed,
+                artifact,
+                imported_utc_ns,
+                origin,
+                limits: self.artifact_limits,
+                reply: reply_sender,
+            })
+            .map_err(|_| {
+                ArtifactImportError::new(
+                    ArtifactRejectReason::Persistence,
+                    "Store writer queue is unavailable or full",
+                )
+            })?;
+        reply_receiver.recv_timeout(ARTIFACT_IMPORT_RESPONSE_TIMEOUT).map_err(|_| {
+            ArtifactImportError::new(
+                ArtifactRejectReason::Persistence,
+                "Store writer did not complete artifact import before the response deadline",
+            )
+        })?
+    }
+
+    /// Queries one committed candidate artifact by its content digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Store cannot be read or retained bytes are invalid.
+    pub fn query_artifact(
+        &self,
+        digest: ArtifactDigest,
+    ) -> Result<Option<SealedArtifact>, HostError> {
+        query_artifact(&self.database_path, digest)
+    }
+
+    /// Exports exact sealed bytes for one committed candidate artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Store cannot be read or retained bytes are invalid.
+    pub fn export_artifact(&self, digest: ArtifactDigest) -> Result<Option<Box<[u8]>>, HostError> {
+        Ok(self.query_artifact(digest)?.map(|artifact| artifact.bytes().into()))
+    }
+
+    /// Creates finite-lived one-time pairing information for the companion entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero or greater-than-ten-minute lifetime, an
+    /// unrepresentable clock value, or failure to obtain secure random bytes.
+    pub fn begin_companion_pairing(
+        &self,
+        valid_for: Duration,
+    ) -> Result<PairingOffer, CompanionError> {
+        if valid_for.is_zero() || valid_for > MAX_PAIRING_LIFETIME {
+            return Err(CompanionError::new(
+                CompanionRejectReason::LimitExceeded,
+                "pairing lifetime must be between one nanosecond and ten minutes",
+            ));
+        }
+        let now = utc_now_ns(self.clock.as_ref()).map_err(|_| companion_clock_error())?;
+        let duration = u64::try_from(valid_for.as_nanos()).map_err(|_| companion_clock_error())?;
+        let expires = now.checked_add(duration).ok_or_else(companion_clock_error)?;
+        let id = secure_random::<16>(self.companion_entropy.as_ref())?;
+        let code = PairingCode::from_bytes(secure_random::<16>(self.companion_entropy.as_ref())?);
+        let server_ephemeral_secret = secure_random::<32>(self.companion_entropy.as_ref())?;
+        let mut companion = self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        companion.offer(now.into(), id, code, server_ephemeral_secret, expires.into())
+    }
+
+    /// Returns the Store-stable public identity companion clients must pin.
+    #[must_use]
+    pub fn companion_server_identity(&self) -> CompanionServerIdentity {
+        self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).server_identity()
+    }
+
+    /// Measures and signs one Host-owned half of a two-way clock sample.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a wrong pin, expired offer, or unrepresentable Host time.
+    pub fn begin_companion_clock_sample(
+        &self,
+        pairing_id: PairingId,
+        pinned_server_identity: CompanionServerIdentity,
+        client_nonce: crate::companion::ClientNonce,
+        client_send: crate::artifact::PhoneNanoseconds,
+    ) -> Result<ClockSampleChallenge, CompanionError> {
+        let host_receive = self.companion_monotonic_now()?;
+        let now = utc_now_ns(self.clock.as_ref()).map_err(|_| companion_clock_error())?;
+        let host_send = self.companion_monotonic_now()?;
+        self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clock_challenge(
+            pairing_id,
+            pinned_server_identity,
+            client_nonce,
+            ClockChallengeMeasurement { now_utc: now.into(), client_send, host_receive, host_send },
+        )
+    }
+
+    /// Consumes one wire-reconstructable request after signed clock validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a wrong pin or code, expired/reused offer, forged or
+    /// invalid clock samples, or failure to obtain a fresh session identity.
+    pub fn connect_companion(
+        &self,
+        request: CompanionHandshakeRequest,
+    ) -> Result<CompanionHandshakeResponse, CompanionError> {
+        let now = utc_now_ns(self.clock.as_ref()).map_err(|_| companion_clock_error())?;
+        let session_id = secure_random::<16>(self.companion_entropy.as_ref())?;
+        self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).connect(
+            request,
+            now.into(),
+            session_id,
+        )
+    }
+
+    fn companion_monotonic_now(&self) -> Result<crate::artifact::HostNanoseconds, CompanionError> {
+        let now = self.clock.monotonic_now();
+        let mut origin =
+            self.companion_monotonic_origin.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let origin = *origin.get_or_insert(now);
+        let nanos = u64::try_from(now.saturating_duration_since(origin).as_nanos())
+            .map_err(|_| companion_clock_error())?;
+        Ok(nanos.into())
+    }
+
+    /// Accepts one authenticated companion chunk and imports completed bytes.
+    ///
+    /// Exact duplicate chunks are idempotent. Incomplete uploads remain bounded
+    /// in the paired session so a caller can resume after an interrupted send.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/expired session, authentication failure,
+    /// conflicting chunk, exceeded limit, or shared artifact import rejection.
+    pub fn upload_companion_chunk(
+        &self,
+        chunk: CompanionChunk,
+    ) -> Result<UploadProgress, CompanionError> {
+        let now = utc_now_ns(self.clock.as_ref()).map_err(|_| companion_clock_error())?;
+        let assembled = self
+            .companion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accept_chunk(chunk, now.into(), self.artifact_limits.max_artifact_bytes())?;
+        if let Some(receipt) = &assembled.completed_receipt {
+            return Ok(UploadProgress::Imported(receipt.clone()));
+        }
+        if assembled.bytes.is_empty() {
+            return Ok(UploadProgress::Pending {
+                received_chunks: assembled.received_chunks,
+                total_chunks: assembled.total_chunks,
+            });
+        }
+        let uploaded = SealedArtifact::parse(&assembled.bytes)
+            .and_then(|sealed| sealed.decode())
+            .map_err(ArtifactImportError::invalid_artifact)
+            .map_err(CompanionError::from_artifact)?;
+        if let Artifact::Supervision(segment) = uploaded
+            && segment.time_relation != assembled.clock_relation
+        {
+            return Err(CompanionError::from_artifact(ArtifactImportError::new(
+                ArtifactRejectReason::InvalidRelation,
+                "supervision clock relation differs from its authenticated companion session",
+            )));
+        }
+        let receipt = self
+            .import_artifact_from(&assembled.bytes, ArtifactOrigin::Companion)
+            .map_err(CompanionError::from_artifact)?;
+        self.companion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_completed(&assembled, receipt.clone())?;
+        Ok(UploadProgress::Imported(receipt))
+    }
+
+    /// Parses and accepts one encrypted companion transport frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded protocol and shared-import failures as
+    /// [`Self::upload_companion_chunk`], plus malformed frame rejection.
+    pub fn upload_companion_bytes(
+        &self,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<UploadProgress, CompanionError> {
+        let chunk =
+            CompanionChunk::parse(bytes.as_ref(), self.artifact_limits.max_artifact_bytes())?;
+        self.upload_companion_chunk(chunk)
     }
 
     /// Returns a bounded newest suffix of non-authoritative rejection diagnostics.
@@ -1179,6 +1494,17 @@ struct SupervisorContext {
     completion: Arc<(Mutex<Completion>, Condvar)>,
     rejections: Arc<Mutex<VecDeque<RejectedDatagram>>>,
     ready_sender: mpsc::SyncSender<Result<(), HostError>>,
+    artifact_receiver: mpsc::Receiver<ArtifactCommand>,
+}
+
+#[derive(Debug)]
+struct ArtifactCommand {
+    sealed: SealedArtifact,
+    artifact: Artifact,
+    imported_utc_ns: u64,
+    origin: ArtifactOrigin,
+    limits: ArtifactLimits,
+    reply: mpsc::SyncSender<Result<ImportedArtifact, ArtifactImportError>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1276,8 +1602,8 @@ mod persistence;
 use persistence::{validate_native_route_pins, writer_loop};
 mod query;
 use query::{
-    query_native_capabilities, query_native_csi, query_native_facts, query_native_health,
-    query_raw, query_raw_losses,
+    query_artifact, query_artifact_receipt, query_native_capabilities, query_native_csi,
+    query_native_facts, query_native_health, query_raw, query_raw_losses,
 };
 
 fn validate_native_query_limit(limit: usize) -> Result<(), HostError> {
@@ -1313,6 +1639,21 @@ fn finish_completion(completion: &(Mutex<Completion>, Condvar), failure: Option<
     state.done = true;
     state.failure = failure;
     changed.notify_all();
+}
+
+fn secure_random<const N: usize>(
+    entropy: &dyn CompanionEntropy,
+) -> Result<[u8; N], CompanionError> {
+    let mut bytes = [0_u8; N];
+    entropy.fill(&mut bytes).map_err(CompanionError::entropy)?;
+    Ok(bytes)
+}
+
+fn companion_clock_error() -> CompanionError {
+    CompanionError::new(
+        CompanionRejectReason::InvalidClockRelation,
+        "Host clock cannot represent companion pairing time",
+    )
 }
 
 fn record_rejection(

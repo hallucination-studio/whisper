@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+pub mod artifact;
+pub mod companion;
 mod host;
 mod identity;
 pub(crate) mod key;

@@ -9,17 +9,21 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, params};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Stable Store database basename from the persistence layout contract.
 const DATABASE_NAME: &str = "facts.sqlite3";
 /// Cooperative process-ownership marker beside the database.
 const LEASE_NAME: &str = ".whisper.lease";
+/// Store-private Ed25519 signing seed for the companion server identity.
+const COMPANION_SIGNING_SEED_NAME: &str = ".whisper.companion-signing-seed";
 /// SQLite application identifier (`WRF1`) written at header offset 68. Changing
 /// it makes all existing Stores intentionally unrecognizable.
 const STORE_APPLICATION_ID: u32 = 0x5752_4631;
 /// Exact SQLite schema generation. Incrementing it requires an explicitly
-/// scoped migration; this ticket recognizes only newly initialized generation 3.
-const STORE_SCHEMA_VERSION: u32 = 3;
+/// scoped migration. Generation 4 combines native typed facts and immutable
+/// spatial artifacts; earlier independent generations are deliberately rejected.
+const STORE_SCHEMA_VERSION: u32 = 4;
 /// SQLite's fixed database header size in bytes. Changing this file-format
 /// value would shift every recognition offset and misclassify database bytes.
 const SQLITE_HEADER_BYTES: usize = 100;
@@ -35,9 +39,8 @@ const ROOT_MODE: u32 = 0o700;
 /// Owner read/write Unix file permission bits required by the host trust
 /// policy. Changing them alters which Store-owned mutable files are trusted.
 const FILE_MODE: u32 = 0o600;
-/// Kernel CSPRNG byte source on supported Unix hosts. Replacing it changes the
-/// Store-identity entropy trust boundary and must preserve blocking/error semantics.
-const RANDOM_SOURCE: &str = "/dev/urandom";
+/// Diagnostic identity for the platform CSPRNG capability.
+const RANDOM_SOURCE: &str = "operating-system-randomness";
 /// SQLite WAL header width in bytes. Changing this file-format value would
 /// shift frame validation and misclassify WAL companions.
 const WAL_HEADER_BYTES: usize = 32;
@@ -157,7 +160,18 @@ const NATIVE_HEALTH_FACTS_SCHEMA: &str = "CREATE TABLE native_health_facts (
                  callback_max_us INTEGER NOT NULL CHECK (callback_max_us BETWEEN 0 AND 4294967295),
                  encoder_max_us INTEGER NOT NULL CHECK (encoder_max_us BETWEEN 0 AND 4294967295)
              ) STRICT";
-const EXPECTED_SCHEMA: [(&str, &str); 8] = [
+const SPATIAL_ARTIFACTS_SCHEMA: &str = "CREATE TABLE spatial_artifacts (
+                 artifact_row_id INTEGER PRIMARY KEY,
+                 digest BLOB NOT NULL UNIQUE CHECK (typeof(digest) = 'blob' AND length(digest) = 32),
+                 kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 3),
+                 artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0),
+                 revision INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 4294967295),
+                 imported_utc_ns INTEGER NOT NULL CHECK (imported_utc_ns >= 0),
+                 origin TEXT NOT NULL CHECK (origin IN ('local', 'companion')),
+                 sealed_bytes BLOB NOT NULL CHECK (typeof(sealed_bytes) = 'blob'),
+                 UNIQUE (kind, artifact_id, revision)
+             ) STRICT";
+const EXPECTED_SCHEMA: [(&str, &str); 9] = [
     ("store_identity", STORE_IDENTITY_SCHEMA),
     ("replay_windows", REPLAY_WINDOWS_SCHEMA),
     ("native_route_pins", NATIVE_ROUTE_PINS_SCHEMA),
@@ -166,14 +180,17 @@ const EXPECTED_SCHEMA: [(&str, &str); 8] = [
     ("native_capability_facts", NATIVE_CAPABILITY_FACTS_SCHEMA),
     ("native_csi_facts", NATIVE_CSI_FACTS_SCHEMA),
     ("native_health_facts", NATIVE_HEALTH_FACTS_SCHEMA),
+    ("spatial_artifacts", SPATIAL_ARTIFACTS_SCHEMA),
 ];
 // SQLite owns these implicit indexes for the declared UNIQUE and composite
 // PRIMARY KEY constraints. Their exact names, owning tables, and NULL SQL are
-// part of schema generation 3; any other SQLite-owned object is unrecognized.
-const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 3] = [
+// part of schema generation 4; any other SQLite-owned object is unrecognized.
+const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 5] = [
     ("sqlite_autoindex_raw_facts_1", "raw_facts"),
     ("sqlite_autoindex_replay_windows_1", "replay_windows"),
     ("sqlite_autoindex_native_route_pins_1", "native_route_pins"),
+    ("sqlite_autoindex_spatial_artifacts_1", "spatial_artifacts"),
+    ("sqlite_autoindex_spatial_artifacts_2", "spatial_artifacts"),
 ];
 
 trait Entropy {
@@ -190,7 +207,7 @@ impl Entropy for SystemEntropy {
     }
 
     fn fill(&self, bytes: &mut [u8]) -> io::Result<()> {
-        File::open(RANDOM_SOURCE)?.read_exact(bytes)
+        getrandom::fill(bytes).map_err(io::Error::other)
     }
 }
 
@@ -362,11 +379,41 @@ impl std::error::Error for StoreOpenError {
 }
 
 /// An exclusively leased RF world-model Store ready for Host ownership.
-#[derive(Debug)]
 pub struct Store {
     root: PathBuf,
     id: StoreId,
+    companion_signing_seed: Option<CompanionSigningSeed>,
     lease: File,
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub(crate) struct CompanionSigningSeed([u8; 32]);
+
+impl CompanionSigningSeed {
+    pub(crate) const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CompanionSigningSeed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompanionSigningSeed([REDACTED])")
+    }
+}
+
+impl fmt::Debug for Store {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Store")
+            .field("root", &self.root)
+            .field("id", &self.id)
+            .field("companion_signing_seed", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) struct StoreSnapshot {
@@ -420,10 +467,17 @@ impl Store {
             set_root_permissions(root)?;
             let lease = acquire_lease(root, true)?;
             let id = random_store_id(entropy)?;
+            let companion_signing_seed = random_companion_signing_seed(entropy)?;
+            write_companion_signing_seed(root, &companion_signing_seed)?;
             let database_path = root.join(DATABASE_NAME);
             initialize_database(&database_path, id)?;
             sync_directory(root)?;
-            Ok(Self { root: root.to_owned(), id, lease })
+            Ok(Self {
+                root: root.to_owned(),
+                id,
+                companion_signing_seed: Some(companion_signing_seed),
+                lease,
+            })
         })();
 
         if result.is_err() {
@@ -455,6 +509,7 @@ impl Store {
             validate_root(root)?;
             let database_path = root.join(DATABASE_NAME);
             recognize_database_header(&database_path)?;
+            let companion_signing_seed = read_companion_signing_seed(root)?;
             let lease = acquire_lease(root, false)?;
             let wal_path = database_path.with_extension("sqlite3-wal");
             let shm_path = database_path.with_extension("sqlite3-shm");
@@ -463,7 +518,12 @@ impl Store {
             validate_wal_shape(&wal_path)?;
             validate_shm_shape(&shm_path, wal_path.exists())?;
             let id = validate_database_snapshot(&database_path, &wal_path, &shm_path, entropy)?;
-            Ok(Self { root: root.to_owned(), id, lease })
+            Ok(Self {
+                root: root.to_owned(),
+                id,
+                companion_signing_seed: Some(companion_signing_seed),
+                lease,
+            })
         })()
         .map_err(|source| StoreOpenError {
             root: root.to_owned(),
@@ -480,6 +540,12 @@ impl Store {
 
     pub(crate) fn database_path(&self) -> PathBuf {
         self.root.join(DATABASE_NAME)
+    }
+
+    pub(crate) fn take_companion_signing_seed(&mut self) -> CompanionSigningSeed {
+        self.companion_signing_seed
+            .take()
+            .expect("a Store transfers its companion signing seed only once")
     }
 
     pub(crate) fn database_snapshot(&self) -> io::Result<StoreSnapshot> {
@@ -727,6 +793,49 @@ fn random_bytes<const N: usize>(entropy: &dyn Entropy) -> Result<[u8; N], StoreE
     Ok(bytes)
 }
 
+fn random_companion_signing_seed(
+    entropy: &dyn Entropy,
+) -> Result<CompanionSigningSeed, StoreError> {
+    let mut seed = CompanionSigningSeed::new([0; 32]);
+    entropy.fill(&mut seed.0).map_err(|source| io_error(entropy.source_path(), source))?;
+    Ok(seed)
+}
+
+fn write_companion_signing_seed(
+    root: &Path,
+    signing_seed: &CompanionSigningSeed,
+) -> Result<(), StoreError> {
+    let path = root.join(COMPANION_SIGNING_SEED_NAME);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(FILE_MODE).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = options.open(&path).map_err(|source| io_error(&path, source))?;
+    use std::io::Write;
+    file.write_all(signing_seed.as_bytes()).map_err(|source| io_error(&path, source))?;
+    set_file_permissions(&path)?;
+    file.sync_all().map_err(|source| io_error(&path, source))
+}
+
+fn read_companion_signing_seed(root: &Path) -> Result<CompanionSigningSeed, StoreError> {
+    let path = root.join(COMPANION_SIGNING_SEED_NAME);
+    validate_regular_file(&path)?;
+    let mut signing_seed = CompanionSigningSeed::new([0; 32]);
+    let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
+    if let Err(source) = file.read_exact(&mut signing_seed.0) {
+        if source.kind() == io::ErrorKind::UnexpectedEof {
+            return Err(StoreErrorKind::Unrecognized.into());
+        }
+        return Err(io_error(&path, source));
+    }
+    let mut trailing = [0_u8; 1];
+    match file.read(&mut trailing) {
+        Ok(0) => Ok(signing_seed),
+        Ok(_) => Err(StoreErrorKind::Unrecognized.into()),
+        Err(source) => Err(io_error(&path, source)),
+    }
+}
+
 #[cfg(unix)]
 fn validate_root(path: &Path) -> Result<(), StoreError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
@@ -811,6 +920,7 @@ fn database_error(source: rusqlite::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -843,6 +953,12 @@ mod tests {
 
     #[test]
     fn initialization_uses_the_injected_entropy_capability() {
+        assert!(std::mem::needs_drop::<CompanionSigningSeed>());
+        let mut disposable_seed = CompanionSigningSeed::new([0xab; 32]);
+        assert_eq!(format!("{disposable_seed:?}"), "CompanionSigningSeed([REDACTED])");
+        disposable_seed.zeroize();
+        assert_eq!(disposable_seed.as_bytes(), &[0; 32]);
+
         let root = root("fixed");
         let store = Store::initialize_with_entropy(&root, &FixedEntropy(Ok(0x5a))).unwrap();
         assert_eq!(store.id, StoreId([0x5a; STORE_ID_BYTES]));
@@ -878,6 +994,39 @@ mod tests {
         let store_source = std::error::Error::source(&error).unwrap();
         assert!(store_source.source().is_some());
         assert_eq!(fs::read(database).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn signing_seed_open_failure_retains_seed_path_and_io_source() {
+        let root = root("signing-seed-open-failure");
+        fs::create_dir(&root).unwrap();
+        write_companion_signing_seed(&root, &CompanionSigningSeed::new([1; 32])).unwrap();
+
+        let error =
+            write_companion_signing_seed(&root, &CompanionSigningSeed::new([2; 32])).unwrap_err();
+        let expected_path = root.join(COMPANION_SIGNING_SEED_NAME);
+        assert!(error.to_string().contains(expected_path.to_str().unwrap()));
+        assert_eq!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .map(io::Error::kind),
+            Some(io::ErrorKind::AlreadyExists)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_seed_chmod_failure_is_an_io_error_with_seed_path() {
+        let root = root("signing-seed-chmod-failure");
+        fs::create_dir(&root).unwrap();
+        let seed_path = root.join(COMPANION_SIGNING_SEED_NAME);
+
+        let error = set_file_permissions(&seed_path).unwrap_err();
+        assert!(error.to_string().contains(seed_path.to_str().unwrap()));
+        assert!(error.source().and_then(|source| source.downcast_ref::<io::Error>()).is_some());
         fs::remove_dir_all(root).unwrap();
     }
 }

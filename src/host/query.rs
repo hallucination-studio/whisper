@@ -10,6 +10,76 @@ use crate::native_frame::{
     authenticate_datagram, decode_authenticated,
 };
 use rusqlite::{Row, types::FromSql};
+
+pub(super) fn query_artifact(
+    path: &Path,
+    digest: ArtifactDigest,
+) -> Result<Option<SealedArtifact>, HostError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))?;
+    let bytes: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT sealed_bytes FROM spatial_artifacts WHERE digest = ?1",
+            [digest.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))?;
+    bytes
+        .map(|bytes| {
+            SealedArtifact::parse(bytes).map_err(|_| {
+                HostError::message_at(
+                    "decode persisted spatial artifact",
+                    path,
+                    "persisted artifact bytes are invalid",
+                )
+            })
+        })
+        .transpose()
+}
+
+pub(super) fn query_artifact_receipt(
+    path: &Path,
+    digest: ArtifactDigest,
+) -> Result<Option<ImportedArtifact>, ArtifactImportError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| ArtifactImportError::database("open artifact receipt query", path, error))?;
+    let row: Option<(u8, String, u32, String)> = connection
+        .query_row(
+            "SELECT kind, artifact_id, revision, origin FROM spatial_artifacts WHERE digest = ?1",
+            [digest.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| ArtifactImportError::database("query artifact receipt", path, error))?;
+    row.map(|(kind, artifact_id, revision, origin)| {
+        let kind = ArtifactKind::from_code(kind).ok_or_else(|| {
+            ArtifactImportError::new(
+                ArtifactRejectReason::Persistence,
+                "persisted artifact kind is invalid",
+            )
+        })?;
+        let origin = match origin.as_str() {
+            "local" => ArtifactOrigin::Local,
+            "companion" => ArtifactOrigin::Companion,
+            _ => {
+                return Err(ArtifactImportError::new(
+                    ArtifactRejectReason::Persistence,
+                    "persisted artifact origin is invalid",
+                ));
+            }
+        };
+        Ok(ImportedArtifact::from_parts(digest, kind, artifact_id, revision, origin))
+    })
+    .transpose()
+}
+
 pub(super) fn query_raw(path: &Path, limit: usize) -> Result<Vec<RawFact>, HostError> {
     let connection = Connection::open_with_flags(
         path,
