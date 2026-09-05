@@ -8,6 +8,7 @@ two operative scopes; all other former Host target specifications are removed.
 | Fixed ESP firmware, authenticated UDP, capability, native CSI and provisioning input | [Native-frame v1](native-frame-v1.md) |
 | Phone calibration, heterogeneous RF, selected joint model, A/B/C, history, runtime and acceptance | [RF world-model v1](rf-world-model-v1.md) |
 | Canonical locally coherent array-capture bytes and qualified path-adapter behavior | [Array capture v1](array-capture-v1.md) |
+| Versioned local Python worker and Rust numerical-client boundary | [Model worker protocol v1](model-worker-v1.md) |
 
 The RF specification is the accepted direct-rebuild target. Its implementations
 and any narrower byte/schema artifacts are owned by the new
