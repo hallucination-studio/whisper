@@ -47,20 +47,17 @@ fn fragment_with(
     expected: u16,
     digest: u8,
     bytes: u32,
+    quality: EvidenceQuality,
 ) -> MeasurementFragment {
     MeasurementFragment::new(
         key(boot, event),
         FragmentPosition::new(ordinal, expected).unwrap(),
-        FragmentFact::new(
-            [digest; 32],
-            FragmentBytes::new(bytes).unwrap(),
-            EvidenceQuality::Captured,
-        ),
+        FragmentFact::new([digest; 32], FragmentBytes::new(bytes).unwrap(), quality),
     )
 }
 
 fn fragment(boot: u32, event: u8, ordinal: u16, expected: u16) -> MeasurementFragment {
-    fragment_with(boot, event, ordinal, expected, ordinal as u8 + 1, 12)
+    fragment_with(boot, event, ordinal, expected, ordinal as u8 + 1, 12, EvidenceQuality::Captured)
 }
 
 fn limits(open: usize, fragments: u16, bytes: u64, wait: u64) -> AssemblyLimits {
@@ -71,11 +68,11 @@ fn limits(open: usize, fragments: u16, bytes: u64, wait: u64) -> AssemblyLimits 
 }
 
 #[test]
-fn assembly_reorders_and_records_exact_duplicates_without_mutating_membership() {
+fn deterministic_fixture_covers_reorder_duplicate_missing_late_and_cross_boot() {
     const FIXTURE: &str = include_str!("fixtures/measurement/fragments-v1.txt");
     const FIXTURE_SHA256: [u8; 32] = [
-        205, 38, 239, 195, 234, 42, 62, 253, 208, 219, 42, 62, 250, 124, 7, 23, 56, 77, 84, 86, 43,
-        181, 180, 152, 157, 226, 125, 234, 3, 30, 89, 163,
+        188, 120, 104, 227, 213, 174, 58, 52, 104, 218, 30, 95, 148, 246, 9, 181, 165, 190, 36,
+        153, 5, 41, 190, 214, 233, 214, 112, 183, 116, 39, 45, 38,
     ];
     assert_eq!(<[u8; 32]>::from(Sha256::digest(FIXTURE.as_bytes())), FIXTURE_SHA256);
     let mut assembler = MeasurementAssembler::new(limits(4, 4, 64, 10));
@@ -93,6 +90,10 @@ fn assembly_reorders_and_records_exact_duplicates_without_mutating_membership() 
                         values[4].parse().unwrap(),
                         values[5].parse().unwrap(),
                         values[6].parse().unwrap(),
+                        match values[7] {
+                            "captured" => EvidenceQuality::Captured,
+                            other => panic!("unsupported fixture quality: {other}"),
+                        },
                     ),
                     SourceTick::new(arrival),
                 )
@@ -101,7 +102,16 @@ fn assembly_reorders_and_records_exact_duplicates_without_mutating_membership() 
     }
     assert_eq!(
         closes.iter().map(|close| close.reason()).collect::<Vec<_>>(),
-        [AssemblyCloseReason::DuplicateFragment, AssemblyCloseReason::Complete,]
+        [
+            AssemblyCloseReason::DuplicateFragment,
+            AssemblyCloseReason::Complete,
+            AssemblyCloseReason::WaitLimit,
+            AssemblyCloseReason::LateFragment,
+            AssemblyCloseReason::WaitLimit,
+            AssemblyCloseReason::LateFragment,
+            AssemblyCloseReason::WaitLimit,
+            AssemblyCloseReason::LateFragment,
+        ]
     );
     assert_eq!(
         closes[1].members().iter().map(|member| member.ordinal()).collect::<Vec<_>>(),
@@ -109,6 +119,20 @@ fn assembly_reorders_and_records_exact_duplicates_without_mutating_membership() 
     );
     assert_eq!(closes[1].expected_fragments(), 2);
     assert!(closes[1].missing_ordinals().is_empty());
+    let cross_boot_waits = closes
+        .iter()
+        .filter(|close| {
+            close.reason() == AssemblyCloseReason::WaitLimit
+                && close.key().event().native_event() == NativeEventIdentity::new([10; 32])
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cross_boot_waits.len(), 2);
+    assert_eq!(cross_boot_waits[0].key().source().boot(), BootGeneration::new(1).unwrap());
+    assert_eq!(cross_boot_waits[0].members()[0].ordinal(), 0);
+    assert_eq!(cross_boot_waits[0].missing_ordinals(), [1]);
+    assert_eq!(cross_boot_waits[1].key().source().boot(), BootGeneration::new(2).unwrap());
+    assert_eq!(cross_boot_waits[1].members()[0].ordinal(), 1);
+    assert_eq!(cross_boot_waits[1].missing_ordinals(), [0]);
 }
 
 #[test]
@@ -121,6 +145,27 @@ fn partial_timeout_and_late_data_are_separate_immutable_facts() {
     let late = assembler.late(fragment(1, 8, 1, 2), SourceTick::new(16));
     assert_eq!(late.reason(), AssemblyCloseReason::LateFragment);
     assert_eq!(original.missing_ordinals(), [1]);
+}
+
+#[test]
+fn duplicate_identity_includes_digest_payload_bytes_and_quality() {
+    for (event, bytes, quality) in
+        [(20, 13, EvidenceQuality::Captured), (21, 12, EvidenceQuality::Invalid)]
+    {
+        let mut assembler = MeasurementAssembler::new(limits(4, 4, 64, 10));
+        assembler
+            .ingest(
+                fragment_with(1, event, 0, 2, 7, 12, EvidenceQuality::Captured),
+                SourceTick::new(1),
+            )
+            .unwrap();
+        let closes = assembler
+            .ingest(fragment_with(1, event, 0, 2, 7, bytes, quality), SourceTick::new(2))
+            .unwrap();
+        assert_eq!(closes[0].reason(), AssemblyCloseReason::ConflictingDuplicate);
+        assert_eq!(closes[0].members()[0].payload_bytes(), 12);
+        assert_eq!(closes[0].members()[0].quality(), EvidenceQuality::Captured);
+    }
 }
 
 #[test]

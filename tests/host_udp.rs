@@ -597,6 +597,130 @@ fn resource_limit_close_remains_closed_across_restart() {
 }
 
 #[test]
+fn repeated_exact_duplicates_round_trip_with_per_attempt_metrics() {
+    let parent = temporary_directory("host-repeated-measurement-duplicates");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let store_root = parent.join("world-store");
+    let key = AssemblyKey::new(
+        SourceInstance::new(
+            SensorId::try_from("duplicate-rx").unwrap(),
+            DeviceId::new(95),
+            KeyEpoch::new(3).unwrap(),
+            BootGeneration::new(8).unwrap(),
+        ),
+        EventIdentity::new(
+            TransmitterIdentity::new([1; 32]),
+            NativeEventIdentity::new([2; 32]),
+            None,
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new([3; 32]),
+            RadioIdentity::new([4; 32]),
+            ChannelIdentity::new([5; 32]),
+        ),
+    );
+    let fragment = || {
+        MeasurementFragment::new(
+            key.clone(),
+            FragmentPosition::new(0, 2).unwrap(),
+            FragmentFact::new([6; 32], FragmentBytes::new(5).unwrap(), EvidenceQuality::Captured),
+        )
+    };
+    let host = start_host(Store::initialize(&store_root).unwrap(), &sender, &secret_root);
+    assert!(host.persist_measurement_fragment(fragment(), SourceTick::new(1)).unwrap().is_empty());
+    for tick in [2, 3] {
+        let closes = host.persist_measurement_fragment(fragment(), SourceTick::new(tick)).unwrap();
+        assert_eq!(closes[0].reason(), AssemblyCloseReason::DuplicateFragment);
+        assert_eq!(closes[0].metrics().attempted_fragments(), 2);
+        assert_eq!(closes[0].metrics().attempted_bytes(), 10);
+    }
+    let duplicates = host
+        .query_measurement_closes(4)
+        .unwrap()
+        .into_iter()
+        .filter(|close| close.reason() == AssemblyCloseReason::DuplicateFragment)
+        .collect::<Vec<_>>();
+    assert_eq!(duplicates.len(), 2);
+    host.shutdown().unwrap();
+
+    let reopened = start_host(Store::open(&store_root).unwrap(), &sender, &secret_root);
+    assert_eq!(reopened.query_measurement_closes(4).unwrap().len(), 2);
+    reopened.shutdown().unwrap();
+    let database = rusqlite::Connection::open(store_root.join("facts.sqlite3")).unwrap();
+    database
+        .execute(
+            "UPDATE measurement_fragments SET quality='invalid'
+             WHERE fragment_id=(SELECT min(fragment_id) FROM measurement_fragments)",
+            [],
+        )
+        .unwrap();
+    drop(database);
+    let tampered = start_host(Store::open(&store_root).unwrap(), &sender, &secret_root);
+    assert!(tampered.query_measurement_closes(4).is_err());
+    tampered.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn measurement_query_rejects_non_null_wait_limit_trigger() {
+    let parent = temporary_directory("host-wait-trigger-tamper");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let store_root = parent.join("world-store");
+    let source = SourceInstance::new(
+        SensorId::try_from("wait-rx").unwrap(),
+        DeviceId::new(96),
+        KeyEpoch::new(3).unwrap(),
+        BootGeneration::new(8).unwrap(),
+    );
+    let key = AssemblyKey::new(
+        source.clone(),
+        EventIdentity::new(
+            TransmitterIdentity::new([1; 32]),
+            NativeEventIdentity::new([2; 32]),
+            None,
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new([3; 32]),
+            RadioIdentity::new([4; 32]),
+            ChannelIdentity::new([5; 32]),
+        ),
+    );
+    let fragment = |ordinal, digest| {
+        MeasurementFragment::new(
+            key.clone(),
+            FragmentPosition::new(ordinal, 2).unwrap(),
+            FragmentFact::new(
+                [digest; 32],
+                FragmentBytes::new(1).unwrap(),
+                EvidenceQuality::Captured,
+            ),
+        )
+    };
+    let host = start_host(Store::initialize(&store_root).unwrap(), &sender, &secret_root);
+    host.persist_measurement_fragment(fragment(0, 6), SourceTick::new(1)).unwrap();
+    host.expire_measurements(source, SourceTick::new(1_000_001)).unwrap();
+    host.persist_measurement_fragment(fragment(1, 7), SourceTick::new(1_000_002)).unwrap();
+    host.shutdown().unwrap();
+
+    let database = rusqlite::Connection::open(store_root.join("facts.sqlite3")).unwrap();
+    database
+        .execute(
+            "UPDATE measurement_assemblies
+             SET trigger_fragment_id=(SELECT max(fragment_id) FROM measurement_fragments)
+             WHERE close_reason='wait_limit'",
+            [],
+        )
+        .unwrap();
+    drop(database);
+    let reopened = start_host(Store::open(&store_root).unwrap(), &sender, &secret_root);
+    assert!(reopened.query_measurement_closes(4).is_err());
+    reopened.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
 fn restart_rejects_open_fragment_count_or_byte_limit_tampering() {
     for (label, mutation) in [
         ("count", "UPDATE measurement_fragments SET expected_fragments=5"),

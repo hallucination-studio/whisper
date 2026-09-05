@@ -982,11 +982,7 @@ fn validate_close_integrity(
                 && metrics.attempted_fragments() == u32::try_from(members.len()).unwrap_or(u32::MAX)
                 && metrics.attempted_bytes() == total
                 && elapsed >= limits.wait().get()
-                && trigger.as_ref().is_none_or(|fact| {
-                    !members.iter().any(|member| {
-                        member.ordinal() == fact.ordinal && member.fact_digest() == fact.digest
-                    })
-                })
+                && trigger.is_none()
         }
         AssemblyCloseReason::CountLimit => {
             uncertainty == AssociationUncertainty::ExactNativeIdentity
@@ -1032,11 +1028,12 @@ fn validate_close_integrity(
                     == u32::try_from(members.len()).unwrap_or(u32::MAX).saturating_add(1)
                 && trigger.as_ref().is_some_and(|fact| {
                     (fact.expected != expected
-                        || (members.iter().any(|member| member.ordinal() == fact.ordinal)
-                            && members.iter().all(|member| {
-                                member.ordinal() != fact.ordinal
-                                    || member.fact_digest() != fact.digest
-                            })))
+                        || members.iter().any(|member| {
+                            member.ordinal() == fact.ordinal
+                                && (member.fact_digest() != fact.digest
+                                    || member.payload_bytes() != fact.bytes
+                                    || member.quality() != fact.quality)
+                        }))
                         && metrics.attempted_bytes() == total.saturating_add(u64::from(fact.bytes))
                 })
         }
@@ -1051,14 +1048,31 @@ fn validate_close_integrity(
     if reason == AssemblyCloseReason::DuplicateFragment {
         let trigger = trigger_fragment_id.expect("duplicate consistency requires a trigger");
         let member = members[0];
+        let member_quality = match member.quality() {
+            EvidenceQuality::Captured => "captured",
+            EvidenceQuality::NotCaptured => "not_captured",
+            EvidenceQuality::Lost => "lost",
+            EvidenceQuality::Invalid => "invalid",
+            EvidenceQuality::Interpolated => "interpolated",
+            EvidenceQuality::TrainingMasked => "training_masked",
+        };
         let (prior_count, prior_bytes, matching): (u32, u64, u32) = connection
             .query_row(
-                "SELECT count(*),coalesce(sum(payload_bytes),0),
-                        coalesce(sum(ordinal=?2 AND fact_digest=?3),0)
-                 FROM measurement_fragments
-                 WHERE fragment_id < ?1 AND sensor=?4 AND device_id=?5 AND key_epoch=?6
-                   AND boot_generation=?7 AND transmitter=?8 AND native_event=?9
-                   AND retransmission IS ?10 AND profile=?11 AND radio=?12 AND channel=?13",
+                "WITH prior AS (
+                     SELECT fragment_id,ordinal,fact_digest,payload_bytes,quality
+                     FROM measurement_fragments
+                     WHERE fragment_id < ?1 AND sensor=?4 AND device_id=?5 AND key_epoch=?6
+                       AND boot_generation=?7 AND transmitter=?8 AND native_event=?9
+                       AND retransmission IS ?10 AND profile=?11 AND radio=?12 AND channel=?13
+                 )
+                 SELECT count(*),coalesce(sum(payload_bytes),0),
+                        coalesce(sum(ordinal=?2 AND fact_digest=?3
+                                     AND payload_bytes=?14 AND quality=?15),0)
+                 FROM prior AS candidate
+                 WHERE fragment_id=(
+                     SELECT min(fragment_id) FROM prior AS earlier
+                     WHERE earlier.ordinal=candidate.ordinal
+                 )",
                 params![
                     trigger,
                     member.ordinal(),
@@ -1072,7 +1086,9 @@ fn validate_close_integrity(
                     key.event().retransmission().map(RetransmissionIdentity::bytes),
                     key.context().profile().bytes(),
                     key.context().radio().bytes(),
-                    key.context().channel().bytes()
+                    key.context().channel().bytes(),
+                    member.payload_bytes(),
+                    member_quality
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )

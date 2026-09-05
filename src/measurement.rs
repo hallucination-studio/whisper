@@ -870,7 +870,10 @@ impl MeasurementAssembler {
             )]);
         }
         if let Some(existing) = open.members.get(&fragment.position.ordinal) {
-            if existing.fact_digest == fragment.fact.digest {
+            if existing.fact_digest == fragment.fact.digest
+                && existing.payload_bytes == fragment.fact.bytes.get()
+                && existing.quality == fragment.fact.quality
+            {
                 let metrics = AssemblyCloseMetrics::new(
                     open.first_tick,
                     arrival,

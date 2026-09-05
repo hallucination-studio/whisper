@@ -2,3 +2,9 @@
 2,1,8,1,2,2,12,captured
 3,1,8,1,2,2,12,captured
 4,1,8,0,2,1,12,captured
+5,1,9,0,2,3,7,captured
+15,1,9,0,2,3,7,captured
+20,1,10,0,2,4,8,captured
+20,2,10,1,2,5,9,captured
+30,1,10,0,2,4,8,captured
+30,2,10,1,2,5,9,captured
