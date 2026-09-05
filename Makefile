@@ -4,9 +4,12 @@ PROVISION_TOOLS_DIRECTORY := $(FIRMWARE_DIRECTORY)/build/provision-tools
 NVS_PARTITION_TOOL_DIRECTORY := $(PROVISION_TOOLS_DIRECTORY)/nvs-partition-tool
 PROVISION_PYTHON := $(PROVISION_TOOLS_DIRECTORY)/venv/bin/python
 
-.PHONY: check check-firmware check-policy check-python check-rust esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
+.PHONY: check check-firmware check-phone check-policy check-python check-rust esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
 
-check: check-policy check-python check-rust check-firmware
+check: check-policy check-python check-rust check-phone check-firmware
+
+check-phone:
+	swift test --package-path PhoneClient
 
 check-firmware: esp32-native-frame-firmware
 

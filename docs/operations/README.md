@@ -7,6 +7,7 @@ receipt.
 | Trigger | Owner |
 | --- | --- |
 | Repository software and policy checks | Run `make check` from the repository root. |
+| Phone Swift package build, export, or companion recovery | [Phone client operations](phone-client.md) |
 | ESP-IDF build, parity, QEMU, provisioning, flash, verification, live smoke, or receipt retention | [Firmware operations](firmware.md) |
 
 No host-runtime or browser operations runbook has been recovered. Any active
@@ -28,5 +29,6 @@ there is no skip path. The image supplies the remaining ESP-IDF dependencies.
 The command is software evidence only. It does not run or silently pass phone,
 LiDAR, RF-array, ESP hardware, trained-model accuracy, or 14-day acceptance.
 Those checks need their ticket-specific equipment and retained execution
-evidence. A future Python, Swift or browser package must add its build and
-behavior command to `make check` in the ticket that introduces the package.
+evidence. The phone Swift package build and behavior command is included in
+`make check` by the phone-client ticket; future Python or browser packages must
+add their own commands when introduced.
