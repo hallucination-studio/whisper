@@ -7,9 +7,9 @@ use std::thread;
 use std::time::Duration;
 
 use whisper::model_worker::{
-    Checkpoint, DispatchDecision, DispatchQueue, ExecutionClass, InputManifest, ModelRequest,
-    ModelResponse, ModelRun, ModelRunId, NumericContract, RequestIdentity, ResponseStatus,
-    WorkerClient, WorkerLimits,
+    Checkpoint, ContentDigest, DispatchDecision, DispatchQueue, ExecutionClass, InputManifest,
+    ModelRequest, ModelResponse, ModelRun, ModelRunId, NumericContract, RequestIdentity,
+    ResponseStatus, WorkerClient, WorkerLimits,
 };
 
 fn request(id: &str, tensor: Vec<u8>) -> ModelRequest {
@@ -203,4 +203,118 @@ fn public_deserialization_preserves_identifier_and_numeric_invariants() {
     ] {
         assert!(serde_json::from_str::<NumericContract>(invalid).is_err());
     }
+}
+
+#[test]
+fn model_run_deserialization_rejects_invalid_schema_digest_text_and_shapes() {
+    let value = serde_json::to_value(request("request-1", vec![0; 4])).unwrap();
+    let model_run = value["model_run"].clone();
+    for (field, invalid) in [
+        ("schema_version", serde_json::json!(2)),
+        ("weights_digest", serde_json::json!("00".repeat(32))),
+        ("algorithm", serde_json::json!("")),
+        ("max_shape", serde_json::json!([])),
+        ("output_shape", serde_json::json!([0])),
+    ] {
+        let mut mutated = model_run.clone();
+        mutated[field] = invalid;
+        assert!(
+            serde_json::from_value::<ModelRun>(mutated).is_err(),
+            "accepted invalid model-run {field}"
+        );
+    }
+}
+
+#[test]
+fn input_manifest_deserialization_rejects_invalid_schema_digests_text_and_shape() {
+    let value = serde_json::to_value(request("request-1", vec![0; 4])).unwrap();
+    let manifest = value["input_manifest"].clone();
+    for (field, invalid) in [
+        ("schema_version", serde_json::json!(2)),
+        ("manifest_digest", serde_json::json!("00".repeat(32))),
+        ("tensor_digest", serde_json::json!("00".repeat(32))),
+        ("preprocessing", serde_json::json!("")),
+        ("shape", serde_json::json!([2])),
+    ] {
+        let mut mutated = manifest.clone();
+        mutated[field] = invalid;
+        assert!(
+            serde_json::from_value::<InputManifest>(mutated).is_err(),
+            "accepted invalid input-manifest {field}"
+        );
+    }
+}
+
+#[test]
+fn checkpoint_deserialization_rejects_digest_mutation() {
+    let value = serde_json::to_value(request("request-1", vec![0; 4])).unwrap();
+    let mut checkpoint = value["checkpoint"].clone();
+    checkpoint["digest"] = serde_json::json!("00".repeat(32));
+    assert!(serde_json::from_value::<Checkpoint>(checkpoint).is_err());
+}
+
+#[test]
+fn model_request_deserialization_rejects_protocol_and_cross_binding_mutations() {
+    let request = serde_json::to_value(request("request-1", vec![0; 4])).unwrap();
+    let mut invalid_protocol = request.clone();
+    invalid_protocol["protocol_version"] = serde_json::json!(2);
+    assert!(serde_json::from_value::<ModelRequest>(invalid_protocol).is_err());
+
+    for path in ["run_id", "epoch", "cutoff_ns", "predecessor_digest"] {
+        let mut mutated = request.clone();
+        mutated["identity"][path] = match path {
+            "run_id" => serde_json::json!("different-run"),
+            "epoch" => serde_json::json!(8),
+            "cutoff_ns" => serde_json::json!(250_000_001_u64),
+            "predecessor_digest" => serde_json::json!("00".repeat(32)),
+            _ => unreachable!(),
+        };
+        assert!(
+            serde_json::from_value::<ModelRequest>(mutated).is_err(),
+            "accepted invalid request {path} binding"
+        );
+    }
+
+    let mut mismatched_semantics = request;
+    mismatched_semantics["input_manifest"]["preprocessing"] = serde_json::json!("other-v1");
+    assert!(serde_json::from_value::<ModelRequest>(mismatched_semantics).is_err());
+}
+
+#[test]
+fn model_response_deserialization_rejects_invalid_success_and_failure_invariants() {
+    let model_request = request("request-1", vec![0; 4]);
+    let mut failure = serde_json::to_value(ModelResponse::failure(
+        model_request.identity().clone(),
+        ResponseStatus::OperatorFailure,
+        "operator failed",
+    ))
+    .unwrap();
+
+    let mut invalid_protocol = failure.clone();
+    invalid_protocol["protocol_version"] = serde_json::json!(2);
+    assert!(serde_json::from_value::<ModelResponse>(invalid_protocol).is_err());
+
+    failure["candidate_hex"] = serde_json::json!("00000000");
+    assert!(serde_json::from_value::<ModelResponse>(failure).is_err());
+
+    let request_value = serde_json::to_value(&model_request).unwrap();
+    let candidate = [1.0_f32.to_le_bytes(), 2.0_f32.to_le_bytes()].concat();
+    let successor = b"successor".to_vec();
+    let mut payload = candidate.clone();
+    payload.extend_from_slice(&successor);
+    let mut success = serde_json::json!({
+        "protocol_version": 1,
+        "identity": request_value["identity"],
+        "status": "success",
+        "detail": "",
+        "candidate_hex": candidate.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "successor_hex": successor.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "input_tensor_digest": request_value["input_manifest"]["tensor_digest"],
+        "output_numeric_digest": ContentDigest::of(&candidate),
+        "return_payload_digest": ContentDigest::of(&payload),
+        "numeric_qualification": request_value["model_run"]["execution"],
+    });
+    assert!(serde_json::from_value::<ModelResponse>(success.clone()).is_ok());
+    success["output_numeric_digest"] = serde_json::json!("00".repeat(32));
+    assert!(serde_json::from_value::<ModelResponse>(success).is_err());
 }

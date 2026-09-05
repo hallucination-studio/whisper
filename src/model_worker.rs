@@ -241,7 +241,7 @@ impl NumericContract {
 }
 
 /// Immutable model and interpretation selected for one run.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelRun {
     schema_version: u16,
     run_id: ModelRunId,
@@ -261,6 +261,58 @@ pub struct ModelRun {
     max_shape: Vec<u32>,
     output_shape: Vec<u32>,
     execution: NumericContract,
+}
+
+#[derive(Deserialize)]
+struct ModelRunWire {
+    schema_version: u16,
+    run_id: ModelRunId,
+    weights_digest: ContentDigest,
+    #[serde(with = "hex_bytes")]
+    weights_hex: Vec<u8>,
+    algorithm: String,
+    preprocessing: String,
+    normalization: String,
+    input_semantics: String,
+    output_semantics: String,
+    label_semantics: String,
+    calibration_policy: String,
+    tolerance_policy: String,
+    fusion_policy: String,
+    state_format: String,
+    max_shape: Vec<u32>,
+    output_shape: Vec<u32>,
+    execution: NumericContract,
+}
+
+impl<'de> Deserialize<'de> for ModelRun {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ModelRunWire::deserialize(deserializer)?;
+        let value = Self {
+            schema_version: wire.schema_version,
+            run_id: wire.run_id,
+            weights_digest: wire.weights_digest,
+            weights_hex: wire.weights_hex,
+            algorithm: wire.algorithm,
+            preprocessing: wire.preprocessing,
+            normalization: wire.normalization,
+            input_semantics: wire.input_semantics,
+            output_semantics: wire.output_semantics,
+            label_semantics: wire.label_semantics,
+            calibration_policy: wire.calibration_policy,
+            tolerance_policy: wire.tolerance_policy,
+            fusion_policy: wire.fusion_policy,
+            state_format: wire.state_format,
+            max_shape: wire.max_shape,
+            output_shape: wire.output_shape,
+            execution: wire.execution,
+        };
+        value.validate_contract().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl ModelRun {
@@ -289,6 +341,33 @@ impl ModelRun {
             state_format: None,
             output_shape: None,
         }
+    }
+
+    fn validate_contract(&self) -> Result<(), ModelWorkerError> {
+        if self.schema_version != ARTIFACT_SCHEMA_VERSION {
+            return Err(ModelWorkerError::invalid("unsupported model-run schema version"));
+        }
+        validate_text(self.run_id.as_str(), "model run ID")?;
+        for (value, field) in [
+            (&self.algorithm, "algorithm"),
+            (&self.preprocessing, "preprocessing"),
+            (&self.normalization, "normalization"),
+            (&self.input_semantics, "input semantics"),
+            (&self.output_semantics, "output semantics"),
+            (&self.label_semantics, "label semantics"),
+            (&self.calibration_policy, "calibration policy"),
+            (&self.tolerance_policy, "tolerance policy"),
+            (&self.fusion_policy, "fusion policy"),
+            (&self.state_format, "state format"),
+        ] {
+            validate_text(value, field)?;
+        }
+        self.execution.validate()?;
+        if self.weights_digest != ContentDigest::of(&self.weights_hex) {
+            return Err(ModelWorkerError::invalid("model weights digest mismatch"));
+        }
+        validate_nonzero_shape(&self.max_shape, "maximum input shape")?;
+        validate_nonzero_shape(&self.output_shape, "output shape")
     }
 }
 
@@ -350,7 +429,7 @@ impl ModelRunBuilder {
             validate_text(&value, field)?;
             Ok(value)
         };
-        Ok(ModelRun {
+        let value = ModelRun {
             schema_version: ARTIFACT_SCHEMA_VERSION,
             run_id: self.run_id,
             weights_digest: ContentDigest::of(&self.weights),
@@ -370,12 +449,14 @@ impl ModelRunBuilder {
                 .output_shape
                 .ok_or_else(|| ModelWorkerError::invalid("missing output shape"))?,
             execution: self.execution,
-        })
+        };
+        value.validate_contract()?;
+        Ok(value)
     }
 }
 
 /// Frozen manifest binding and its canonical materialized tensor.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct InputManifest {
     schema_version: u16,
     manifest_digest: ContentDigest,
@@ -393,6 +474,53 @@ pub struct InputManifest {
     tensor_hex: Vec<u8>,
     source_count: u32,
     clock_domain_count: u32,
+}
+
+#[derive(Deserialize)]
+struct InputManifestWire {
+    schema_version: u16,
+    manifest_digest: ContentDigest,
+    #[serde(with = "hex_bytes")]
+    manifest_hex: Vec<u8>,
+    run_id: ModelRunId,
+    epoch: u64,
+    cutoff_ns: u64,
+    predecessor_digest: ContentDigest,
+    preprocessing: String,
+    input_semantics: String,
+    shape: Vec<u32>,
+    tensor_digest: ContentDigest,
+    #[serde(with = "hex_bytes")]
+    tensor_hex: Vec<u8>,
+    source_count: u32,
+    clock_domain_count: u32,
+}
+
+impl<'de> Deserialize<'de> for InputManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = InputManifestWire::deserialize(deserializer)?;
+        let value = Self {
+            schema_version: wire.schema_version,
+            manifest_digest: wire.manifest_digest,
+            manifest_hex: wire.manifest_hex,
+            run_id: wire.run_id,
+            epoch: wire.epoch,
+            cutoff_ns: wire.cutoff_ns,
+            predecessor_digest: wire.predecessor_digest,
+            preprocessing: wire.preprocessing,
+            input_semantics: wire.input_semantics,
+            shape: wire.shape,
+            tensor_digest: wire.tensor_digest,
+            tensor_hex: wire.tensor_hex,
+            source_count: wire.source_count,
+            clock_domain_count: wire.clock_domain_count,
+        };
+        value.validate_contract().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl InputManifest {
@@ -418,6 +546,30 @@ impl InputManifest {
             source_count: None,
             clock_domain_count: None,
         }
+    }
+
+    fn validate_contract(&self) -> Result<(), ModelWorkerError> {
+        if self.schema_version != ARTIFACT_SCHEMA_VERSION {
+            return Err(ModelWorkerError::invalid("unsupported input-manifest schema version"));
+        }
+        validate_text(self.run_id.as_str(), "manifest run ID")?;
+        validate_text(&self.preprocessing, "manifest preprocessing")?;
+        validate_text(&self.input_semantics, "manifest input semantics")?;
+        if self.manifest_digest != ContentDigest::of(&self.manifest_hex)
+            || self.tensor_digest != ContentDigest::of(&self.tensor_hex)
+        {
+            return Err(ModelWorkerError::invalid("manifest content digest mismatch"));
+        }
+        let elements = shape_elements(&self.shape, "tensor shape")?;
+        let expected_bytes = elements
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| ModelWorkerError::invalid("tensor byte count overflow"))?;
+        if expected_bytes != self.tensor_hex.len() {
+            return Err(ModelWorkerError::invalid(
+                "tensor byte count does not match float32 shape",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -496,7 +648,7 @@ impl InputManifestBuilder {
         }
         let tensor =
             self.tensor.ok_or_else(|| ModelWorkerError::invalid("missing tensor bytes"))?;
-        Ok(InputManifest {
+        let value = InputManifest {
             schema_version: ARTIFACT_SCHEMA_VERSION,
             manifest_digest: ContentDigest::of(&self.manifest),
             manifest_hex: self.manifest,
@@ -515,18 +667,42 @@ impl InputManifestBuilder {
             clock_domain_count: self
                 .clock_domain_count
                 .ok_or_else(|| ModelWorkerError::invalid("missing clock-domain count"))?,
-        })
+        };
+        value.validate_contract()?;
+        Ok(value)
     }
 }
 
 /// Bounded predecessor material supplied explicitly with every request.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Checkpoint {
     run_id: ModelRunId,
     epoch: u64,
     digest: ContentDigest,
     #[serde(rename = "bytes_hex", with = "hex_bytes")]
     bytes: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct CheckpointWire {
+    run_id: ModelRunId,
+    epoch: u64,
+    digest: ContentDigest,
+    #[serde(rename = "bytes_hex", with = "hex_bytes")]
+    bytes: Vec<u8>,
+}
+
+impl<'de> Deserialize<'de> for Checkpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CheckpointWire::deserialize(deserializer)?;
+        let value =
+            Self { run_id: wire.run_id, epoch: wire.epoch, digest: wire.digest, bytes: wire.bytes };
+        value.validate_contract().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl Checkpoint {
@@ -540,6 +716,14 @@ impl Checkpoint {
     #[must_use]
     pub fn digest(&self) -> ContentDigest {
         self.digest
+    }
+
+    fn validate_contract(&self) -> Result<(), ModelWorkerError> {
+        validate_text(self.run_id.as_str(), "checkpoint run ID")?;
+        if self.digest != ContentDigest::of(&self.bytes) {
+            return Err(ModelWorkerError::invalid("checkpoint content digest mismatch"));
+        }
+        Ok(())
     }
 }
 
@@ -574,7 +758,7 @@ impl RequestIdentity {
 }
 
 /// Complete immutable calculation request sent to the local worker.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelRequest {
     protocol_version: u16,
     identity: RequestIdentity,
@@ -582,6 +766,35 @@ pub struct ModelRequest {
     model_run: ModelRun,
     input_manifest: InputManifest,
     checkpoint: Checkpoint,
+}
+
+#[derive(Deserialize)]
+struct ModelRequestWire {
+    protocol_version: u16,
+    identity: RequestIdentity,
+    deadline_monotonic_ns: u64,
+    model_run: ModelRun,
+    input_manifest: InputManifest,
+    checkpoint: Checkpoint,
+}
+
+impl<'de> Deserialize<'de> for ModelRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ModelRequestWire::deserialize(deserializer)?;
+        let value = Self {
+            protocol_version: wire.protocol_version,
+            identity: wire.identity,
+            deadline_monotonic_ns: wire.deadline_monotonic_ns,
+            model_run: wire.model_run,
+            input_manifest: wire.input_manifest,
+            checkpoint: wire.checkpoint,
+        };
+        value.validate_contract().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl ModelRequest {
@@ -624,38 +837,34 @@ impl ModelRequest {
     }
 
     fn validate(&self, limits: &WorkerLimits) -> Result<(), ModelWorkerError> {
-        if self.protocol_version != PROTOCOL_VERSION
-            || self.model_run.schema_version != ARTIFACT_SCHEMA_VERSION
-            || self.input_manifest.schema_version != ARTIFACT_SCHEMA_VERSION
+        self.validate_contract()?;
+        check_limit(self.input_manifest.manifest_hex.len(), limits.max_manifest_bytes, "manifest")?;
+        check_limit(self.model_run.weights_hex.len(), limits.max_weights_bytes, "weights")?;
+        check_limit(self.input_manifest.tensor_hex.len(), limits.max_tensor_bytes, "tensor")?;
+        check_limit(self.checkpoint.bytes.len(), limits.max_checkpoint_bytes, "checkpoint")?;
+        if self.input_manifest.source_count > limits.max_sources
+            || self.input_manifest.clock_domain_count > limits.max_clock_domains
         {
-            return Err(ModelWorkerError::invalid("unsupported request or artifact version"));
+            return Err(ModelWorkerError::invalid("manifest reference count exceeds limit"));
         }
-        for (value, field) in [
-            (&self.identity.run_id.0, "identity run ID"),
-            (&self.identity.request_id.0, "request ID"),
-            (&self.model_run.run_id.0, "model run ID"),
-            (&self.input_manifest.run_id.0, "manifest run ID"),
-            (&self.checkpoint.run_id.0, "checkpoint run ID"),
-        ] {
-            validate_text(value, field)?;
+        validate_shape(
+            &self.input_manifest.shape,
+            &self.model_run.max_shape,
+            self.input_manifest.tensor_hex.len(),
+            limits,
+        )?;
+        validate_shape_dimensions(&self.model_run.output_shape, limits).map(|_| ())
+    }
+
+    fn validate_contract(&self) -> Result<(), ModelWorkerError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(ModelWorkerError::invalid("unsupported request version"));
         }
-        for (value, field) in [
-            (&self.model_run.algorithm, "algorithm"),
-            (&self.model_run.preprocessing, "preprocessing"),
-            (&self.model_run.normalization, "normalization"),
-            (&self.model_run.input_semantics, "input semantics"),
-            (&self.model_run.output_semantics, "output semantics"),
-            (&self.model_run.label_semantics, "label semantics"),
-            (&self.model_run.calibration_policy, "calibration policy"),
-            (&self.model_run.tolerance_policy, "tolerance policy"),
-            (&self.model_run.fusion_policy, "fusion policy"),
-            (&self.model_run.state_format, "state format"),
-            (&self.input_manifest.preprocessing, "manifest preprocessing"),
-            (&self.input_manifest.input_semantics, "manifest input semantics"),
-        ] {
-            validate_text(value, field)?;
-        }
-        self.model_run.execution.validate()?;
+        validate_text(self.identity.run_id.as_str(), "identity run ID")?;
+        validate_text(self.identity.request_id.as_str(), "request ID")?;
+        self.model_run.validate_contract()?;
+        self.input_manifest.validate_contract()?;
+        self.checkpoint.validate_contract()?;
         if self.identity.run_id != self.model_run.run_id
             || self.identity.run_id != self.input_manifest.run_id
             || self.identity.run_id != self.checkpoint.run_id
@@ -673,36 +882,12 @@ impl ModelRequest {
         {
             return Err(ModelWorkerError::invalid("cutoff or predecessor differs across request"));
         }
-        if self.model_run.weights_digest != ContentDigest::of(&self.model_run.weights_hex)
-            || self.input_manifest.manifest_digest
-                != ContentDigest::of(&self.input_manifest.manifest_hex)
-            || self.input_manifest.tensor_digest
-                != ContentDigest::of(&self.input_manifest.tensor_hex)
-            || self.checkpoint.digest != ContentDigest::of(&self.checkpoint.bytes)
-        {
-            return Err(ModelWorkerError::invalid("content digest mismatch"));
-        }
         if self.input_manifest.preprocessing != self.model_run.preprocessing
             || self.input_manifest.input_semantics != self.model_run.input_semantics
         {
             return Err(ModelWorkerError::invalid("model and manifest semantics differ"));
         }
-        check_limit(self.input_manifest.manifest_hex.len(), limits.max_manifest_bytes, "manifest")?;
-        check_limit(self.model_run.weights_hex.len(), limits.max_weights_bytes, "weights")?;
-        check_limit(self.input_manifest.tensor_hex.len(), limits.max_tensor_bytes, "tensor")?;
-        check_limit(self.checkpoint.bytes.len(), limits.max_checkpoint_bytes, "checkpoint")?;
-        if self.input_manifest.source_count > limits.max_sources
-            || self.input_manifest.clock_domain_count > limits.max_clock_domains
-        {
-            return Err(ModelWorkerError::invalid("manifest reference count exceeds limit"));
-        }
-        validate_shape(
-            &self.input_manifest.shape,
-            &self.model_run.max_shape,
-            self.input_manifest.tensor_hex.len(),
-            limits,
-        )?;
-        validate_shape_dimensions(&self.model_run.output_shape, limits).map(|_| ())
+        Ok(())
     }
 }
 
@@ -741,7 +926,7 @@ pub enum ResponseStatus {
 }
 
 /// Candidate result returned for coordinator validation; it has no publish authority.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelResponse {
     protocol_version: u16,
     identity: RequestIdentity,
@@ -758,6 +943,48 @@ pub struct ModelResponse {
     #[serde(default, with = "optional_digest")]
     return_payload_digest: Option<ContentDigest>,
     numeric_qualification: Option<NumericContract>,
+}
+
+#[derive(Deserialize)]
+struct ModelResponseWire {
+    protocol_version: u16,
+    identity: RequestIdentity,
+    status: ResponseStatus,
+    detail: String,
+    #[serde(with = "hex_bytes")]
+    candidate_hex: Vec<u8>,
+    #[serde(with = "hex_bytes")]
+    successor_hex: Vec<u8>,
+    #[serde(default, with = "optional_digest")]
+    input_tensor_digest: Option<ContentDigest>,
+    #[serde(default, with = "optional_digest")]
+    output_numeric_digest: Option<ContentDigest>,
+    #[serde(default, with = "optional_digest")]
+    return_payload_digest: Option<ContentDigest>,
+    numeric_qualification: Option<NumericContract>,
+}
+
+impl<'de> Deserialize<'de> for ModelResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ModelResponseWire::deserialize(deserializer)?;
+        let value = Self {
+            protocol_version: wire.protocol_version,
+            identity: wire.identity,
+            status: wire.status,
+            detail: wire.detail,
+            candidate_hex: wire.candidate_hex,
+            successor_hex: wire.successor_hex,
+            input_tensor_digest: wire.input_tensor_digest,
+            output_numeric_digest: wire.output_numeric_digest,
+            return_payload_digest: wire.return_payload_digest,
+            numeric_qualification: wire.numeric_qualification,
+        };
+        value.validate_contract().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl ModelResponse {
@@ -802,13 +1029,17 @@ impl ModelResponse {
     }
 
     fn validate(&self, limits: &WorkerLimits) -> Result<(), ModelWorkerError> {
+        self.validate_contract()?;
+        check_limit(self.candidate_hex.len(), limits.max_result_bytes, "candidate")?;
+        check_limit(self.successor_hex.len(), limits.max_checkpoint_bytes, "successor checkpoint")
+    }
+
+    fn validate_contract(&self) -> Result<(), ModelWorkerError> {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(ModelWorkerError::invalid("unsupported response version"));
         }
-        validate_text(&self.identity.run_id.0, "response run ID")?;
-        validate_text(&self.identity.request_id.0, "response request ID")?;
-        check_limit(self.candidate_hex.len(), limits.max_result_bytes, "candidate")?;
-        check_limit(self.successor_hex.len(), limits.max_checkpoint_bytes, "successor checkpoint")?;
+        validate_text(self.identity.run_id.as_str(), "response run ID")?;
+        validate_text(self.identity.request_id.as_str(), "response request ID")?;
         if self.detail.len() > 256 {
             return Err(ModelWorkerError::invalid("response detail exceeds 256 bytes"));
         }
@@ -1041,6 +1272,21 @@ fn check_limit(actual: usize, maximum: usize, field: &str) -> Result<(), ModelWo
         return Err(ModelWorkerError::invalid(format!("{field} exceeds {maximum}-byte limit")));
     }
     Ok(())
+}
+
+fn validate_nonzero_shape(shape: &[u32], field: &str) -> Result<(), ModelWorkerError> {
+    shape_elements(shape, field).map(|_| ())
+}
+
+fn shape_elements(shape: &[u32], field: &str) -> Result<usize, ModelWorkerError> {
+    if shape.is_empty() || shape.contains(&0) {
+        return Err(ModelWorkerError::invalid(format!("{field} dimensions must be non-zero")));
+    }
+    shape.iter().try_fold(1_usize, |elements, dimension| {
+        elements
+            .checked_mul(*dimension as usize)
+            .ok_or_else(|| ModelWorkerError::invalid(format!("{field} element count overflow")))
+    })
 }
 
 fn validate_shape(
