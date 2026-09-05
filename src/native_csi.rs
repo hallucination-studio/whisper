@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
-use crate::identity::{BootGeneration, DeviceId, KeyEpoch, MessageSequence};
+use crate::identity::{BootGeneration, DeviceId, KeyEpoch, MessageSequence, SensorId};
 use crate::native_frame::{CapabilitiesV1, CsiDataV1};
 
 #[doc(inline)]
@@ -40,6 +40,7 @@ pub enum SampleAxis {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NativeFactProvenance {
     provenance_digest: [u8; 32],
+    sensor: SensorId,
     peer: SocketAddr,
     received_at: SystemTime,
     device_id: DeviceId,
@@ -53,6 +54,12 @@ impl NativeFactProvenance {
     #[must_use]
     pub const fn provenance_digest(&self) -> &[u8; 32] {
         &self.provenance_digest
+    }
+
+    /// Returns the configured sensor identity that admitted this fact.
+    #[must_use]
+    pub const fn sensor(&self) -> &SensorId {
+        &self.sensor
     }
 
     /// Returns the authenticated datagram's receive peer.
@@ -91,8 +98,13 @@ impl NativeFactProvenance {
         self.message_sequence
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "These are the fixed native-fact provenance fields"
+    )]
     pub(crate) const fn new(
         provenance_digest: [u8; 32],
+        sensor: SensorId,
         peer: SocketAddr,
         received_at: SystemTime,
         device_id: DeviceId,
@@ -102,6 +114,7 @@ impl NativeFactProvenance {
     ) -> Self {
         Self {
             provenance_digest,
+            sensor,
             peer,
             received_at,
             device_id,

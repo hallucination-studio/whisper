@@ -24,13 +24,13 @@ pub use admission::{
 };
 #[doc(inline)]
 pub use host::{
-    Host, HostBuilder, HostError, HostRuntime, NativeFrameRoute, RawFact, RawLoss, RawLossKind,
-    RejectReason, RejectedDatagram, RouteError,
+    DecodedRoute, DecodedRouteError, Host, HostBuilder, HostError, HostRuntime, NativeFrameRoute,
+    RadioRouteFacts, RawFact, RawLoss, RawLossKind, RejectReason, RejectedDatagram, RouteError,
 };
 #[doc(inline)]
 pub use identity::{
     BootGeneration, DeploymentId, DeploymentIdError, DeviceId, IdentityValueError, KeyEpoch,
-    MessageSequence, NativeFrameKind,
+    MessageSequence, NativeFrameKind, SensorId, SensorIdError,
 };
 #[doc(inline)]
 pub use native_csi::{

@@ -78,6 +78,78 @@ impl fmt::Display for DeploymentIdError {
 
 impl std::error::Error for DeploymentIdError {}
 
+/// A nonempty identifier for one configured sensing endpoint.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SensorId(Box<str>);
+
+impl SensorId {
+    /// Returns the exact configured sensor identifier.
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for SensorId {
+    type Error = SensorIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            return Err(SensorIdError {
+                input_length: 0,
+                backtrace: Box::new(Backtrace::capture()),
+            });
+        }
+        Ok(Self(value.into()))
+    }
+}
+
+impl FromStr for SensorId {
+    type Err = SensorIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+impl fmt::Display for SensorId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// An empty configured sensor identifier.
+#[derive(Debug)]
+pub struct SensorIdError {
+    input_length: usize,
+    backtrace: Box<Backtrace>,
+}
+
+impl SensorIdError {
+    /// Returns the rejected UTF-8 byte length.
+    #[must_use]
+    pub const fn input_length(&self) -> usize {
+        self.input_length
+    }
+
+    /// Returns the captured validation backtrace.
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
+    }
+}
+
+impl fmt::Display for SensorIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "sensor identifier must not be empty (input was {} bytes)",
+            self.input_length
+        )
+    }
+}
+
+impl std::error::Error for SensorIdError {}
+
 /// Invalid numeric text or a wire-reserved zero identity value.
 #[derive(Debug)]
 pub struct IdentityValueError {

@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 
 use crate::admission::AdmissionLimits;
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
-use crate::native_csi::{NativeCapabilityFact, NativeCsiFact, NativeFact, NativeHealthFact};
+use crate::native_csi::{
+    NativeCapabilityFact, NativeCsiFact, NativeFact, NativeHealthFact, RadioRxS3, S3BandwidthKind,
+    S3PhyKind, S3SecondaryKind,
+};
 use crate::native_frame::{
     AuthenticatedDatagram, Header, Message, authenticate_datagram, decode_authenticated,
     parse_header,
@@ -26,7 +29,9 @@ use crate::replay::{
     derive_replay_window_identity,
 };
 use crate::store::{Store, StoreSnapshot};
-use crate::{BootGeneration, DeploymentId, DeviceId, KeyEpoch, MessageSequence, NativeFrameKind};
+use crate::{
+    BootGeneration, DeploymentId, DeviceId, KeyEpoch, MessageSequence, NativeFrameKind, SensorId,
+};
 
 /// Authenticated datagrams buffered before transaction A. This initial
 /// deployment value is a local memory/back-pressure budget; changing it alters
@@ -120,13 +125,190 @@ impl Clock for SystemClock {
     }
 }
 
-/// One exact peer, device, key epoch, and secret key admission route.
+/// The radio identity fields that a configured decoded route admits exactly.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RadioRouteFacts {
+    phy: S3PhyKind,
+    bandwidth: S3BandwidthKind,
+    secondary: S3SecondaryKind,
+    stbc: bool,
+    rate: u8,
+    mcs: u8,
+    rx_antenna: u8,
+}
+
+impl RadioRouteFacts {
+    /// Captures the stable radio identity fields from one validated CSI radio value.
+    #[must_use]
+    pub const fn from_radio(radio: RadioRxS3) -> Self {
+        Self {
+            phy: radio.phy(),
+            bandwidth: radio.bandwidth(),
+            secondary: radio.secondary(),
+            stbc: radio.stbc(),
+            rate: radio.rate(),
+            mcs: radio.mcs(),
+            rx_antenna: radio.rx_antenna(),
+        }
+    }
+
+    /// Returns the admitted PHY category.
+    #[must_use]
+    pub const fn phy(self) -> S3PhyKind {
+        self.phy
+    }
+
+    /// Returns the admitted channel bandwidth.
+    #[must_use]
+    pub const fn bandwidth(self) -> S3BandwidthKind {
+        self.bandwidth
+    }
+
+    /// Returns the admitted secondary-channel placement.
+    #[must_use]
+    pub const fn secondary(self) -> S3SecondaryKind {
+        self.secondary
+    }
+
+    /// Returns whether the admitted route requires STBC.
+    #[must_use]
+    pub const fn stbc(self) -> bool {
+        self.stbc
+    }
+
+    /// Returns the admitted Non-HT rate field.
+    #[must_use]
+    pub const fn rate(self) -> u8 {
+        self.rate
+    }
+
+    /// Returns the admitted HT MCS field.
+    #[must_use]
+    pub const fn mcs(self) -> u8 {
+        self.mcs
+    }
+
+    /// Returns the admitted receive antenna ordinal.
+    #[must_use]
+    pub const fn rx_antenna(self) -> u8 {
+        self.rx_antenna
+    }
+
+    fn matches(self, radio: RadioRxS3) -> bool {
+        self == Self::from_radio(radio)
+    }
+}
+
+/// Explicit post-authentication identity and capability admission for one sensor.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct DecodedRoute {
+    sensor: SensorId,
+    source_mac: [u8; 6],
+    channel: u8,
+    radio: RadioRouteFacts,
+    firmware_build_digest: [u8; 32],
+    capability_digest: [u8; 32],
+}
+
+impl DecodedRoute {
+    /// Creates a decoded route whose sensor, link, radio, build, and capability are all pinned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source MAC is all zero or the channel is outside `1..=14`.
+    pub fn try_new(
+        sensor: SensorId,
+        source_mac: [u8; 6],
+        channel: u8,
+        radio: RadioRouteFacts,
+        firmware_build_digest: [u8; 32],
+        capability_digest: [u8; 32],
+    ) -> Result<Self, DecodedRouteError> {
+        if source_mac == [0; 6] {
+            return Err(DecodedRouteError::new("decoded route source MAC must not be all zero"));
+        }
+        if !(1..=14).contains(&channel) {
+            return Err(DecodedRouteError::new("decoded route channel must be between 1 and 14"));
+        }
+        Ok(Self { sensor, source_mac, channel, radio, firmware_build_digest, capability_digest })
+    }
+
+    /// Returns the configured sensor identity.
+    #[must_use]
+    pub const fn sensor(&self) -> &SensorId {
+        &self.sensor
+    }
+
+    /// Returns the authenticated CSI source MAC that is admitted.
+    #[must_use]
+    pub const fn source_mac(&self) -> [u8; 6] {
+        self.source_mac
+    }
+
+    /// Returns the exact primary channel admitted by this route.
+    #[must_use]
+    pub const fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// Returns the stable radio identity fields admitted by this route.
+    #[must_use]
+    pub const fn radio(&self) -> RadioRouteFacts {
+        self.radio
+    }
+
+    /// Returns the firmware build digest pinned by this route.
+    #[must_use]
+    pub const fn firmware_build_digest(&self) -> [u8; 32] {
+        self.firmware_build_digest
+    }
+
+    /// Returns the capability digest pinned by this route.
+    #[must_use]
+    pub const fn capability_digest(&self) -> [u8; 32] {
+        self.capability_digest
+    }
+
+    fn admits_radio(&self, radio: RadioRxS3) -> bool {
+        self.channel == radio.channel() && self.radio.matches(radio)
+    }
+}
+
+/// Invalid post-authentication decoded-route configuration.
+#[derive(Debug)]
+pub struct DecodedRouteError {
+    reason: &'static str,
+    backtrace: Box<Backtrace>,
+}
+
+impl DecodedRouteError {
+    fn new(reason: &'static str) -> Self {
+        Self { reason, backtrace: Box::new(Backtrace::capture()) }
+    }
+
+    /// Returns the captured configuration backtrace.
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
+    }
+}
+
+impl fmt::Display for DecodedRouteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.reason.fmt(formatter)
+    }
+}
+
+impl std::error::Error for DecodedRouteError {}
+
+/// One exact peer, device, key epoch, secret key, and decoded identity route.
+#[derive(Clone)]
 pub struct NativeFrameRoute {
     peer: IpAddr,
     device_id: DeviceId,
     key_epoch: KeyEpoch,
     key: EpochKey,
     limits: AdmissionLimits,
+    decoded: DecodedRoute,
 }
 
 impl fmt::Debug for NativeFrameRoute {
@@ -137,12 +319,17 @@ impl fmt::Debug for NativeFrameRoute {
             .field("device_id", &self.device_id)
             .field("key_epoch", &self.key_epoch)
             .field("key", &"[REDACTED]")
+            .field("decoded", &self.decoded)
             .finish()
     }
 }
 
 impl NativeFrameRoute {
     /// Loads one epoch key and creates an exact authenticated native-frame route.
+    ///
+    /// The caller must provide the decoded sensor identity, source, radio tuple, firmware build,
+    /// and capability digest that are already configured for this route. The Host never learns
+    /// these values from the first authenticated datagram.
     ///
     /// # Errors
     ///
@@ -153,6 +340,7 @@ impl NativeFrameRoute {
         device_id: DeviceId,
         key_epoch: KeyEpoch,
         limits: AdmissionLimits,
+        decoded: DecodedRoute,
         secret_root: impl AsRef<Path>,
     ) -> Result<Self, RouteError> {
         let secret_root = secret_root.as_ref();
@@ -166,7 +354,49 @@ impl NativeFrameRoute {
         }
         let key = load_epoch_key(secret_root, device_id.get(), key_epoch.get())
             .map_err(|source| RouteError::secret(peer, device_id, key_epoch, source))?;
-        Ok(Self { peer, device_id, key_epoch, key, limits })
+        Ok(Self { peer, device_id, key_epoch, key, limits, decoded })
+    }
+
+    /// Returns the post-authentication identity and capability route.
+    #[must_use]
+    pub const fn decoded(&self) -> &DecodedRoute {
+        &self.decoded
+    }
+
+    fn semantic_rejection(&self, message: &Message) -> Option<RejectReason> {
+        match message {
+            Message::Capabilities(capability)
+                if capability.capability_digest() != self.decoded.capability_digest()
+                    || capability.descriptor().firmware_build_digest()
+                        != self.decoded.firmware_build_digest()
+                    || usize::from(capability.descriptor().datagram_budget_bytes())
+                        > self.limits.datagram_bytes.get() =>
+            {
+                Some(RejectReason::CapabilityConflict)
+            }
+            Message::CsiData(data)
+                if data.capability_digest() != self.decoded.capability_digest() =>
+            {
+                Some(RejectReason::CapabilityConflict)
+            }
+            Message::CsiData(data) if data.source_mac() != self.decoded.source_mac() => {
+                Some(RejectReason::SourceConflict)
+            }
+            Message::CsiData(data) if !self.decoded.admits_radio(data.radio()) => {
+                Some(RejectReason::RadioConflict)
+            }
+            Message::Health(health)
+                if health.capability_digest() != self.decoded.capability_digest() =>
+            {
+                Some(RejectReason::CapabilityConflict)
+            }
+            Message::Health(health)
+                if health.callback_max_us() != 0 || health.encoder_max_us() != 0 =>
+            {
+                Some(RejectReason::UnsupportedHealthLatency)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -306,7 +536,7 @@ impl fmt::Debug for HostBuilder {
 }
 
 impl HostBuilder {
-    /// Adds one exact peer and epoch-key route.
+    /// Adds one exact peer, epoch-key, and decoded-identity route.
     #[must_use]
     pub fn route(mut self, route: NativeFrameRoute) -> Self {
         self.routes.push(route);
@@ -328,6 +558,7 @@ impl HostBuilder {
     /// startup failure, or failure to open the Store writer.
     pub fn start(self) -> Result<HostRuntime, HostError> {
         validate_builder(&self)?;
+        let query_routes = Arc::new(self.routes.clone());
         let database_path = self.store.database_path();
         let replay_snapshot = self.store.database_snapshot().map_err(|source| {
             HostError::io_during(
@@ -389,7 +620,14 @@ impl HostBuilder {
         ready_receiver.recv().map_err(|_| {
             HostError::message_during("await Host startup", "Host supervisor exited during startup")
         })??;
-        Ok(HostRuntime { local_addr, database_path, stop, completion, rejections })
+        Ok(HostRuntime {
+            local_addr,
+            database_path,
+            routes: query_routes,
+            stop,
+            completion,
+            rejections,
+        })
     }
 }
 
@@ -398,6 +636,7 @@ impl HostBuilder {
 pub struct HostRuntime {
     local_addr: SocketAddr,
     database_path: PathBuf,
+    routes: Arc<Vec<NativeFrameRoute>>,
     stop: Arc<AtomicBool>,
     completion: Arc<(Mutex<Completion>, Condvar)>,
     rejections: Arc<Mutex<VecDeque<RejectedDatagram>>>,
@@ -453,7 +692,7 @@ impl HostRuntime {
     /// The limit must be between one and 1,024, and the Store must remain readable.
     pub fn query_native_facts(&self, limit: usize) -> Result<Vec<NativeFact>, HostError> {
         validate_native_query_limit(limit)?;
-        query_native_facts(&self.database_path, limit)
+        query_native_facts(&self.database_path, &self.routes, limit)
     }
 
     /// Queries at most `limit` capability-qualified native CSI observations.
@@ -465,7 +704,7 @@ impl HostRuntime {
     /// The limit must be between one and 1,024, and the Store must remain readable.
     pub fn query_native_csi(&self, limit: usize) -> Result<Vec<NativeCsiFact>, HostError> {
         validate_native_query_limit(limit)?;
-        query_native_csi(&self.database_path, limit)
+        query_native_csi(&self.database_path, &self.routes, limit)
     }
 
     /// Queries at most `limit` persisted native capability declarations.
@@ -480,7 +719,7 @@ impl HostRuntime {
         limit: usize,
     ) -> Result<Vec<NativeCapabilityFact>, HostError> {
         validate_native_query_limit(limit)?;
-        query_native_capabilities(&self.database_path, limit)
+        query_native_capabilities(&self.database_path, &self.routes, limit)
     }
 
     /// Queries at most `limit` persisted native health reports.
@@ -492,7 +731,7 @@ impl HostRuntime {
     /// The limit must be between one and 1,024, and the Store must remain readable.
     pub fn query_native_health(&self, limit: usize) -> Result<Vec<NativeHealthFact>, HostError> {
         validate_native_query_limit(limit)?;
-        query_native_health(&self.database_path, limit)
+        query_native_health(&self.database_path, &self.routes, limit)
     }
 
     /// Returns a bounded newest suffix of non-authoritative rejection diagnostics.
@@ -575,6 +814,8 @@ pub enum RejectReason {
     CapabilityUnavailable,
     /// The body capability identity conflicts with the epoch capability pin.
     CapabilityConflict,
+    /// Health latency fields are not accepted by the current host contract.
+    UnsupportedHealthLatency,
     /// The authenticated CSI source identity conflicts with the epoch source pin.
     SourceConflict,
     /// The authenticated CSI radio channel conflicts with the epoch radio pin.
@@ -1110,12 +1351,34 @@ mod tests {
     }
 
     fn route() -> NativeFrameRoute {
+        let radio = RadioRxS3::try_new(
+            1,
+            S3SecondaryKind::None,
+            S3PhyKind::NonHt,
+            S3BandwidthKind::TwentyMhz,
+            false,
+            -42,
+            -95,
+            6,
+            0,
+            0,
+        )
+        .unwrap();
         NativeFrameRoute {
             peer: "127.0.0.1".parse().unwrap(),
             device_id: DeviceId::new(0x0102_0304_0506_0708),
             key_epoch: KeyEpoch::try_from(7).unwrap(),
             key: EpochKey::try_from(KEY.as_slice()).unwrap(),
             limits: limits(),
+            decoded: DecodedRoute::try_new(
+                SensorId::try_from("sensor-a").unwrap(),
+                [2, 0, 0, 0, 0, 10],
+                1,
+                RadioRouteFacts::from_radio(radio),
+                [0x11; 32],
+                [0x34; 32],
+            )
+            .unwrap(),
         }
     }
 

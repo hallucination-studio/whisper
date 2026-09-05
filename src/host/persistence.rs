@@ -262,7 +262,9 @@ fn persist_admitted(
         .map_err(|error| HostError::database_at(path, error))?;
     let fact_id = transaction.last_insert_rowid();
     let semantic_rejection = match decode_authenticated(&item.authenticated) {
-        Ok(decoded) => persist_typed_fact(&transaction, path, fact_id, &item, decoded.message())?,
+        Ok(decoded) => {
+            persist_typed_fact(&transaction, path, fact_id, route, &item, decoded.message())?
+        }
         Err(error) => Some(match error {
             crate::native_frame::WireError::UnknownKind { .. } => RejectReason::UnknownKind,
             crate::native_frame::WireError::MalformedBody { .. } => RejectReason::MalformedBody,
@@ -301,13 +303,17 @@ fn persist_typed_fact(
     transaction: &rusqlite::Transaction<'_>,
     path: &Path,
     fact_id: i64,
+    route: &NativeFrameRoute,
     item: &AdmittedDatagram,
     message: &Message,
 ) -> Result<Option<RejectReason>, HostError> {
+    if let Some(reason) = route.semantic_rejection(message) {
+        return Ok(Some(reason));
+    }
     match message {
         Message::Capabilities(capability) => {
-            if let Some(expected) = previous_capability_digest(transaction, &item.header, fact_id)
-                .map_err(|error| HostError::database_at(path, error))?
+            if let Some(expected) =
+                previous_capability_digest(transaction, path, &item.header, fact_id)?
                 && expected != capability.capability_digest()
             {
                 return Ok(Some(RejectReason::CapabilityConflict));
@@ -330,22 +336,20 @@ fn persist_typed_fact(
             Ok(None)
         }
         Message::CsiData(data) => {
-            let Some(expected) = previous_capability_digest(transaction, &item.header, fact_id)
-                .map_err(|error| HostError::database_at(path, error))?
+            let Some(expected) =
+                previous_capability_digest(transaction, path, &item.header, fact_id)?
             else {
                 return Ok(Some(RejectReason::CapabilityUnavailable));
             };
             if expected != data.capability_digest() {
                 return Ok(Some(RejectReason::CapabilityConflict));
             }
-            if let Some(source_mac) = previous_csi_source(transaction, &item.header, fact_id)
-                .map_err(|error| HostError::database_at(path, error))?
+            if let Some(source_mac) = previous_csi_source(transaction, path, &item.header, fact_id)?
                 && source_mac != data.source_mac()
             {
                 return Ok(Some(RejectReason::SourceConflict));
             }
-            if let Some(channel) = previous_csi_channel(transaction, &item.header, fact_id)
-                .map_err(|error| HostError::database_at(path, error))?
+            if let Some(channel) = previous_csi_channel(transaction, path, &item.header, fact_id)?
                 && channel != data.radio().channel()
             {
                 return Ok(Some(RejectReason::RadioConflict));
@@ -392,8 +396,8 @@ fn persist_typed_fact(
             Ok(None)
         }
         Message::Health(health) => {
-            if let Some(expected) = previous_capability_digest(transaction, &item.header, fact_id)
-                .map_err(|error| HostError::database_at(path, error))?
+            if let Some(expected) =
+                previous_capability_digest(transaction, path, &item.header, fact_id)?
                 && expected != health.capability_digest()
             {
                 return Ok(Some(RejectReason::CapabilityConflict));
@@ -429,9 +433,10 @@ fn persist_typed_fact(
 
 fn previous_capability_digest(
     connection: &rusqlite::Transaction<'_>,
+    path: &Path,
     header: &Header,
     fact_id: i64,
-) -> Result<Option<[u8; 32]>, rusqlite::Error> {
+) -> Result<Option<[u8; 32]>, HostError> {
     let value: Option<Vec<u8>> = connection
         .query_row(
             "SELECT c.capability_digest
@@ -448,15 +453,27 @@ fn previous_capability_digest(
             ],
             |row| row.get(0),
         )
-        .optional()?;
-    Ok(value.map(|bytes| bytes.try_into().expect("Store schema validates capability digest width")))
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))?;
+    value
+        .map(|bytes| {
+            bytes.try_into().map_err(|_| {
+                HostError::message_at(
+                    "validate persisted native capability state",
+                    path,
+                    "persisted capability digest width is invalid",
+                )
+            })
+        })
+        .transpose()
 }
 
 fn previous_csi_source(
     connection: &rusqlite::Transaction<'_>,
+    path: &Path,
     header: &Header,
     fact_id: i64,
-) -> Result<Option<[u8; 6]>, rusqlite::Error> {
+) -> Result<Option<[u8; 6]>, HostError> {
     let value: Option<Vec<u8>> = connection
         .query_row(
             "SELECT c.source_mac
@@ -473,15 +490,27 @@ fn previous_csi_source(
             ],
             |row| row.get(0),
         )
-        .optional()?;
-    Ok(value.map(|bytes| bytes.try_into().expect("Store schema validates source MAC width")))
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))?;
+    value
+        .map(|bytes| {
+            bytes.try_into().map_err(|_| {
+                HostError::message_at(
+                    "validate persisted native CSI state",
+                    path,
+                    "persisted CSI source MAC width is invalid",
+                )
+            })
+        })
+        .transpose()
 }
 
 fn previous_csi_channel(
     connection: &rusqlite::Transaction<'_>,
+    path: &Path,
     header: &Header,
     fact_id: i64,
-) -> Result<Option<u8>, rusqlite::Error> {
+) -> Result<Option<u8>, HostError> {
     connection
         .query_row(
             "SELECT c.channel
@@ -499,6 +528,7 @@ fn previous_csi_channel(
             |row| row.get(0),
         )
         .optional()
+        .map_err(|error| HostError::database_at(path, error))
 }
 
 fn encode_blocks(blocks: &[LtfBlock]) -> Box<[u8]> {
