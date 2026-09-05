@@ -52,6 +52,9 @@ public struct CameraKeyframe: Codable, Equatable, Sendable {
 }
 
 /// Authenticated prerequisites required before a phone capture can be exported.
+///
+/// The calibration passed to `PhoneArtifactExporter` must be created with
+/// `CalibrationBundle.bound(to:)` using this exact measured registration.
 public struct PhoneExportPrerequisites: Equatable, Sendable {
     public let measuredRegistration: MeasuredRFRegistrationInput
     public let verifiedCompanionRelation: VerifiedCompanionTimeRelation
@@ -64,6 +67,124 @@ public struct PhoneExportPrerequisites: Equatable, Sendable {
         self.measuredRegistration = measuredRegistration
         self.verifiedCompanionRelation = verifiedCompanionRelation
     }
+
+    fileprivate func validate(calibration: CalibrationBundle) throws {
+        guard calibration.rfDeviceIdentity == measuredRegistration.rfDeviceIdentity,
+              calibration.antennaReference == measuredRegistration.antennaReference,
+              calibration.metadata.provenance.contains(measuredRegistration.measurementSource) else {
+            throw PhoneClientError.exportPrerequisitesMissing
+        }
+
+        let expectedBinding = try registrationBindingSource(
+            measuredRegistration: measuredRegistration,
+            calibration: calibration.withoutRegistrationBinding()
+        )
+        let bindings = calibration.metadata.provenance.filter { $0.namespace == registrationBindingNamespace }
+        guard bindings.count == 1, bindings[0] == expectedBinding else {
+            throw PhoneClientError.exportPrerequisitesMissing
+        }
+    }
+}
+
+private let registrationBindingNamespace = "whisper-rf-registration-binding-v1"
+
+extension CalibrationBundle {
+    /// Returns a calibration whose complete WSA1 contract is bound to one measured registration.
+    ///
+    /// The registration transform, its uncertainty, source provenance, and every field already
+    /// carried by the calibration artifact are included in a canonical binding identity stored in
+    /// artifact provenance. Export accepts only this bound form, so a calibration cannot be paired
+    /// with another measured registration by RF identity alone.
+    public func bound(to measuredRegistration: MeasuredRFRegistrationInput) throws -> CalibrationBundle {
+        _ = try measuredRegistration.registration()
+        guard rfDeviceIdentity == measuredRegistration.rfDeviceIdentity,
+              antennaReference == measuredRegistration.antennaReference,
+              metadata.provenance.contains(measuredRegistration.measurementSource) else {
+            throw PhoneClientError.exportPrerequisitesMissing
+        }
+
+        let unbound = try withoutRegistrationBinding()
+        let binding = try registrationBindingSource(measuredRegistration: measuredRegistration, calibration: unbound)
+        var provenance = unbound.metadata.provenance
+        provenance.append(binding)
+        let bound = replacingMetadata(
+            ArtifactMetadata(artifactID: unbound.metadata.artifactID, revision: unbound.metadata.revision, provenance: provenance)
+        )
+        try bound.validate()
+        return bound
+    }
+
+    fileprivate func withoutRegistrationBinding() throws -> CalibrationBundle {
+        let provenance = metadata.provenance.filter { $0.namespace != registrationBindingNamespace }
+        guard !provenance.isEmpty else {
+            throw PhoneClientError.invalidArtifact("calibration provenance must retain a non-binding source")
+        }
+        return replacingMetadata(
+            ArtifactMetadata(artifactID: metadata.artifactID, revision: metadata.revision, provenance: provenance)
+        )
+    }
+
+    private func replacingMetadata(_ metadata: ArtifactMetadata) -> CalibrationBundle {
+        CalibrationBundle(
+            metadata: metadata,
+            sceneDigest: sceneDigest,
+            rfDeviceIdentity: rfDeviceIdentity,
+            antennaReference: antennaReference,
+            worldTransform: worldTransform,
+            signalPaths: signalPaths,
+            arrayCondition: arrayCondition,
+            arrayGeometry: arrayGeometry,
+            phaseRelation: phaseRelation,
+            timeRelation: timeRelation,
+            maxErrorM: maxErrorM,
+            validFromUTC: validFromUTC,
+            validUntilUTC: validUntilUTC
+        )
+    }
+}
+
+private func registrationBindingSource(
+    measuredRegistration: MeasuredRFRegistrationInput,
+    calibration: CalibrationBundle
+) throws -> SourceIdentity {
+    let calibrationBytes = try SealedArtifact.seal(.calibration(calibration)).bytes
+    var input = Data("WSRF-REGISTRATION-BINDING-1".utf8)
+    let registrationBytes = canonicalRegistrationBytes(measuredRegistration)
+    input.appendUInt64LE(UInt64(registrationBytes.count))
+    input.append(registrationBytes)
+    input.appendUInt64LE(UInt64(calibrationBytes.count))
+    input.append(calibrationBytes)
+    return SourceIdentity(namespace: registrationBindingNamespace, identity: hexadecimal(SHA256Digest.hash(input)))
+}
+
+private func canonicalRegistrationBytes(_ registration: MeasuredRFRegistrationInput) -> Data {
+    var output = Data("WSRF-MEASURED-REGISTRATION-1".utf8)
+    appendBindingString(&output, registration.rfDeviceIdentity)
+    appendBindingString(&output, registration.markerIdentity)
+    appendBindingString(&output, registration.antennaReference)
+    appendBindingTransform(&output, registration.markerToAntenna)
+    output.appendDoubleLE(registration.errorM)
+    appendBindingString(&output, registration.measurementSource.namespace)
+    appendBindingString(&output, registration.measurementSource.identity)
+    return output
+}
+
+private func appendBindingTransform(_ output: inout Data, _ transform: CoordinateTransform) {
+    appendBindingString(&output, transform.sourceCoordinateSystem)
+    appendBindingString(&output, transform.targetCoordinateSystem)
+    output.appendUInt64LE(UInt64(transform.matrix.count))
+    for value in transform.matrix { output.appendDoubleLE(value) }
+    output.appendDoubleLE(transform.maxErrorM)
+}
+
+private func appendBindingString(_ output: inout Data, _ value: String) {
+    let bytes = Data(value.utf8)
+    output.appendUInt64LE(UInt64(bytes.count))
+    output.append(bytes)
+}
+
+private func hexadecimal(_ data: Data) -> String {
+    data.map { String(format: "%02x", $0) }.joined()
 }
 
 /// The complete local export consisting of three Host-importable artifacts and display assets.
@@ -264,8 +385,13 @@ private func validatePackage(scene: SceneSnapshot, calibration: CalibrationBundl
         throw PhoneClientError.unknownRFIdentity(calibration.rfDeviceIdentity)
     }
     if let exportPrerequisites {
-        guard calibration.rfDeviceIdentity == exportPrerequisites.measuredRegistration.rfDeviceIdentity,
-              supervision.timeRelation == exportPrerequisites.verifiedCompanionRelation.relation else {
+        try exportPrerequisites.validate(calibration: calibration)
+        guard supervision.timeRelation == exportPrerequisites.verifiedCompanionRelation.relation else {
+            throw PhoneClientError.exportPrerequisitesMissing
+        }
+    } else {
+        let bindings = calibration.metadata.provenance.filter { $0.namespace == registrationBindingNamespace }
+        guard bindings.count == 1 else {
             throw PhoneClientError.exportPrerequisitesMissing
         }
     }
@@ -276,7 +402,9 @@ private func validatePackage(scene: SceneSnapshot, calibration: CalibrationBundl
     guard calibration.sceneDigest == sceneDigest, supervision.sceneDigest == sceneDigest else {
         throw PhoneClientError.invalidArtifact("calibration and supervision must reference this scene digest")
     }
-    let combinedCalibrationError = scene.mapErrorM + calibration.worldTransform.maxErrorM + calibration.arrayGeometry.deviceToArray.maxErrorM + calibration.arrayGeometry.maximumPositionErrorM + calibration.maxErrorM
+    let measuredRegistrationError = exportPrerequisites?.measuredRegistration.errorM ?? 0
+    let markerToAntennaError = exportPrerequisites?.measuredRegistration.markerToAntenna.maxErrorM ?? 0
+    let combinedCalibrationError = scene.mapErrorM + calibration.worldTransform.maxErrorM + calibration.arrayGeometry.deviceToArray.maxErrorM + calibration.arrayGeometry.maximumPositionErrorM + calibration.maxErrorM + measuredRegistrationError + markerToAntennaError
     guard combinedCalibrationError <= limits.maxPositionErrorM else { throw PhoneClientError.errorBudgetExceeded }
     for sample in supervision.samples {
         guard sample.cameraToWorld.targetCoordinateSystem == scene.worldCoordinateSystem else {

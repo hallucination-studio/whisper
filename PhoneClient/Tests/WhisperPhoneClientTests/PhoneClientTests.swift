@@ -116,12 +116,12 @@ final class PhoneClientTests: XCTestCase {
     func testExporterRejectsUnknownRFAndRoundTripsOfflinePackage() throws {
         let scene = makeScene()
         let sceneDigest = try SealedArtifact.seal(.scene(scene)).digest
-        let calibration = makeCalibration(sceneDigest: sceneDigest)
+        let exportPrerequisites = try makeExportPrerequisites()
+        let calibration = try makeCalibration(sceneDigest: sceneDigest).bound(to: exportPrerequisites.measuredRegistration)
         let supervision = makeSupervision(sceneDigest: sceneDigest, depthReference: "depth/1")
         let usdzData = Data([0x55, 0x53, 0x44, 0x5a])
         let keyframes = [CameraKeyframe(reference: "pose/1", phoneTime: 500, pose: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: 1, trackingQuality: .normal, depthQuality: .missing)]
         let media = [try makeRGBMedia(), try makeDepthMedia()]
-        let exportPrerequisites = try makeExportPrerequisites()
         let unknownExporter = try PhoneArtifactExporter(knownRFIdentities: ["other-rf"], exportPrerequisites: exportPrerequisites)
         XCTAssertThrowsError(try unknownExporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media)) { error in
             XCTAssertEqual(error as? PhoneClientError, .unknownRFIdentity("rf-1"))
@@ -140,6 +140,112 @@ final class PhoneClientTests: XCTestCase {
         let restored = try PhoneCapturePackage.parse(archive, knownRFIdentities: ["rf-1"])
         XCTAssertEqual(restored, package)
         XCTAssertEqual(try package.digest(), try ArtifactDigest(bytes: SHA256Digest.hash(archive)))
+    }
+
+    func testExporterRejectsMeasuredRegistrationChangesAfterCalibrationBinding() throws {
+        let scene = makeScene()
+        let sceneDigest = try SealedArtifact.seal(.scene(scene)).digest
+        let originalPrerequisites = try makeExportPrerequisites()
+        let calibration = try makeCalibration(sceneDigest: sceneDigest).bound(to: originalPrerequisites.measuredRegistration)
+        let supervision = makeSupervision(sceneDigest: sceneDigest, depthReference: "depth/1")
+        let usdzData = Data([0x55, 0x53, 0x44, 0x5a])
+        let keyframes = [CameraKeyframe(reference: "pose/1", phoneTime: 500, pose: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: 1, trackingQuality: .normal, depthQuality: .missing)]
+        let media = [try makeRGBMedia(), try makeDepthMedia()]
+
+        let changedAntenna = try makeMeasuredRegistration(
+            antennaReference: "different-antenna",
+            markerToAntenna: makeTransform(source: "marker-1", target: "different-antenna", error: 0.02)
+        )
+        let changedMarker = try makeMeasuredRegistration(
+            markerIdentity: "marker-2",
+            markerToAntenna: makeTransform(source: "marker-2", target: "marker-to-array", error: 0.02)
+        )
+        let changedTransform = try makeMeasuredRegistration(
+            markerToAntenna: CoordinateTransform(
+                sourceCoordinateSystem: "marker-1",
+                targetCoordinateSystem: "marker-to-array",
+                matrix: [1, 0, 0, 0.25, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+                maxErrorM: 0.02
+            )
+        )
+        let changedTransformError = try makeMeasuredRegistration(
+            markerToAntenna: makeTransform(source: "marker-1", target: "marker-to-array", error: 0.04)
+        )
+        let changedRegistrationError = try makeMeasuredRegistration(errorM: 0.05)
+        let changedProvenance = try makeMeasuredRegistration(
+            measurementSource: SourceIdentity(namespace: "survey", identity: "registration-2")
+        )
+
+        for measuredRegistration in [changedAntenna, changedMarker, changedTransform, changedTransformError, changedRegistrationError, changedProvenance] {
+            let prerequisites = try PhoneExportPrerequisites(
+                measuredRegistration: measuredRegistration,
+                verifiedCompanionRelation: originalPrerequisites.verifiedCompanionRelation
+            )
+            let exporter = try PhoneArtifactExporter(knownRFIdentities: ["rf-1"], exportPrerequisites: prerequisites)
+            XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media))
+        }
+    }
+
+    func testExporterRejectsMutationOfEveryBoundCalibrationContractRelationship() throws {
+        let scene = makeScene()
+        let sceneDigest = try SealedArtifact.seal(.scene(scene)).digest
+        let prerequisites = try makeExportPrerequisites()
+        let original = try makeCalibration(sceneDigest: sceneDigest).bound(to: prerequisites.measuredRegistration)
+        let supervision = makeSupervision(sceneDigest: sceneDigest, depthReference: "depth/1")
+        let usdzData = Data([0x55, 0x53, 0x44, 0x5a])
+        let keyframes = [CameraKeyframe(reference: "pose/1", phoneTime: 500, pose: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: 1, trackingQuality: .normal, depthQuality: .missing)]
+        let media = [try makeRGBMedia(), try makeDepthMedia()]
+        let exporter = try PhoneArtifactExporter(knownRFIdentities: ["rf-1"], exportPrerequisites: prerequisites)
+        XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: makeCalibration(sceneDigest: sceneDigest), supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media))
+
+        let changedWorldTransform = CoordinateTransform(sourceCoordinateSystem: "array", targetCoordinateSystem: "arkit-world", matrix: [1, 0, 0, 0.1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], maxErrorM: 0.06)
+        let changedDeviceTransform = CoordinateTransform(sourceCoordinateSystem: "device", targetCoordinateSystem: "array", matrix: [1, 0, 0, 0.1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], maxErrorM: 0.03)
+        let changedGeometry = DeviceArrayGeometry(
+            source: SourceIdentity(namespace: "metrology", identity: "run-2"),
+            applicability: original.arrayGeometry.applicability,
+            minimumFrequencyHz: original.arrayGeometry.minimumFrequencyHz,
+            maximumFrequencyHz: original.arrayGeometry.maximumFrequencyHz,
+            deviceToArray: changedDeviceTransform,
+            elements: original.arrayGeometry.elements,
+            maximumPositionErrorM: 0.02,
+            validFromUTC: original.arrayGeometry.validFromUTC,
+            validUntilUTC: original.arrayGeometry.validUntilUTC,
+            epoch: original.arrayGeometry.epoch
+        )
+        let changedMetadata = ArtifactMetadata(
+            artifactID: original.metadata.artifactID,
+            revision: original.metadata.revision,
+            provenance: original.metadata.provenance + [SourceIdentity(namespace: "extra", identity: "provenance")]
+        )
+        let changedPhase = PhaseRelation(
+            source: SourceIdentity(namespace: "metrology", identity: "phase-2"),
+            scope: original.phaseRelation.scope,
+            maximumErrorRadians: original.phaseRelation.maximumErrorRadians,
+            validFromUTC: original.phaseRelation.validFromUTC,
+            validUntilUTC: original.phaseRelation.validUntilUTC,
+            epoch: original.phaseRelation.epoch
+        )
+        let changedTime = RfTimeRelation(
+            source: SourceIdentity(namespace: "metrology", identity: "time-2"),
+            offset: original.timeRelation.offset,
+            maximumError: original.timeRelation.maximumError,
+            validFromUTC: original.timeRelation.validFromUTC,
+            validUntilUTC: original.timeRelation.validUntilUTC,
+            epoch: original.timeRelation.epoch
+        )
+        let variants = [
+            copyCalibration(original, antennaReference: "different-antenna"),
+            copyCalibration(original, worldTransform: changedWorldTransform),
+            copyCalibration(original, arrayGeometry: changedGeometry),
+            copyCalibration(original, maxErrorM: original.maxErrorM + 0.01),
+            copyCalibration(original, metadata: changedMetadata),
+            copyCalibration(original, phaseRelation: changedPhase),
+            copyCalibration(original, timeRelation: changedTime),
+        ]
+
+        for variant in variants {
+            XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: variant, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media))
+        }
     }
 
     func testCompanionPairingClockAndUploadWireContract() throws {
@@ -334,12 +440,13 @@ final class PhoneClientTests: XCTestCase {
     func testPackageRejectsMissingOrUnreferencedCaptureAssets() throws {
         let scene = makeScene()
         let sceneDigest = try SealedArtifact.seal(.scene(scene)).digest
-        let calibration = makeCalibration(sceneDigest: sceneDigest)
+        let exportPrerequisites = try makeExportPrerequisites()
+        let calibration = try makeCalibration(sceneDigest: sceneDigest).bound(to: exportPrerequisites.measuredRegistration)
         let supervision = makeSupervision(sceneDigest: sceneDigest, depthReference: "depth/1")
         let usdz = Data([0x55, 0x53, 0x44, 0x5a])
         let keyframe = CameraKeyframe(reference: "pose/1", phoneTime: 500, pose: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: 1, trackingQuality: .normal, depthQuality: .missing)
         let media = [try makeRGBMedia()]
-        let exporter = try PhoneArtifactExporter(knownRFIdentities: ["rf-1"], exportPrerequisites: try makeExportPrerequisites())
+        let exporter = try PhoneArtifactExporter(knownRFIdentities: ["rf-1"], exportPrerequisites: exportPrerequisites)
         XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: Data(), keyframes: [keyframe], media: media))
         XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdz, keyframes: [], media: media))
         XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdz, keyframes: [keyframe], media: []))
@@ -489,20 +596,31 @@ private func makeRegistration() -> RFDeviceRegistration {
     RFDeviceRegistration(rfDeviceIdentity: "rf-1", markerIdentity: "marker-1", antennaReference: "marker-to-array", markerToAntenna: makeTransform(source: "marker-1", target: "marker-to-array", error: 0.01), errorM: 0.01, source: SourceIdentity(namespace: "phone", identity: "registration-1"))
 }
 
-private func makeExportPrerequisites() throws -> PhoneExportPrerequisites {
-    let measured = try MeasuredRFRegistrationInput(
-        rfDeviceIdentity: "rf-1",
-        markerIdentity: "marker-1",
-        antennaReference: "marker-to-array",
-        markerToAntenna: CoordinateTransform(
-            sourceCoordinateSystem: "marker-1",
-            targetCoordinateSystem: "marker-to-array",
+private func makeMeasuredRegistration(
+    rfDeviceIdentity: String = "rf-1",
+    markerIdentity: String = "marker-1",
+    antennaReference: String = "marker-to-array",
+    markerToAntenna: CoordinateTransform? = nil,
+    errorM: Double = 0.03,
+    measurementSource: SourceIdentity = SourceIdentity(namespace: "survey", identity: "registration-1")
+) throws -> MeasuredRFRegistrationInput {
+    try MeasuredRFRegistrationInput(
+        rfDeviceIdentity: rfDeviceIdentity,
+        markerIdentity: markerIdentity,
+        antennaReference: antennaReference,
+        markerToAntenna: markerToAntenna ?? CoordinateTransform(
+            sourceCoordinateSystem: markerIdentity,
+            targetCoordinateSystem: antennaReference,
             matrix: [1, 0, 0, 0.02, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
             maxErrorM: 0.02
         ),
-        errorM: 0.03,
-        measurementSource: SourceIdentity(namespace: "survey", identity: "registration-1")
+        errorM: errorM,
+        measurementSource: measurementSource
     )
+}
+
+private func makeExportPrerequisites() throws -> PhoneExportPrerequisites {
+    let measured = try makeMeasuredRegistration()
     let pairingID = try PairingID(bytes: Data(repeating: 41, count: 16))
     let identity = try CompanionServerIdentity(bytes: Data(repeating: 42, count: 32))
     let invitation = try CompanionInvitation(
@@ -544,13 +662,40 @@ private func makeExportPrerequisites() throws -> PhoneExportPrerequisites {
     return try PhoneExportPrerequisites(measuredRegistration: measured, verifiedCompanionRelation: connection.verifiedTimeRelation)
 }
 
+private func copyCalibration(
+    _ calibration: CalibrationBundle,
+    metadata: ArtifactMetadata? = nil,
+    antennaReference: String? = nil,
+    worldTransform: CoordinateTransform? = nil,
+    arrayGeometry: DeviceArrayGeometry? = nil,
+    phaseRelation: PhaseRelation? = nil,
+    timeRelation: RfTimeRelation? = nil,
+    maxErrorM: Double? = nil
+) -> CalibrationBundle {
+    CalibrationBundle(
+        metadata: metadata ?? calibration.metadata,
+        sceneDigest: calibration.sceneDigest,
+        rfDeviceIdentity: calibration.rfDeviceIdentity,
+        antennaReference: antennaReference ?? calibration.antennaReference,
+        worldTransform: worldTransform ?? calibration.worldTransform,
+        signalPaths: calibration.signalPaths,
+        arrayCondition: calibration.arrayCondition,
+        arrayGeometry: arrayGeometry ?? calibration.arrayGeometry,
+        phaseRelation: phaseRelation ?? calibration.phaseRelation,
+        timeRelation: timeRelation ?? calibration.timeRelation,
+        maxErrorM: maxErrorM ?? calibration.maxErrorM,
+        validFromUTC: calibration.validFromUTC,
+        validUntilUTC: calibration.validUntilUTC
+    )
+}
+
 private func makePhoneRelation() throws -> PhoneTimeRelation {
     try PhoneTimeRelation(relationID: Data(repeating: 9, count: 16), offsetAtReference: 20, driftPartsPerBillion: 10, referencePhoneTime: 500, maximumError: 5, validFromPhoneTime: 0, validUntilPhoneTime: 1_000_000)
 }
 
 private func makeCalibration(sceneDigest: ArtifactDigest) -> CalibrationBundle {
     CalibrationBundle(
-        metadata: ArtifactMetadata(artifactID: "calibration-a", revision: 1, provenance: [SourceIdentity(namespace: "phone", identity: "calibration")]),
+        metadata: ArtifactMetadata(artifactID: "calibration-a", revision: 1, provenance: [SourceIdentity(namespace: "phone", identity: "calibration"), SourceIdentity(namespace: "survey", identity: "registration-1")]),
         sceneDigest: sceneDigest,
         rfDeviceIdentity: "rf-1",
         antennaReference: "marker-to-array",

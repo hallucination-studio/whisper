@@ -9,7 +9,9 @@ world coordinate system.
 The workflow requires room dimensions and door confirmation, caller-supplied measured marker RF
 registration, fixed-phone confirmation, and explicit relocalization after every tracking epoch
 reset. Export remains disabled until that measured registration and an authenticated Host clock
-relation are both present; the app never synthesizes a transform, uncertainty, or time relation. A
+relation are both present. The calibration must also be bound to that exact measured registration;
+the binding covers the registration transform, uncertainty, provenance, and every calibration field
+carried by WSA1. The app never synthesizes a transform, uncertainty, or time relation. A
 partial camera view produces an unknown or visible-set label, never a whole-room empty label. The
 map and SwiftUI summaries keep visual scan coverage, RF-expected coverage, and field-calibration
 coverage separate.
