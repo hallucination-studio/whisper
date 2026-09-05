@@ -166,6 +166,76 @@ fn store_with_matching_identity_header_but_corrupt_schema_is_rejected_without_wr
     fs::remove_dir_all(parent).expect("temporary Store removed");
 }
 
+#[cfg(unix)]
+#[test]
+fn spoofed_schema_with_matching_header_and_table_names_is_rejected_without_writes() {
+    let parent = temporary_directory("store-spoof-schema");
+    let root = parent.join("world-store");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let database_path = root.join("facts.sqlite3");
+    let database = rusqlite::Connection::open(&database_path).unwrap();
+    database
+        .execute_batch(
+            "PRAGMA application_id = 1465009713;
+             PRAGMA user_version = 1;
+             CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY, store_id BLOB);
+             INSERT INTO store_identity VALUES (1, zeroblob(16));
+             CREATE TABLE replay_windows(identity BLOB);
+             CREATE TABLE raw_facts(datagram BLOB);
+             CREATE TABLE raw_losses(kind TEXT);",
+        )
+        .unwrap();
+    drop(database);
+    fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let lease = root.join(".whisper.lease");
+    fs::write(&lease, []).unwrap();
+    fs::set_permissions(&lease, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = snapshot(&root);
+
+    let error = Store::open(&root).expect_err("same names cannot spoof exact schema recognition");
+    assert!(error.is_unrecognized_format());
+    assert_eq!(snapshot(&root), before);
+
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn corrupt_wal_companion_is_rejected_without_changing_any_store_bytes() {
+    let parent = temporary_directory("store-corrupt-wal");
+    let root = parent.join("world-store");
+    drop(Store::initialize(&root).unwrap());
+    let wal = root.join("facts.sqlite3-wal");
+    fs::write(&wal, b"not a sqlite wal").unwrap();
+    fs::set_permissions(&wal, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = snapshot(&root);
+
+    let error = Store::open(&root).expect_err("corrupt WAL cannot reach a target SQLite open");
+    assert!(error.is_unrecognized_format());
+    assert_eq!(snapshot(&root), before);
+
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn orphaned_shm_companion_is_rejected_without_changing_any_store_bytes() {
+    let parent = temporary_directory("store-orphan-shm");
+    let root = parent.join("world-store");
+    drop(Store::initialize(&root).unwrap());
+    let shm = root.join("facts.sqlite3-shm");
+    fs::write(&shm, vec![0_u8; 32_768]).unwrap();
+    fs::set_permissions(&shm, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = snapshot(&root);
+
+    let error = Store::open(&root).expect_err("orphaned SHM cannot reach a target SQLite open");
+    assert!(error.is_unrecognized_format());
+    assert_eq!(snapshot(&root), before);
+
+    fs::remove_dir_all(parent).unwrap();
+}
+
 fn temporary_directory(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

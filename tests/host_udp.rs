@@ -9,7 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use whisper::{Host, NativeFrameRoute, RawLossKind, RejectReason, Store};
+use whisper::{
+    AdmissionLimits, BootGeneration, DeploymentId, DeviceId, Host, KeyEpoch, MessageSequence,
+    NativeFrameKind, NativeFrameRoute, RawLossKind, RejectReason, Store,
+};
 
 const KEY: [u8; 32] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -26,12 +29,13 @@ fn authenticated_production_udp_datagram_is_queryable_as_exact_raw_bytes() {
     let secret_root = create_secret_root(&parent);
     let route = NativeFrameRoute::load(
         sender.local_addr().unwrap().ip(),
-        DEVICE_ID,
-        KEY_EPOCH,
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
         &secret_root,
     )
     .expect("exact route is valid");
-    let host = Host::builder(store, "lab", "127.0.0.1:0".parse().unwrap())
+    let host = Host::builder(store, deployment("lab"), "127.0.0.1:0".parse().unwrap())
         .route(route)
         .start()
         .expect("Host starts");
@@ -51,11 +55,11 @@ fn authenticated_production_udp_datagram_is_queryable_as_exact_raw_bytes() {
     assert_eq!(fact.datagram(), datagram);
     assert_eq!(fact.digest(), &<[u8; 32]>::from(Sha256::digest(&datagram)));
     assert_eq!(fact.peer(), sender.local_addr().unwrap());
-    assert_eq!(fact.device_id(), DEVICE_ID);
-    assert_eq!(fact.key_epoch(), KEY_EPOCH);
-    assert_eq!(fact.boot_generation(), 9);
-    assert_eq!(fact.message_sequence(), 12);
-    assert_eq!(fact.kind_byte(), 2);
+    assert_eq!(fact.device_id(), device_id());
+    assert_eq!(fact.key_epoch(), key_epoch());
+    assert_eq!(fact.boot_generation(), BootGeneration::new(9).unwrap());
+    assert_eq!(fact.message_sequence(), MessageSequence::new(12).unwrap());
+    assert_eq!(fact.kind(), NativeFrameKind::new(2));
     assert!(fact.received_at() <= SystemTime::now());
 
     host.shutdown().expect("Host shuts down");
@@ -93,6 +97,117 @@ fn restart_preserves_raw_fact_and_replay_rejection_excludes_duplicate_bytes() {
 }
 
 #[test]
+fn restart_rejects_changed_replay_identity_or_window_without_touching_facts() {
+    let parent = temporary_directory("host-replay-config-mismatch");
+    let root = parent.join("world-store");
+    let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let secret_root = create_secret_root(&parent);
+    let datagram = hex_fixture(include_str!("fixtures/native-frame/csi-non-ht-3-pairs.hex"));
+    let first = start_host(Store::initialize(&root).unwrap(), &sender, &secret_root);
+    sender.send_to(&datagram, first.local_addr()).unwrap();
+    wait_for_fact_count(&first, 1);
+    first.shutdown().unwrap();
+    let database_path = root.join("facts.sqlite3");
+    let before = fs::read(&database_path).unwrap();
+
+    let changed_deployment = NativeFrameRoute::load(
+        sender.local_addr().unwrap().ip(),
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
+        &secret_root,
+    )
+    .unwrap();
+    Host::builder(Store::open(&root).unwrap(), deployment("other"), "127.0.0.1:0".parse().unwrap())
+        .route(changed_deployment)
+        .start()
+        .expect_err("changed deployment must not reset replay state");
+    assert_eq!(fs::read(&database_path).unwrap(), before);
+
+    let changed_window = NativeFrameRoute::load(
+        sender.local_addr().unwrap().ip(),
+        device_id(),
+        key_epoch(),
+        AdmissionLimits::new(1_200, 1_000, 1_200_000, 32).unwrap(),
+        &secret_root,
+    )
+    .unwrap();
+    Host::builder(wait_for_store(&root), deployment("lab"), "127.0.0.1:0".parse().unwrap())
+        .route(changed_window)
+        .start()
+        .expect_err("changed replay window must not reset replay state");
+    assert_eq!(fs::read(&database_path).unwrap(), before);
+
+    let advanced_epoch = KeyEpoch::new(KEY_EPOCH + 1).unwrap();
+    write_epoch_key(&secret_root, advanced_epoch);
+    let advanced_route = NativeFrameRoute::load(
+        sender.local_addr().unwrap().ip(),
+        device_id(),
+        advanced_epoch,
+        admission_limits(1_000),
+        &secret_root,
+    )
+    .unwrap();
+    Host::builder(wait_for_store(&root), deployment("lab"), "127.0.0.1:0".parse().unwrap())
+        .route(advanced_route)
+        .start()
+        .expect_err("an unprovisioned advanced epoch must not replace retained replay state");
+    assert_eq!(fs::read(&database_path).unwrap(), before);
+
+    drop(wait_for_store(&root));
+    let database = rusqlite::Connection::open(&database_path).unwrap();
+    database.execute("UPDATE replay_windows SET state = x'00'", []).unwrap();
+    drop(database);
+    let corrupt_before = fs::read(&database_path).unwrap();
+    let route = NativeFrameRoute::load(
+        sender.local_addr().unwrap().ip(),
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
+        &secret_root,
+    )
+    .unwrap();
+    Host::builder(Store::open(&root).unwrap(), deployment("lab"), "127.0.0.1:0".parse().unwrap())
+        .route(route)
+        .start()
+        .expect_err("corrupt retained replay state must not be silently reset");
+    assert_eq!(fs::read(&database_path).unwrap(), corrupt_before);
+
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn restart_rejects_missing_replay_row_without_touching_database_bytes() {
+    let parent = temporary_directory("host-replay-row-missing");
+    let root = parent.join("world-store");
+    let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let secret_root = create_secret_root(&parent);
+    let first = start_host(Store::initialize(&root).unwrap(), &sender, &secret_root);
+    first.shutdown().unwrap();
+    let database_path = root.join("facts.sqlite3");
+    let database = rusqlite::Connection::open(&database_path).unwrap();
+    database.execute("DELETE FROM replay_windows", []).unwrap();
+    drop(database);
+    let before = fs::read(&database_path).unwrap();
+
+    let route = NativeFrameRoute::load(
+        sender.local_addr().unwrap().ip(),
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
+        &secret_root,
+    )
+    .unwrap();
+    Host::builder(Store::open(&root).unwrap(), deployment("lab"), "127.0.0.1:0".parse().unwrap())
+        .route(route)
+        .start()
+        .expect_err("missing persisted route must not be silently recreated");
+    assert_eq!(fs::read(&database_path).unwrap(), before);
+
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
 fn authenticated_route_rate_limit_excludes_packet_before_replay_admission() {
     let parent = temporary_directory("host-route-rate");
     let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
@@ -101,14 +216,14 @@ fn authenticated_route_rate_limit_excludes_packet_before_replay_admission() {
     let secret_root = create_secret_root(&parent);
     let route = NativeFrameRoute::load(
         sender.local_addr().unwrap().ip(),
-        DEVICE_ID,
-        KEY_EPOCH,
+        device_id(),
+        key_epoch(),
+        admission_limits(1),
         &secret_root,
     )
     .unwrap();
-    let host = Host::builder(store, "lab", "127.0.0.1:0".parse().unwrap())
+    let host = Host::builder(store, deployment("lab"), "127.0.0.1:0".parse().unwrap())
         .route(route)
-        .peak_packets_per_second(1)
         .start()
         .unwrap();
     let sequence_12 = hex_fixture(include_str!("fixtures/native-frame/csi-non-ht-3-pairs.hex"));
@@ -140,6 +255,7 @@ fn missing_and_reordered_sequences_are_preserved_as_explicit_raw_losses() {
     let sequence_13 =
         hex_fixture(include_str!("fixtures/native-frame/csi-ht-5-pairs-first-invalid.hex"));
     let sequence_14 = hex_fixture(include_str!("fixtures/native-frame/csi-ht-stbc-7-pairs.hex"));
+    let sequence_15 = hex_fixture(include_str!("fixtures/native-frame/health-v1.hex"));
 
     sender.send_to(&sequence_12, host.local_addr()).unwrap();
     wait_for_fact_count(&host, 1);
@@ -147,19 +263,26 @@ fn missing_and_reordered_sequences_are_preserved_as_explicit_raw_losses() {
     wait_for_fact_count(&host, 2);
     sender.send_to(&sequence_13, host.local_addr()).unwrap();
     wait_for_fact_count(&host, 3);
+    sender.send_to(&sequence_15, host.local_addr()).unwrap();
+    wait_for_fact_count(&host, 4);
 
     let losses = host.query_raw_losses(10).expect("local raw-loss query succeeds");
     assert!(losses.iter().any(|loss| {
         loss.kind() == RawLossKind::SequenceGapObserved
-            && loss.device_id() == Some(DEVICE_ID)
-            && loss.boot_generation() == Some(9)
-            && loss.first_sequence() == Some(13)
-            && loss.last_sequence() == Some(13)
+            && loss.device_id() == Some(device_id())
+            && loss.boot_generation() == BootGeneration::new(9)
+            && loss.first_sequence() == MessageSequence::new(13)
+            && loss.last_sequence() == MessageSequence::new(13)
     }));
+    assert_eq!(
+        losses.iter().filter(|loss| loss.kind() == RawLossKind::SequenceGapObserved).count(),
+        1,
+        "arrival 12,14,13,15 must not manufacture a second 14 gap from latest fact order"
+    );
     assert!(losses.iter().any(|loss| {
         loss.kind() == RawLossKind::ReorderedArrival
-            && loss.first_sequence() == Some(13)
-            && loss.last_sequence() == Some(13)
+            && loss.first_sequence() == MessageSequence::new(13)
+            && loss.last_sequence() == MessageSequence::new(13)
     }));
 
     host.shutdown().expect("Host shuts down");
@@ -174,12 +297,13 @@ fn authenticated_queue_pressure_is_preserved_as_bounded_raw_loss() {
     let secret_root = create_secret_root(&parent);
     let route = NativeFrameRoute::load(
         sender.local_addr().unwrap().ip(),
-        DEVICE_ID,
-        KEY_EPOCH,
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
         &secret_root,
     )
     .expect("exact route is valid");
-    let host = Host::builder(store, "lab", "127.0.0.1:0".parse().unwrap())
+    let host = Host::builder(store, deployment("lab"), "127.0.0.1:0".parse().unwrap())
         .route(route)
         .ingress_capacity(1)
         .start()
@@ -249,15 +373,32 @@ fn start_host(
 ) -> whisper::HostRuntime {
     let route = NativeFrameRoute::load(
         sender.local_addr().unwrap().ip(),
-        DEVICE_ID,
-        KEY_EPOCH,
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
         secret_root,
     )
     .expect("exact route is valid");
-    Host::builder(store, "lab", "127.0.0.1:0".parse().unwrap())
+    Host::builder(store, deployment("lab"), "127.0.0.1:0".parse().unwrap())
         .route(route)
         .start()
         .expect("Host starts")
+}
+
+fn device_id() -> DeviceId {
+    DeviceId::new(DEVICE_ID)
+}
+
+fn key_epoch() -> KeyEpoch {
+    KeyEpoch::new(KEY_EPOCH).unwrap()
+}
+
+fn deployment(value: &str) -> DeploymentId {
+    DeploymentId::try_from(value).unwrap()
+}
+
+fn admission_limits(packets_per_second: u32) -> AdmissionLimits {
+    AdmissionLimits::new(1_200, packets_per_second, 1_200_000, 64).unwrap()
 }
 
 #[cfg(unix)]
@@ -274,6 +415,14 @@ fn create_secret_root(parent: &std::path::Path) -> PathBuf {
     root
 }
 
+#[cfg(unix)]
+fn write_epoch_key(secret_root: &std::path::Path, epoch: KeyEpoch) {
+    let key =
+        secret_root.join(format!("device-{DEVICE_ID}")).join(format!("key-{}.bin", epoch.get()));
+    fs::write(&key, KEY).unwrap();
+    fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 fn wait_for_fact_count(host: &whisper::HostRuntime, expected: usize) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -282,6 +431,20 @@ fn wait_for_fact_count(host: &whisper::HostRuntime, expected: usize) {
         }
         assert!(Instant::now() < deadline, "raw fact count did not reach {expected}");
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_store(root: &std::path::Path) -> Store {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match Store::open(root) {
+            Ok(store) => return store,
+            Err(error) if error.is_lease_conflict() => {
+                assert!(Instant::now() < deadline, "failed Host did not release Store lease");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("Store failed to reopen: {error}"),
+        }
     }
 }
 

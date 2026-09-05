@@ -83,6 +83,18 @@ pub(crate) struct ReplayState {
 }
 
 impl ReplayAdmission {
+    pub(crate) const fn window_packets(&self) -> u16 {
+        self.window_packets
+    }
+
+    pub(crate) const fn boot_generation(&self) -> Option<u32> {
+        self.boot_generation
+    }
+
+    pub(crate) const fn maximum_message_sequence(&self) -> Option<u64> {
+        self.maximum_message_sequence
+    }
+
     /// Creates empty replay state for a non-zero bounded packet window.
     pub fn new(window_packets: u16) -> Result<Self, ReplayStateError> {
         if window_packets == 0 {

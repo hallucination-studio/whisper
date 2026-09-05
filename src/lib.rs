@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod host;
+mod identity;
 pub(crate) mod key;
 #[expect(dead_code, reason = "retained for the next lossless native-CSI fact slice")]
 pub(crate) mod native_csi;
@@ -15,11 +16,16 @@ mod store;
 
 #[doc(inline)]
 pub use host::{
-    Host, HostBuilder, HostError, HostRuntime, NativeFrameRoute, RawFact, RawLoss, RawLossKind,
-    RejectReason, RejectedDatagram, RouteError,
+    AdmissionLimits, AdmissionLimitsError, Host, HostBuilder, HostError, HostRuntime,
+    NativeFrameRoute, RawFact, RawLoss, RawLossKind, RejectReason, RejectedDatagram, RouteError,
 };
 #[doc(inline)]
-pub use store::{Store, StoreError, StoreId};
+pub use identity::{
+    BootGeneration, DeploymentId, DeploymentIdError, DeviceId, KeyEpoch, MessageSequence,
+    NativeFrameKind,
+};
+#[doc(inline)]
+pub use store::{Store, StoreId, StoreInitError, StoreOpenError};
 
 #[cfg(test)]
 mod conformance;

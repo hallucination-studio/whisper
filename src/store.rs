@@ -1,5 +1,6 @@
 //! Persistent identity and explicit lifecycle for RF world-model facts.
 
+use std::backtrace::Backtrace;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -9,16 +10,101 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, params};
 
+/// Stable Store database basename from the persistence layout contract.
 const DATABASE_NAME: &str = "facts.sqlite3";
+/// Cooperative process-ownership marker beside the database.
 const LEASE_NAME: &str = ".whisper.lease";
+/// SQLite application identifier (`WRF1`) written at header offset 68. Changing
+/// it makes all existing Stores intentionally unrecognizable.
 const STORE_APPLICATION_ID: u32 = 0x5752_4631;
+/// Exact SQLite schema generation. Incrementing it requires an explicitly
+/// scoped migration; this ticket recognizes only newly initialized generation 1.
 const STORE_SCHEMA_VERSION: u32 = 1;
+/// SQLite's fixed database header size in bytes, defined by the file format.
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+/// Persistent Store identity width in bytes; 128 random bits are enough to make
+/// accidental identity collision negligible without treating this as a secret.
 const STORE_ID_BYTES: usize = 16;
+/// Owner-only directory mode required by the host secret-adjacent trust policy.
 const ROOT_MODE: u32 = 0o700;
+/// Owner read/write file mode required for every Store-owned mutable file.
 const FILE_MODE: u32 = 0o600;
+/// Kernel CSPRNG byte source on supported Unix hosts. Replacing it changes the
+/// Store-identity entropy trust boundary and must preserve blocking/error semantics.
 const RANDOM_SOURCE: &str = "/dev/urandom";
+/// SQLite WAL header width in bytes, defined by the SQLite WAL file format.
+const WAL_HEADER_BYTES: usize = 32;
+/// Per-page WAL frame-header width in bytes, defined by the SQLite WAL format.
+const WAL_FRAME_HEADER_BYTES: usize = 24;
+/// Smallest legal SQLite database page in bytes.
+const SQLITE_MINIMUM_PAGE_BYTES: usize = 512;
+/// SQLite's encoded page-size sentinel `1` represents this 64 KiB page size.
+const SQLITE_SENTINEL_PAGE_BYTES: usize = 65_536;
+/// SQLite wal-index shared-memory regions are fixed at 32 KiB. Changing this
+/// would accept companion layouts SQLite itself cannot consume.
+const WAL_INDEX_REGION_BYTES: u64 = 32_768;
+/// Big- and little-checksum-endian SQLite WAL file magic values.
+const WAL_MAGIC_VALUES: [u32; 2] = [0x377f_0682, 0x377f_0683];
+
+// These canonical DDL strings are both creation input and exact recognition
+// identity. Fixed widths are protocol/schema bytes (Store 16, digest/identity
+// 32, device/sequence 8, boot 4, epoch 2); changing any literal changes the
+// accepted persistence contract and therefore requires a schema generation.
+const STORE_IDENTITY_SCHEMA: &str = "CREATE TABLE store_identity (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 store_id BLOB NOT NULL CHECK (typeof(store_id) = 'blob' AND length(store_id) = 16),
+                 admission_configured INTEGER NOT NULL CHECK (admission_configured IN (0, 1))
+             ) STRICT";
+const REPLAY_WINDOWS_SCHEMA: &str = "CREATE TABLE replay_windows (
+                 device_id BLOB NOT NULL CHECK (typeof(device_id) = 'blob' AND length(device_id) = 8),
+                 key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
+                 identity BLOB NOT NULL CHECK (typeof(identity) = 'blob' AND length(identity) = 32),
+                 window_packets INTEGER NOT NULL CHECK (window_packets BETWEEN 1 AND 65535),
+                 state BLOB NOT NULL CHECK (typeof(state) = 'blob'),
+                 PRIMARY KEY (device_id, key_epoch)
+             ) STRICT";
+const RAW_FACTS_SCHEMA: &str = "CREATE TABLE raw_facts (
+                 fact_id INTEGER PRIMARY KEY,
+                 digest BLOB NOT NULL UNIQUE CHECK (length(digest) = 32),
+                 received_utc_ns INTEGER NOT NULL,
+                 peer TEXT NOT NULL,
+                 device_id BLOB NOT NULL CHECK (length(device_id) = 8),
+                 key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
+                 boot_generation BLOB NOT NULL CHECK (typeof(boot_generation) = 'blob' AND length(boot_generation) = 4),
+                 message_sequence BLOB NOT NULL CHECK (length(message_sequence) = 8),
+                 kind INTEGER NOT NULL CHECK (kind BETWEEN 0 AND 255),
+                 datagram BLOB NOT NULL CHECK (typeof(datagram) = 'blob')
+             ) STRICT";
+const RAW_LOSSES_SCHEMA: &str = "CREATE TABLE raw_losses (
+                 loss_id INTEGER PRIMARY KEY,
+                 observed_utc_ns INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 count INTEGER NOT NULL CHECK (count > 0),
+                 device_id BLOB CHECK (device_id IS NULL OR (typeof(device_id) = 'blob' AND length(device_id) = 8)),
+                 boot_generation BLOB CHECK (boot_generation IS NULL OR (typeof(boot_generation) = 'blob' AND length(boot_generation) = 4)),
+                 first_sequence BLOB CHECK (first_sequence IS NULL OR (typeof(first_sequence) = 'blob' AND length(first_sequence) = 8)),
+                 last_sequence BLOB CHECK (last_sequence IS NULL OR (typeof(last_sequence) = 'blob' AND length(last_sequence) = 8))
+             ) STRICT";
+const EXPECTED_SCHEMA: [(&str, &str); 4] = [
+    ("store_identity", STORE_IDENTITY_SCHEMA),
+    ("replay_windows", REPLAY_WINDOWS_SCHEMA),
+    ("raw_facts", RAW_FACTS_SCHEMA),
+    ("raw_losses", RAW_LOSSES_SCHEMA),
+];
+
+trait Entropy {
+    fn fill(&self, bytes: &mut [u8]) -> io::Result<()>;
+}
+
+#[derive(Debug)]
+struct SystemEntropy;
+
+impl Entropy for SystemEntropy {
+    fn fill(&self, bytes: &mut [u8]) -> io::Result<()> {
+        File::open(RANDOM_SOURCE)?.read_exact(bytes)
+    }
+}
 
 /// A non-secret persistent identity for one Store.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -39,9 +125,9 @@ impl fmt::Display for StoreId {
     }
 }
 
-/// Failure to initialize or open the new RF world-model Store.
+/// Internal Store failure retained as the source of operation-specific errors.
 #[derive(Debug)]
-pub struct StoreError {
+struct StoreError {
     kind: StoreErrorKind,
 }
 
@@ -103,12 +189,101 @@ impl From<StoreErrorKind> for StoreError {
     }
 }
 
+/// Failure to explicitly initialize a new Store.
+#[derive(Debug)]
+pub struct StoreInitError {
+    root: PathBuf,
+    source: StoreError,
+    backtrace: Box<Backtrace>,
+}
+
+impl StoreInitError {
+    /// Reports that initialization refused to replace an existing target.
+    #[must_use]
+    pub const fn is_existing_target(&self) -> bool {
+        self.source.is_existing_target()
+    }
+
+    /// Returns the captured construction backtrace.
+    pub fn backtrace(&self) -> &Backtrace {
+        self.backtrace.as_ref()
+    }
+}
+
+impl fmt::Display for StoreInitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "could not initialize Store at {}: {}", self.root.display(), self.source)
+    }
+}
+
+impl std::error::Error for StoreInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Failure to recognize, validate, or exclusively open an existing Store.
+#[derive(Debug)]
+pub struct StoreOpenError {
+    root: PathBuf,
+    source: StoreError,
+    backtrace: Box<Backtrace>,
+}
+
+impl StoreOpenError {
+    /// Reports that existing bytes do not identify the exact Store format.
+    #[must_use]
+    pub const fn is_unrecognized_format(&self) -> bool {
+        self.source.is_unrecognized_format()
+    }
+
+    /// Reports that another cooperative process currently owns the Store.
+    #[must_use]
+    pub const fn is_lease_conflict(&self) -> bool {
+        self.source.is_lease_conflict()
+    }
+
+    /// Returns the captured open backtrace.
+    pub fn backtrace(&self) -> &Backtrace {
+        self.backtrace.as_ref()
+    }
+}
+
+impl fmt::Display for StoreOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "could not open Store at {}: {}", self.root.display(), self.source)
+    }
+}
+
+impl std::error::Error for StoreOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// An exclusively leased RF world-model Store ready for Host ownership.
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
     id: StoreId,
     lease: File,
+}
+
+pub(crate) struct StoreSnapshot {
+    root: PathBuf,
+    database: PathBuf,
+}
+
+impl StoreSnapshot {
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database
+    }
+}
+
+impl Drop for StoreSnapshot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 impl Store {
@@ -118,15 +293,25 @@ impl Store {
     ///
     /// Returns an error without replacing any object when `root` already exists,
     /// or when the new Store cannot be durably created and exclusively leased.
-    pub fn initialize(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub fn initialize(root: impl AsRef<Path>) -> Result<Self, StoreInitError> {
         let root = root.as_ref();
         match fs::create_dir(root) {
             Ok(()) => {}
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(StoreErrorKind::AlreadyExists.into());
+                return Err(StoreInitError {
+                    root: root.to_owned(),
+                    source: StoreErrorKind::AlreadyExists.into(),
+                    backtrace: Box::new(Backtrace::capture()),
+                });
             }
-            Err(source) => return Err(io_error(root, source)),
-        }
+            Err(source) => {
+                return Err(StoreInitError {
+                    root: root.to_owned(),
+                    source: io_error(root, source),
+                    backtrace: Box::new(Backtrace::capture()),
+                });
+            }
+        };
 
         let result = (|| {
             set_root_permissions(root)?;
@@ -141,7 +326,11 @@ impl Store {
         if result.is_err() {
             let _ = fs::remove_dir_all(root);
         }
-        result
+        result.map_err(|source| StoreInitError {
+            root: root.to_owned(),
+            source,
+            backtrace: Box::new(Backtrace::capture()),
+        })
     }
 
     /// Opens one explicitly initialized Store and acquires its cooperative lease.
@@ -154,16 +343,27 @@ impl Store {
     ///
     /// Returns an error when the format or filesystem identity is not trusted,
     /// another process holds the lease, or SQLite validation fails.
-    pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreOpenError> {
         let root = root.as_ref();
-        validate_root(root)?;
-        let database_path = root.join(DATABASE_NAME);
-        recognize_database_header(&database_path)?;
-        let id = validate_database_read_only(&database_path)?;
-        let lease = acquire_lease(root, false)?;
-        validate_optional_regular_file(&database_path.with_extension("sqlite3-wal"))?;
-        validate_optional_regular_file(&database_path.with_extension("sqlite3-shm"))?;
-        Ok(Self { root: root.to_owned(), id, lease })
+        (|| {
+            validate_root(root)?;
+            let database_path = root.join(DATABASE_NAME);
+            recognize_database_header(&database_path)?;
+            let lease = acquire_lease(root, false)?;
+            let wal_path = database_path.with_extension("sqlite3-wal");
+            let shm_path = database_path.with_extension("sqlite3-shm");
+            validate_optional_regular_file(&wal_path)?;
+            validate_optional_regular_file(&shm_path)?;
+            validate_wal_shape(&wal_path)?;
+            validate_shm_shape(&shm_path, wal_path.exists())?;
+            let id = validate_database_snapshot(&database_path, &wal_path, &shm_path)?;
+            Ok(Self { root: root.to_owned(), id, lease })
+        })()
+        .map_err(|source| StoreOpenError {
+            root: root.to_owned(),
+            source,
+            backtrace: Box::new(Backtrace::capture()),
+        })
     }
 
     /// Returns the persistent non-secret Store identity.
@@ -174,6 +374,30 @@ impl Store {
 
     pub(crate) fn database_path(&self) -> PathBuf {
         self.root.join(DATABASE_NAME)
+    }
+
+    pub(crate) fn database_snapshot(&self) -> io::Result<StoreSnapshot> {
+        let mut nonce = [0_u8; 16];
+        SystemEntropy.fill(&mut nonce)?;
+        let name = nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let root = std::env::temp_dir().join(format!("whisper-store-read-{name}"));
+        fs::create_dir(&root)?;
+        let database = root.join(DATABASE_NAME);
+        let source = self.database_path();
+        if let Err(error) = (|| {
+            fs::copy(&source, &database)?;
+            for extension in ["sqlite3-wal", "sqlite3-shm"] {
+                let companion = source.with_extension(extension);
+                if companion.exists() {
+                    fs::copy(&companion, database.with_extension(extension))?;
+                }
+            }
+            Ok::<(), io::Error>(())
+        })() {
+            let _ = fs::remove_dir_all(&root);
+            return Err(error);
+        }
+        Ok(StoreSnapshot { root, database })
     }
 }
 
@@ -195,43 +419,17 @@ fn initialize_database(path: &Path, id: StoreId) -> Result<(), StoreError> {
     connection
         .execute_batch(&format!(
             "PRAGMA application_id = {STORE_APPLICATION_ID};
-             PRAGMA user_version = {STORE_SCHEMA_VERSION};
-             CREATE TABLE store_identity (
-                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                 store_id BLOB NOT NULL CHECK (length(store_id) = {STORE_ID_BYTES})
-             ) STRICT;
-             CREATE TABLE replay_windows (
-                 identity BLOB PRIMARY KEY CHECK (length(identity) = 32),
-                 device_id BLOB NOT NULL CHECK (length(device_id) = 8),
-                 key_epoch INTEGER NOT NULL,
-                 state BLOB NOT NULL
-             ) STRICT;
-             CREATE TABLE raw_facts (
-                 fact_id INTEGER PRIMARY KEY,
-                 digest BLOB NOT NULL UNIQUE CHECK (length(digest) = 32),
-                 received_utc_ns INTEGER NOT NULL,
-                 peer TEXT NOT NULL,
-                 device_id BLOB NOT NULL CHECK (length(device_id) = 8),
-                 key_epoch INTEGER NOT NULL,
-                 boot_generation INTEGER NOT NULL,
-                 message_sequence BLOB NOT NULL CHECK (length(message_sequence) = 8),
-                 kind INTEGER NOT NULL,
-                 datagram BLOB NOT NULL
-             ) STRICT;
-             CREATE TABLE raw_losses (
-                 loss_id INTEGER PRIMARY KEY,
-                 observed_utc_ns INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 count INTEGER NOT NULL,
-                 device_id BLOB,
-                 boot_generation INTEGER,
-                 first_sequence BLOB,
-                 last_sequence BLOB
-             ) STRICT;"
+             PRAGMA user_version = {STORE_SCHEMA_VERSION};"
         ))
         .map_err(database_error)?;
+    for (_, schema) in EXPECTED_SCHEMA {
+        connection.execute_batch(schema).map_err(database_error)?;
+    }
     connection
-        .execute("INSERT INTO store_identity (singleton, store_id) VALUES (1, ?1)", params![id.0])
+        .execute(
+            "INSERT INTO store_identity (singleton, store_id, admission_configured) VALUES (1, ?1, 0)",
+            params![id.0],
+        )
         .map_err(database_error)?;
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").map_err(database_error)?;
     drop(connection);
@@ -255,12 +453,9 @@ fn recognize_database_header(path: &Path) -> Result<(), StoreError> {
 }
 
 fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
-    let uri = immutable_sqlite_uri(path)?;
     let connection = Connection::open_with_flags(
-        uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
     let integrity: String = connection
@@ -269,15 +464,6 @@ fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
     if integrity != "ok" {
         return Err(StoreErrorKind::Unrecognized.into());
     }
-    let schema_count: u32 = connection
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema
-             WHERE type = 'table'
-               AND name IN ('store_identity', 'replay_windows', 'raw_facts', 'raw_losses')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
     let total_user_tables: u32 = connection
         .query_row(
             "SELECT count(*) FROM sqlite_schema
@@ -286,8 +472,20 @@ fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
             |row| row.get(0),
         )
         .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-    if schema_count != 4 || total_user_tables != 4 {
+    if total_user_tables != EXPECTED_SCHEMA.len() as u32 {
         return Err(StoreErrorKind::Unrecognized.into());
+    }
+    for (name, expected_sql) in EXPECTED_SCHEMA {
+        let actual_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+        if actual_sql != expected_sql {
+            return Err(StoreErrorKind::Unrecognized.into());
+        }
     }
     let bytes: Vec<u8> = connection
         .query_row("SELECT store_id FROM store_identity WHERE singleton = 1", [], |row| row.get(0))
@@ -297,30 +495,71 @@ fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
     Ok(StoreId(bytes))
 }
 
-#[cfg(unix)]
-fn immutable_sqlite_uri(path: &Path) -> Result<String, StoreError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let absolute = fs::canonicalize(path).map_err(|source| io_error(path, source))?;
-    let mut uri = String::from("file:");
-    for byte in absolute.as_os_str().as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' => {
-                uri.push(char::from(*byte));
-            }
-            _ => {
-                use std::fmt::Write;
-                write!(uri, "%{byte:02X}").expect("writing to a String cannot fail");
-            }
+fn validate_database_snapshot(
+    database: &Path,
+    wal: &Path,
+    shm: &Path,
+) -> Result<StoreId, StoreError> {
+    let nonce = random_bytes::<16>()?;
+    let name = nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let root = std::env::temp_dir().join(format!("whisper-store-validation-{name}"));
+    fs::create_dir(&root).map_err(|source| io_error(&root, source))?;
+    let snapshot_database = root.join(DATABASE_NAME);
+    let result = (|| {
+        fs::copy(database, &snapshot_database).map_err(|source| io_error(database, source))?;
+        if wal.exists() {
+            fs::copy(wal, snapshot_database.with_extension("sqlite3-wal"))
+                .map_err(|source| io_error(wal, source))?;
         }
-    }
-    uri.push_str("?immutable=1");
-    Ok(uri)
+        if shm.exists() {
+            fs::copy(shm, snapshot_database.with_extension("sqlite3-shm"))
+                .map_err(|source| io_error(shm, source))?;
+        }
+        validate_database_read_only(&snapshot_database)
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
 }
 
-#[cfg(not(unix))]
-fn immutable_sqlite_uri(_path: &Path) -> Result<String, StoreError> {
-    Err(StoreErrorKind::Untrusted.into())
+fn validate_wal_shape(path: &Path) -> Result<(), StoreError> {
+    let Ok(bytes) = fs::read(path) else {
+        return if path.exists() { Err(StoreErrorKind::Unrecognized.into()) } else { Ok(()) };
+    };
+    if bytes.len() < WAL_HEADER_BYTES {
+        return Err(StoreErrorKind::Unrecognized.into());
+    }
+    let magic = u32::from_be_bytes(bytes[0..4].try_into().expect("fixed WAL magic width"));
+    if !WAL_MAGIC_VALUES.contains(&magic) {
+        return Err(StoreErrorKind::Unrecognized.into());
+    }
+    let encoded_page_size =
+        u32::from_be_bytes(bytes[8..12].try_into().expect("fixed WAL page width"));
+    let page_size = if encoded_page_size == 1 {
+        SQLITE_SENTINEL_PAGE_BYTES
+    } else {
+        encoded_page_size as usize
+    };
+    let frame_bytes =
+        WAL_FRAME_HEADER_BYTES.checked_add(page_size).ok_or(StoreErrorKind::Unrecognized)?;
+    if page_size < SQLITE_MINIMUM_PAGE_BYTES
+        || !page_size.is_power_of_two()
+        || !(bytes.len() - WAL_HEADER_BYTES).is_multiple_of(frame_bytes)
+    {
+        return Err(StoreErrorKind::Unrecognized.into());
+    }
+    Ok(())
+}
+
+fn validate_shm_shape(path: &Path, wal_exists: bool) -> Result<(), StoreError> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return if path.exists() { Err(StoreErrorKind::Unrecognized.into()) } else { Ok(()) };
+    };
+    // SQLite's wal-index uses 32 KiB regions and is only meaningful beside a WAL.
+    if !wal_exists || metadata.len() == 0 || !metadata.len().is_multiple_of(WAL_INDEX_REGION_BYTES)
+    {
+        return Err(StoreErrorKind::Unrecognized.into());
+    }
+    Ok(())
 }
 
 fn acquire_lease(root: &Path, create: bool) -> Result<File, StoreError> {
@@ -343,12 +582,14 @@ fn acquire_lease(root: &Path, create: bool) -> Result<File, StoreError> {
 }
 
 fn random_store_id() -> Result<StoreId, StoreError> {
+    Ok(StoreId(random_bytes()?))
+}
+
+fn random_bytes<const N: usize>() -> Result<[u8; N], StoreError> {
     let path = Path::new(RANDOM_SOURCE);
-    let mut bytes = [0_u8; STORE_ID_BYTES];
-    File::open(path)
-        .and_then(|mut source| source.read_exact(&mut bytes))
-        .map_err(|source| io_error(path, source))?;
-    Ok(StoreId(bytes))
+    let mut bytes = [0_u8; N];
+    SystemEntropy.fill(&mut bytes).map_err(|source| io_error(path, source))?;
+    Ok(bytes)
 }
 
 #[cfg(unix)]
