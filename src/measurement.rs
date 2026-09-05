@@ -222,10 +222,19 @@ pub struct WaitTicks(u64);
 
 impl WaitTicks {
     /// Constructs a nonzero wait bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` is zero.
     pub fn new(value: u64) -> Result<Self, MeasurementError> {
         (value != 0)
             .then_some(Self(value))
             .ok_or_else(|| MeasurementError::new("wait bound must be nonzero"))
+    }
+    /// Returns the source-tick count.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
     }
 }
 
@@ -238,6 +247,10 @@ pub struct TickRange {
 
 impl TickRange {
     /// Constructs an ordered inclusive interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `end` precedes `start`.
     pub fn new(start: SourceTick, end: SourceTick) -> Result<Self, MeasurementError> {
         (start <= end)
             .then_some(Self { start, end })
@@ -339,6 +352,10 @@ pub struct FragmentPosition {
 
 impl FragmentPosition {
     /// Constructs a position inside a nonempty declared member set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty set or an ordinal outside the declared set.
     pub fn new(ordinal: u16, expected: u16) -> Result<Self, MeasurementError> {
         (expected != 0 && ordinal < expected)
             .then_some(Self { ordinal, expected })
@@ -362,6 +379,10 @@ pub struct FragmentBytes(u32);
 
 impl FragmentBytes {
     /// Constructs a byte count within the finite assembly ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the byte count exceeds the implementation ceiling.
     pub fn new(value: u32) -> Result<Self, MeasurementError> {
         (u64::from(value) <= MAX_ASSEMBLY_BYTES)
             .then_some(Self(value))
@@ -446,6 +467,10 @@ pub struct AssemblyCapacity {
 
 impl AssemblyCapacity {
     /// Constructs capacity values within the implementation's finite ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any bound is zero or exceeds the implementation ceiling.
     pub fn new(open: usize, fragments: u16, bytes: u64) -> Result<Self, MeasurementError> {
         if open == 0
             || open > MAX_OPEN_ASSEMBLIES
@@ -457,6 +482,21 @@ impl AssemblyCapacity {
             return Err(MeasurementError::new("assembly capacity is outside finite bounds"));
         }
         Ok(Self { open, fragments, bytes })
+    }
+    /// Returns the simultaneous-open ceiling.
+    #[must_use]
+    pub const fn open(self) -> usize {
+        self.open
+    }
+    /// Returns the per-assembly fragment ceiling.
+    #[must_use]
+    pub const fn fragments(self) -> u16 {
+        self.fragments
+    }
+    /// Returns the per-assembly byte ceiling.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        self.bytes
     }
 }
 
@@ -473,6 +513,16 @@ impl AssemblyLimits {
     pub const fn new(capacity: AssemblyCapacity, wait: WaitTicks) -> Self {
         Self { capacity, wait }
     }
+    /// Returns count and byte ceilings.
+    #[must_use]
+    pub const fn capacity(self) -> AssemblyCapacity {
+        self.capacity
+    }
+    /// Returns the residence-time ceiling.
+    #[must_use]
+    pub const fn wait(self) -> WaitTicks {
+        self.wait
+    }
 
     pub(crate) fn host_default() -> Self {
         Self::new(
@@ -480,6 +530,67 @@ impl AssemblyLimits {
                 .expect("host assembly capacity constants are valid"),
             WaitTicks::new(HOST_ASSEMBLY_WAIT_TICKS).expect("host assembly wait constant is valid"),
         )
+    }
+}
+
+/// Persisted counters and limits that justify an immutable close reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssemblyCloseMetrics {
+    first_tick: SourceTick,
+    close_tick: SourceTick,
+    limits: AssemblyLimits,
+    attempted_fragments: u32,
+    attempted_bytes: u64,
+    open_assemblies: u32,
+}
+
+impl AssemblyCloseMetrics {
+    pub(crate) const fn new(
+        first_tick: SourceTick,
+        close_tick: SourceTick,
+        limits: AssemblyLimits,
+        attempted_fragments: u32,
+        attempted_bytes: u64,
+        open_assemblies: u32,
+    ) -> Self {
+        Self {
+            first_tick,
+            close_tick,
+            limits,
+            attempted_fragments,
+            attempted_bytes,
+            open_assemblies,
+        }
+    }
+    /// Returns the first fragment tick.
+    #[must_use]
+    pub const fn first_tick(self) -> SourceTick {
+        self.first_tick
+    }
+    /// Returns the decision tick.
+    #[must_use]
+    pub const fn close_tick(self) -> SourceTick {
+        self.close_tick
+    }
+    /// Returns the configured limits used by the decision.
+    #[must_use]
+    pub const fn limits(self) -> AssemblyLimits {
+        self.limits
+    }
+    /// Returns the fragment count including the triggering attempt.
+    #[must_use]
+    pub const fn attempted_fragments(self) -> u32 {
+        self.attempted_fragments
+    }
+    /// Returns bytes including the triggering attempt.
+    #[must_use]
+    pub const fn attempted_bytes(self) -> u64 {
+        self.attempted_bytes
+    }
+    /// Returns simultaneous open assemblies observed at the decision.
+    #[must_use]
+    pub const fn open_assemblies(self) -> u32 {
+        self.open_assemblies
     }
 }
 
@@ -576,18 +687,32 @@ pub struct AssemblyClose {
     reason: AssemblyCloseReason,
     uncertainty: AssociationUncertainty,
     total_bytes: u64,
+    metrics: AssemblyCloseMetrics,
+}
+
+pub(crate) struct PersistedAssemblyClose {
+    pub(crate) key: AssemblyKey,
+    pub(crate) expected_fragments: u16,
+    pub(crate) members: Box<[AssemblyMember]>,
+    pub(crate) missing_ordinals: Box<[u16]>,
+    pub(crate) reason: AssemblyCloseReason,
+    pub(crate) uncertainty: AssociationUncertainty,
+    pub(crate) total_bytes: u64,
+    pub(crate) metrics: AssemblyCloseMetrics,
 }
 
 impl AssemblyClose {
-    pub(crate) fn persisted(
-        key: AssemblyKey,
-        expected_fragments: u16,
-        members: Box<[AssemblyMember]>,
-        missing_ordinals: Box<[u16]>,
-        reason: AssemblyCloseReason,
-        uncertainty: AssociationUncertainty,
-        total_bytes: u64,
-    ) -> Self {
+    pub(crate) fn persisted(value: PersistedAssemblyClose) -> Self {
+        let PersistedAssemblyClose {
+            key,
+            expected_fragments,
+            members,
+            missing_ordinals,
+            reason,
+            uncertainty,
+            total_bytes,
+            metrics,
+        } = value;
         Self {
             key,
             expected_fragments,
@@ -596,6 +721,7 @@ impl AssemblyClose {
             reason,
             uncertainty,
             total_bytes,
+            metrics,
         }
     }
     /// Returns the immutable event identity.
@@ -633,6 +759,11 @@ impl AssemblyClose {
     pub const fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
+    /// Returns persisted decision counters and configured limits.
+    #[must_use]
+    pub const fn metrics(&self) -> AssemblyCloseMetrics {
+        self.metrics
+    }
 }
 
 #[derive(Debug)]
@@ -658,12 +789,24 @@ impl MeasurementAssembler {
     }
 
     /// Incorporates one fragment and emits every immutable decision caused by it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when arithmetic overflows or the fragment cannot be represented
+    /// under the configured limits.
     pub fn ingest(
         &mut self,
         fragment: MeasurementFragment,
         arrival: SourceTick,
     ) -> Result<Vec<AssemblyClose>, MeasurementError> {
-        self.ingest_inner(fragment, arrival, true)
+        let key = fragment.key.clone();
+        let mut closes = self.expire(key.source(), arrival);
+        if closes.iter().any(|close| close.key() == &key) {
+            closes.push(self.isolated_close(fragment, AssemblyCloseReason::LateFragment, arrival));
+            return Ok(closes);
+        }
+        closes.extend(self.ingest_inner(fragment, arrival, true)?);
+        Ok(closes)
     }
 
     pub(crate) fn restore(
@@ -686,8 +829,13 @@ impl MeasurementAssembler {
         enforce_resources: bool,
     ) -> Result<Vec<AssemblyClose>, MeasurementError> {
         let key = fragment.key.clone();
+        let open_count = self.open.len();
         if !self.open.contains_key(&key) && self.open.len() == self.limits.capacity.open {
-            return Ok(vec![Self::isolated_close(fragment, AssemblyCloseReason::ResourceLimit)]);
+            return Ok(vec![self.isolated_close(
+                fragment,
+                AssemblyCloseReason::ResourceLimit,
+                arrival,
+            )]);
         }
         let open = self.open.entry(key.clone()).or_insert_with(|| OpenAssembly {
             first_tick: arrival,
@@ -696,16 +844,43 @@ impl MeasurementAssembler {
             total_bytes: 0,
         });
         if open.expected != fragment.position.expected {
-            return Ok(vec![self.close_with(&key, AssemblyCloseReason::ConflictingDuplicate)]);
+            let attempted_fragments = u32::try_from(open.members.len()).unwrap_or(u32::MAX) + 1;
+            let attempted_bytes =
+                open.total_bytes.saturating_add(u64::from(fragment.fact.bytes.get()));
+            return Ok(vec![self.close_with(
+                &key,
+                AssemblyCloseReason::ConflictingDuplicate,
+                arrival,
+                attempted_fragments,
+                attempted_bytes,
+            )]);
         }
         if let Some(existing) = open.members.get(&fragment.position.ordinal) {
             if existing.fact_digest == fragment.fact.digest {
-                return Ok(vec![Self::isolated_close(
+                let metrics = AssemblyCloseMetrics::new(
+                    open.first_tick,
+                    arrival,
+                    self.limits,
+                    u32::try_from(open.members.len()).unwrap_or(u32::MAX) + 1,
+                    open.total_bytes.saturating_add(u64::from(fragment.fact.bytes.get())),
+                    u32::try_from(open_count).unwrap_or(u32::MAX),
+                );
+                return Ok(vec![Self::isolated_close_with_metrics(
                     fragment,
                     AssemblyCloseReason::DuplicateFragment,
+                    metrics,
                 )]);
             }
-            return Ok(vec![self.close_with(&key, AssemblyCloseReason::ConflictingDuplicate)]);
+            let attempted_fragments = u32::try_from(open.members.len()).unwrap_or(u32::MAX) + 1;
+            let attempted_bytes =
+                open.total_bytes.saturating_add(u64::from(fragment.fact.bytes.get()));
+            return Ok(vec![self.close_with(
+                &key,
+                AssemblyCloseReason::ConflictingDuplicate,
+                arrival,
+                attempted_fragments,
+                attempted_bytes,
+            )]);
         }
         open.total_bytes = open
             .total_bytes
@@ -721,31 +896,77 @@ impl MeasurementAssembler {
         } else {
             None
         };
-        Ok(reason.map(|reason| vec![self.close_with(&key, reason)]).unwrap_or_default())
+        let attempted_fragments = u32::try_from(open.members.len()).unwrap_or(u32::MAX);
+        let attempted_bytes = open.total_bytes;
+        Ok(reason
+            .map(|reason| {
+                vec![self.close_with(&key, reason, arrival, attempted_fragments, attempted_bytes)]
+            })
+            .unwrap_or_default())
     }
 
     /// Closes assemblies from one source whose bounded wait elapsed.
     #[must_use]
     pub fn expire(&mut self, source: &SourceInstance, now: SourceTick) -> Vec<AssemblyClose> {
-        let keys = self
+        let decisions = self
             .open
             .iter()
             .filter_map(|(key, open)| {
                 (key.source() == source
                     && now.get().saturating_sub(open.first_tick.get()) >= self.limits.wait.0)
-                    .then_some(key.clone())
+                    .then_some((
+                        key.clone(),
+                        u32::try_from(open.members.len()).unwrap_or(u32::MAX),
+                        open.total_bytes,
+                    ))
             })
             .collect::<Vec<_>>();
-        keys.into_iter().map(|key| self.close_with(&key, AssemblyCloseReason::WaitLimit)).collect()
+        decisions
+            .into_iter()
+            .map(|(key, attempted_fragments, attempted_bytes)| {
+                self.close_with(
+                    &key,
+                    AssemblyCloseReason::WaitLimit,
+                    now,
+                    attempted_fragments,
+                    attempted_bytes,
+                )
+            })
+            .collect()
     }
 
     /// Creates a separate late-arrival fact after durable storage proves an earlier close.
     #[must_use]
-    pub fn late(fragment: MeasurementFragment) -> AssemblyClose {
-        Self::isolated_close(fragment, AssemblyCloseReason::LateFragment)
+    pub fn late(&self, fragment: MeasurementFragment, arrival: SourceTick) -> AssemblyClose {
+        self.isolated_close(fragment, AssemblyCloseReason::LateFragment, arrival)
     }
 
-    fn isolated_close(fragment: MeasurementFragment, reason: AssemblyCloseReason) -> AssemblyClose {
+    fn isolated_close(
+        &self,
+        fragment: MeasurementFragment,
+        reason: AssemblyCloseReason,
+        close_tick: SourceTick,
+    ) -> AssemblyClose {
+        let total_bytes = u64::from(fragment.fact.bytes.get());
+        Self::isolated_close_with_metrics(
+            fragment,
+            reason,
+            AssemblyCloseMetrics::new(
+                close_tick,
+                close_tick,
+                self.limits,
+                1,
+                total_bytes,
+                u32::try_from(self.open.len()).unwrap_or(u32::MAX),
+            ),
+        )
+    }
+
+    fn isolated_close_with_metrics(
+        fragment: MeasurementFragment,
+        reason: AssemblyCloseReason,
+        metrics: AssemblyCloseMetrics,
+    ) -> AssemblyClose {
         let expected = fragment.position.expected;
         let ordinal = fragment.position.ordinal;
         let total_bytes = u64::from(fragment.fact.bytes.get());
@@ -762,10 +983,18 @@ impl MeasurementAssembler {
             reason,
             uncertainty,
             total_bytes,
+            metrics,
         }
     }
 
-    fn close_with(&mut self, key: &AssemblyKey, reason: AssemblyCloseReason) -> AssemblyClose {
+    fn close_with(
+        &mut self,
+        key: &AssemblyKey,
+        reason: AssemblyCloseReason,
+        close_tick: SourceTick,
+        attempted_fragments: u32,
+        attempted_bytes: u64,
+    ) -> AssemblyClose {
         let open = self.open.remove(key).expect("close key must identify an open assembly");
         let missing =
             (0..open.expected).filter(|ordinal| !open.members.contains_key(ordinal)).collect();
@@ -782,6 +1011,14 @@ impl MeasurementAssembler {
             reason,
             uncertainty,
             total_bytes: open.total_bytes,
+            metrics: AssemblyCloseMetrics::new(
+                open.first_tick,
+                close_tick,
+                self.limits,
+                attempted_fragments,
+                attempted_bytes,
+                u32::try_from(self.open.len() + 1).unwrap_or(u32::MAX),
+            ),
         }
     }
 }
@@ -798,6 +1035,10 @@ pub struct RelationValidity {
 
 impl RelationValidity {
     /// Constructs a bounded nonempty provenance record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provenance is empty or exceeds the finite byte bound.
     pub fn new(
         provenance: impl Into<Box<str>>,
         source: SourceInstance,
@@ -849,6 +1090,10 @@ pub struct TimeRelation {
 
 impl TimeRelation {
     /// Constructs a clock-domain and fit-scoped relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either clock-domain name is empty or overlong.
     pub fn new(
         common: RelationValidity,
         source_clock: impl Into<Box<str>>,
@@ -898,6 +1143,10 @@ pub struct PhaseRelation {
 
 impl PhaseRelation {
     /// Constructs a reference- and coherence-scoped phase relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when coherence is not contained by relation validity.
     pub fn new(
         common: RelationValidity,
         reference: PhaseReferenceIdentity,
@@ -976,6 +1225,10 @@ pub struct PortMapping {
 
 impl PortMapping {
     /// Constructs a nonempty finite mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty, overlong, or duplicate signal-path mapping.
     pub fn new(
         common: RelationValidity,
         entries: impl IntoIterator<Item = PortMapEntry>,
@@ -1037,6 +1290,10 @@ pub struct Geometry {
 
 impl Geometry {
     /// Constructs an explicit frame-to-frame pose.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either coordinate-frame name is empty or overlong.
     pub fn new(
         common: RelationValidity,
         source_frame: impl Into<Box<str>>,
@@ -1104,28 +1361,78 @@ impl QualificationRelation {
 /// Identity and exact time window of one causal evidence block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvidenceBlockIdentity {
-    source: SourceInstance,
+    scope: EvidenceScope,
     members: Box<[EvidenceMemberIdentity]>,
+    signal_paths: Box<[SignalPath]>,
+}
+
+impl EvidenceBlockIdentity {
+    /// Constructs finite, duplicate-free member and signal-path sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the member set is empty or too large, or when either set
+    /// contains duplicate identities or exceeds its finite bound.
+    pub fn new(
+        scope: EvidenceScope,
+        members: impl IntoIterator<Item = EvidenceMemberIdentity>,
+        signal_paths: impl IntoIterator<Item = SignalPath>,
+    ) -> Result<Self, MeasurementError> {
+        let members = members.into_iter().collect::<Vec<_>>();
+        let signal_paths = signal_paths.into_iter().collect::<Vec<_>>();
+        if members.is_empty()
+            || members.len() > MAX_EVIDENCE_MEMBERS
+            || members.iter().enumerate().any(|(index, member)| members[..index].contains(member))
+            || signal_paths.len() > MAX_PORT_ENTRIES
+            || signal_paths
+                .iter()
+                .enumerate()
+                .any(|(index, path)| signal_paths[..index].contains(path))
+        {
+            return Err(MeasurementError::new("evidence member count is outside finite bounds"));
+        }
+        Ok(Self {
+            scope,
+            members: members.into_boxed_slice(),
+            signal_paths: signal_paths.into_boxed_slice(),
+        })
+    }
+}
+
+/// Source, capture context, window, and qualification revision of one evidence block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceScope {
+    source: SourceInstance,
+    context: MeasurementContext,
     window: TickRange,
     epoch: QualificationEpoch,
 }
 
-impl EvidenceBlockIdentity {
-    /// Constructs a nonempty finite member set.
-    pub fn new(
+impl EvidenceScope {
+    /// Groups the exact boundaries within which block evidence is interchangeable.
+    #[must_use]
+    pub const fn new(
         source: SourceInstance,
-        members: impl IntoIterator<Item = EvidenceMemberIdentity>,
+        context: MeasurementContext,
         window: TickRange,
         epoch: QualificationEpoch,
-    ) -> Result<Self, MeasurementError> {
-        let members = members.into_iter().collect::<Vec<_>>();
-        if members.is_empty()
-            || members.len() > MAX_EVIDENCE_MEMBERS
-            || members.iter().enumerate().any(|(index, member)| members[..index].contains(member))
-        {
-            return Err(MeasurementError::new("evidence member count is outside finite bounds"));
-        }
-        Ok(Self { source, members: members.into_boxed_slice(), window, epoch })
+    ) -> Self {
+        Self { source, context, window, epoch }
+    }
+}
+
+/// One transmitter-stream and receiver-chain signal path present in a block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalPath {
+    tx_stream: u16,
+    rx_chain: u16,
+}
+
+impl SignalPath {
+    /// Groups a protocol transmitter stream with its capture receive chain.
+    #[must_use]
+    pub const fn new(tx_stream: u16, rx_chain: u16) -> Self {
+        Self { tx_stream, rx_chain }
     }
 }
 
@@ -1138,6 +1445,10 @@ pub struct EvidenceBlock {
 
 impl EvidenceBlock {
     /// Constructs a block only when each named member has one quality state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the quality count does not equal the member count.
     pub fn new(
         identity: EvidenceBlockIdentity,
         quality: impl IntoIterator<Item = EvidenceQuality>,
@@ -1161,18 +1472,190 @@ pub enum PhysicalOperator {
     AngleDelay,
 }
 
-/// Artifact activation boundary used by eligibility.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ModelRequirements {
+/// Artifact and capture boundaries required by one model operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactScope {
     activation: TickRange,
     epoch: QualificationEpoch,
+    context: MeasurementContext,
+}
+
+impl ArtifactScope {
+    /// Groups exact artifact activation, revision, and capture boundaries.
+    #[must_use]
+    pub const fn new(
+        activation: TickRange,
+        epoch: QualificationEpoch,
+        context: MeasurementContext,
+    ) -> Self {
+        Self { activation, epoch, context }
+    }
+}
+
+/// Required named clock domains, fit, and maximum time error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeRequirement {
+    source_clock: Box<str>,
+    target_clock: Box<str>,
+    fit: FitIdentity,
+    maximum_error: ErrorBound,
+}
+
+impl TimeRequirement {
+    /// Constructs exact clock and fit requirements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty or overlong clock-domain names.
+    pub fn new(
+        source_clock: impl Into<Box<str>>,
+        target_clock: impl Into<Box<str>>,
+        fit: FitIdentity,
+        maximum_error: ErrorBound,
+    ) -> Result<Self, MeasurementError> {
+        let source_clock = source_clock.into();
+        let target_clock = target_clock.into();
+        if source_clock.is_empty()
+            || target_clock.is_empty()
+            || source_clock.len() > MAX_SOURCE_BYTES
+            || target_clock.len() > MAX_SOURCE_BYTES
+        {
+            return Err(MeasurementError::new("clock requirements must be nonempty"));
+        }
+        Ok(Self { source_clock, target_clock, fit, maximum_error })
+    }
+}
+
+/// Required phase reference, coherence interval, and maximum phase error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhaseRequirement {
+    reference: PhaseReferenceIdentity,
+    coherence: TickRange,
+    maximum_error: ErrorBound,
+}
+
+impl PhaseRequirement {
+    /// Groups exact phase requirements.
+    #[must_use]
+    pub const fn new(
+        reference: PhaseReferenceIdentity,
+        coherence: TickRange,
+        maximum_error: ErrorBound,
+    ) -> Self {
+        Self { reference, coherence, maximum_error }
+    }
+}
+
+/// Required physical mapping for one block signal path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortRequirement {
+    path: SignalPath,
+    tx_antenna: u16,
+    rx_antenna: u16,
+}
+
+impl PortRequirement {
+    /// Groups one exact signal-path-to-physical-antenna requirement.
+    #[must_use]
+    pub const fn new(path: SignalPath, tx_antenna: u16, rx_antenna: u16) -> Self {
+        Self { path, tx_antenna, rx_antenna }
+    }
+}
+
+/// Required coordinate frames, pose, and maximum geometry error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeometryRequirement {
+    source_frame: Box<str>,
+    target_frame: Box<str>,
+    pose: Pose,
+    maximum_error: ErrorBound,
+}
+
+impl GeometryRequirement {
+    /// Constructs exact geometry requirements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty or overlong coordinate-frame names.
+    pub fn new(
+        source_frame: impl Into<Box<str>>,
+        target_frame: impl Into<Box<str>>,
+        pose: Pose,
+        maximum_error: ErrorBound,
+    ) -> Result<Self, MeasurementError> {
+        let source_frame = source_frame.into();
+        let target_frame = target_frame.into();
+        if source_frame.is_empty()
+            || target_frame.is_empty()
+            || source_frame.len() > MAX_SOURCE_BYTES
+            || target_frame.len() > MAX_SOURCE_BYTES
+        {
+            return Err(MeasurementError::new("geometry requirements must be nonempty"));
+        }
+        Ok(Self { source_frame, target_frame, pose, maximum_error })
+    }
+}
+
+/// Exact independently established physical inputs required by an operator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalRequirements {
+    time: TimeRequirement,
+    phase: Option<PhaseRequirement>,
+    ports: Box<[PortRequirement]>,
+    geometry: Option<GeometryRequirement>,
+}
+
+impl PhysicalRequirements {
+    /// Constructs a finite, duplicate-free physical requirement set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when port requirements exceed the finite bound or repeat a signal path.
+    pub fn new(
+        time: TimeRequirement,
+        phase: Option<PhaseRequirement>,
+        ports: impl IntoIterator<Item = PortRequirement>,
+        geometry: Option<GeometryRequirement>,
+    ) -> Result<Self, MeasurementError> {
+        let ports = ports.into_iter().collect::<Vec<_>>();
+        if ports.len() > MAX_PORT_ENTRIES
+            || ports
+                .iter()
+                .enumerate()
+                .any(|(index, port)| ports[..index].iter().any(|earlier| earlier.path == port.path))
+        {
+            return Err(MeasurementError::new("physical port requirements are invalid"));
+        }
+        Ok(Self { time, phase, ports: ports.into_boxed_slice(), geometry })
+    }
+}
+
+/// Exact scope and physical inputs for one operator invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelRequirements {
+    operator: PhysicalOperator,
+    artifact: ArtifactScope,
+    physical: PhysicalRequirements,
 }
 
 impl ModelRequirements {
-    /// Constructs exact artifact activation boundaries.
-    #[must_use]
-    pub const fn new(activation: TickRange, epoch: QualificationEpoch) -> Self {
-        Self { activation, epoch }
+    /// Constructs per-operator requirements without supplying inferred physical inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when angle-delay requirements omit phase, ports, or geometry, or
+    /// when another operator includes inputs it does not consume.
+    pub fn new(
+        operator: PhysicalOperator,
+        artifact: ArtifactScope,
+        physical: PhysicalRequirements,
+    ) -> Result<Self, MeasurementError> {
+        let angle_inputs =
+            physical.phase.is_some() && !physical.ports.is_empty() && physical.geometry.is_some();
+        if (operator == PhysicalOperator::AngleDelay) != angle_inputs {
+            return Err(MeasurementError::new("physical requirements do not match operator"));
+        }
+        Ok(Self { operator, artifact, physical })
     }
 }
 
@@ -1201,9 +1684,8 @@ impl Qualification {
     #[must_use]
     pub fn eligibility(
         &self,
-        operator: PhysicalOperator,
         block: &EvidenceBlock,
-        artifact: ModelRequirements,
+        requirements: &ModelRequirements,
     ) -> Eligibility {
         let mut gaps = Vec::new();
         for quality in &block.quality {
@@ -1219,38 +1701,123 @@ impl Qualification {
                 gaps.push(gap);
             }
         }
-        if artifact.epoch != block.identity.epoch
-            || !artifact.activation.covers(block.identity.window)
+        let scope = &block.identity.scope;
+        if requirements.artifact.epoch != scope.epoch
+            || !requirements.artifact.activation.covers(scope.window)
         {
             gaps.push(QualificationGap::ArtifactActivation);
         }
-        let mut require = |common: Option<&RelationValidity>, gap| {
-            if !common.is_some_and(|validity| {
-                validity.source == block.identity.source
-                    && validity.epoch == block.identity.epoch
-                    && validity.validity.covers(block.identity.window)
-            }) {
-                gaps.push(gap);
-            }
+        if requirements.artifact.context != scope.context {
+            gaps.push(QualificationGap::MeasurementContext);
+        }
+
+        let valid_common = |common: &RelationValidity| {
+            common.source == scope.source
+                && common.epoch == scope.epoch
+                && common.validity.covers(scope.window)
         };
-        require(self.time.as_ref().map(TimeRelation::common), QualificationGap::TimeRelation);
-        if operator == PhysicalOperator::AngleDelay {
-            require(
-                self.phase.as_ref().map(PhaseRelation::common).filter(|_| {
-                    self.phase
-                        .as_ref()
-                        .is_some_and(|relation| relation.coherence.covers(block.identity.window))
-                }),
-                QualificationGap::PhaseRelation,
-            );
-            require(self.port.as_ref().map(PortMapping::common), QualificationGap::PortMapping);
-            require(self.geometry.as_ref().map(Geometry::common), QualificationGap::Geometry);
-            if self.port.as_ref().is_some_and(|mapping| !mapping.tx_geometry_known()) {
-                gaps.push(QualificationGap::TxGeometry);
+        match &self.time {
+            None => gaps.push(QualificationGap::TimeRelation),
+            Some(relation) => {
+                if !valid_common(relation.common()) {
+                    gaps.push(QualificationGap::TimeScope);
+                }
+                let required = &requirements.physical.time;
+                if relation.source_clock() != required.source_clock.as_ref()
+                    || relation.target_clock() != required.target_clock.as_ref()
+                {
+                    gaps.push(QualificationGap::TimeClockDomains);
+                }
+                if relation.fit() != required.fit {
+                    gaps.push(QualificationGap::TimeFit);
+                }
+                if !within_error(relation.common.error, required.maximum_error) {
+                    gaps.push(QualificationGap::TimeError);
+                }
+            }
+        }
+
+        if requirements.operator == PhysicalOperator::AngleDelay {
+            let phase_required = requirements
+                .physical
+                .phase
+                .as_ref()
+                .expect("angle-delay requirements contain phase");
+            match &self.phase {
+                None => gaps.push(QualificationGap::PhaseRelation),
+                Some(relation) => {
+                    if !valid_common(relation.common()) {
+                        gaps.push(QualificationGap::PhaseScope);
+                    }
+                    if relation.reference != phase_required.reference {
+                        gaps.push(QualificationGap::PhaseReference);
+                    }
+                    if !relation.coherence.covers(scope.window)
+                        || !phase_required.coherence.covers(scope.window)
+                        || !relation.coherence.covers(phase_required.coherence)
+                    {
+                        gaps.push(QualificationGap::PhaseCoherence);
+                    }
+                    if !within_error(relation.common.error, phase_required.maximum_error) {
+                        gaps.push(QualificationGap::PhaseError);
+                    }
+                }
+            }
+            match &self.port {
+                None => gaps.push(QualificationGap::PortMapping),
+                Some(mapping) => {
+                    if !valid_common(mapping.common()) {
+                        gaps.push(QualificationGap::PortScope);
+                    }
+                    let exact_paths = mapping.entries.len() == block.identity.signal_paths.len()
+                        && requirements.physical.ports.len() == block.identity.signal_paths.len()
+                        && block.identity.signal_paths.iter().all(|path| {
+                            requirements.physical.ports.iter().any(|required| {
+                                required.path == *path
+                                    && mapping.entries.iter().any(|entry| {
+                                        entry.tx_stream == path.tx_stream
+                                            && entry.rx_chain == path.rx_chain
+                                            && entry.tx_antenna == Some(required.tx_antenna)
+                                            && entry.rx_antenna == required.rx_antenna
+                                    })
+                            })
+                        });
+                    if !exact_paths {
+                        gaps.push(QualificationGap::SignalPathMapping);
+                    }
+                }
+            }
+            let geometry_required = requirements
+                .physical
+                .geometry
+                .as_ref()
+                .expect("angle-delay requirements contain geometry");
+            match &self.geometry {
+                None => gaps.push(QualificationGap::Geometry),
+                Some(geometry) => {
+                    if !valid_common(geometry.common()) {
+                        gaps.push(QualificationGap::GeometryScope);
+                    }
+                    if geometry.source_frame() != geometry_required.source_frame.as_ref()
+                        || geometry.target_frame() != geometry_required.target_frame.as_ref()
+                    {
+                        gaps.push(QualificationGap::GeometryFrames);
+                    }
+                    if geometry.pose != geometry_required.pose {
+                        gaps.push(QualificationGap::GeometryPose);
+                    }
+                    if !within_error(geometry.common.error, geometry_required.maximum_error) {
+                        gaps.push(QualificationGap::GeometryError);
+                    }
+                }
             }
         }
         Eligibility { gaps: gaps.into_boxed_slice() }
     }
+}
+
+fn within_error(actual: ErrorBound, maximum: ErrorBound) -> bool {
+    actual.value != u64::MAX && actual.unit == maximum.unit && actual.value <= maximum.value
 }
 
 /// One explicit reason an operator cannot consume an evidence block.
@@ -1268,16 +1835,44 @@ pub enum QualificationGap {
     TrainingMasked,
     /// The block lies outside artifact activation or epoch.
     ArtifactActivation,
+    /// Capture profile, radio mode, or channel differs from the artifact requirement.
+    MeasurementContext,
     /// No exactly scoped time relation covers the block.
     TimeRelation,
+    /// Time provenance has the wrong source, epoch, or validity window.
+    TimeScope,
+    /// Required clock domains do not match.
+    TimeClockDomains,
+    /// Required clock fit does not match.
+    TimeFit,
+    /// Time error unit or magnitude exceeds the operator tolerance.
+    TimeError,
     /// No exactly scoped coherent phase relation covers the block.
     PhaseRelation,
+    /// Phase provenance has the wrong source, epoch, or validity window.
+    PhaseScope,
+    /// Phase reference does not match.
+    PhaseReference,
+    /// Phase coherence does not cover the required interval and block.
+    PhaseCoherence,
+    /// Phase error unit or magnitude exceeds the operator tolerance.
+    PhaseError,
     /// No exactly scoped port mapping covers the block.
     PortMapping,
+    /// Port provenance has the wrong source, epoch, or validity window.
+    PortScope,
+    /// Block signal paths do not exactly match required physical mappings.
+    SignalPathMapping,
     /// No exactly scoped geometry covers the block.
     Geometry,
-    /// Transmitter precoding leaves physical antenna geometry unknown.
-    TxGeometry,
+    /// Geometry provenance has the wrong source, epoch, or validity window.
+    GeometryScope,
+    /// Coordinate frames do not match.
+    GeometryFrames,
+    /// Required pose does not match.
+    GeometryPose,
+    /// Geometry error unit or magnitude exceeds the operator tolerance.
+    GeometryError,
 }
 
 /// Queryable per-operator eligibility result.

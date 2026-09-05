@@ -2,12 +2,13 @@
 
 use super::*;
 use crate::measurement::{
-    AssemblyClose, AssemblyCloseReason, AssemblyKey, AssemblyMember, AssociationUncertainty,
-    ChannelIdentity, ErrorBound, ErrorUnit, EventIdentity, EvidenceQuality, FitIdentity, Geometry,
-    MeasurementContext, NativeEventIdentity, PhaseReferenceIdentity, PhaseRelation, PortMapEntry,
-    PortMapping, Pose, ProfileIdentity, QualificationEpoch, QualificationRelation, RadioIdentity,
-    RelationValidity, RetransmissionIdentity, SourceInstance, SourceTick, TickRange, TimeRelation,
-    TransmitterIdentity,
+    AssemblyCapacity, AssemblyClose, AssemblyCloseMetrics, AssemblyCloseReason, AssemblyKey,
+    AssemblyLimits, AssemblyMember, AssociationUncertainty, ChannelIdentity, ErrorBound, ErrorUnit,
+    EventIdentity, EvidenceQuality, FitIdentity, Geometry, MeasurementContext, NativeEventIdentity,
+    PersistedAssemblyClose, PhaseReferenceIdentity, PhaseRelation, PortMapEntry, PortMapping, Pose,
+    ProfileIdentity, QualificationEpoch, QualificationRelation, RadioIdentity, RelationValidity,
+    RetransmissionIdentity, SourceInstance, SourceTick, TickRange, TimeRelation,
+    TransmitterIdentity, WaitTicks,
 };
 use crate::native_csi::{
     CapabilityDescriptor, LtfBlock, LtfKind, NativeCapabilityFact, NativeCsiFact, NativeFact,
@@ -753,6 +754,7 @@ fn raw_loss_error(path: &Path, message: &'static str) -> HostError {
 #[derive(Debug)]
 struct StoredClose {
     id: i64,
+    trigger_fragment_id: Option<i64>,
     sensor: String,
     device: Vec<u8>,
     key_epoch: Vec<u8>,
@@ -768,6 +770,15 @@ struct StoredClose {
     reason: String,
     uncertainty: String,
     total: u64,
+    first_tick: Vec<u8>,
+    close_tick: Vec<u8>,
+    limit_open: usize,
+    limit_fragments: u16,
+    limit_bytes: u64,
+    limit_wait: Vec<u8>,
+    attempted_fragments: u32,
+    attempted_bytes: u64,
+    open_assemblies: u32,
 }
 
 pub(super) fn query_measurement_closes(
@@ -780,30 +791,42 @@ pub(super) fn query_measurement_closes(
     )
     .map_err(|error| HostError::database_at(path, error))?;
     let mut statement = connection.prepare(
-        "SELECT assembly_id,sensor,device_id,key_epoch,boot_generation,transmitter,native_event,
+        "SELECT assembly_id,trigger_fragment_id,sensor,device_id,key_epoch,boot_generation,transmitter,native_event,
                 retransmission,profile,radio,channel,expected_fragments,missing_ordinals,
-                close_reason,association_uncertainty,total_bytes
+                close_reason,association_uncertainty,total_bytes,first_tick,close_tick,
+                limit_open,limit_fragments,limit_bytes,limit_wait,attempted_fragments,
+                attempted_bytes,open_assemblies
          FROM measurement_assemblies ORDER BY assembly_id DESC LIMIT ?1",
     ).map_err(|error| HostError::database_at(path, error))?;
     let rows = statement
         .query_map([i64::try_from(limit).expect("query limit fits i64")], |row| {
             Ok(StoredClose {
                 id: row.get(0)?,
-                sensor: row.get(1)?,
-                device: row.get(2)?,
-                key_epoch: row.get(3)?,
-                boot: row.get(4)?,
-                transmitter: row.get(5)?,
-                event: row.get(6)?,
-                retransmission: row.get(7)?,
-                profile: row.get(8)?,
-                radio: row.get(9)?,
-                channel: row.get(10)?,
-                expected: row.get(11)?,
-                missing: row.get(12)?,
-                reason: row.get(13)?,
-                uncertainty: row.get(14)?,
-                total: row.get(15)?,
+                trigger_fragment_id: row.get(1)?,
+                sensor: row.get(2)?,
+                device: row.get(3)?,
+                key_epoch: row.get(4)?,
+                boot: row.get(5)?,
+                transmitter: row.get(6)?,
+                event: row.get(7)?,
+                retransmission: row.get(8)?,
+                profile: row.get(9)?,
+                radio: row.get(10)?,
+                channel: row.get(11)?,
+                expected: row.get(12)?,
+                missing: row.get(13)?,
+                reason: row.get(14)?,
+                uncertainty: row.get(15)?,
+                total: row.get(16)?,
+                first_tick: row.get(17)?,
+                close_tick: row.get(18)?,
+                limit_open: row.get(19)?,
+                limit_fragments: row.get(20)?,
+                limit_bytes: row.get(21)?,
+                limit_wait: row.get(22)?,
+                attempted_fragments: row.get(23)?,
+                attempted_bytes: row.get(24)?,
+                open_assemblies: row.get(25)?,
             })
         })
         .map_err(|error| HostError::database_at(path, error))?;
@@ -815,6 +838,19 @@ pub(super) fn query_measurement_closes(
         let members = query_assembly_members(&connection, path, row.id)?;
         let reason = decode_close_reason(path, &row.reason)?;
         let uncertainty = decode_uncertainty(path, &row.uncertainty)?;
+        let metrics = AssemblyCloseMetrics::new(
+            SourceTick::new(decode_be_u64(path, row.first_tick.clone(), "first tick")?),
+            SourceTick::new(decode_be_u64(path, row.close_tick.clone(), "close tick")?),
+            AssemblyLimits::new(
+                AssemblyCapacity::new(row.limit_open, row.limit_fragments, row.limit_bytes)
+                    .map_err(|_| measurement_error(path))?,
+                WaitTicks::new(decode_be_u64(path, row.limit_wait.clone(), "wait limit")?)
+                    .map_err(|_| measurement_error(path))?,
+            ),
+            row.attempted_fragments,
+            row.attempted_bytes,
+            row.open_assemblies,
+        );
         validate_close_integrity(
             &connection,
             path,
@@ -826,17 +862,21 @@ pub(super) fn query_measurement_closes(
                 reason,
                 uncertainty,
                 total: row.total,
+                metrics,
+                assembly_id: row.id,
+                trigger_fragment_id: row.trigger_fragment_id,
             },
         )?;
-        closes.push(AssemblyClose::persisted(
+        closes.push(AssemblyClose::persisted(PersistedAssemblyClose {
             key,
-            row.expected,
-            members.into_boxed_slice(),
-            missing.into_boxed_slice(),
+            expected_fragments: row.expected,
+            members: members.into_boxed_slice(),
+            missing_ordinals: missing.into_boxed_slice(),
             reason,
             uncertainty,
-            row.total,
-        ));
+            total_bytes: row.total,
+            metrics,
+        }));
     }
     closes.reverse();
     Ok(closes)
@@ -877,6 +917,9 @@ struct PersistedCloseView<'a> {
     reason: AssemblyCloseReason,
     uncertainty: AssociationUncertainty,
     total: u64,
+    metrics: AssemblyCloseMetrics,
+    assembly_id: i64,
+    trigger_fragment_id: Option<i64>,
 }
 
 fn validate_close_integrity(
@@ -884,7 +927,18 @@ fn validate_close_integrity(
     path: &Path,
     close: PersistedCloseView<'_>,
 ) -> Result<(), HostError> {
-    let PersistedCloseView { key, expected, missing, members, reason, uncertainty, total } = close;
+    let PersistedCloseView {
+        key,
+        expected,
+        missing,
+        members,
+        reason,
+        uncertainty,
+        total,
+        metrics,
+        assembly_id,
+        trigger_fragment_id,
+    } = close;
     if expected == 0
         || members.len() + missing.len() != usize::from(expected)
         || total != members.iter().map(|member| u64::from(member.payload_bytes())).sum::<u64>()
@@ -895,17 +949,98 @@ fn validate_close_integrity(
             "member count, missing count, or total bytes is inconsistent",
         ));
     }
+    let limits = metrics.limits();
+    let isolated = members.len() == 1 && missing.len() + 1 == usize::from(expected);
+    let elapsed = metrics.close_tick().get().saturating_sub(metrics.first_tick().get());
+    let trigger = trigger_fragment_id
+        .map(|id| query_trigger_fragment(connection, path, key, id))
+        .transpose()?;
+    if trigger.as_ref().is_some_and(|fact| fact.arrival != metrics.close_tick()) {
+        return Err(measurement_error(path));
+    }
+    let trigger_is_member = trigger.as_ref().is_some_and(|fact| {
+        fact.expected == expected
+            && members.iter().any(|member| {
+                member.ordinal() == fact.ordinal
+                    && member.fact_digest() == fact.digest
+                    && member.payload_bytes() == fact.bytes
+                    && member.quality() == fact.quality
+            })
+    });
     let semantic_consistency = match reason {
         AssemblyCloseReason::Complete => {
-            missing.is_empty() && uncertainty == AssociationUncertainty::ExactNativeIdentity
+            missing.is_empty()
+                && uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.attempted_fragments() == u32::from(expected)
+                && metrics.attempted_bytes() == total
+                && elapsed < limits.wait().get()
+                && trigger_is_member
+        }
+        AssemblyCloseReason::WaitLimit => {
+            !missing.is_empty()
+                && uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.attempted_fragments() == u32::try_from(members.len()).unwrap_or(u32::MAX)
+                && metrics.attempted_bytes() == total
+                && elapsed >= limits.wait().get()
+                && trigger.as_ref().is_none_or(|fact| {
+                    !members.iter().any(|member| {
+                        member.ordinal() == fact.ordinal && member.fact_digest() == fact.digest
+                    })
+                })
+        }
+        AssemblyCloseReason::CountLimit => {
+            uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && expected > limits.capacity().fragments()
+                && metrics.attempted_fragments() == u32::try_from(members.len()).unwrap_or(u32::MAX)
+                && metrics.attempted_bytes() == total
+                && trigger_is_member
+        }
+        AssemblyCloseReason::ByteLimit => {
+            uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.attempted_bytes() > limits.capacity().bytes()
+                && metrics.attempted_bytes() == total
+                && metrics.attempted_fragments() == u32::try_from(members.len()).unwrap_or(u32::MAX)
+                && trigger_is_member
+        }
+        AssemblyCloseReason::ResourceLimit => {
+            isolated
+                && uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.open_assemblies()
+                    == u32::try_from(limits.capacity().open()).unwrap_or(u32::MAX)
+                && metrics.first_tick() == metrics.close_tick()
+                && metrics.attempted_fragments() == 1
+                && metrics.attempted_bytes() == total
+                && trigger_is_member
         }
         AssemblyCloseReason::LateFragment => {
-            members.len() == 1 && uncertainty == AssociationUncertainty::LateAfterClose
+            isolated
+                && uncertainty == AssociationUncertainty::LateAfterClose
+                && metrics.first_tick() == metrics.close_tick()
+                && metrics.attempted_fragments() == 1
+                && metrics.attempted_bytes() == total
+                && trigger_is_member
+        }
+        AssemblyCloseReason::DuplicateFragment => {
+            isolated
+                && uncertainty == AssociationUncertainty::ExactNativeIdentity
+                && metrics.attempted_fragments() >= 2
+                && metrics.attempted_bytes() > total
+                && trigger_is_member
         }
         AssemblyCloseReason::ConflictingDuplicate => {
             uncertainty == AssociationUncertainty::ConflictingFacts
+                && metrics.attempted_fragments()
+                    == u32::try_from(members.len()).unwrap_or(u32::MAX).saturating_add(1)
+                && metrics.attempted_bytes() > total
+                && trigger.as_ref().is_some_and(|fact| {
+                    fact.expected == expected
+                        && members.iter().any(|member| member.ordinal() == fact.ordinal)
+                        && members.iter().all(|member| {
+                            member.ordinal() != fact.ordinal || member.fact_digest() != fact.digest
+                        })
+                        && metrics.attempted_bytes() == total.saturating_add(u64::from(fact.bytes))
+                })
         }
-        _ => uncertainty == AssociationUncertainty::ExactNativeIdentity,
     };
     if !semantic_consistency {
         return Err(HostError::message_at(
@@ -913,6 +1048,71 @@ fn validate_close_integrity(
             path,
             "close reason, membership, missing set, and uncertainty are inconsistent",
         ));
+    }
+    if reason == AssemblyCloseReason::DuplicateFragment {
+        let trigger = trigger_fragment_id.expect("duplicate consistency requires a trigger");
+        let member = members[0];
+        let (prior_count, prior_bytes, matching): (u32, u64, u32) = connection
+            .query_row(
+                "SELECT count(*),coalesce(sum(payload_bytes),0),
+                        coalesce(sum(ordinal=?2 AND fact_digest=?3),0)
+                 FROM measurement_fragments
+                 WHERE fragment_id < ?1 AND sensor=?4 AND device_id=?5 AND key_epoch=?6
+                   AND boot_generation=?7 AND transmitter=?8 AND native_event=?9
+                   AND retransmission IS ?10 AND profile=?11 AND radio=?12 AND channel=?13",
+                params![
+                    trigger,
+                    member.ordinal(),
+                    member.fact_digest(),
+                    key.source().sensor().as_str(),
+                    key.source().device().get().to_be_bytes(),
+                    key.source().key_epoch().get().to_be_bytes(),
+                    key.source().boot().get().to_be_bytes(),
+                    key.event().transmitter().bytes(),
+                    key.event().native_event().bytes(),
+                    key.event().retransmission().map(RetransmissionIdentity::bytes),
+                    key.context().profile().bytes(),
+                    key.context().radio().bytes(),
+                    key.context().channel().bytes()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| HostError::database_at(path, error))?;
+        if matching == 0
+            || metrics.attempted_fragments() != prior_count.saturating_add(1)
+            || metrics.attempted_bytes()
+                != prior_bytes.saturating_add(u64::from(member.payload_bytes()))
+        {
+            return Err(measurement_error(path));
+        }
+    }
+    if reason == AssemblyCloseReason::LateFragment {
+        let prior: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM measurement_assemblies
+             WHERE assembly_id < ?1 AND sensor=?2 AND device_id=?3 AND key_epoch=?4
+               AND boot_generation=?5 AND transmitter=?6 AND native_event=?7
+               AND retransmission IS ?8 AND profile=?9 AND radio=?10 AND channel=?11
+               AND close_reason NOT IN ('late_fragment','duplicate_fragment')",
+                params![
+                    assembly_id,
+                    key.source().sensor().as_str(),
+                    key.source().device().get().to_be_bytes(),
+                    key.source().key_epoch().get().to_be_bytes(),
+                    key.source().boot().get().to_be_bytes(),
+                    key.event().transmitter().bytes(),
+                    key.event().native_event().bytes(),
+                    key.event().retransmission().map(RetransmissionIdentity::bytes),
+                    key.context().profile().bytes(),
+                    key.context().radio().bytes(),
+                    key.context().channel().bytes()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| HostError::database_at(path, error))?;
+        if prior == 0 {
+            return Err(measurement_error(path));
+        }
     }
     let mut seen = vec![false; usize::from(expected)];
     for ordinal in missing.iter().copied().chain(members.iter().map(|member| member.ordinal())) {
@@ -948,8 +1148,9 @@ fn validate_close_integrity(
             "SELECT count(*) FROM measurement_fragments WHERE sensor=?1 AND device_id=?2 AND key_epoch=?3
              AND boot_generation=?4 AND transmitter=?5 AND native_event=?6 AND retransmission IS ?7
              AND profile=?8 AND radio=?9 AND channel=?10 AND ordinal=?11 AND expected_fragments=?12
-             AND fact_digest=?13 AND payload_bytes=?14 AND quality=?15",
-            params![source.sensor().as_str(), source.device().get().to_be_bytes(), source.key_epoch().get().to_be_bytes(), source.boot().get().to_be_bytes(), event.transmitter().bytes(), event.native_event().bytes(), event.retransmission().map(RetransmissionIdentity::bytes), context.profile().bytes(), context.radio().bytes(), context.channel().bytes(), member.ordinal(), expected, member.fact_digest(), member.payload_bytes(), quality],
+             AND fact_digest=?13 AND payload_bytes=?14 AND quality=?15
+             AND (?16 IS NULL OR fragment_id <= ?16)",
+            params![source.sensor().as_str(), source.device().get().to_be_bytes(), source.key_epoch().get().to_be_bytes(), source.boot().get().to_be_bytes(), event.transmitter().bytes(), event.native_event().bytes(), event.retransmission().map(RetransmissionIdentity::bytes), context.profile().bytes(), context.radio().bytes(), context.channel().bytes(), member.ordinal(), expected, member.fact_digest(), member.payload_bytes(), quality, trigger_fragment_id],
             |row| row.get(0),
         ).map_err(|error| HostError::database_at(path, error))?;
         if count == 0 {
@@ -961,6 +1162,65 @@ fn validate_close_integrity(
         }
     }
     Ok(())
+}
+
+struct StoredTriggerFragment {
+    ordinal: u16,
+    expected: u16,
+    digest: [u8; 32],
+    bytes: u32,
+    quality: EvidenceQuality,
+    arrival: SourceTick,
+}
+
+fn query_trigger_fragment(
+    connection: &Connection,
+    path: &Path,
+    key: &AssemblyKey,
+    trigger: i64,
+) -> Result<StoredTriggerFragment, HostError> {
+    connection
+        .query_row(
+            "SELECT ordinal,expected_fragments,fact_digest,payload_bytes,quality,arrival_tick
+             FROM measurement_fragments
+         WHERE fragment_id=?1 AND sensor=?2 AND device_id=?3 AND key_epoch=?4
+           AND boot_generation=?5 AND transmitter=?6 AND native_event=?7
+           AND retransmission IS ?8 AND profile=?9 AND radio=?10 AND channel=?11",
+            params![
+                trigger,
+                key.source().sensor().as_str(),
+                key.source().device().get().to_be_bytes(),
+                key.source().key_epoch().get().to_be_bytes(),
+                key.source().boot().get().to_be_bytes(),
+                key.event().transmitter().bytes(),
+                key.event().native_event().bytes(),
+                key.event().retransmission().map(RetransmissionIdentity::bytes),
+                key.context().profile().bytes(),
+                key.context().radio().bytes(),
+                key.context().channel().bytes()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, u16>(0)?,
+                    row.get::<_, u16>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .map_err(|error| HostError::database_at(path, error))
+        .and_then(|(ordinal, expected, digest, bytes, quality, arrival)| {
+            Ok(StoredTriggerFragment {
+                ordinal,
+                expected,
+                digest: decode_32(path, digest)?,
+                bytes,
+                quality: decode_quality(path, &quality)?,
+                arrival: SourceTick::new(decode_be_u64(path, arrival, "arrival tick")?),
+            })
+        })
 }
 
 fn query_assembly_members(

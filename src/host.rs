@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::admission::AdmissionLimits;
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
 use crate::measurement::{
-    AssemblyClose, MeasurementFragment, QualificationRelation, SourceInstance, SourceTick,
+    AssemblyClose, AssemblyLimits, MeasurementFragment, QualificationRelation, SourceInstance,
+    SourceTick,
 };
 use crate::native_csi::{
     CapabilityIdentity, ChannelPolicy, FirmwareBuildIdentity, NativeCapabilityFact, NativeCsiFact,
@@ -519,6 +520,7 @@ impl Host {
             bind,
             routes: Vec::new(),
             ingress_capacity: DEFAULT_INGRESS_CAPACITY,
+            measurement_limits: AssemblyLimits::host_default(),
             network: Arc::new(SystemNetwork),
             threads: Arc::new(SystemThreads),
             clock: Arc::new(SystemClock),
@@ -533,6 +535,7 @@ pub struct HostBuilder {
     bind: SocketAddr,
     routes: Vec<NativeFrameRoute>,
     ingress_capacity: usize,
+    measurement_limits: AssemblyLimits,
     network: Arc<dyn Network>,
     threads: Arc<dyn Threads>,
     clock: Arc<dyn Clock>,
@@ -547,6 +550,7 @@ impl fmt::Debug for HostBuilder {
             .field("bind", &self.bind)
             .field("routes", &self.routes)
             .field("ingress_capacity", &self.ingress_capacity)
+            .field("measurement_limits", &self.measurement_limits)
             .finish_non_exhaustive()
     }
 }
@@ -563,6 +567,13 @@ impl HostBuilder {
     #[must_use]
     pub fn ingress_capacity(mut self, capacity: usize) -> Self {
         self.ingress_capacity = capacity;
+        self
+    }
+
+    /// Sets fixed assembly count, byte, and wait ceilings for the sole writer.
+    #[must_use]
+    pub fn measurement_limits(mut self, limits: AssemblyLimits) -> Self {
+        self.measurement_limits = limits;
         self
     }
 
@@ -1354,6 +1365,7 @@ struct WriterConfig {
     deployment: DeploymentId,
     routes: Arc<Vec<NativeFrameRoute>>,
     clock: Arc<dyn Clock>,
+    measurement_limits: AssemblyLimits,
 }
 
 struct ReaderConfig {

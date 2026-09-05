@@ -159,6 +159,7 @@ const NATIVE_HEALTH_FACTS_SCHEMA: &str = "CREATE TABLE native_health_facts (
              ) STRICT";
 const MEASUREMENT_ASSEMBLIES_SCHEMA: &str = "CREATE TABLE measurement_assemblies (
                  assembly_id INTEGER PRIMARY KEY,
+                 trigger_fragment_id INTEGER REFERENCES measurement_fragments(fragment_id),
                  sensor TEXT NOT NULL CHECK (typeof(sensor) = 'text' AND length(sensor) > 0),
                  device_id BLOB NOT NULL CHECK (typeof(device_id) = 'blob' AND length(device_id) = 8),
                  key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
@@ -173,7 +174,16 @@ const MEASUREMENT_ASSEMBLIES_SCHEMA: &str = "CREATE TABLE measurement_assemblies
                  missing_ordinals BLOB NOT NULL CHECK (typeof(missing_ordinals) = 'blob' AND length(missing_ordinals) % 2 = 0),
                  close_reason TEXT NOT NULL CHECK (close_reason IN ('complete', 'wait_limit', 'count_limit', 'byte_limit', 'resource_limit', 'late_fragment', 'duplicate_fragment', 'conflicting_duplicate')),
                  association_uncertainty TEXT NOT NULL CHECK (association_uncertainty IN ('exact_native_identity', 'late_after_close', 'conflicting_facts')),
-                 total_bytes INTEGER NOT NULL CHECK (total_bytes BETWEEN 0 AND 33554432)
+                 total_bytes INTEGER NOT NULL CHECK (total_bytes BETWEEN 0 AND 33554432),
+                 first_tick BLOB NOT NULL CHECK (typeof(first_tick) = 'blob' AND length(first_tick) = 8),
+                 close_tick BLOB NOT NULL CHECK (typeof(close_tick) = 'blob' AND length(close_tick) = 8),
+                 limit_open INTEGER NOT NULL CHECK (limit_open BETWEEN 1 AND 1024),
+                 limit_fragments INTEGER NOT NULL CHECK (limit_fragments BETWEEN 1 AND 1024),
+                 limit_bytes INTEGER NOT NULL CHECK (limit_bytes BETWEEN 1 AND 16777216),
+                 limit_wait BLOB NOT NULL CHECK (typeof(limit_wait) = 'blob' AND length(limit_wait) = 8),
+                 attempted_fragments INTEGER NOT NULL CHECK (attempted_fragments BETWEEN 1 AND 65536),
+                 attempted_bytes INTEGER NOT NULL CHECK (attempted_bytes BETWEEN 0 AND 33554432),
+                 open_assemblies INTEGER NOT NULL CHECK (open_assemblies BETWEEN 0 AND 1024)
              ) STRICT";
 const MEASUREMENT_FRAGMENTS_SCHEMA: &str = "CREATE TABLE measurement_fragments (
                  fragment_id INTEGER PRIMARY KEY,

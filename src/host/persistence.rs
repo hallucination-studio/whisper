@@ -2,10 +2,10 @@
 
 use super::*;
 use crate::measurement::{
-    AssemblyCloseReason, AssemblyKey, AssemblyLimits, AssociationUncertainty, ChannelIdentity,
-    EventIdentity, EvidenceQuality, FragmentBytes, FragmentFact, FragmentPosition,
-    MeasurementAssembler, MeasurementContext, NativeEventIdentity, ProfileIdentity,
-    QualificationRelation, RadioIdentity, RetransmissionIdentity, TransmitterIdentity,
+    AssemblyCloseReason, AssemblyKey, AssociationUncertainty, ChannelIdentity, EventIdentity,
+    EvidenceQuality, FragmentBytes, FragmentFact, FragmentPosition, MeasurementAssembler,
+    MeasurementContext, NativeEventIdentity, ProfileIdentity, QualificationRelation, RadioIdentity,
+    RetransmissionIdentity, TransmitterIdentity,
 };
 use crate::native_frame::{
     LTF_BLOCK_BYTES, LtfBlock, LtfKind, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
@@ -98,7 +98,7 @@ pub(super) fn writer_loop(
         return Ok(());
     }
     let mut replay = startup.states;
-    let mut assembler = MeasurementAssembler::new(AssemblyLimits::host_default());
+    let mut assembler = MeasurementAssembler::new(config.measurement_limits);
     restore_open_fragments(&connection, &config.database_path, &mut assembler)?;
     if ready.send(Ok(())).is_err() {
         return Ok(());
@@ -315,8 +315,9 @@ fn persist_fragment_in_transaction(
 ) -> Result<Vec<AssemblyClose>, HostError> {
     insert_measurement_fragment(transaction, path, &fragment, arrival)?;
     let fragment_id = transaction.last_insert_rowid();
+    let trigger_key = fragment.key().clone();
     let closes = if has_durable_primary_close(transaction, path, fragment.key())? {
-        vec![MeasurementAssembler::late(fragment)]
+        vec![assembler.late(fragment, arrival)]
     } else {
         assembler.ingest(fragment, arrival).map_err(|_| measurement_persistence_error(path))?
     };
@@ -343,7 +344,8 @@ fn persist_fragment_in_transaction(
         } else {
             mark_open_fragments(transaction, path, close.key(), disposition)?;
         }
-        persist_close(transaction, path, close)?;
+        let trigger = (close.key() == &trigger_key).then_some(fragment_id);
+        persist_close(transaction, path, close, trigger)?;
     }
     Ok(closes)
 }
@@ -370,7 +372,7 @@ fn persist_expired(
         .map_err(|error| HostError::database_at(path, error))?;
     for close in &closes {
         mark_open_fragments(&transaction, path, close.key(), "closed")?;
-        persist_close(&transaction, path, close)?;
+        persist_close(&transaction, path, close, None)?;
     }
     transaction.commit().map_err(|error| HostError::database_at(path, error))?;
     Ok(closes)
@@ -431,7 +433,7 @@ fn has_durable_primary_close(
          WHERE sensor=?1 AND device_id=?2 AND key_epoch=?3 AND boot_generation=?4
            AND transmitter=?5 AND native_event=?6 AND retransmission IS ?7
            AND profile=?8 AND radio=?9 AND channel=?10
-           AND close_reason NOT IN ('late_fragment','duplicate_fragment','resource_limit'))",
+           AND close_reason NOT IN ('late_fragment','duplicate_fragment'))",
             params![
                 source.sensor().as_str(),
                 source.device().get().to_be_bytes(),
@@ -486,11 +488,14 @@ fn persist_close(
     transaction: &rusqlite::Transaction<'_>,
     path: &Path,
     close: &AssemblyClose,
+    trigger_fragment_id: Option<i64>,
 ) -> Result<(), HostError> {
     let key = close.key();
     let source = key.source();
     let event = key.event();
     let context = key.context();
+    let metrics = close.metrics();
+    let limits = metrics.limits();
     let missing = close
         .missing_ordinals()
         .iter()
@@ -499,11 +504,15 @@ fn persist_close(
     transaction
         .execute(
             "INSERT INTO measurement_assemblies (
-             sensor, device_id, key_epoch, boot_generation, transmitter, native_event,
+             trigger_fragment_id, sensor, device_id, key_epoch, boot_generation, transmitter, native_event,
              retransmission, profile, radio, channel, expected_fragments, missing_ordinals,
-             close_reason, association_uncertainty, total_bytes
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+             close_reason, association_uncertainty, total_bytes, first_tick, close_tick,
+             limit_open, limit_fragments, limit_bytes, limit_wait, attempted_fragments,
+             attempted_bytes, open_assemblies
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
+                   ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
             params![
+                trigger_fragment_id,
                 source.sensor().as_str(),
                 source.device().get().to_be_bytes(),
                 source.key_epoch().get().to_be_bytes(),
@@ -518,7 +527,16 @@ fn persist_close(
                 missing,
                 encode_close_reason(close.reason()),
                 encode_uncertainty(close.uncertainty()),
-                close.total_bytes()
+                close.total_bytes(),
+                metrics.first_tick().get().to_be_bytes(),
+                metrics.close_tick().get().to_be_bytes(),
+                limits.capacity().open(),
+                limits.capacity().fragments(),
+                limits.capacity().bytes(),
+                limits.wait().get().to_be_bytes(),
+                metrics.attempted_fragments(),
+                metrics.attempted_bytes(),
+                metrics.open_assemblies(),
             ],
         )
         .map_err(|error| HostError::database_at(path, error))?;

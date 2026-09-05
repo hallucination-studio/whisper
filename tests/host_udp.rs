@@ -15,12 +15,12 @@ use aes_gcm::{
 };
 use sha2::{Digest, Sha256};
 use whisper::measurement::{
-    AssemblyCloseReason, AssemblyKey, ChannelIdentity, ErrorBound, ErrorUnit, EventIdentity,
-    EvidenceQuality, FitIdentity, FragmentBytes, FragmentFact, FragmentPosition,
-    MeasurementContext, MeasurementFragment, NativeEventIdentity, PhaseReferenceIdentity,
-    PhaseRelation, PortMapEntry, PortMapping, Pose, ProfileIdentity, QualificationEpoch,
-    QualificationRelation, RadioIdentity, RelationValidity, SourceInstance, SourceTick, TickRange,
-    TimeRelation, TransmitterIdentity,
+    AssemblyCapacity, AssemblyCloseReason, AssemblyKey, AssemblyLimits, ChannelIdentity,
+    ErrorBound, ErrorUnit, EventIdentity, EvidenceQuality, FitIdentity, FragmentBytes,
+    FragmentFact, FragmentPosition, MeasurementContext, MeasurementFragment, NativeEventIdentity,
+    PhaseReferenceIdentity, PhaseRelation, PortMapEntry, PortMapping, Pose, ProfileIdentity,
+    QualificationEpoch, QualificationRelation, RadioIdentity, RelationValidity, SourceInstance,
+    SourceTick, TickRange, TimeRelation, TransmitterIdentity, WaitTicks,
 };
 use whisper::native_csi::{
     CapabilityIdentity, ChannelPolicy, CsiPath, FirmwareBuildIdentity, NativeFact, RadioRxS3,
@@ -326,6 +326,40 @@ fn heterogeneous_partial_assembly_survives_restart_and_late_data_cannot_reopen_i
         )
         .unwrap();
     assert_eq!(conflict[0].reason(), AssemblyCloseReason::ConflictingDuplicate);
+    let waited_key = key_for_event(10);
+    reopened
+        .persist_measurement_fragment(
+            MeasurementFragment::new(
+                waited_key.clone(),
+                FragmentPosition::new(0, 2).unwrap(),
+                FragmentFact::new(
+                    [12; 32],
+                    FragmentBytes::new(1).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(20),
+        )
+        .unwrap();
+    let after_deadline = reopened
+        .persist_measurement_fragment(
+            MeasurementFragment::new(
+                waited_key,
+                FragmentPosition::new(1, 2).unwrap(),
+                FragmentFact::new(
+                    [13; 32],
+                    FragmentBytes::new(1).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(1_000_020),
+        )
+        .unwrap();
+    assert_eq!(
+        after_deadline.iter().map(|close| close.reason()).collect::<Vec<_>>(),
+        [AssemblyCloseReason::WaitLimit, AssemblyCloseReason::LateFragment]
+    );
+    assert!(!after_deadline.iter().any(|close| close.reason() == AssemblyCloseReason::Complete));
     let reasons = reopened
         .query_measurement_closes(16)
         .unwrap()
@@ -345,7 +379,7 @@ fn heterogeneous_partial_assembly_survives_restart_and_late_data_cannot_reopen_i
 }
 
 #[test]
-fn measurement_query_rejects_expected_member_partition_tampering() {
+fn measurement_query_rejects_same_width_tampering_for_every_close_reason() {
     let parent = temporary_directory("host-measurement-tamper");
     let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
     let secret_root = create_secret_root(&parent);
@@ -356,41 +390,197 @@ fn measurement_query_rejects_expected_member_partition_tampering() {
         KeyEpoch::new(3).unwrap(),
         BootGeneration::new(8).unwrap(),
     );
-    let key = AssemblyKey::new(
-        source,
-        EventIdentity::new(
-            TransmitterIdentity::new([1; 32]),
-            NativeEventIdentity::new([9; 32]),
-            None,
-        ),
-        MeasurementContext::new(
-            ProfileIdentity::new([3; 32]),
-            RadioIdentity::new([4; 32]),
-            ChannelIdentity::new([5; 32]),
-        ),
-    );
-    let host = start_host(Store::initialize(&store_root).unwrap(), &sender, &secret_root);
-    host.persist_measurement_fragment(
+    let key_for_event = |event| {
+        AssemblyKey::new(
+            source.clone(),
+            EventIdentity::new(
+                TransmitterIdentity::new([1; 32]),
+                NativeEventIdentity::new([event; 32]),
+                None,
+            ),
+            MeasurementContext::new(
+                ProfileIdentity::new([3; 32]),
+                RadioIdentity::new([4; 32]),
+                ChannelIdentity::new([5; 32]),
+            ),
+        )
+    };
+    let fragment = |event, ordinal, expected, digest, bytes| {
         MeasurementFragment::new(
-            key,
-            FragmentPosition::new(0, 1).unwrap(),
-            FragmentFact::new([4; 32], FragmentBytes::new(8).unwrap(), EvidenceQuality::Captured),
-        ),
-        SourceTick::new(1),
-    )
-    .unwrap();
+            key_for_event(event),
+            FragmentPosition::new(ordinal, expected).unwrap(),
+            FragmentFact::new(
+                [digest; 32],
+                FragmentBytes::new(bytes).unwrap(),
+                EvidenceQuality::Captured,
+            ),
+        )
+    };
+    let limits =
+        AssemblyLimits::new(AssemblyCapacity::new(2, 2, 8).unwrap(), WaitTicks::new(5).unwrap());
+    let host = start_host_with_measurement_limits(
+        Store::initialize(&store_root).unwrap(),
+        &sender,
+        &secret_root,
+        limits,
+    );
+    host.persist_measurement_fragment(fragment(1, 0, 1, 1, 1), SourceTick::new(0)).unwrap();
+    host.persist_measurement_fragment(fragment(2, 0, 2, 2, 1), SourceTick::new(0)).unwrap();
+    host.expire_measurements(source.clone(), SourceTick::new(5)).unwrap();
+    host.persist_measurement_fragment(fragment(3, 0, 3, 3, 1), SourceTick::new(5)).unwrap();
+    host.persist_measurement_fragment(fragment(4, 0, 2, 4, 5), SourceTick::new(5)).unwrap();
+    host.persist_measurement_fragment(fragment(4, 1, 2, 5, 5), SourceTick::new(6)).unwrap();
+    host.persist_measurement_fragment(fragment(5, 0, 2, 6, 1), SourceTick::new(6)).unwrap();
+    host.persist_measurement_fragment(fragment(6, 0, 2, 7, 1), SourceTick::new(6)).unwrap();
+    host.persist_measurement_fragment(fragment(7, 0, 2, 8, 1), SourceTick::new(6)).unwrap();
+    host.persist_measurement_fragment(fragment(5, 1, 2, 9, 1), SourceTick::new(7)).unwrap();
+    host.persist_measurement_fragment(fragment(6, 1, 2, 10, 1), SourceTick::new(7)).unwrap();
+    host.persist_measurement_fragment(fragment(8, 0, 2, 11, 1), SourceTick::new(7)).unwrap();
+    host.persist_measurement_fragment(fragment(8, 0, 2, 11, 1), SourceTick::new(8)).unwrap();
+    host.persist_measurement_fragment(fragment(9, 0, 2, 12, 1), SourceTick::new(8)).unwrap();
+    host.persist_measurement_fragment(fragment(9, 0, 2, 13, 1), SourceTick::new(9)).unwrap();
+    host.persist_measurement_fragment(fragment(1, 0, 1, 14, 1), SourceTick::new(9)).unwrap();
+    assert_eq!(host.query_measurement_closes(32).unwrap().len(), 10);
     host.shutdown().unwrap();
-    let database = rusqlite::Connection::open(store_root.join("facts.sqlite3")).unwrap();
-    database.execute("UPDATE measurement_assemblies SET expected_fragments=2", []).unwrap();
-    drop(database);
-    let reopened = start_host(Store::open(&store_root).unwrap(), &sender, &secret_root);
-    assert!(reopened.query_measurement_closes(4).is_err());
+
+    let mutations = [
+        ("complete", "attempted_fragments", "attempted_fragments + 1"),
+        ("wait_limit", "close_tick", "first_tick"),
+        ("count_limit", "attempted_fragments", "attempted_fragments + 1"),
+        ("byte_limit", "attempted_bytes", "limit_bytes"),
+        ("resource_limit", "open_assemblies", "open_assemblies - 1"),
+        ("late_fragment", "attempted_fragments", "attempted_fragments + 1"),
+        ("duplicate_fragment", "attempted_fragments", "1"),
+        ("conflicting_duplicate", "attempted_bytes", "total_bytes"),
+    ];
+    let database_path = store_root.join("facts.sqlite3");
+    for (reason, column, expression) in mutations {
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        let id: i64 = database
+            .query_row(
+                "SELECT assembly_id FROM measurement_assemblies WHERE close_reason=?1 LIMIT 1",
+                [reason],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original: rusqlite::types::Value = database
+            .query_row(
+                &format!("SELECT {column} FROM measurement_assemblies WHERE assembly_id=?1"),
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        database
+            .execute(
+                &format!(
+                    "UPDATE measurement_assemblies SET {column}={expression} WHERE assembly_id=?1"
+                ),
+                [id],
+            )
+            .unwrap();
+        drop(database);
+        let reopened = start_host_with_measurement_limits(
+            Store::open(&store_root).unwrap(),
+            &sender,
+            &secret_root,
+            limits,
+        );
+        assert!(reopened.query_measurement_closes(32).is_err(), "accepted {reason} tamper");
+        reopened.shutdown().unwrap();
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                &format!("UPDATE measurement_assemblies SET {column}=?1 WHERE assembly_id=?2"),
+                rusqlite::params![original, id],
+            )
+            .unwrap();
+    }
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn resource_limit_close_remains_closed_across_restart() {
+    let parent = temporary_directory("host-measurement-resource-restart");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let store_root = parent.join("world-store");
+    let source = SourceInstance::new(
+        SensorId::try_from("resource-rx").unwrap(),
+        DeviceId::new(93),
+        KeyEpoch::new(3).unwrap(),
+        BootGeneration::new(8).unwrap(),
+    );
+    let key_for_event = |event: u16| {
+        let mut identity = [0_u8; 32];
+        identity[..2].copy_from_slice(&event.to_be_bytes());
+        AssemblyKey::new(
+            source.clone(),
+            EventIdentity::new(
+                TransmitterIdentity::new([1; 32]),
+                NativeEventIdentity::new(identity),
+                None,
+            ),
+            MeasurementContext::new(
+                ProfileIdentity::new([3; 32]),
+                RadioIdentity::new([4; 32]),
+                ChannelIdentity::new([5; 32]),
+            ),
+        )
+    };
+    let fragment_for = |event| {
+        MeasurementFragment::new(
+            key_for_event(event),
+            FragmentPosition::new(0, 2).unwrap(),
+            FragmentFact::new(
+                [event as u8; 32],
+                FragmentBytes::new(1).unwrap(),
+                EvidenceQuality::Captured,
+            ),
+        )
+    };
+
+    let limits = AssemblyLimits::new(
+        AssemblyCapacity::new(4, 1_024, 16 * 1024 * 1024).unwrap(),
+        WaitTicks::new(1_000_000).unwrap(),
+    );
+    let host = start_host_with_measurement_limits(
+        Store::initialize(&store_root).unwrap(),
+        &sender,
+        &secret_root,
+        limits,
+    );
+    for event in 0..4 {
+        assert!(
+            host.persist_measurement_fragment(
+                fragment_for(event),
+                SourceTick::new(u64::from(event))
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+    let resource = host.persist_measurement_fragment(fragment_for(4), SourceTick::new(4)).unwrap();
+    assert_eq!(resource[0].reason(), AssemblyCloseReason::ResourceLimit);
+    host.shutdown().unwrap();
+
+    let reopened = start_host_with_measurement_limits(
+        Store::open(&store_root).unwrap(),
+        &sender,
+        &secret_root,
+        limits,
+    );
+    let late = reopened.persist_measurement_fragment(fragment_for(4), SourceTick::new(5)).unwrap();
+    assert_eq!(late[0].reason(), AssemblyCloseReason::LateFragment);
+    let closes = reopened.query_measurement_closes(4).unwrap();
+    assert!(closes.iter().any(|close| close.reason() == AssemblyCloseReason::ResourceLimit));
+    assert!(closes.iter().any(|close| close.reason() == AssemblyCloseReason::LateFragment));
     reopened.shutdown().unwrap();
     fs::remove_dir_all(parent).unwrap();
 }
 
 #[test]
 fn saturated_control_refill_rotates_to_udp_ingress() {
+    const CONCURRENT_COMMANDS: usize = 96;
     let parent = temporary_directory("host-writer-fairness");
     let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
     let secret_root = create_secret_root(&parent);
@@ -399,42 +589,35 @@ fn saturated_control_refill_rotates_to_udp_ingress() {
         &sender,
         &secret_root,
     ));
-    let barrier = Arc::new(Barrier::new(17));
+    let barrier = Arc::new(Barrier::new(CONCURRENT_COMMANDS + 1));
     let mut workers = Vec::new();
-    for worker in 0..16 {
+    for worker in 0..CONCURRENT_COMMANDS {
         let host = Arc::clone(&host);
         let barrier = Arc::clone(&barrier);
         workers.push(thread::spawn(move || {
             barrier.wait();
-            for revision in 0..8 {
-                let source = SourceInstance::new(
-                    SensorId::try_from("fairness-rx").unwrap(),
-                    DeviceId::new(120),
-                    KeyEpoch::new(4).unwrap(),
-                    BootGeneration::new(9).unwrap(),
-                );
-                let common = RelationValidity::new(
-                    "fairness-fit",
-                    source,
-                    ErrorBound::new(1, ErrorUnit::Nanoseconds),
-                    TickRange::new(SourceTick::new(0), SourceTick::new(100)).unwrap(),
-                    QualificationEpoch::new(worker * 8 + revision),
-                )
-                .unwrap();
-                host.persist_qualification(QualificationRelation::Time(
-                    TimeRelation::new(
-                        common,
-                        "source",
-                        "target",
-                        FitIdentity::new([worker as u8; 32]),
-                    )
+            let source = SourceInstance::new(
+                SensorId::try_from("fairness-rx").unwrap(),
+                DeviceId::new(120),
+                KeyEpoch::new(4).unwrap(),
+                BootGeneration::new(9).unwrap(),
+            );
+            let common = RelationValidity::new(
+                "fairness-fit",
+                source,
+                ErrorBound::new(1, ErrorUnit::Nanoseconds),
+                TickRange::new(SourceTick::new(0), SourceTick::new(100)).unwrap(),
+                QualificationEpoch::new(worker as u64),
+            )
+            .unwrap();
+            host.persist_qualification(QualificationRelation::Time(
+                TimeRelation::new(common, "source", "target", FitIdentity::new([worker as u8; 32]))
                     .unwrap(),
-                ))
-                .unwrap();
-            }
+            ))
         }));
     }
     barrier.wait();
+    let ingress_started = Instant::now();
     sender
         .send_to(
             &hex_fixture(include_str!("fixtures/native-frame/capabilities-v1.hex")),
@@ -442,8 +625,14 @@ fn saturated_control_refill_rotates_to_udp_ingress() {
         )
         .unwrap();
     wait_for_fact_count(&host, 1);
+    assert!(ingress_started.elapsed() < Duration::from_secs(3));
     for worker in workers {
-        worker.join().unwrap();
+        if let Err(error) = worker.join().unwrap() {
+            assert!(
+                error.to_string().contains("control queue count deadline elapsed"),
+                "unexpected saturated-control result: {error}"
+            );
+        }
     }
     Arc::try_unwrap(host).expect("workers released host").shutdown().unwrap();
     fs::remove_dir_all(parent).unwrap();
@@ -1590,6 +1779,28 @@ fn start_host_with_radio(
     .expect("exact route is valid");
     Host::builder(store, deployment("lab"), "127.0.0.1:0".parse().unwrap())
         .route(route)
+        .start()
+        .expect("Host starts")
+}
+
+fn start_host_with_measurement_limits(
+    store: Store,
+    sender: &UdpSocket,
+    secret_root: &std::path::Path,
+    limits: AssemblyLimits,
+) -> whisper::HostRuntime {
+    let route = NativeFrameRoute::load(
+        sender.local_addr().unwrap().ip(),
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
+        decoded_route(non_ht_radio()),
+        secret_root,
+    )
+    .expect("exact route is valid");
+    Host::builder(store, deployment("lab"), "127.0.0.1:0".parse().unwrap())
+        .route(route)
+        .measurement_limits(limits)
         .start()
         .expect("Host starts")
 }

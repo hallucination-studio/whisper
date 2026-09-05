@@ -28,6 +28,7 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
         deployment: builder.deployment.clone(),
         routes: Arc::clone(&routes),
         clock: Arc::clone(&builder.clock),
+        measurement_limits: builder.measurement_limits,
     };
     let writer = threads.spawn(
         "whisper-fact-writer",

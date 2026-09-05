@@ -2,14 +2,16 @@
 
 use sha2::{Digest, Sha256};
 use whisper::measurement::{
-    AssemblyCapacity, AssemblyCloseReason, AssemblyKey, AssemblyLimits, ChannelIdentity,
-    ErrorBound, ErrorUnit, EventIdentity, EvidenceBlock, EvidenceBlockIdentity,
-    EvidenceMemberIdentity, EvidenceQuality, FitIdentity, FragmentBytes, FragmentFact,
-    FragmentPosition, Geometry, MeasurementAssembler, MeasurementContext, MeasurementFragment,
-    ModelRequirements, NativeEventIdentity, PhaseReferenceIdentity, PhaseRelation,
-    PhysicalOperator, PortMapEntry, PortMapping, Pose, ProfileIdentity, Qualification,
-    QualificationEpoch, QualificationGap, RadioIdentity, RelationValidity, SourceInstance,
-    SourceTick, TickRange, TimeRelation, TransmitterIdentity, WaitTicks,
+    ArtifactScope, AssemblyCapacity, AssemblyCloseReason, AssemblyKey, AssemblyLimits,
+    ChannelIdentity, ErrorBound, ErrorUnit, EventIdentity, EvidenceBlock, EvidenceBlockIdentity,
+    EvidenceMemberIdentity, EvidenceQuality, EvidenceScope, FitIdentity, FragmentBytes,
+    FragmentFact, FragmentPosition, Geometry, GeometryRequirement, MeasurementAssembler,
+    MeasurementContext, MeasurementFragment, ModelRequirements, NativeEventIdentity,
+    PhaseReferenceIdentity, PhaseRelation, PhaseRequirement, PhysicalOperator,
+    PhysicalRequirements, PortMapEntry, PortMapping, PortRequirement, Pose, ProfileIdentity,
+    Qualification, QualificationEpoch, QualificationGap, RadioIdentity, RelationValidity,
+    SignalPath, SourceInstance, SourceTick, TickRange, TimeRelation, TimeRequirement,
+    TransmitterIdentity, WaitTicks,
 };
 use whisper::{BootGeneration, DeviceId, KeyEpoch, SensorId};
 
@@ -116,7 +118,7 @@ fn partial_timeout_and_late_data_are_separate_immutable_facts() {
     let original = assembler.expire(&source(1), SourceTick::new(15)).remove(0);
     assert_eq!(original.reason(), AssemblyCloseReason::WaitLimit);
     assert_eq!(original.missing_ordinals(), [1]);
-    let late = MeasurementAssembler::late(fragment(1, 8, 1, 2));
+    let late = assembler.late(fragment(1, 8, 1, 2), SourceTick::new(16));
     assert_eq!(late.reason(), AssemblyCloseReason::LateFragment);
     assert_eq!(original.missing_ordinals(), [1]);
 }
@@ -180,26 +182,59 @@ fn range(start: u64, end: u64) -> TickRange {
 }
 
 fn validity(end: u64) -> RelationValidity {
-    RelationValidity::new(
-        "survey",
-        source(1),
-        ErrorBound::new(3, ErrorUnit::Nanoseconds),
-        range(0, end),
-        QualificationEpoch::new(4),
-    )
-    .unwrap()
+    validity_with_error(end, ErrorBound::new(3, ErrorUnit::Nanoseconds))
+}
+
+fn validity_with_error(end: u64, error: ErrorBound) -> RelationValidity {
+    RelationValidity::new("survey", source(1), error, range(0, end), QualificationEpoch::new(4))
+        .unwrap()
 }
 
 fn block(window: TickRange, quality: EvidenceQuality) -> EvidenceBlock {
     EvidenceBlock::new(
         EvidenceBlockIdentity::new(
-            source(1),
+            EvidenceScope::new(source(1), key(1, 1).context(), window, QualificationEpoch::new(4)),
             [EvidenceMemberIdentity::new([1; 32])],
-            window,
-            QualificationEpoch::new(4),
+            [SignalPath::new(0, 0)],
         )
         .unwrap(),
         [quality],
+    )
+    .unwrap()
+}
+
+fn requirements(operator: PhysicalOperator, activation: TickRange) -> ModelRequirements {
+    let angle = operator == PhysicalOperator::AngleDelay;
+    ModelRequirements::new(
+        operator,
+        ArtifactScope::new(activation, QualificationEpoch::new(4), key(1, 1).context()),
+        PhysicalRequirements::new(
+            TimeRequirement::new(
+                "sensor-clock",
+                "model-clock",
+                FitIdentity::new([1; 32]),
+                ErrorBound::new(3, ErrorUnit::Nanoseconds),
+            )
+            .unwrap(),
+            angle.then_some(PhaseRequirement::new(
+                PhaseReferenceIdentity::new([2; 32]),
+                range(0, 10),
+                ErrorBound::new(3, ErrorUnit::Nanoseconds),
+            )),
+            angle.then_some(PortRequirement::new(SignalPath::new(0, 0), 2, 1)),
+            angle
+                .then(|| {
+                    GeometryRequirement::new(
+                        "sensor",
+                        "room",
+                        Pose::new([0; 7]),
+                        ErrorBound::new(3, ErrorUnit::Nanoseconds),
+                    )
+                })
+                .transpose()
+                .unwrap(),
+        )
+        .unwrap(),
     )
     .unwrap()
 }
@@ -221,11 +256,13 @@ fn eligibility_checks_exact_relation_source_window_and_operator_requirements() {
         Some(Geometry::new(validity(10), "sensor", "room", Pose::new([0; 7])).unwrap()),
     );
     let result = qualification.eligibility(
-        PhysicalOperator::AngleDelay,
         &block(range(5, 6), EvidenceQuality::Captured),
-        ModelRequirements::new(range(0, 10), QualificationEpoch::new(4)),
+        &requirements(PhysicalOperator::AngleDelay, range(0, 10)),
     );
-    assert_eq!(result.gaps(), [QualificationGap::PhaseRelation, QualificationGap::TxGeometry]);
+    assert_eq!(
+        result.gaps(),
+        [QualificationGap::PhaseRelation, QualificationGap::SignalPathMapping]
+    );
 }
 
 #[test]
@@ -248,11 +285,117 @@ fn activation_relation_and_quality_failures_remain_distinct() {
         None,
     );
     let result = qualification.eligibility(
-        PhysicalOperator::AbsoluteResponse,
         &block(range(5, 5), EvidenceQuality::Interpolated),
-        ModelRequirements::new(range(0, 4), QualificationEpoch::new(4)),
+        &requirements(PhysicalOperator::AbsoluteResponse, range(0, 4)),
     );
     assert!(result.gaps().contains(&QualificationGap::Interpolated));
     assert!(result.gaps().contains(&QualificationGap::ArtifactActivation));
-    assert!(result.gaps().contains(&QualificationGap::TimeRelation));
+    assert!(result.gaps().contains(&QualificationGap::TimeScope));
+}
+
+#[test]
+fn eligibility_reports_exact_physical_mismatches_without_accepting_unrelated_inputs() {
+    let evidence = block(range(5, 6), EvidenceQuality::Captured);
+    let required = requirements(PhysicalOperator::AngleDelay, range(0, 10));
+
+    let bad_time = Qualification::new(
+        Some(
+            TimeRelation::new(
+                validity_with_error(10, ErrorBound::new(u64::MAX, ErrorUnit::Nanoseconds)),
+                "sensor-clock",
+                "model-clock",
+                FitIdentity::new([1; 32]),
+            )
+            .unwrap(),
+        ),
+        Some(
+            PhaseRelation::new(
+                validity_with_error(10, ErrorBound::new(u64::MAX, ErrorUnit::Nanoseconds)),
+                PhaseReferenceIdentity::new([9; 32]),
+                range(0, 10),
+            )
+            .unwrap(),
+        ),
+        Some(
+            PortMapping::new(
+                validity(10),
+                [PortMapEntry::new(0, 0, Some(2), 1), PortMapEntry::new(8, 8, Some(8), 8)],
+            )
+            .unwrap(),
+        ),
+        Some(
+            Geometry::new(
+                validity_with_error(10, ErrorBound::new(u64::MAX, ErrorUnit::Nanoseconds)),
+                "sensor",
+                "other-room",
+                Pose::new([0; 7]),
+            )
+            .unwrap(),
+        ),
+    );
+
+    let gaps = bad_time.eligibility(&evidence, &required);
+    assert!(gaps.gaps().contains(&QualificationGap::TimeError));
+    assert!(gaps.gaps().contains(&QualificationGap::PhaseReference));
+    assert!(gaps.gaps().contains(&QualificationGap::PhaseError));
+    assert!(gaps.gaps().contains(&QualificationGap::SignalPathMapping));
+    assert!(gaps.gaps().contains(&QualificationGap::GeometryFrames));
+    assert!(gaps.gaps().contains(&QualificationGap::GeometryError));
+    assert!(!gaps.is_eligible());
+
+    let exact = Qualification::new(
+        Some(
+            TimeRelation::new(
+                validity(10),
+                "sensor-clock",
+                "model-clock",
+                FitIdentity::new([1; 32]),
+            )
+            .unwrap(),
+        ),
+        Some(
+            PhaseRelation::new(validity(10), PhaseReferenceIdentity::new([2; 32]), range(0, 10))
+                .unwrap(),
+        ),
+        Some(PortMapping::new(validity(10), [PortMapEntry::new(0, 0, Some(2), 1)]).unwrap()),
+        Some(Geometry::new(validity(10), "sensor", "room", Pose::new([0; 7])).unwrap()),
+    );
+    assert!(exact.eligibility(&evidence, &required).is_eligible());
+}
+
+#[test]
+fn eligibility_rejects_profile_radio_or_channel_crossing() {
+    let identity = EvidenceBlockIdentity::new(
+        EvidenceScope::new(
+            source(1),
+            MeasurementContext::new(
+                ProfileIdentity::new([99; 32]),
+                RadioIdentity::new([5; 32]),
+                ChannelIdentity::new([6; 32]),
+            ),
+            range(5, 6),
+            QualificationEpoch::new(4),
+        ),
+        [EvidenceMemberIdentity::new([1; 32])],
+        [],
+    )
+    .unwrap();
+    let evidence = EvidenceBlock::new(identity, [EvidenceQuality::Captured]).unwrap();
+    let qualification = Qualification::new(
+        Some(
+            TimeRelation::new(
+                validity(10),
+                "sensor-clock",
+                "model-clock",
+                FitIdentity::new([1; 32]),
+            )
+            .unwrap(),
+        ),
+        None,
+        None,
+        None,
+    );
+    let gaps = qualification
+        .eligibility(&evidence, &requirements(PhysicalOperator::AbsoluteResponse, range(0, 10)));
+    assert!(gaps.gaps().contains(&QualificationGap::MeasurementContext));
 }
