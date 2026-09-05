@@ -46,6 +46,48 @@ clock-domain limits are checked before numerical execution. The worker receives
 all context explicitly, so a restart rematerializes the same input from the
 frozen request and has no hidden continuation state.
 
+## Feature front-end manifest
+
+The numerical front-end uses the canonical JSON identity `rf-feature-manifest-v1`
+inside the request's immutable `manifest_hex`. Its required top-level fields are
+`run_id`, `epoch`, `cutoff_ns`, `preprocessing_version`, `weights_digest`,
+`qualification_epoch`, `causal_context_ns`, `source_provenance`, `blocks`,
+`paths`, and `map_grid`. JSON uses sorted keys, compact separators, UTF-8, and
+no non-finite numbers; the SHA-256 digest covers those exact bytes.
+
+Each block names a unique `block_id`, source and boot identity, capture time,
+the raw `absolute_response`, `spectrum_shape`, `background_residual`, and
+`fast_values`, plus a shape-matched mask for every vector and the preprocessing
+version. Source provenance retains profile, radio, channel, clock-domain, and
+raw-record digest. Blocks are strictly ordered per source and cannot lie after
+the causal cutoff or repeat an identity.
+
+The slow branch consumes the current absolute response, spectrum shape, and
+conditional background residual without centering away the absolute stationary
+level. The fast branch is a bounded causal TCN whose context is at most two
+seconds; it records actual block intervals and masks and never reads a future
+block. Missing or metadata-only values remain masked rather than becoming an
+empty-room conclusion.
+
+Each path must declare `qualified=true`, `operator=angle_delay`, and
+`adapter_kind=qualified_array`, with angle, delay, path class, uncertainty,
+coverage, calibration digest, phase-calibration digest, and qualification epoch.
+The path also records its qualification expiry and an explicit capture-interval
+coherence assertion; an expired or non-coherent path is rejected.
+The four classes (`direct_path_possible`, `stable_static`,
+`dynamic_candidate`, and `unexplained`) are all retained. Ordinary ESP input,
+unqualified paths, or an epoch mismatch fail closed; no path is a person or
+world-state position.
+
+The front-end also contains a small supervised scattering bias/noise head. It
+returns a three-coordinate foot/root-node bias, noise, and conservative
+propagated uncertainty; fitting is deterministic and bounded and does not claim
+real-world accuracy. Two-person inputs use order-independent sum and absolute
+difference features. Explicit map cells are fused once by deterministic
+cross-source attention, retaining source weights and masks rather than adding a
+second task vote. Materialization rejects oversized vectors/tensors and any
+NaN/Inf before returning the packed little-endian float32 tensor.
+
 `execution.class` is either `production_gpu` or the explicitly declared
 `cpu_baseline`. It also records whether deterministic algorithms are requested,
 finite non-negative absolute and relative tolerances, and a reproducibility
