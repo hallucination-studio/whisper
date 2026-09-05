@@ -989,13 +989,16 @@ impl<'de> Deserialize<'de> for ModelResponse {
 
 impl ModelResponse {
     /// Creates an authority-free bounded failure response.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `status` is success or `detail` exceeds 256 UTF-8 bytes.
     pub fn failure(
         identity: RequestIdentity,
         status: ResponseStatus,
         detail: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ModelWorkerError> {
+        let value = Self {
             protocol_version: PROTOCOL_VERSION,
             identity,
             status,
@@ -1006,7 +1009,9 @@ impl ModelResponse {
             output_numeric_digest: None,
             return_payload_digest: None,
             numeric_qualification: None,
-        }
+        };
+        value.validate_contract()?;
+        Ok(value)
     }
 
     /// Returns the explicit worker outcome.

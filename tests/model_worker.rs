@@ -109,7 +109,8 @@ fn local_client_sends_and_receives_one_bounded_frame() {
         request("request-1", vec![0; 4]).identity().clone(),
         ResponseStatus::GpuOom,
         "simulated allocation failure",
-    );
+    )
+    .unwrap();
     let response_frame = response.encode(&WorkerLimits::default()).unwrap();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -283,11 +284,14 @@ fn model_request_deserialization_rejects_protocol_and_cross_binding_mutations() 
 #[test]
 fn model_response_deserialization_rejects_invalid_success_and_failure_invariants() {
     let model_request = request("request-1", vec![0; 4]);
-    let mut failure = serde_json::to_value(ModelResponse::failure(
-        model_request.identity().clone(),
-        ResponseStatus::OperatorFailure,
-        "operator failed",
-    ))
+    let mut failure = serde_json::to_value(
+        ModelResponse::failure(
+            model_request.identity().clone(),
+            ResponseStatus::OperatorFailure,
+            "operator failed",
+        )
+        .unwrap(),
+    )
     .unwrap();
 
     let mut invalid_protocol = failure.clone();
@@ -317,4 +321,17 @@ fn model_response_deserialization_rejects_invalid_success_and_failure_invariants
     assert!(serde_json::from_value::<ModelResponse>(success.clone()).is_ok());
     success["output_numeric_digest"] = serde_json::json!("00".repeat(32));
     assert!(serde_json::from_value::<ModelResponse>(success).is_err());
+}
+
+#[test]
+fn failure_response_constructor_rejects_success_and_overlong_utf8_detail() {
+    let identity = request("request-1", vec![0; 4]).identity().clone();
+    assert!(ModelResponse::failure(identity.clone(), ResponseStatus::Success, "").is_err());
+
+    let overlong_utf8_detail = "界".repeat(86);
+    assert_eq!(overlong_utf8_detail.len(), 258);
+    assert!(
+        ModelResponse::failure(identity, ResponseStatus::OperatorFailure, overlong_utf8_detail,)
+            .is_err()
+    );
 }
