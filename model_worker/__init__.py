@@ -1,1 +1,1 @@
-"""Bounded local model worker protocol."""
+"""Bounded local model-worker protocol and deterministic RF feature front-end."""
