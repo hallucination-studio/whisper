@@ -13,6 +13,9 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
 };
 use sha2::{Digest, Sha256};
+use whisper::measurement::{
+    AssemblyCloseReason, QualificationRelation, RelationValidity, TimeRelation,
+};
 use whisper::native_csi::{
     CapabilityIdentity, ChannelPolicy, CsiPath, FirmwareBuildIdentity, NativeFact, RadioRxS3,
     S3BandwidthKind, S3PhyKind, S3SecondaryKind, SampleAxis, SourceMac,
@@ -35,6 +38,52 @@ const CAPABILITY_DIGEST: [u8; 32] = [
     0x34, 0x93, 0x9e, 0x35, 0xea, 0xbe, 0x30, 0x4c, 0xa5, 0x66, 0x14, 0x4f, 0x25, 0x8c, 0x1e, 0x52,
     0x2c, 0x88, 0x7f, 0x1e, 0xc5, 0x39, 0x5e, 0xdb, 0xbc, 0x22, 0x68, 0xe1, 0xfc, 0x54, 0x08, 0x43,
 ];
+
+#[test]
+fn native_csi_closes_one_persisted_measurement_and_relations_round_trip() {
+    let parent = temporary_directory("host-measurement-close");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let host =
+        start_host(Store::initialize(parent.join("world-store")).unwrap(), &sender, &secret_root);
+    sender
+        .send_to(
+            &hex_fixture(include_str!("fixtures/native-frame/capabilities-v1.hex")),
+            host.local_addr(),
+        )
+        .unwrap();
+    sender
+        .send_to(
+            &hex_fixture(include_str!("fixtures/native-frame/csi-non-ht-3-pairs.hex")),
+            host.local_addr(),
+        )
+        .unwrap();
+    wait_for_fact_count(&host, 2);
+
+    let closes = host.query_measurement_closes(4).unwrap();
+    assert_eq!(closes.len(), 1);
+    assert_eq!(closes[0].reason(), AssemblyCloseReason::Complete);
+    assert_eq!(closes[0].members().len(), 1);
+    assert_eq!(
+        closes[0].members()[0].fact_digest(),
+        *host.query_native_csi(1).unwrap()[0].provenance().provenance_digest()
+    );
+
+    let relation = QualificationRelation::Time(TimeRelation::new(
+        RelationValidity::new("clock-fit-7", 30, 40, 50, 6).unwrap(),
+    ));
+    host.persist_qualification(relation.clone()).unwrap();
+    let persisted = host.query_qualifications(4).unwrap();
+    assert_eq!(persisted.as_slice(), std::slice::from_ref(&relation));
+
+    host.shutdown().unwrap();
+    let reopened =
+        start_host(Store::open(parent.join("world-store")).unwrap(), &sender, &secret_root);
+    assert_eq!(reopened.query_measurement_closes(4).unwrap().len(), 1);
+    assert_eq!(reopened.query_qualifications(4).unwrap(), [relation]);
+    reopened.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
 
 #[test]
 fn route_budget_carries_every_supported_native_frame_v1_message() {

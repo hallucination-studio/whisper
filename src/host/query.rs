@@ -1,6 +1,11 @@
 //! Restricted local queries over committed raw facts and loss facts.
 
 use super::*;
+use crate::measurement::{
+    AssemblyClose, AssemblyCloseReason, AssemblyKey, AssemblyMember, AssociationUncertainty,
+    EvidenceQuality, Geometry, PhaseRelation, PortMapping, QualificationRelation, RelationValidity,
+    TimeRelation,
+};
 use crate::native_csi::{
     CapabilityDescriptor, LtfBlock, LtfKind, NativeCapabilityFact, NativeCsiFact, NativeFact,
     NativeFactProvenance, NativeHealthFact, RadioRxS3, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
@@ -740,4 +745,315 @@ fn native_fact_error(path: &Path, message: &'static str) -> HostError {
 
 fn raw_loss_error(path: &Path, message: &'static str) -> HostError {
     HostError::message_at("decode persisted raw loss", path, message)
+}
+
+pub(super) fn query_measurement_closes(
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<AssemblyClose>, HostError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT assembly_id, source_fact_id, device_id, boot_generation, transmitter, native_event,
+                    retransmission, missing_ordinals, close_reason,
+                    association_uncertainty, total_bytes
+             FROM measurement_assemblies ORDER BY assembly_id DESC LIMIT ?1",
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    let rows = statement
+        .query_map([i64::try_from(limit).expect("query limit fits i64")], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, u64>(10)?,
+            ))
+        })
+        .map_err(|error| HostError::database_at(path, error))?;
+    let mut closes = Vec::with_capacity(limit);
+    for row in rows {
+        let (
+            id,
+            source_fact_id,
+            device,
+            boot,
+            transmitter,
+            event,
+            retransmission,
+            missing,
+            reason,
+            uncertainty,
+            total,
+        ) = row.map_err(|error| HostError::database_at(path, error))?;
+        let device = decode_be_u64(path, device, "measurement device")?;
+        let boot = decode_be_u32(path, boot, "measurement boot")?;
+        let transmitter: [u8; 6] = transmitter.try_into().map_err(|_| measurement_error(path))?;
+        let event = decode_be_u64(path, event, "measurement event")?;
+        let retransmission = retransmission
+            .map(|bytes| decode_be_u64(path, bytes, "measurement retransmission"))
+            .transpose()?;
+        let missing = decode_ordinals(path, &missing)?;
+        let reason = decode_close_reason(path, &reason)?;
+        let uncertainty = decode_uncertainty(path, &uncertainty)?;
+        let members = query_assembly_members(&connection, path, id)?;
+        validate_native_assembly(
+            &connection,
+            path,
+            source_fact_id,
+            device,
+            boot,
+            transmitter,
+            event,
+            retransmission,
+            &missing,
+            reason,
+            uncertainty,
+            total,
+            &members,
+        )?;
+        closes.push(AssemblyClose::persisted(
+            AssemblyKey::new(
+                DeviceId::new(device),
+                BootGeneration::new(boot).ok_or_else(|| measurement_error(path))?,
+                transmitter,
+                event,
+                retransmission,
+            ),
+            members.into_boxed_slice(),
+            missing.into_boxed_slice(),
+            reason,
+            uncertainty,
+            total,
+        ));
+    }
+    closes.reverse();
+    Ok(closes)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation compares every persisted assembly field with its sole native source"
+)]
+fn validate_native_assembly(
+    connection: &Connection,
+    path: &Path,
+    source_fact_id: i64,
+    device: u64,
+    boot: u32,
+    transmitter: [u8; 6],
+    event: u64,
+    retransmission: Option<u64>,
+    missing: &[u16],
+    reason: AssemblyCloseReason,
+    uncertainty: AssociationUncertainty,
+    total: u64,
+    members: &[AssemblyMember],
+) -> Result<(), HostError> {
+    let source = connection
+        .query_row(
+            "SELECT f.digest, f.device_id, f.boot_generation, f.message_sequence,
+                    c.source_mac, c.capture_sequence, c.first_invalid_bytes,
+                    c.trailing_invalid_bytes, length(c.raw_csi)
+             FROM native_csi_facts AS c
+             JOIN raw_facts AS f ON f.fact_id = c.fact_id
+             WHERE c.fact_id = ?1",
+            [source_fact_id],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, u8>(6)?,
+                    row.get::<_, u8>(7)?,
+                    row.get::<_, u64>(8)?,
+                ))
+            },
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    let digest: [u8; 32] = source.0.try_into().map_err(|_| measurement_error(path))?;
+    let source_device = decode_be_u64(path, source.1, "source device")?;
+    let source_boot = decode_be_u32(path, source.2, "source boot")?;
+    let source_retransmission = decode_be_u64(path, source.3, "source sequence")?;
+    let source_transmitter: [u8; 6] = source.4.try_into().map_err(|_| measurement_error(path))?;
+    let source_event = decode_be_u64(path, source.5, "source event")?;
+    let source_quality = if source.6 == 0 && source.7 == 0 {
+        EvidenceQuality::Captured
+    } else {
+        EvidenceQuality::Invalid
+    };
+    if source_device != device
+        || source_boot != boot
+        || source_transmitter != transmitter
+        || source_event != event
+        || retransmission != Some(source_retransmission)
+        || !missing.is_empty()
+        || reason != AssemblyCloseReason::Complete
+        || uncertainty != AssociationUncertainty::ExactNativeIdentity
+        || total != source.8
+        || members.len() != 1
+        || members[0].ordinal() != 0
+        || members[0].fact_digest() != digest
+        || u64::from(members[0].payload_bytes()) != source.8
+        || members[0].quality() != source_quality
+    {
+        return Err(measurement_error(path));
+    }
+    Ok(())
+}
+
+fn query_assembly_members(
+    connection: &Connection,
+    path: &Path,
+    assembly_id: i64,
+) -> Result<Vec<AssemblyMember>, HostError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT ordinal, fact_digest, payload_bytes, quality
+             FROM measurement_members WHERE assembly_id = ?1 ORDER BY ordinal",
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    let rows = statement
+        .query_map([assembly_id], |row| {
+            Ok((
+                row.get::<_, u16>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| HostError::database_at(path, error))?;
+    rows.map(|row| {
+        let (ordinal, digest, bytes, quality) =
+            row.map_err(|error| HostError::database_at(path, error))?;
+        let digest = digest.try_into().map_err(|_| measurement_error(path))?;
+        Ok(AssemblyMember::persisted(ordinal, digest, bytes, decode_quality(path, &quality)?))
+    })
+    .collect()
+}
+
+pub(super) fn query_qualifications(
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<QualificationRelation>, HostError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT kind, source, error_bound, valid_from_tick, valid_until_tick,
+                    epoch, tx_geometry_known
+             FROM qualification_relations ORDER BY relation_id DESC LIMIT ?1",
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
+    let rows = statement
+        .query_map([i64::try_from(limit).expect("query limit fits i64")], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Option<u8>>(6)?,
+            ))
+        })
+        .map_err(|error| HostError::database_at(path, error))?;
+    let mut relations = Vec::with_capacity(limit);
+    for row in rows {
+        let (kind, source, error, from, until, epoch, tx_geometry) =
+            row.map_err(|error| HostError::database_at(path, error))?;
+        let validity = RelationValidity::new(
+            source,
+            decode_be_u64(path, error, "relation error")?,
+            decode_be_u64(path, from, "relation start")?,
+            decode_be_u64(path, until, "relation end")?,
+            decode_be_u64(path, epoch, "relation epoch")?,
+        )
+        .map_err(|_| measurement_error(path))?;
+        relations.push(match (kind.as_str(), tx_geometry) {
+            ("time", None) => QualificationRelation::Time(TimeRelation::new(validity)),
+            ("phase", None) => QualificationRelation::Phase(PhaseRelation::new(validity)),
+            ("port", Some(known @ 0..=1)) => {
+                QualificationRelation::Port(PortMapping::new(validity, known == 1))
+            }
+            ("geometry", None) => QualificationRelation::Geometry(Geometry::new(validity)),
+            _ => return Err(measurement_error(path)),
+        });
+    }
+    relations.reverse();
+    Ok(relations)
+}
+
+fn decode_be_u64(path: &Path, bytes: Vec<u8>, _field: &'static str) -> Result<u64, HostError> {
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| measurement_error(path))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn decode_be_u32(path: &Path, bytes: Vec<u8>, _field: &'static str) -> Result<u32, HostError> {
+    let bytes: [u8; 4] = bytes.try_into().map_err(|_| measurement_error(path))?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn decode_ordinals(path: &Path, bytes: &[u8]) -> Result<Vec<u16>, HostError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(measurement_error(path));
+    }
+    Ok(bytes.chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])).collect())
+}
+
+fn decode_close_reason(path: &Path, value: &str) -> Result<AssemblyCloseReason, HostError> {
+    match value {
+        "complete" => Ok(AssemblyCloseReason::Complete),
+        "wait_limit" => Ok(AssemblyCloseReason::WaitLimit),
+        "count_limit" => Ok(AssemblyCloseReason::CountLimit),
+        "byte_limit" => Ok(AssemblyCloseReason::ByteLimit),
+        "late_fragment" => Ok(AssemblyCloseReason::LateFragment),
+        "conflicting_duplicate" => Ok(AssemblyCloseReason::ConflictingDuplicate),
+        _ => Err(measurement_error(path)),
+    }
+}
+
+fn decode_uncertainty(path: &Path, value: &str) -> Result<AssociationUncertainty, HostError> {
+    match value {
+        "exact_native_identity" => Ok(AssociationUncertainty::ExactNativeIdentity),
+        "late_after_close" => Ok(AssociationUncertainty::LateAfterClose),
+        "conflicting_facts" => Ok(AssociationUncertainty::ConflictingFacts),
+        _ => Err(measurement_error(path)),
+    }
+}
+
+fn decode_quality(path: &Path, value: &str) -> Result<EvidenceQuality, HostError> {
+    match value {
+        "captured" => Ok(EvidenceQuality::Captured),
+        "not_captured" => Ok(EvidenceQuality::NotCaptured),
+        "lost" => Ok(EvidenceQuality::Lost),
+        "invalid" => Ok(EvidenceQuality::Invalid),
+        "interpolated" => Ok(EvidenceQuality::Interpolated),
+        "training_masked" => Ok(EvidenceQuality::TrainingMasked),
+        _ => Err(measurement_error(path)),
+    }
+}
+
+fn measurement_error(path: &Path) -> HostError {
+    HostError::message_at(
+        "decode persisted measurement",
+        path,
+        "persisted measurement or qualification is invalid",
+    )
 }

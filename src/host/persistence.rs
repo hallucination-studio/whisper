@@ -1,6 +1,7 @@
 //! Sole-writer transaction A and durable replay-state persistence.
 
 use super::*;
+use crate::measurement::QualificationRelation;
 use crate::native_frame::{
     LTF_BLOCK_BYTES, LtfBlock, LtfKind, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
 };
@@ -47,6 +48,7 @@ impl NativeRoutePin {
 pub(super) fn writer_loop(
     config: WriterConfig,
     ingress: mpsc::Receiver<AdmittedDatagram>,
+    qualifications: mpsc::Receiver<QualificationCommand>,
     overflow: &OverflowSummary,
     rejections: &Mutex<VecDeque<RejectedDatagram>>,
     ready: mpsc::SyncSender<Result<(), HostError>>,
@@ -96,6 +98,28 @@ pub(super) fn writer_loop(
 
     loop {
         persist_overflow(&mut connection, &config.database_path, overflow, config.clock.as_ref())?;
+        loop {
+            match qualifications.try_recv() {
+                Ok(command) => {
+                    let result = persist_qualification(
+                        &connection,
+                        &config.database_path,
+                        &command.relation,
+                    );
+                    let failed = result.is_err();
+                    let _ = command.reply.send(result);
+                    if failed {
+                        return Err(HostError::message_at(
+                            "persist qualification",
+                            &config.database_path,
+                            "qualification persistence failed",
+                        ));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
         match ingress.recv_timeout(SOCKET_POLL_INTERVAL) {
             Ok(item) => persist_admitted(
                 &mut connection,
@@ -113,6 +137,38 @@ pub(super) fn writer_loop(
     connection
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(|error| HostError::database_at(&config.database_path, error))?;
+    Ok(())
+}
+
+fn persist_qualification(
+    connection: &Connection,
+    path: &Path,
+    relation: &QualificationRelation,
+) -> Result<(), HostError> {
+    let validity = relation.validity();
+    let (kind, tx_geometry_known) = match relation {
+        QualificationRelation::Time(_) => ("time", None),
+        QualificationRelation::Phase(_) => ("phase", None),
+        QualificationRelation::Port(mapping) => ("port", Some(mapping.tx_geometry_known())),
+        QualificationRelation::Geometry(_) => ("geometry", None),
+    };
+    connection
+        .execute(
+            "INSERT INTO qualification_relations (
+                 kind, source, error_bound, valid_from_tick, valid_until_tick,
+                 epoch, tx_geometry_known
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                kind,
+                validity.source(),
+                validity.error_bound().to_be_bytes(),
+                validity.valid_from_tick().to_be_bytes(),
+                validity.valid_until_tick().to_be_bytes(),
+                validity.epoch().to_be_bytes(),
+                tx_geometry_known.map(u8::from),
+            ],
+        )
+        .map_err(|error| HostError::database_at(path, error))?;
     Ok(())
 }
 
@@ -524,9 +580,15 @@ fn persist_admitted(
         .map_err(|error| HostError::database_at(path, error))?;
     let fact_id = transaction.last_insert_rowid();
     let semantic_rejection = match decode_authenticated(&item.authenticated) {
-        Ok(decoded) => {
-            persist_typed_fact(&transaction, path, fact_id, route, &item, decoded.message())?
-        }
+        Ok(decoded) => persist_typed_fact(
+            &transaction,
+            path,
+            fact_id,
+            digest,
+            route,
+            &item,
+            decoded.message(),
+        )?,
         Err(error) => Some(match error {
             crate::native_frame::WireError::UnknownKind { .. } => RejectReason::UnknownKind,
             crate::native_frame::WireError::MalformedBody { .. } => RejectReason::MalformedBody,
@@ -565,6 +627,7 @@ fn persist_typed_fact(
     transaction: &rusqlite::Transaction<'_>,
     path: &Path,
     fact_id: i64,
+    fact_digest: [u8; 32],
     route: &NativeFrameRoute,
     item: &AdmittedDatagram,
     message: &Message,
@@ -653,6 +716,39 @@ fn persist_typed_fact(
                         blocks,
                         data.raw_csi(),
                     ],
+                )
+                .map_err(|error| HostError::database_at(path, error))?;
+            let quality = if data.first_invalid_bytes() == 0 && data.trailing_invalid_bytes() == 0 {
+                "captured"
+            } else {
+                "invalid"
+            };
+            transaction
+                .execute(
+                    "INSERT INTO measurement_assemblies (
+                         source_fact_id, device_id, boot_generation, transmitter,
+                         native_event, retransmission, expected_fragments,
+                         missing_ordinals, close_reason, association_uncertainty, total_bytes
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, zeroblob(0),
+                               'complete', 'exact_native_identity', ?7)",
+                    params![
+                        fact_id,
+                        item.header.device_id().to_be_bytes(),
+                        item.header.boot_generation().to_be_bytes(),
+                        data.source_mac(),
+                        data.capture_sequence().to_be_bytes(),
+                        item.header.message_seq().to_be_bytes(),
+                        data.raw_csi().len(),
+                    ],
+                )
+                .map_err(|error| HostError::database_at(path, error))?;
+            let assembly_id = transaction.last_insert_rowid();
+            transaction
+                .execute(
+                    "INSERT INTO measurement_members (
+                         assembly_id, ordinal, fact_digest, payload_bytes, quality
+                     ) VALUES (?1, 0, ?2, ?3, ?4)",
+                    params![assembly_id, fact_digest, data.raw_csi().len(), quality],
                 )
                 .map_err(|error| HostError::database_at(path, error))?;
             Ok(None)

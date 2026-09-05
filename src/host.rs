@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::admission::AdmissionLimits;
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
+use crate::measurement::{AssemblyClose, QualificationRelation};
 use crate::native_csi::{
     CapabilityIdentity, ChannelPolicy, FirmwareBuildIdentity, NativeCapabilityFact, NativeCsiFact,
     NativeFact, NativeHealthFact, RadioRxS3, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
@@ -45,6 +46,9 @@ const MAXIMUM_RAW_QUERY_FACTS: usize = 1_024;
 /// fixed ceiling prevents hostile traffic from creating an unbounded side log.
 /// Changing it alters only diagnostic retention, never authoritative facts.
 const REJECTION_DIAGNOSTIC_CAPACITY: usize = 64;
+/// Independently established qualification revisions awaiting the sole writer.
+/// This count bound limits control-plane memory and each pre-ingress writer batch.
+const QUALIFICATION_QUEUE_CAPACITY: usize = 64;
 /// Worker stop/error polling period in milliseconds. The value keeps shutdown
 /// latency interactive while avoiding a busy loop; changing it affects both
 /// idle wakeups and worst-case cooperative shutdown latency.
@@ -584,6 +588,8 @@ impl HostBuilder {
         let rejections =
             Arc::new(Mutex::new(VecDeque::with_capacity(REJECTION_DIAGNOSTIC_CAPACITY)));
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (qualification_sender, qualification_receiver) =
+            mpsc::sync_channel(QUALIFICATION_QUEUE_CAPACITY);
         let supervisor_stop = Arc::clone(&stop);
         let supervisor_completion = Arc::clone(&completion);
         let supervisor_rejections = Arc::clone(&rejections);
@@ -604,6 +610,7 @@ impl HostBuilder {
                             completion: supervisor_completion,
                             rejections: supervisor_rejections,
                             ready_sender,
+                            qualification_receiver,
                         },
                     );
                 }),
@@ -628,6 +635,7 @@ impl HostBuilder {
             stop,
             completion,
             rejections,
+            qualification_sender: Some(qualification_sender),
         })
     }
 }
@@ -641,6 +649,7 @@ pub struct HostRuntime {
     stop: Arc<AtomicBool>,
     completion: Arc<(Mutex<Completion>, Condvar)>,
     rejections: Arc<Mutex<VecDeque<RejectedDatagram>>>,
+    qualification_sender: Option<mpsc::SyncSender<QualificationCommand>>,
 }
 
 impl HostRuntime {
@@ -735,6 +744,50 @@ impl HostRuntime {
         query_native_health(&self.database_path, &self.routes, limit)
     }
 
+    /// Persists one independently established physical-input qualification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sole Store writer is unavailable or persistence fails.
+    pub fn persist_qualification(&self, relation: QualificationRelation) -> Result<(), HostError> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        self.qualification_sender
+            .as_ref()
+            .ok_or_else(|| {
+                HostError::message_during("persist qualification", "Host is shutting down")
+            })?
+            .send(QualificationCommand { relation, reply: reply_sender })
+            .map_err(|_| {
+                HostError::message_during("persist qualification", "Store writer is unavailable")
+            })?;
+        reply_receiver.recv().map_err(|_| {
+            HostError::message_during("persist qualification", "Store writer exited")
+        })?
+    }
+
+    /// Queries a bounded newest suffix of immutable assembly closes.
+    ///
+    /// # Errors
+    ///
+    /// The limit must be between one and 1,024, and the Store must remain readable.
+    pub fn query_measurement_closes(&self, limit: usize) -> Result<Vec<AssemblyClose>, HostError> {
+        validate_native_query_limit(limit)?;
+        query_measurement_closes(&self.database_path, limit)
+    }
+
+    /// Queries a bounded newest suffix of persisted qualification relations.
+    ///
+    /// # Errors
+    ///
+    /// The limit must be between one and 1,024, and the Store must remain readable.
+    pub fn query_qualifications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<QualificationRelation>, HostError> {
+        validate_native_query_limit(limit)?;
+        query_qualifications(&self.database_path, limit)
+    }
+
     /// Returns a bounded newest suffix of non-authoritative rejection diagnostics.
     ///
     /// # Errors
@@ -764,8 +817,9 @@ impl HostRuntime {
     /// # Errors
     ///
     /// Returns the first fatal reader or writer failure observed by the supervisor.
-    pub fn shutdown(self) -> Result<(), HostError> {
+    pub fn shutdown(mut self) -> Result<(), HostError> {
         self.stop.store(true, Ordering::Release);
+        self.qualification_sender.take();
         wait_for_completion(&self.completion)
     }
 }
@@ -1179,6 +1233,13 @@ struct SupervisorContext {
     completion: Arc<(Mutex<Completion>, Condvar)>,
     rejections: Arc<Mutex<VecDeque<RejectedDatagram>>>,
     ready_sender: mpsc::SyncSender<Result<(), HostError>>,
+    qualification_receiver: mpsc::Receiver<QualificationCommand>,
+}
+
+#[derive(Debug)]
+struct QualificationCommand {
+    relation: QualificationRelation,
+    reply: mpsc::SyncSender<Result<(), HostError>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1276,8 +1337,8 @@ mod persistence;
 use persistence::{validate_native_route_pins, writer_loop};
 mod query;
 use query::{
-    query_native_capabilities, query_native_csi, query_native_facts, query_native_health,
-    query_raw, query_raw_losses,
+    query_measurement_closes, query_native_capabilities, query_native_csi, query_native_facts,
+    query_native_health, query_qualifications, query_raw, query_raw_losses,
 };
 
 fn validate_native_query_limit(limit: usize) -> Result<(), HostError> {

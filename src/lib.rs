@@ -6,6 +6,7 @@ mod admission;
 mod host;
 mod identity;
 pub(crate) mod key;
+pub mod measurement;
 pub mod native_csi;
 /// Native-frame v1 authentication, parsing, and lossless body values.
 #[cfg_attr(
