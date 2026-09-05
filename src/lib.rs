@@ -2,10 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "retained for the next authenticated raw-fact Host slice")
-)]
+mod host;
 pub(crate) mod key;
 #[expect(dead_code, reason = "retained for the next lossless native-CSI fact slice")]
 pub(crate) mod native_csi;
@@ -13,11 +10,16 @@ pub(crate) mod native_csi;
 #[expect(dead_code, reason = "retained as the fixed deployed-device input contract")]
 #[path = "wire.rs"]
 pub(crate) mod native_frame;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "retained for durable authenticated raw-fact admission")
-)]
 pub(crate) mod replay;
+mod store;
+
+#[doc(inline)]
+pub use host::{
+    Host, HostBuilder, HostError, HostRuntime, NativeFrameRoute, RawFact, RawLoss, RawLossKind,
+    RejectReason, RejectedDatagram, RouteError,
+};
+#[doc(inline)]
+pub use store::{Store, StoreError, StoreId};
 
 #[cfg(test)]
 mod conformance;

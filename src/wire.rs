@@ -1690,6 +1690,12 @@ pub(crate) struct AuthenticatedDatagram {
 }
 
 impl AuthenticatedDatagram {
+    /// Returns the authenticated fixed header.
+    #[must_use]
+    pub(crate) const fn header(&self) -> Header {
+        self.header
+    }
+
     /// Returns the authenticated cleartext body for the later decoder stage.
     #[must_use]
     pub(crate) fn plaintext(&self) -> &[u8] {
