@@ -18,6 +18,35 @@ from typing import Callable, Protocol
 MAGIC = b"WMW1"
 PROTOCOL_VERSION = 1
 HEX_DIGEST_CHARS = 64
+# Smallest complete WMW1 failure frame, using the canonical fallback identity,
+# the longest known failure status, and an empty detail string.
+MIN_FRAME_BYTES = 386
+FAILURE_STATUSES = frozenset(
+    {
+        "unsupported_version",
+        "malformed_request",
+        "contract_mismatch",
+        "digest_mismatch",
+        "invalid_shape",
+        "limit_exceeded",
+        "deadline_exceeded",
+        "epoch_mismatch",
+        "non_finite",
+        "gpu_oom",
+        "backend_unavailable",
+        "request_conflict",
+        "operator_failure",
+    }
+)
+FALLBACK_IDENTITY = MappingProxyType(
+    {
+        "run_id": "unknown",
+        "epoch": 0,
+        "request_id": "unknown",
+        "cutoff_ns": 0,
+        "predecessor_digest": "0" * HEX_DIGEST_CHARS,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +65,10 @@ class Limits:
     max_sources: int = 64
     max_clock_domains: int = 64
     max_completed_replies: int = 64
+
+    def __post_init__(self) -> None:
+        if self.max_frame_bytes < MIN_FRAME_BYTES:
+            raise ValueError(f"max_frame_bytes must be at least {MIN_FRAME_BYTES}")
 
 
 class Operator(Protocol):
@@ -137,7 +170,7 @@ class ContractFailure(Exception):
 
     def __init__(self, status: str, detail: str):
         super().__init__(detail)
-        self.status = status
+        self.status = status if status in FAILURE_STATUSES else "operator_failure"
         self.detail = detail
 
 
@@ -379,11 +412,12 @@ class Worker:
 
     def _failure(self, identity: dict, status: str, detail: str) -> bytes:
         safe_identity = self._safe_identity(identity)
+        safe_status = status if status in FAILURE_STATUSES else "operator_failure"
         safe_detail = detail.encode("utf-8", errors="replace")[:256].decode("utf-8", errors="ignore")
         full = {
                 "protocol_version": PROTOCOL_VERSION,
                 "identity": safe_identity,
-                "status": status,
+                "status": safe_status,
                 "detail": safe_detail,
                 "candidate_hex": "",
                 "successor_hex": "",
@@ -394,8 +428,7 @@ class Worker:
         }
         candidates = (
             full,
-            {**full, "identity": {}, "detail": ""},
-            {"protocol_version": PROTOCOL_VERSION, "identity": {}, "status": status, "detail": ""},
+            {**full, "identity": dict(FALLBACK_IDENTITY), "detail": ""},
         )
         for candidate in candidates:
             try:
@@ -413,7 +446,7 @@ class Worker:
     @classmethod
     def _safe_identity(cls, value: object) -> dict:
         if not isinstance(value, dict):
-            return {}
+            return dict(FALLBACK_IDENTITY)
         try:
             run_id = _text(value["run_id"], "run_id")
             request_id = _text(value["request_id"], "request_id")
@@ -421,7 +454,7 @@ class Worker:
             cutoff = cls._integer(value["cutoff_ns"], "cutoff", 64)
             predecessor = value["predecessor_digest"]
             if not isinstance(predecessor, str) or len(predecessor) != HEX_DIGEST_CHARS:
-                return {}
+                return dict(FALLBACK_IDENTITY)
             bytes.fromhex(predecessor)
             return {
                 "run_id": run_id,
@@ -431,7 +464,7 @@ class Worker:
                 "predecessor_digest": predecessor,
             }
         except (ContractFailure, KeyError, TypeError, ValueError):
-            return {}
+            return dict(FALLBACK_IDENTITY)
 
 
 def serve_connection(connection: socket.socket, worker: Worker) -> None:

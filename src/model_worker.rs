@@ -15,6 +15,8 @@ const MAGIC: &[u8; 4] = b"WMW1";
 const PROTOCOL_VERSION: u16 = 1;
 const ARTIFACT_SCHEMA_VERSION: u16 = 1;
 const MAX_TEXT_BYTES: usize = 128;
+/// Smallest frame that can carry a complete schema-valid WMW1 failure response.
+pub const MIN_FRAME_BYTES: usize = 386;
 
 /// SHA-256 digest used for immutable worker inputs and outputs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -207,6 +209,10 @@ impl<'de> Deserialize<'de> for NumericContract {
 
 impl NumericContract {
     /// Creates an explicit numerical contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or oversized environment or invalid tolerances.
     pub fn new(
         execution_class: ExecutionClass,
         deterministic_algorithms: bool,
@@ -422,6 +428,10 @@ impl ModelRunBuilder {
     }
 
     /// Validates and returns the immutable run description.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required semantic field or shape is invalid.
     pub fn build(self) -> Result<ModelRun, ModelWorkerError> {
         let required = |value: Option<String>, field| {
             let value =
@@ -633,6 +643,10 @@ impl InputManifestBuilder {
     }
 
     /// Validates required semantic fields and builds the immutable binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing semantics, invalid shape, or mismatched tensor bytes.
     pub fn build(self) -> Result<InputManifest, ModelWorkerError> {
         let preprocessing = self
             .preprocessing
@@ -824,12 +838,20 @@ impl ModelRequest {
     }
 
     /// Encodes and validates one bounded request frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request contract or configured resource limits are invalid.
     pub fn encode(&self, limits: &WorkerLimits) -> Result<Vec<u8>, ModelWorkerError> {
         self.validate(limits)?;
         encode_json(self, limits)
     }
 
     /// Decodes and validates one complete bounded request frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed frames, invalid contracts, or exceeded limits.
     pub fn decode(frame: &[u8], limits: &WorkerLimits) -> Result<Self, ModelWorkerError> {
         let value: Self = decode_json(frame, limits)?;
         value.validate(limits)?;
@@ -1021,12 +1043,20 @@ impl ModelResponse {
     }
 
     /// Encodes one bounded response frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response contract or configured resource limits are invalid.
     pub fn encode(&self, limits: &WorkerLimits) -> Result<Vec<u8>, ModelWorkerError> {
         self.validate(limits)?;
         encode_json(self, limits)
     }
 
     /// Decodes and validates one bounded response frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed frames, invalid responses, or exceeded limits.
     pub fn decode(frame: &[u8], limits: &WorkerLimits) -> Result<Self, ModelWorkerError> {
         let value: Self = decode_json(frame, limits)?;
         value.validate(limits)?;
@@ -1108,6 +1138,10 @@ impl DispatchQueue {
     }
 
     /// Submits without waiting for worker progress, replacing only the latest pending context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request or pending context exceeds its contract or limits.
     pub fn submit(&mut self, request: ModelRequest) -> Result<DispatchDecision, ModelWorkerError> {
         let encoded = request.encode(&self.limits)?;
         check_limit(encoded.len(), self.limits.max_pending_context_bytes, "pending context")?;
@@ -1125,6 +1159,10 @@ impl DispatchQueue {
     }
 
     /// Completes the active request and promotes exactly one latest pending context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `request_id` does not identify the active request.
     pub fn complete(
         &mut self,
         request_id: ModelRequestId,
@@ -1156,6 +1194,10 @@ impl WorkerClient {
     }
 
     /// Executes one request over a Unix-domain socket and validates response identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for request validation, transport failure, or an invalid worker response.
     pub fn execute(
         &self,
         socket_path: impl AsRef<Path>,
@@ -1353,6 +1395,7 @@ fn encode_json<T: Serialize>(
     value: &T,
     limits: &WorkerLimits,
 ) -> Result<Vec<u8>, ModelWorkerError> {
+    validate_minimum_frame_limit(limits)?;
     let payload = serde_json::to_vec(value).map_err(ModelWorkerError::json)?;
     let length = payload
         .len()
@@ -1372,6 +1415,7 @@ fn decode_json<T: for<'de> Deserialize<'de>>(
     frame: &[u8],
     limits: &WorkerLimits,
 ) -> Result<T, ModelWorkerError> {
+    validate_minimum_frame_limit(limits)?;
     if frame.len() < 8 || &frame[..4] != MAGIC {
         return Err(ModelWorkerError::invalid("invalid worker frame magic"));
     }
@@ -1389,6 +1433,7 @@ fn decode_json<T: for<'de> Deserialize<'de>>(
 }
 
 fn read_frame(stream: &mut UnixStream, limits: &WorkerLimits) -> Result<Vec<u8>, ModelWorkerError> {
+    validate_minimum_frame_limit(limits)?;
     let mut header = [0_u8; 8];
     stream.read_exact(&mut header).map_err(ModelWorkerError::io)?;
     if &header[..4] != MAGIC {
@@ -1406,6 +1451,15 @@ fn read_frame(stream: &mut UnixStream, limits: &WorkerLimits) -> Result<Vec<u8>,
     frame.resize(frame_length, 0);
     stream.read_exact(&mut frame[8..]).map_err(ModelWorkerError::io)?;
     Ok(frame)
+}
+
+fn validate_minimum_frame_limit(limits: &WorkerLimits) -> Result<(), ModelWorkerError> {
+    if limits.max_frame_bytes < MIN_FRAME_BYTES {
+        return Err(ModelWorkerError::invalid(format!(
+            "maximum frame size must be at least {MIN_FRAME_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 mod hex_bytes {

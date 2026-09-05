@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use whisper::model_worker::{
     Checkpoint, ContentDigest, DispatchDecision, DispatchQueue, ExecutionClass, InputManifest,
-    ModelRequest, ModelResponse, ModelRun, ModelRunId, NumericContract, RequestIdentity,
-    ResponseStatus, WorkerClient, WorkerLimits,
+    MIN_FRAME_BYTES, ModelRequest, ModelResponse, ModelRun, ModelRunId, NumericContract,
+    RequestIdentity, ResponseStatus, WorkerClient, WorkerLimits,
 };
 
 fn request(id: &str, tensor: Vec<u8>) -> ModelRequest {
@@ -78,6 +78,38 @@ fn codec_rejects_tensor_over_limit_before_transport() {
     let limits = WorkerLimits { max_tensor_bytes: 4, ..WorkerLimits::default() };
     let error = request("request-1", vec![0; 8]).encode(&limits).unwrap_err();
     assert!(error.to_string().contains("tensor"));
+}
+
+#[test]
+fn codec_rejects_frame_limit_below_protocol_minimum() {
+    let limits = WorkerLimits { max_frame_bytes: MIN_FRAME_BYTES - 1, ..WorkerLimits::default() };
+    let error = request("request-1", vec![0; 4]).encode(&limits).unwrap_err();
+    assert!(error.to_string().contains(&MIN_FRAME_BYTES.to_string()));
+}
+
+#[test]
+fn rust_decodes_python_minimum_limit_fallback_as_a_complete_response() {
+    let script = r#"
+import sys
+from model_worker.worker import DeterministicTestOperator, Limits, MIN_FRAME_BYTES, Worker
+assert MIN_FRAME_BYTES == int(sys.argv[1])
+limits = Limits(max_frame_bytes=MIN_FRAME_BYTES)
+oversized = b"WMW1" + (MIN_FRAME_BYTES).to_bytes(4, "big")
+sys.stdout.buffer.write(Worker(DeterministicTestOperator(), limits).handle_frame(oversized))
+"#;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(MIN_FRAME_BYTES.to_string())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let limits = WorkerLimits { max_frame_bytes: MIN_FRAME_BYTES, ..WorkerLimits::default() };
+    let response = ModelResponse::decode(&output.stdout, &limits).unwrap();
+    assert_eq!(response.status(), ResponseStatus::MalformedRequest);
+    assert!(output.stdout.len() <= MIN_FRAME_BYTES);
 }
 
 #[test]

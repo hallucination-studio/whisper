@@ -11,7 +11,10 @@ from unittest.mock import patch
 from model_worker.worker import (
     ContractFailure,
     DeterministicTestOperator,
+    FALLBACK_IDENTITY,
+    FAILURE_STATUSES,
     Limits,
+    MIN_FRAME_BYTES,
     TorchOperator,
     Worker,
     decode_frame,
@@ -165,6 +168,19 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertFalse(hasattr(worker, "store"))
         self.assertFalse(hasattr(worker, "fact_log"))
 
+    def test_operator_contract_failure_cannot_emit_success_or_unknown_status(self) -> None:
+        for supplied_status in ("success", "invented_failure"):
+            with self.subTest(status=supplied_status):
+                class FailingOperator:
+                    def evaluate(self, _request):
+                        raise ContractFailure(supplied_status, "invalid operator status")
+
+                worker = Worker(FailingOperator(), Limits(), now_ns=lambda: 1)
+                response = decode_frame(worker.handle_frame(encode_frame(request(), Limits())), Limits())
+                self.assertEqual(response["status"], "operator_failure")
+                self.assertEqual(response["candidate_hex"], "")
+                self.assertIsNone(response["numeric_qualification"])
+
     def test_wrong_result_shape_is_a_bounded_failure(self) -> None:
         class WrongShapeOperator:
             def evaluate(self, _request):
@@ -264,8 +280,36 @@ class WorkerProtocolTests(unittest.TestCase):
         response_frame = Worker(DeterministicTestOperator(), limits).handle_frame(frame)
         self.assertLessEqual(len(response_frame), limits.max_frame_bytes)
         response = decode_frame(response_frame, limits)
-        self.assertEqual(response["identity"], {})
+        self.assertEqual(response["identity"], dict(FALLBACK_IDENTITY))
         self.assertLessEqual(len(response["detail"].encode("utf-8")), 256)
+
+    def test_minimum_frame_limit_always_returns_complete_schema_valid_failure(self) -> None:
+        limits = Limits(max_frame_bytes=MIN_FRAME_BYTES)
+        oversized_request = encode_frame(request(), Limits())
+        response_frame = Worker(DeterministicTestOperator(), limits).handle_frame(oversized_request)
+        self.assertLessEqual(len(response_frame), MIN_FRAME_BYTES)
+        response = decode_frame(response_frame, limits)
+        self.assertEqual(response["status"], "malformed_request")
+        self.assertEqual(response["identity"], dict(FALLBACK_IDENTITY))
+        self.assertEqual(response["candidate_hex"], "")
+        self.assertEqual(response["successor_hex"], "")
+        self.assertEqual(response["input_tensor_digest"], "")
+        self.assertEqual(response["output_numeric_digest"], "")
+        self.assertEqual(response["return_payload_digest"], "")
+        self.assertIsNone(response["numeric_qualification"])
+
+        worker = Worker(DeterministicTestOperator(), limits)
+        for status in FAILURE_STATUSES:
+            with self.subTest(status=status):
+                response_frame = worker._failure({}, status, "界" * 200)
+                response = decode_frame(response_frame, limits)
+                self.assertEqual(response["status"], status)
+                self.assertEqual(response["identity"], dict(FALLBACK_IDENTITY))
+                self.assertLessEqual(len(response_frame), MIN_FRAME_BYTES)
+
+    def test_frame_limit_below_protocol_minimum_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, str(MIN_FRAME_BYTES)):
+            Limits(max_frame_bytes=MIN_FRAME_BYTES - 1)
 
     def test_connection_returns_failure_frame_for_invalid_input(self) -> None:
         worker_side, client_side = socket.socketpair()
