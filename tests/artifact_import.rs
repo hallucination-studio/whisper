@@ -1,0 +1,569 @@
+//! Spatial artifact import, persistence, query, and export behavior.
+
+use std::fs;
+use std::net::UdpSocket;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use whisper::{
+    AdmissionLimits, Artifact, ArtifactLimits, ArtifactRejectReason, AuthenticatedBytesPerSecond,
+    CalibrationBundle, ClockExchange, CompanionRejectReason, CompanionServerIdentity,
+    CoordinateTransform, DatagramBytes, DeploymentId, DepthQuality, DeviceId, GeometryElement,
+    GeometryKind, Host, JointLabel, KeyEpoch, LabelScope, NativeFrameRoute, PacketsPerSecond,
+    PersonLabel, PhaseCondition, PortCondition, ReplayWindowPackets, SceneSnapshot, SealedArtifact,
+    SourceIdentity, Store, SupervisionSample, SupervisionSegment, TrackingQuality, UploadId,
+    UploadProgress,
+};
+
+const KEY: [u8; 32] = [7; 32];
+
+#[test]
+fn scene_sealed_bytes_round_trip_without_losing_geometry_or_uncertainty() {
+    let scene = SceneSnapshot {
+        artifact_id: "room-a".into(),
+        revision: 3,
+        world_coordinate_system: "arkit-world-42".into(),
+        geometry: vec![GeometryElement {
+            kind: GeometryKind::Door,
+            vertices_m: vec![[1.0, 0.0, 0.0], [1.0, 2.1, 0.0]],
+        }],
+        scan_coverage: 0.96,
+        map_error_m: 0.12,
+        usdz_display_reference: Some("room-a.usdz#sha256=0123".into()),
+        provenance: vec![SourceIdentity {
+            namespace: "phone-capture".into(),
+            identity: "capture-7".into(),
+        }],
+    };
+
+    let sealed = SealedArtifact::seal(Artifact::Scene(scene.clone())).unwrap();
+    let second = SealedArtifact::seal(Artifact::Scene(scene.clone())).unwrap();
+
+    assert_eq!(sealed.bytes(), second.bytes());
+    assert_eq!(sealed.digest(), second.digest());
+    assert_eq!(sealed.decode().unwrap(), Artifact::Scene(scene));
+}
+
+#[test]
+fn calibration_and_supervision_round_trip_with_conditions_masks_and_joint_uncertainty() {
+    let scene_digest = SealedArtifact::seal(Artifact::Scene(scene())).unwrap().digest();
+    let calibration = CalibrationBundle {
+        artifact_id: "calibration-a".into(),
+        revision: 2,
+        scene_digest,
+        rf_device_identity: "rx-array-1".into(),
+        antenna_reference: "fiducial-11-to-array-origin".into(),
+        world_transform: CoordinateTransform {
+            source_coordinate_system: "array-1".into(),
+            target_coordinate_system: "arkit-world-42".into(),
+            matrix: [
+                1.0, 0.0, 0.0, 2.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.0, 1.0,
+            ],
+            max_error_m: 0.08,
+        },
+        ports: vec![PortCondition { port: 0, antenna_identity: "element-0".into() }],
+        phase_condition: PhaseCondition::PacketCoherent,
+        max_error_m: 0.14,
+        valid_from_utc_ns: 1_000,
+        valid_until_utc_ns: 9_000_000_000_000_000_000,
+        provenance: sources(),
+    };
+    let supervision = SupervisionSegment {
+        artifact_id: "labels-a".into(),
+        revision: 4,
+        scene_digest,
+        camera_intrinsics: [800.0, 0.0, 320.0, 0.0, 800.0, 240.0, 0.0, 0.0, 1.0],
+        samples: vec![SupervisionSample {
+            rgb_time_ns: 2_000,
+            depth_time_ns: 2_002,
+            pose_time_ns: 2_001,
+            maximum_time_error_ns: 5,
+            tracking_epoch: 7,
+            relocalized: true,
+            tracking_quality: TrackingQuality::Normal,
+            depth_quality: DepthQuality::Measured,
+            scope: LabelScope::LocallyVisible,
+            person_visibility: vec![0.9],
+            label: JointLabel::VisibleSet(vec![PersonLabel {
+                station: "station-3".into(),
+                pose: "standing".into(),
+                position_m: [1.2, 0.0, 2.0],
+                max_error_m: 0.16,
+            }]),
+        }],
+        shared_position_error_m: 0.1,
+        provenance: sources(),
+    };
+
+    for artifact in [Artifact::Calibration(calibration), Artifact::Supervision(supervision)] {
+        let sealed = SealedArtifact::seal(artifact.clone()).unwrap();
+        assert_eq!(sealed.decode().unwrap(), artifact);
+    }
+}
+
+#[test]
+fn explicit_local_import_is_immutable_queryable_and_byte_exact_on_export() {
+    let parent = temporary_directory("artifact-local-import");
+    let root = parent.join("world-store");
+    let host = start_host(&parent, &root);
+    let server_identity = host.companion_server_identity();
+    let sealed = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
+
+    let first = host.import_artifact(sealed.bytes()).expect("valid scene imports");
+    let duplicate = host.import_artifact(sealed.bytes()).expect("exact retry is idempotent");
+
+    assert_eq!(first, duplicate);
+    assert_eq!(
+        host.query_artifact(sealed.digest()).unwrap().unwrap().decode().unwrap(),
+        Artifact::Scene(scene())
+    );
+    assert_eq!(host.export_artifact(sealed.digest()).unwrap().unwrap().as_ref(), sealed.bytes());
+
+    host.shutdown().unwrap();
+    let reopened =
+        start_host_from_store(&parent, Store::open(&root).unwrap(), ArtifactLimits::default());
+    assert_eq!(reopened.companion_server_identity(), server_identity);
+    assert_eq!(
+        reopened.export_artifact(sealed.digest()).unwrap().unwrap().as_ref(),
+        sealed.bytes(),
+        "artifact remains queryable after Host restart"
+    );
+    reopened.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn local_import_commits_scene_calibration_and_supervision_as_separate_candidates() {
+    let parent = temporary_directory("artifact-three-kinds");
+    let root = parent.join("world-store");
+    let host = start_host(&parent, &root);
+    let scene_sealed = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
+    host.import_artifact(scene_sealed.bytes()).unwrap();
+    let calibration =
+        SealedArtifact::seal(Artifact::Calibration(calibration(scene_sealed.digest()))).unwrap();
+    let supervision =
+        SealedArtifact::seal(Artifact::Supervision(supervision(scene_sealed.digest()))).unwrap();
+
+    let calibration_receipt = host.import_artifact(calibration.bytes()).unwrap();
+    let supervision_receipt = host.import_artifact(supervision.bytes()).unwrap();
+
+    assert_eq!(calibration_receipt.kind(), whisper::ArtifactKind::Calibration);
+    assert_eq!(supervision_receipt.kind(), whisper::ArtifactKind::Supervision);
+    assert_eq!(host.query_artifact(calibration.digest()).unwrap().unwrap(), calibration);
+    assert_eq!(host.query_artifact(supervision.digest()).unwrap().unwrap(), supervision);
+
+    host.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn invalid_incompatible_and_conflicting_artifacts_fail_closed() {
+    let parent = temporary_directory("artifact-fail-closed");
+    let root = parent.join("world-store");
+    let host = start_host(&parent, &root);
+    let scene_sealed = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
+    host.import_artifact(scene_sealed.bytes()).unwrap();
+
+    let mut corrupt = scene_sealed.bytes().to_vec();
+    corrupt[12] ^= 1;
+    assert_eq!(
+        host.import_artifact(&corrupt).unwrap_err().reason(),
+        ArtifactRejectReason::InvalidArtifact
+    );
+
+    let mut conflicting_scene = scene();
+    conflicting_scene.scan_coverage = 0.95;
+    let conflict = SealedArtifact::seal(Artifact::Scene(conflicting_scene)).unwrap();
+    assert_eq!(
+        host.import_artifact(conflict.bytes()).unwrap_err().reason(),
+        ArtifactRejectReason::IdentityConflict
+    );
+
+    let mut unknown = calibration(scene_sealed.digest());
+    unknown.rf_device_identity = "unregistered-rx".into();
+    let unknown = SealedArtifact::seal(Artifact::Calibration(unknown)).unwrap();
+    assert_eq!(
+        host.import_artifact(unknown.bytes()).unwrap_err().reason(),
+        ArtifactRejectReason::UnknownRfIdentity
+    );
+
+    let mut expired = calibration(scene_sealed.digest());
+    expired.valid_until_utc_ns = 2_000;
+    let expired = SealedArtifact::seal(Artifact::Calibration(expired)).unwrap();
+    assert_eq!(
+        host.import_artifact(expired.bytes()).unwrap_err().reason(),
+        ArtifactRejectReason::Expired
+    );
+
+    let missing_scene = SealedArtifact::seal(Artifact::Calibration(calibration(
+        SealedArtifact::seal(Artifact::Scene(SceneSnapshot {
+            artifact_id: "other".into(),
+            ..scene()
+        }))
+        .unwrap()
+        .digest(),
+    )))
+    .unwrap();
+    assert_eq!(
+        host.import_artifact(missing_scene.bytes()).unwrap_err().reason(),
+        ArtifactRejectReason::MissingScene
+    );
+
+    let mut reset_segment = supervision(scene_sealed.digest());
+    let mut reset = reset_segment.samples[0].clone();
+    reset.pose_time_ns += 10;
+    reset.rgb_time_ns += 10;
+    reset.depth_time_ns += 10;
+    reset.tracking_epoch += 1;
+    reset.relocalized = false;
+    reset_segment.samples.push(reset);
+    let reset = SealedArtifact::seal(Artifact::Supervision(reset_segment)).unwrap();
+    assert_eq!(
+        host.import_artifact(reset.bytes()).unwrap_err().reason(),
+        ArtifactRejectReason::TrackingNotRelocalized
+    );
+
+    let mut unseen_empty = supervision(scene_sealed.digest());
+    unseen_empty.samples[0].person_visibility.clear();
+    unseen_empty.samples[0].label = JointLabel::WholeRoomEmpty;
+    assert!(
+        SealedArtifact::seal(Artifact::Supervision(unseen_empty)).is_err(),
+        "a locally visible region cannot encode an unseen room as empty"
+    );
+
+    assert_eq!(host.query_artifact(scene_sealed.digest()).unwrap().unwrap(), scene_sealed);
+    host.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn artifact_byte_limit_rejects_before_store_write() {
+    let parent = temporary_directory("artifact-size-limit");
+    let root = parent.join("world-store");
+    let limits = ArtifactLimits::new(64, 8, 8, 8, 0.75).unwrap();
+    let host = start_host_with_limits(&parent, &root, limits);
+    let sealed = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
+
+    assert_eq!(
+        host.import_artifact(sealed.bytes()).unwrap_err().reason(),
+        ArtifactRejectReason::LimitExceeded
+    );
+    assert!(host.query_artifact(sealed.digest()).unwrap().is_none());
+
+    host.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn artifact_and_companion_chunk_counts_are_bounded() {
+    let parent = temporary_directory("artifact-count-limit");
+    let root = parent.join("world-store");
+    let limits = ArtifactLimits::new(16 * 1024 * 1024, 1, 8, 8, 0.75).unwrap();
+    let host = start_host_with_limits(&parent, &root, limits);
+    let first = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
+    host.import_artifact(first.bytes()).unwrap();
+    let second = SealedArtifact::seal(Artifact::Scene(SceneSnapshot {
+        artifact_id: "room-b".into(),
+        ..scene()
+    }))
+    .unwrap();
+    assert_eq!(
+        host.import_artifact(second.bytes()).unwrap_err().reason(),
+        ArtifactRejectReason::LimitExceeded
+    );
+
+    let offer = host.begin_companion_pairing(std::time::Duration::from_secs(30)).unwrap();
+    let connection = host
+        .connect_companion(
+            &offer,
+            offer.server_identity(),
+            &[ClockExchange {
+                client_send_ns: 100,
+                host_receive_ns: 120,
+                host_send_ns: 125,
+                client_receive_ns: 150,
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .seal_upload(UploadId::from_bytes([3; 16]), &vec![0; 1_025], 1)
+            .unwrap_err()
+            .reason(),
+        CompanionRejectReason::LimitExceeded
+    );
+
+    host.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn paired_encrypted_companion_upload_resumes_and_uses_shared_candidate_import() {
+    let parent = temporary_directory("artifact-companion-upload");
+    let root = parent.join("world-store");
+    let host = start_host(&parent, &root);
+    let offer = host.begin_companion_pairing(std::time::Duration::from_secs(30)).unwrap();
+    let wrong_pin = CompanionServerIdentity::from_bytes([0; 32]);
+    let clocks = [ClockExchange {
+        client_send_ns: 100,
+        host_receive_ns: 120,
+        host_send_ns: 125,
+        client_receive_ns: 150,
+    }];
+    assert_eq!(
+        host.connect_companion(&offer, wrong_pin, &clocks).unwrap_err().reason(),
+        CompanionRejectReason::ServerIdentityMismatch
+    );
+    let connection = host
+        .connect_companion(&offer, offer.server_identity(), &clocks)
+        .expect("correct pin and bounded clocks pair");
+    assert_eq!(connection.clock_relation().offset_ns(), -2);
+    assert_eq!(connection.clock_relation().error_ns(), 23);
+    assert_eq!(
+        host.connect_companion(&offer, offer.server_identity(), &clocks).unwrap_err().reason(),
+        CompanionRejectReason::PairingUnavailable
+    );
+
+    let sealed = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
+    let chunks = connection.seal_upload(UploadId::from_bytes([9; 16]), sealed.bytes(), 64).unwrap();
+    let first = host.upload_companion_bytes(chunks[0].bytes()).unwrap();
+    assert!(matches!(first, UploadProgress::Pending { received_chunks: 1, .. }));
+    let duplicate = host.upload_companion_bytes(chunks[0].bytes()).unwrap();
+    assert_eq!(duplicate, first, "duplicate chunk is idempotent");
+
+    let mut final_progress = None;
+    for chunk in chunks.into_iter().skip(1) {
+        final_progress = Some(host.upload_companion_bytes(chunk.bytes()).unwrap());
+    }
+    let UploadProgress::Imported(receipt) = final_progress.unwrap() else {
+        panic!("resumed upload did not import its completed artifact");
+    };
+    assert_eq!(receipt.digest(), sealed.digest());
+    assert_eq!(receipt.origin(), whisper::ArtifactOrigin::Companion);
+    assert_eq!(host.export_artifact(sealed.digest()).unwrap().unwrap().as_ref(), sealed.bytes());
+
+    let mut invalid_calibration = calibration(sealed.digest());
+    invalid_calibration.rf_device_identity = "unknown-rx".into();
+    let invalid_calibration =
+        SealedArtifact::seal(Artifact::Calibration(invalid_calibration)).unwrap();
+    let invalid_chunks = connection
+        .seal_upload(
+            UploadId::from_bytes([10; 16]),
+            invalid_calibration.bytes(),
+            invalid_calibration.bytes().len(),
+        )
+        .unwrap();
+    let error = host.upload_companion_bytes(invalid_chunks[0].bytes()).unwrap_err();
+    assert_eq!(error.reason(), CompanionRejectReason::ArtifactRejected);
+    assert_eq!(error.artifact_reason(), Some(ArtifactRejectReason::UnknownRfIdentity));
+
+    host.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn companion_transport_rejects_tampered_ciphertext_without_importing() {
+    let parent = temporary_directory("artifact-companion-tamper");
+    let root = parent.join("world-store");
+    let host = start_host(&parent, &root);
+    let offer = host.begin_companion_pairing(std::time::Duration::from_secs(30)).unwrap();
+    let clocks = [ClockExchange {
+        client_send_ns: 100,
+        host_receive_ns: 120,
+        host_send_ns: 125,
+        client_receive_ns: 150,
+    }];
+    let connection = host.connect_companion(&offer, offer.server_identity(), &clocks).unwrap();
+    let sealed = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
+    let chunk = connection
+        .seal_upload(UploadId::from_bytes([4; 16]), sealed.bytes(), sealed.bytes().len())
+        .unwrap()
+        .remove(0);
+    let mut tampered = chunk.bytes().into_vec();
+    *tampered.last_mut().unwrap() ^= 1;
+
+    assert_eq!(
+        host.upload_companion_bytes(&tampered).unwrap_err().reason(),
+        CompanionRejectReason::AuthenticationFailed
+    );
+    assert!(host.query_artifact(sealed.digest()).unwrap().is_none());
+
+    host.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn companion_pairing_expires_and_clock_round_trip_is_bounded() {
+    let parent = temporary_directory("artifact-companion-expiry");
+    let root = parent.join("world-store");
+    let host = start_host(&parent, &root);
+    let invalid_clock = [ClockExchange {
+        client_send_ns: 1,
+        host_receive_ns: 2,
+        host_send_ns: 3,
+        client_receive_ns: 1_000_000_004,
+    }];
+    let offer = host.begin_companion_pairing(std::time::Duration::from_secs(30)).unwrap();
+    assert_eq!(
+        host.connect_companion(&offer, offer.server_identity(), &invalid_clock)
+            .unwrap_err()
+            .reason(),
+        CompanionRejectReason::InvalidClockRelation
+    );
+
+    let expired = host.begin_companion_pairing(std::time::Duration::from_nanos(1)).unwrap();
+    while SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        <= u128::from(expired.expires_utc_ns())
+    {
+        std::hint::spin_loop();
+    }
+    let valid_clock = [ClockExchange {
+        client_send_ns: 100,
+        host_receive_ns: 120,
+        host_send_ns: 125,
+        client_receive_ns: 150,
+    }];
+    assert_eq!(
+        host.connect_companion(&expired, expired.server_identity(), &valid_clock)
+            .unwrap_err()
+            .reason(),
+        CompanionRejectReason::PairingUnavailable
+    );
+
+    host.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+fn scene() -> SceneSnapshot {
+    SceneSnapshot {
+        artifact_id: "room-a".into(),
+        revision: 3,
+        world_coordinate_system: "arkit-world-42".into(),
+        geometry: vec![GeometryElement {
+            kind: GeometryKind::Wall,
+            vertices_m: vec![[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        }],
+        scan_coverage: 0.96,
+        map_error_m: 0.12,
+        usdz_display_reference: None,
+        provenance: sources(),
+    }
+}
+
+fn calibration(scene_digest: whisper::ArtifactDigest) -> CalibrationBundle {
+    CalibrationBundle {
+        artifact_id: "calibration-a".into(),
+        revision: 2,
+        scene_digest,
+        rf_device_identity: "rx-array-1".into(),
+        antenna_reference: "fiducial-11-to-array-origin".into(),
+        world_transform: CoordinateTransform {
+            source_coordinate_system: "array-1".into(),
+            target_coordinate_system: "arkit-world-42".into(),
+            matrix: [
+                1.0, 0.0, 0.0, 2.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.0, 1.0,
+            ],
+            max_error_m: 0.08,
+        },
+        ports: vec![PortCondition { port: 0, antenna_identity: "element-0".into() }],
+        phase_condition: PhaseCondition::PacketCoherent,
+        max_error_m: 0.14,
+        valid_from_utc_ns: 1_000,
+        valid_until_utc_ns: 9_000_000_000_000_000_000,
+        provenance: sources(),
+    }
+}
+
+fn supervision(scene_digest: whisper::ArtifactDigest) -> SupervisionSegment {
+    SupervisionSegment {
+        artifact_id: "labels-a".into(),
+        revision: 4,
+        scene_digest,
+        camera_intrinsics: [800.0, 0.0, 320.0, 0.0, 800.0, 240.0, 0.0, 0.0, 1.0],
+        samples: vec![SupervisionSample {
+            rgb_time_ns: 2_000,
+            depth_time_ns: 2_002,
+            pose_time_ns: 2_001,
+            maximum_time_error_ns: 5,
+            tracking_epoch: 7,
+            relocalized: true,
+            tracking_quality: TrackingQuality::Normal,
+            depth_quality: DepthQuality::Measured,
+            scope: LabelScope::LocallyVisible,
+            person_visibility: vec![0.9],
+            label: JointLabel::VisibleSet(vec![PersonLabel {
+                station: "station-3".into(),
+                pose: "standing".into(),
+                position_m: [1.2, 0.0, 2.0],
+                max_error_m: 0.16,
+            }]),
+        }],
+        shared_position_error_m: 0.1,
+        provenance: sources(),
+    }
+}
+
+fn sources() -> Vec<SourceIdentity> {
+    vec![SourceIdentity { namespace: "phone-capture".into(), identity: "capture-7".into() }]
+}
+
+fn start_host(parent: &std::path::Path, root: &std::path::Path) -> whisper::HostRuntime {
+    start_host_with_limits(parent, root, ArtifactLimits::default())
+}
+
+fn start_host_with_limits(
+    parent: &std::path::Path,
+    root: &std::path::Path,
+    artifact_limits: ArtifactLimits,
+) -> whisper::HostRuntime {
+    start_host_from_store(parent, Store::initialize(root).unwrap(), artifact_limits)
+}
+
+fn start_host_from_store(
+    parent: &std::path::Path,
+    store: Store,
+    artifact_limits: ArtifactLimits,
+) -> whisper::HostRuntime {
+    let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let secret_root = parent.join("secrets");
+    let device_root = secret_root.join("device-1");
+    fs::create_dir_all(&device_root).unwrap();
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&secret_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&device_root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let key_path = device_root.join("key-1.bin");
+    fs::write(&key_path, KEY).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let limits = AdmissionLimits::new(
+        DatagramBytes::try_from(753).unwrap(),
+        PacketsPerSecond::try_from(10).unwrap(),
+        AuthenticatedBytesPerSecond::try_from(10_000).unwrap(),
+        ReplayWindowPackets::try_from(64).unwrap(),
+    );
+    let route = NativeFrameRoute::load(
+        sender.local_addr().unwrap().ip(),
+        DeviceId::new(1),
+        KeyEpoch::new(1).unwrap(),
+        limits,
+        &secret_root,
+    )
+    .unwrap();
+    Host::builder(store, DeploymentId::try_from("lab").unwrap(), "127.0.0.1:0".parse().unwrap())
+        .route(route)
+        .artifact_limits(artifact_limits)
+        .known_rf_identity("rx-array-1")
+        .start()
+        .unwrap()
+}
+
+fn temporary_directory(label: &str) -> PathBuf {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let path = std::env::temp_dir().join(format!("whisper-{label}-{}-{nonce}", std::process::id()));
+    fs::create_dir(&path).unwrap();
+    path
+}

@@ -164,7 +164,7 @@ fn checkpoint_truncated_zero_byte_wal_with_live_shm_reopens_read_only() {
 fn wal_schema_objects_and_header_pragmas_are_validated_without_target_writes() {
     for (label, mutation) in [
         ("application-id", "PRAGMA application_id=1;"),
-        ("user-version", "PRAGMA user_version=2;"),
+        ("user-version", "PRAGMA user_version=3;"),
         ("view", "CREATE VIEW unexpected_facts AS SELECT * FROM raw_facts;"),
         (
             "trigger",

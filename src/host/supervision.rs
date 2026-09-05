@@ -11,6 +11,7 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
         completion,
         rejections,
         ready_sender: ready,
+        artifact_receiver,
     } = context;
     let overflow = Arc::new(OverflowSummary { count: AtomicU64::new(0) });
     let (ingress_sender, ingress_receiver) = mpsc::sync_channel(builder.ingress_capacity);
@@ -34,6 +35,7 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
             let result = writer_loop(
                 writer_config,
                 ingress_receiver,
+                artifact_receiver,
                 &writer_overflow,
                 &writer_rejections,
                 writer_ready_sender,

@@ -17,9 +17,9 @@ const LEASE_NAME: &str = ".whisper.lease";
 /// SQLite application identifier (`WRF1`) written at header offset 68. Changing
 /// it makes all existing Stores intentionally unrecognizable.
 const STORE_APPLICATION_ID: u32 = 0x5752_4631;
-/// Exact SQLite schema generation. Incrementing it requires an explicitly
-/// scoped migration; this ticket recognizes only newly initialized generation 1.
-const STORE_SCHEMA_VERSION: u32 = 1;
+/// Exact SQLite schema generation. Generation 2 adds the immutable spatial
+/// artifact registry and deliberately provides no migration from generation 1.
+const STORE_SCHEMA_VERSION: u32 = 2;
 /// SQLite's fixed database header size in bytes. Changing this file-format
 /// value would shift every recognition offset and misclassify database bytes.
 const SQLITE_HEADER_BYTES: usize = 100;
@@ -96,18 +96,32 @@ const RAW_LOSSES_SCHEMA: &str = "CREATE TABLE raw_losses (
                  first_sequence BLOB CHECK (first_sequence IS NULL OR (typeof(first_sequence) = 'blob' AND length(first_sequence) = 8)),
                  last_sequence BLOB CHECK (last_sequence IS NULL OR (typeof(last_sequence) = 'blob' AND length(last_sequence) = 8))
              ) STRICT";
-const EXPECTED_SCHEMA: [(&str, &str); 4] = [
+const SPATIAL_ARTIFACTS_SCHEMA: &str = "CREATE TABLE spatial_artifacts (
+                 artifact_row_id INTEGER PRIMARY KEY,
+                 digest BLOB NOT NULL UNIQUE CHECK (typeof(digest) = 'blob' AND length(digest) = 32),
+                 kind INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 3),
+                 artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0),
+                 revision INTEGER NOT NULL CHECK (revision BETWEEN 0 AND 4294967295),
+                 imported_utc_ns INTEGER NOT NULL CHECK (imported_utc_ns >= 0),
+                 origin TEXT NOT NULL CHECK (origin IN ('local', 'companion')),
+                 sealed_bytes BLOB NOT NULL CHECK (typeof(sealed_bytes) = 'blob'),
+                 UNIQUE (kind, artifact_id, revision)
+             ) STRICT";
+const EXPECTED_SCHEMA: [(&str, &str); 5] = [
     ("store_identity", STORE_IDENTITY_SCHEMA),
     ("replay_windows", REPLAY_WINDOWS_SCHEMA),
     ("raw_facts", RAW_FACTS_SCHEMA),
     ("raw_losses", RAW_LOSSES_SCHEMA),
+    ("spatial_artifacts", SPATIAL_ARTIFACTS_SCHEMA),
 ];
 // SQLite owns these implicit indexes for the declared UNIQUE and composite
 // PRIMARY KEY constraints. Their exact names, owning tables, and NULL SQL are
-// part of schema generation 1; any other SQLite-owned object is unrecognized.
-const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 2] = [
+// part of schema generation 2; any other SQLite-owned object is unrecognized.
+const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 4] = [
     ("sqlite_autoindex_raw_facts_1", "raw_facts"),
     ("sqlite_autoindex_replay_windows_1", "replay_windows"),
+    ("sqlite_autoindex_spatial_artifacts_1", "spatial_artifacts"),
+    ("sqlite_autoindex_spatial_artifacts_2", "spatial_artifacts"),
 ];
 
 trait Entropy {
@@ -144,6 +158,12 @@ impl fmt::Display for StoreId {
             write!(formatter, "{byte:02x}")?;
         }
         Ok(())
+    }
+}
+
+impl StoreId {
+    pub(crate) const fn as_bytes(&self) -> &[u8; STORE_ID_BYTES] {
+        &self.0
     }
 }
 

@@ -4,6 +4,7 @@ use super::*;
 pub(super) fn writer_loop(
     config: WriterConfig,
     ingress: mpsc::Receiver<AdmittedDatagram>,
+    artifacts: mpsc::Receiver<ArtifactCommand>,
     overflow: &OverflowSummary,
     rejections: &Mutex<VecDeque<RejectedDatagram>>,
     ready: mpsc::SyncSender<Result<(), HostError>>,
@@ -53,6 +54,12 @@ pub(super) fn writer_loop(
 
     loop {
         persist_overflow(&mut connection, &config.database_path, overflow, config.clock.as_ref())?;
+        match artifacts.try_recv() {
+            Ok(command) => {
+                persist_artifact(&mut connection, &config.database_path, command);
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
+        }
         match ingress.recv_timeout(SOCKET_POLL_INTERVAL) {
             Ok(item) => persist_admitted(
                 &mut connection,
@@ -71,6 +78,120 @@ pub(super) fn writer_loop(
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(|error| HostError::database_at(&config.database_path, error))?;
     Ok(())
+}
+
+fn persist_artifact(connection: &mut Connection, path: &Path, command: ArtifactCommand) {
+    let ArtifactCommand { sealed, artifact, imported_utc_ns, origin, limits, reply } = command;
+    let result = persist_artifact_inner(
+        connection,
+        path,
+        &sealed,
+        &artifact,
+        imported_utc_ns,
+        origin,
+        limits,
+    );
+    let _ = reply.send(result);
+}
+
+fn persist_artifact_inner(
+    connection: &mut Connection,
+    _path: &Path,
+    sealed: &SealedArtifact,
+    artifact: &Artifact,
+    imported_utc_ns: u64,
+    origin: ArtifactOrigin,
+    limits: ArtifactLimits,
+) -> Result<ImportedArtifact, ArtifactImportError> {
+    let digest = sealed.digest();
+    let existing: Option<(u8, String, u32, String)> = connection
+        .query_row(
+            "SELECT kind, artifact_id, revision, origin FROM spatial_artifacts WHERE digest = ?1",
+            [digest.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|_| artifact_persistence_error())?;
+    if let Some((kind, artifact_id, revision, retained_origin)) = existing {
+        let kind = ArtifactKind::from_code(kind).ok_or_else(artifact_persistence_error)?;
+        let origin = match retained_origin.as_str() {
+            "local" => ArtifactOrigin::Local,
+            "companion" => ArtifactOrigin::Companion,
+            _ => return Err(artifact_persistence_error()),
+        };
+        return Ok(ImportedArtifact::from_parts(digest, kind, artifact_id, revision, origin));
+    }
+    let count: usize = connection
+        .query_row("SELECT count(*) FROM spatial_artifacts", [], |row| row.get(0))
+        .map_err(|_| artifact_persistence_error())?;
+    if count >= limits.max_artifacts() {
+        return Err(ArtifactImportError::new(
+            ArtifactRejectReason::LimitExceeded,
+            "Store artifact count limit exceeded",
+        ));
+    }
+    if let Some(scene_digest) = artifact.referenced_scene() {
+        let scene_bytes: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT sealed_bytes FROM spatial_artifacts WHERE digest = ?1 AND kind = 1",
+                [scene_digest.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| artifact_persistence_error())?;
+        let Some(scene_bytes) = scene_bytes else {
+            return Err(ArtifactImportError::new(
+                ArtifactRejectReason::MissingScene,
+                "referenced scene has not been imported",
+            ));
+        };
+        let scene = SealedArtifact::parse(scene_bytes)
+            .and_then(|sealed| sealed.decode())
+            .map_err(|_| artifact_persistence_error())?;
+        let Artifact::Scene(scene) = scene else {
+            return Err(artifact_persistence_error());
+        };
+        artifact.validate_against_scene(&scene, limits)?;
+    }
+    let imported_utc_ns =
+        i64::try_from(imported_utc_ns).map_err(|_| artifact_persistence_error())?;
+    let revision = i64::from(artifact.revision());
+    let insert = connection.execute(
+        "INSERT INTO spatial_artifacts
+         (digest, kind, artifact_id, revision, imported_utc_ns, origin, sealed_bytes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            digest.as_bytes().as_slice(),
+            artifact.kind().code(),
+            artifact.artifact_id(),
+            revision,
+            imported_utc_ns,
+            origin.database_value(),
+            sealed.bytes(),
+        ],
+    );
+    match insert {
+        Ok(_) => Ok(ImportedArtifact::from_parts(
+            digest,
+            artifact.kind(),
+            artifact.artifact_id().to_owned(),
+            artifact.revision(),
+            origin,
+        )),
+        Err(error)
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) =>
+        {
+            Err(ArtifactImportError::new(
+                ArtifactRejectReason::IdentityConflict,
+                "artifact identity and revision already contain different bytes",
+            ))
+        }
+        Err(_) => Err(artifact_persistence_error()),
+    }
+}
+
+fn artifact_persistence_error() -> ArtifactImportError {
+    ArtifactImportError::new(ArtifactRejectReason::Persistence, "artifact Store operation failed")
 }
 
 fn load_replay_states_from_path(

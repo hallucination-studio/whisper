@@ -1,6 +1,36 @@
 //! Restricted local queries over committed raw facts and loss facts.
 
 use super::*;
+pub(super) fn query_artifact(
+    path: &Path,
+    digest: ArtifactDigest,
+) -> Result<Option<SealedArtifact>, HostError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| HostError::database_at(path, error))?;
+    let bytes: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT sealed_bytes FROM spatial_artifacts WHERE digest = ?1",
+            [digest.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))?;
+    bytes
+        .map(|bytes| {
+            SealedArtifact::parse(bytes).map_err(|_| {
+                HostError::message_at(
+                    "decode persisted spatial artifact",
+                    path,
+                    "persisted artifact bytes are invalid",
+                )
+            })
+        })
+        .transpose()
+}
+
 pub(super) fn query_raw(path: &Path, limit: usize) -> Result<Vec<RawFact>, HostError> {
     let connection = Connection::open_with_flags(
         path,
