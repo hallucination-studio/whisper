@@ -644,10 +644,26 @@ pub struct ArrayElementGeometry {
 /// Device-to-array relation and qualified physical element geometry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeviceArrayGeometry {
+    /// Source that measured the device and element geometry.
+    pub source: SourceIdentity,
+    /// RF mode or hardware configuration to which the geometry applies.
+    pub applicability: String,
+    /// Lowest applicable RF frequency in hertz.
+    pub minimum_frequency_hz: u64,
+    /// Highest applicable RF frequency in hertz.
+    pub maximum_frequency_hz: u64,
     /// Transform from device coordinates into array coordinates.
     pub device_to_array: CoordinateTransform,
     /// Physical antenna phase centres in array coordinates.
     pub elements: Vec<ArrayElementGeometry>,
+    /// Conservative physical element position error in metres.
+    pub maximum_position_error_m: f64,
+    /// First UTC instant for which this geometry is qualified.
+    pub valid_from_utc: UtcNanoseconds,
+    /// Last UTC instant for which this geometry is qualified.
+    pub valid_until_utc: UtcNanoseconds,
+    /// Independent geometry continuity epoch.
+    pub epoch: CalibrationEpoch,
 }
 
 /// A versioned RF device, antenna, transform, port, and phase calibration.
@@ -948,6 +964,8 @@ impl Artifact {
                     || calibration.world_transform.max_error_m > limits.max_position_error_m
                     || calibration.array_geometry.device_to_array.max_error_m
                         > limits.max_position_error_m
+                    || calibration.array_geometry.maximum_position_error_m
+                        > limits.max_position_error_m
                 {
                     return Err(ArtifactImportError::new(
                         ArtifactRejectReason::InvalidRelation,
@@ -1038,6 +1056,7 @@ impl Artifact {
                 if scene.map_error_m
                     + calibration.world_transform.max_error_m
                     + calibration.array_geometry.device_to_array.max_error_m
+                    + calibration.array_geometry.maximum_position_error_m
                     + calibration.max_error_m
                     > limits.max_position_error_m()
                 {
@@ -1346,6 +1365,18 @@ fn validate_calibration(calibration: &CalibrationBundle) -> Result<(), ArtifactE
     }
     validate_affine_transform(&calibration.array_geometry.device_to_array)?;
     require_nonnegative_finite(calibration.array_geometry.device_to_array.max_error_m)?;
+    validate_source(&calibration.array_geometry.source)?;
+    require_text(&calibration.array_geometry.applicability)?;
+    require_nonnegative_finite(calibration.array_geometry.maximum_position_error_m)?;
+    if calibration.array_geometry.minimum_frequency_hz == 0
+        || calibration.array_geometry.minimum_frequency_hz
+            > calibration.array_geometry.maximum_frequency_hz
+    {
+        return Err(ArtifactError::new("array geometry frequency range is invalid"));
+    }
+    if calibration.array_geometry.valid_from_utc >= calibration.array_geometry.valid_until_utc {
+        return Err(ArtifactError::new("array geometry validity interval is empty"));
+    }
     if calibration.array_geometry.device_to_array.target_coordinate_system
         != calibration.world_transform.source_coordinate_system
     {
@@ -1387,6 +1418,8 @@ fn validate_calibration(calibration: &CalibrationBundle) -> Result<(), ArtifactE
         || calibration.valid_until_utc > calibration.phase_relation.valid_until_utc
         || calibration.valid_from_utc < calibration.time_relation.valid_from_utc
         || calibration.valid_until_utc > calibration.time_relation.valid_until_utc
+        || calibration.valid_from_utc < calibration.array_geometry.valid_from_utc
+        || calibration.valid_until_utc > calibration.array_geometry.valid_until_utc
     {
         return Err(ArtifactError::new("calibration exceeds its phase or time relation validity"));
     }
@@ -1639,6 +1672,10 @@ fn encode_calibration(
     output.extend_from_slice(&calibration.world_transform.max_error_m.to_le_bytes());
     put_string(output, &calibration.array_condition.array_identity)?;
     output.extend_from_slice(&calibration.array_condition.physical_element_count.to_le_bytes());
+    encode_source(output, &calibration.array_geometry.source)?;
+    put_string(output, &calibration.array_geometry.applicability)?;
+    output.extend_from_slice(&calibration.array_geometry.minimum_frequency_hz.to_le_bytes());
+    output.extend_from_slice(&calibration.array_geometry.maximum_frequency_hz.to_le_bytes());
     encode_transform(output, &calibration.array_geometry.device_to_array)?;
     put_len(output, calibration.array_geometry.elements.len())?;
     for element in &calibration.array_geometry.elements {
@@ -1647,6 +1684,10 @@ fn encode_calibration(
             output.extend_from_slice(&coordinate.to_le_bytes());
         }
     }
+    output.extend_from_slice(&calibration.array_geometry.maximum_position_error_m.to_le_bytes());
+    output.extend_from_slice(&calibration.array_geometry.valid_from_utc.get().to_le_bytes());
+    output.extend_from_slice(&calibration.array_geometry.valid_until_utc.get().to_le_bytes());
+    output.extend_from_slice(&calibration.array_geometry.epoch.get().to_le_bytes());
     put_len(output, calibration.signal_paths.len())?;
     for path in &calibration.signal_paths {
         put_string(output, &path.logical_path)?;
@@ -1689,6 +1730,10 @@ fn decode_calibration(reader: &mut Reader<'_>) -> Result<CalibrationBundle, Arti
     let max_transform_error = reader.f64()?;
     let array_condition =
         ArrayCondition { array_identity: reader.string()?, physical_element_count: reader.u16()? };
+    let geometry_source = decode_source(reader)?;
+    let geometry_applicability = reader.string()?;
+    let minimum_frequency_hz = reader.u64()?;
+    let maximum_frequency_hz = reader.u64()?;
     let device_to_array = decode_transform(reader)?;
     let element_count = reader.len()?;
     let mut elements = Vec::with_capacity(element_count);
@@ -1698,6 +1743,10 @@ fn decode_calibration(reader: &mut Reader<'_>) -> Result<CalibrationBundle, Arti
             position_m: [reader.f64()?, reader.f64()?, reader.f64()?],
         });
     }
+    let maximum_position_error_m = reader.f64()?;
+    let geometry_valid_from_utc = reader.u64()?.into();
+    let geometry_valid_until_utc = reader.u64()?.into();
+    let geometry_epoch = CalibrationEpoch::new(reader.u32()?);
     let path_count = reader.len()?;
     let mut signal_paths = Vec::with_capacity(path_count);
     for _ in 0..path_count {
@@ -1743,7 +1792,18 @@ fn decode_calibration(reader: &mut Reader<'_>) -> Result<CalibrationBundle, Arti
         },
         signal_paths,
         array_condition,
-        array_geometry: DeviceArrayGeometry { device_to_array, elements },
+        array_geometry: DeviceArrayGeometry {
+            source: geometry_source,
+            applicability: geometry_applicability,
+            minimum_frequency_hz,
+            maximum_frequency_hz,
+            device_to_array,
+            elements,
+            maximum_position_error_m,
+            valid_from_utc: geometry_valid_from_utc,
+            valid_until_utc: geometry_valid_until_utc,
+            epoch: geometry_epoch,
+        },
         phase_relation,
         time_relation,
         max_error_m: reader.f64()?,

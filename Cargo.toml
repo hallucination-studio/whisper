@@ -22,10 +22,13 @@ license = "MIT"
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
 getrandom = { version = "0.3.4", default-features = false, features = ["std"] }
+hkdf = { version = "0.12.4", default-features = false }
+hmac = { version = "0.12.1", default-features = false }
 libc = "0.2.189"
 rusqlite = { version = "0.37.0", default-features = false, features = ["bundled"] }
 rustix = { version = "1.1.2", default-features = false, features = ["process"] }
 sha2 = "0.10.9"
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets"] }
 thiserror = "2.0.17"
 
 [workspace.lints.rust]
@@ -42,9 +45,12 @@ undocumented_unsafe_blocks = "deny"
 aes-gcm.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
 sha2.workspace = true
+x25519-dalek.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]

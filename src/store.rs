@@ -700,25 +700,29 @@ fn write_companion_signing_seed(root: &Path, signing_seed: &[u8; 32]) -> Result<
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(FILE_MODE).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    let mut file = options.open(&path).map_err(|source| io_error(root, source))?;
+    let mut file = options.open(&path).map_err(|source| io_error(&path, source))?;
     use std::io::Write;
-    file.write_all(signing_seed).map_err(|source| io_error(root, source))?;
-    set_file_permissions(&path).map_err(|_| StoreError::from(StoreErrorKind::Untrusted))?;
-    file.sync_all().map_err(|source| io_error(root, source))
+    file.write_all(signing_seed).map_err(|source| io_error(&path, source))?;
+    set_file_permissions(&path)?;
+    file.sync_all().map_err(|source| io_error(&path, source))
 }
 
 fn read_companion_signing_seed(root: &Path) -> Result<[u8; 32], StoreError> {
     let path = root.join(COMPANION_SIGNING_SEED_NAME);
     validate_regular_file(&path)?;
     let mut signing_seed = [0_u8; 32];
-    let mut file = File::open(&path).map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-    file.read_exact(&mut signing_seed)
-        .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+    let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
+    if let Err(source) = file.read_exact(&mut signing_seed) {
+        if source.kind() == io::ErrorKind::UnexpectedEof {
+            return Err(StoreErrorKind::Unrecognized.into());
+        }
+        return Err(io_error(&path, source));
+    }
     let mut trailing = [0_u8; 1];
     match file.read(&mut trailing) {
         Ok(0) => Ok(signing_seed),
         Ok(_) => Err(StoreErrorKind::Unrecognized.into()),
-        Err(_) => Err(StoreErrorKind::Unrecognized.into()),
+        Err(source) => Err(io_error(&path, source)),
     }
 }
 
@@ -806,6 +810,7 @@ fn database_error(source: rusqlite::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -873,6 +878,38 @@ mod tests {
         let store_source = std::error::Error::source(&error).unwrap();
         assert!(store_source.source().is_some());
         assert_eq!(fs::read(database).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn signing_seed_open_failure_retains_seed_path_and_io_source() {
+        let root = root("signing-seed-open-failure");
+        fs::create_dir(&root).unwrap();
+        write_companion_signing_seed(&root, &[1; 32]).unwrap();
+
+        let error = write_companion_signing_seed(&root, &[2; 32]).unwrap_err();
+        let expected_path = root.join(COMPANION_SIGNING_SEED_NAME);
+        assert!(error.to_string().contains(expected_path.to_str().unwrap()));
+        assert_eq!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .map(io::Error::kind),
+            Some(io::ErrorKind::AlreadyExists)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_seed_chmod_failure_is_an_io_error_with_seed_path() {
+        let root = root("signing-seed-chmod-failure");
+        fs::create_dir(&root).unwrap();
+        let seed_path = root.join(COMPANION_SIGNING_SEED_NAME);
+
+        let error = set_file_permissions(&seed_path).unwrap_err();
+        assert!(error.to_string().contains(seed_path.to_str().unwrap()));
+        assert!(error.source().and_then(|source| source.downcast_ref::<io::Error>()).is_some());
         fs::remove_dir_all(root).unwrap();
     }
 }

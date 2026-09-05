@@ -631,8 +631,9 @@ impl HostRuntime {
         let expires = now.checked_add(duration).ok_or_else(companion_clock_error)?;
         let id = secure_random::<16>(self.companion_entropy.as_ref())?;
         let code = secure_random::<16>(self.companion_entropy.as_ref())?;
+        let server_ephemeral_secret = secure_random::<32>(self.companion_entropy.as_ref())?;
         let mut companion = self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        companion.offer(now.into(), id, code, expires.into())
+        companion.offer(now.into(), id, code, server_ephemeral_secret, expires.into())
     }
 
     /// Returns the Store-stable public identity companion clients must pin.
