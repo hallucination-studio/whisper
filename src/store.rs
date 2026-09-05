@@ -18,8 +18,8 @@ const LEASE_NAME: &str = ".whisper.lease";
 /// it makes all existing Stores intentionally unrecognizable.
 const STORE_APPLICATION_ID: u32 = 0x5752_4631;
 /// Exact SQLite schema generation. Incrementing it requires an explicitly
-/// scoped migration; this ticket recognizes only newly initialized generation 1.
-const STORE_SCHEMA_VERSION: u32 = 1;
+/// scoped migration; this ticket recognizes only newly initialized generation 2.
+const STORE_SCHEMA_VERSION: u32 = 2;
 /// SQLite's fixed database header size in bytes. Changing this file-format
 /// value would shift every recognition offset and misclassify database bytes.
 const SQLITE_HEADER_BYTES: usize = 100;
@@ -58,8 +58,8 @@ const WAL_INDEX_REGION_BYTES: u64 = 32_768;
 const WAL_MAGIC_VALUES: [u32; 2] = [0x377f_0682, 0x377f_0683];
 
 // These canonical DDL strings are both creation input and exact recognition
-// identity. Fixed widths are protocol/schema bytes (Store 16, digest/identity
-// 32, device/sequence 8, boot 4, epoch 2); changing any literal changes the
+// identity. Fixed widths are protocol/schema bytes (Store 16, digest 32,
+// identity/counter 8, boot 4, epoch 2); changing any literal changes the
 // accepted persistence contract and therefore requires a schema generation.
 const STORE_IDENTITY_SCHEMA: &str = "CREATE TABLE store_identity (
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -96,15 +96,62 @@ const RAW_LOSSES_SCHEMA: &str = "CREATE TABLE raw_losses (
                  first_sequence BLOB CHECK (first_sequence IS NULL OR (typeof(first_sequence) = 'blob' AND length(first_sequence) = 8)),
                  last_sequence BLOB CHECK (last_sequence IS NULL OR (typeof(last_sequence) = 'blob' AND length(last_sequence) = 8))
              ) STRICT";
-const EXPECTED_SCHEMA: [(&str, &str); 4] = [
+const NATIVE_CAPABILITY_FACTS_SCHEMA: &str = "CREATE TABLE native_capability_facts (
+                 fact_id INTEGER PRIMARY KEY REFERENCES raw_facts(fact_id),
+                 capability_digest BLOB NOT NULL CHECK (typeof(capability_digest) = 'blob' AND length(capability_digest) = 32),
+                 firmware_build_digest BLOB NOT NULL CHECK (typeof(firmware_build_digest) = 'blob' AND length(firmware_build_digest) = 32),
+                 idf_wifi_abi_digest BLOB NOT NULL CHECK (typeof(idf_wifi_abi_digest) = 'blob' AND length(idf_wifi_abi_digest) = 32),
+                 datagram_budget_bytes INTEGER NOT NULL CHECK (datagram_budget_bytes BETWEEN 753 AND 65535)
+             ) STRICT";
+const NATIVE_CSI_FACTS_SCHEMA: &str = "CREATE TABLE native_csi_facts (
+                 fact_id INTEGER PRIMARY KEY REFERENCES raw_facts(fact_id),
+                 capability_digest BLOB NOT NULL CHECK (typeof(capability_digest) = 'blob' AND length(capability_digest) = 32),
+                 capture_sequence BLOB NOT NULL CHECK (typeof(capture_sequence) = 'blob' AND length(capture_sequence) = 8 AND capture_sequence <> zeroblob(8)),
+                 driver_rx_timestamp_us INTEGER NOT NULL CHECK (driver_rx_timestamp_us BETWEEN 0 AND 4294967295),
+                 callback_tick_us BLOB NOT NULL CHECK (typeof(callback_tick_us) = 'blob' AND length(callback_tick_us) = 8),
+                 source_mac BLOB NOT NULL CHECK (typeof(source_mac) = 'blob' AND length(source_mac) = 6),
+                 channel INTEGER NOT NULL CHECK (channel BETWEEN 1 AND 14),
+                 secondary INTEGER NOT NULL CHECK (secondary BETWEEN 0 AND 2),
+                 phy INTEGER NOT NULL CHECK (phy BETWEEN 1 AND 2),
+                 bandwidth INTEGER NOT NULL CHECK (bandwidth BETWEEN 1 AND 2),
+                 stbc INTEGER NOT NULL CHECK (stbc IN (0, 1)),
+                 rssi_dbm INTEGER NOT NULL CHECK (rssi_dbm BETWEEN -128 AND 127),
+                 noise_floor_dbm INTEGER NOT NULL CHECK (noise_floor_dbm BETWEEN -128 AND 127),
+                 rate INTEGER NOT NULL CHECK (rate BETWEEN 0 AND 255),
+                 mcs INTEGER NOT NULL CHECK (mcs BETWEEN 0 AND 255),
+                 rx_antenna INTEGER NOT NULL CHECK (rx_antenna BETWEEN 0 AND 1),
+                 first_invalid_bytes INTEGER NOT NULL CHECK (first_invalid_bytes IN (0, 4)),
+                 trailing_invalid_bytes INTEGER NOT NULL CHECK (trailing_invalid_bytes IN (0, 2)),
+                 complex_sample_count INTEGER NOT NULL CHECK (complex_sample_count BETWEEN 1 AND 65535),
+                 blocks BLOB NOT NULL CHECK (typeof(blocks) = 'blob' AND length(blocks) BETWEEN 6 AND 18 AND length(blocks) % 6 = 0),
+                 raw_csi BLOB NOT NULL CHECK (typeof(raw_csi) = 'blob' AND length(raw_csi) <= 612)
+             ) STRICT";
+const NATIVE_HEALTH_FACTS_SCHEMA: &str = "CREATE TABLE native_health_facts (
+                 fact_id INTEGER PRIMARY KEY REFERENCES raw_facts(fact_id),
+                 capability_digest BLOB NOT NULL CHECK (typeof(capability_digest) = 'blob' AND length(capability_digest) = 32),
+                 callback_tick_us BLOB NOT NULL CHECK (typeof(callback_tick_us) = 'blob' AND length(callback_tick_us) = 8),
+                 capture_seen BLOB NOT NULL CHECK (typeof(capture_seen) = 'blob' AND length(capture_seen) = 8),
+                 queue_drop_no_slot BLOB NOT NULL CHECK (typeof(queue_drop_no_slot) = 'blob' AND length(queue_drop_no_slot) = 8),
+                 queue_drop_full BLOB NOT NULL CHECK (typeof(queue_drop_full) = 'blob' AND length(queue_drop_full) = 8),
+                 oversize_reject BLOB NOT NULL CHECK (typeof(oversize_reject) = 'blob' AND length(oversize_reject) = 8),
+                 encode_reject BLOB NOT NULL CHECK (typeof(encode_reject) = 'blob' AND length(encode_reject) = 8),
+                 send_failure BLOB NOT NULL CHECK (typeof(send_failure) = 'blob' AND length(send_failure) = 8),
+                 pool_high_water_slots INTEGER NOT NULL CHECK (pool_high_water_slots BETWEEN 0 AND 65535),
+                 callback_max_us INTEGER NOT NULL CHECK (callback_max_us BETWEEN 0 AND 4294967295),
+                 encoder_max_us INTEGER NOT NULL CHECK (encoder_max_us BETWEEN 0 AND 4294967295)
+             ) STRICT";
+const EXPECTED_SCHEMA: [(&str, &str); 7] = [
     ("store_identity", STORE_IDENTITY_SCHEMA),
     ("replay_windows", REPLAY_WINDOWS_SCHEMA),
     ("raw_facts", RAW_FACTS_SCHEMA),
     ("raw_losses", RAW_LOSSES_SCHEMA),
+    ("native_capability_facts", NATIVE_CAPABILITY_FACTS_SCHEMA),
+    ("native_csi_facts", NATIVE_CSI_FACTS_SCHEMA),
+    ("native_health_facts", NATIVE_HEALTH_FACTS_SCHEMA),
 ];
 // SQLite owns these implicit indexes for the declared UNIQUE and composite
 // PRIMARY KEY constraints. Their exact names, owning tables, and NULL SQL are
-// part of schema generation 1; any other SQLite-owned object is unrecognized.
+// part of schema generation 2; any other SQLite-owned object is unrecognized.
 const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 2] = [
     ("sqlite_autoindex_raw_facts_1", "raw_facts"),
     ("sqlite_autoindex_replay_windows_1", "replay_windows"),

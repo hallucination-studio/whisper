@@ -1,6 +1,9 @@
 //! Sole-writer transaction A and durable replay-state persistence.
 
 use super::*;
+use crate::native_frame::{
+    LTF_BLOCK_BYTES, LtfBlock, LtfKind, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
+};
 pub(super) fn writer_loop(
     config: WriterConfig,
     ingress: mpsc::Receiver<AdmittedDatagram>,
@@ -257,6 +260,21 @@ fn persist_admitted(
             ],
         )
         .map_err(|error| HostError::database_at(path, error))?;
+    let fact_id = transaction.last_insert_rowid();
+    let semantic_rejection = match decode_authenticated(&item.authenticated) {
+        Ok(decoded) => persist_typed_fact(&transaction, path, fact_id, &item, decoded.message())?,
+        Err(error) => Some(match error {
+            crate::native_frame::WireError::UnknownKind { .. } => RejectReason::UnknownKind,
+            crate::native_frame::WireError::MalformedBody { .. } => RejectReason::MalformedBody,
+            _ => {
+                return Err(HostError::message_at(
+                    "decode authenticated native-frame",
+                    path,
+                    "authenticated datagram failed after ingress authentication",
+                ));
+            }
+        }),
+    };
     persist_sequence_discontinuity(&transaction, path, previous, &item)?;
     transaction
         .execute(
@@ -273,7 +291,255 @@ fn persist_admitted(
         .map_err(|error| HostError::database_at(path, error))?;
     transaction.commit().map_err(|error| HostError::database_at(path, error))?;
     state.admission = next;
+    if let Some(reason) = semantic_rejection {
+        record_rejection(rejections, item.peer, reason);
+    }
     Ok(())
+}
+
+fn persist_typed_fact(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &Path,
+    fact_id: i64,
+    item: &AdmittedDatagram,
+    message: &Message,
+) -> Result<Option<RejectReason>, HostError> {
+    match message {
+        Message::Capabilities(capability) => {
+            if let Some(expected) = previous_capability_digest(transaction, &item.header, fact_id)
+                .map_err(|error| HostError::database_at(path, error))?
+                && expected != capability.capability_digest()
+            {
+                return Ok(Some(RejectReason::CapabilityConflict));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO native_capability_facts (
+                         fact_id, capability_digest, firmware_build_digest,
+                         idf_wifi_abi_digest, datagram_budget_bytes
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        fact_id,
+                        capability.capability_digest(),
+                        capability.descriptor().firmware_build_digest(),
+                        capability.descriptor().idf_wifi_abi_digest(),
+                        capability.descriptor().datagram_budget_bytes(),
+                    ],
+                )
+                .map_err(|error| HostError::database_at(path, error))?;
+            Ok(None)
+        }
+        Message::CsiData(data) => {
+            let Some(expected) = previous_capability_digest(transaction, &item.header, fact_id)
+                .map_err(|error| HostError::database_at(path, error))?
+            else {
+                return Ok(Some(RejectReason::CapabilityUnavailable));
+            };
+            if expected != data.capability_digest() {
+                return Ok(Some(RejectReason::CapabilityConflict));
+            }
+            if let Some(source_mac) = previous_csi_source(transaction, &item.header, fact_id)
+                .map_err(|error| HostError::database_at(path, error))?
+                && source_mac != data.source_mac()
+            {
+                return Ok(Some(RejectReason::SourceConflict));
+            }
+            if let Some(channel) = previous_csi_channel(transaction, &item.header, fact_id)
+                .map_err(|error| HostError::database_at(path, error))?
+                && channel != data.radio().channel()
+            {
+                return Ok(Some(RejectReason::RadioConflict));
+            }
+            let blocks = encode_blocks(data.blocks());
+            transaction
+                .execute(
+                    "INSERT INTO native_csi_facts (
+                         fact_id, capability_digest, capture_sequence,
+                         driver_rx_timestamp_us, callback_tick_us, source_mac,
+                         channel, secondary, phy, bandwidth, stbc, rssi_dbm,
+                         noise_floor_dbm, rate, mcs, rx_antenna,
+                         first_invalid_bytes, trailing_invalid_bytes,
+                         complex_sample_count, blocks, raw_csi
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                         ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                     )",
+                    params![
+                        fact_id,
+                        data.capability_digest(),
+                        data.capture_sequence().to_be_bytes(),
+                        data.driver_rx_timestamp_us(),
+                        data.callback_tick_us().to_be_bytes(),
+                        data.source_mac(),
+                        data.radio().channel(),
+                        secondary_byte(data.radio().secondary()),
+                        phy_byte(data.radio().phy()),
+                        bandwidth_byte(data.radio().bandwidth()),
+                        u8::from(data.radio().stbc()),
+                        data.radio().rssi_dbm(),
+                        data.radio().noise_floor_dbm(),
+                        data.radio().rate(),
+                        data.radio().mcs(),
+                        data.radio().rx_antenna(),
+                        data.first_invalid_bytes(),
+                        data.trailing_invalid_bytes(),
+                        data.complex_sample_count(),
+                        blocks,
+                        data.raw_csi(),
+                    ],
+                )
+                .map_err(|error| HostError::database_at(path, error))?;
+            Ok(None)
+        }
+        Message::Health(health) => {
+            if let Some(expected) = previous_capability_digest(transaction, &item.header, fact_id)
+                .map_err(|error| HostError::database_at(path, error))?
+                && expected != health.capability_digest()
+            {
+                return Ok(Some(RejectReason::CapabilityConflict));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO native_health_facts (
+                         fact_id, capability_digest, callback_tick_us, capture_seen,
+                         queue_drop_no_slot, queue_drop_full, oversize_reject,
+                         encode_reject, send_failure, pool_high_water_slots,
+                         callback_max_us, encoder_max_us
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        fact_id,
+                        health.capability_digest(),
+                        health.callback_tick_us().to_be_bytes(),
+                        health.capture_seen().to_be_bytes(),
+                        health.queue_drop_no_slot().to_be_bytes(),
+                        health.queue_drop_full().to_be_bytes(),
+                        health.oversize_reject().to_be_bytes(),
+                        health.encode_reject().to_be_bytes(),
+                        health.send_failure().to_be_bytes(),
+                        health.pool_high_water_slots(),
+                        health.callback_max_us(),
+                        health.encoder_max_us(),
+                    ],
+                )
+                .map_err(|error| HostError::database_at(path, error))?;
+            Ok(None)
+        }
+    }
+}
+
+fn previous_capability_digest(
+    connection: &rusqlite::Transaction<'_>,
+    header: &Header,
+    fact_id: i64,
+) -> Result<Option<[u8; 32]>, rusqlite::Error> {
+    let value: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT c.capability_digest
+             FROM native_capability_facts AS c
+             JOIN raw_facts AS f ON f.fact_id = c.fact_id
+             WHERE f.device_id = ?1 AND f.key_epoch = ?2
+               AND f.boot_generation = ?3 AND c.fact_id < ?4
+             ORDER BY c.fact_id DESC LIMIT 1",
+            params![
+                header.device_id().to_be_bytes(),
+                header.key_epoch().to_be_bytes(),
+                header.boot_generation().to_be_bytes(),
+                fact_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.map(|bytes| bytes.try_into().expect("Store schema validates capability digest width")))
+}
+
+fn previous_csi_source(
+    connection: &rusqlite::Transaction<'_>,
+    header: &Header,
+    fact_id: i64,
+) -> Result<Option<[u8; 6]>, rusqlite::Error> {
+    let value: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT c.source_mac
+             FROM native_csi_facts AS c
+             JOIN raw_facts AS f ON f.fact_id = c.fact_id
+             WHERE f.device_id = ?1 AND f.key_epoch = ?2
+               AND f.boot_generation = ?3 AND c.fact_id < ?4
+             ORDER BY c.fact_id DESC LIMIT 1",
+            params![
+                header.device_id().to_be_bytes(),
+                header.key_epoch().to_be_bytes(),
+                header.boot_generation().to_be_bytes(),
+                fact_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.map(|bytes| bytes.try_into().expect("Store schema validates source MAC width")))
+}
+
+fn previous_csi_channel(
+    connection: &rusqlite::Transaction<'_>,
+    header: &Header,
+    fact_id: i64,
+) -> Result<Option<u8>, rusqlite::Error> {
+    connection
+        .query_row(
+            "SELECT c.channel
+             FROM native_csi_facts AS c
+             JOIN raw_facts AS f ON f.fact_id = c.fact_id
+             WHERE f.device_id = ?1 AND f.key_epoch = ?2
+               AND f.boot_generation = ?3 AND c.fact_id < ?4
+             ORDER BY c.fact_id DESC LIMIT 1",
+            params![
+                header.device_id().to_be_bytes(),
+                header.key_epoch().to_be_bytes(),
+                header.boot_generation().to_be_bytes(),
+                fact_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
+fn encode_blocks(blocks: &[LtfBlock]) -> Box<[u8]> {
+    let mut encoded = Vec::with_capacity(blocks.len() * LTF_BLOCK_BYTES);
+    for block in blocks {
+        encoded.push(ltf_kind_byte(block.kind()));
+        encoded.push(0);
+        encoded.extend_from_slice(&block.sample_count().to_le_bytes());
+        encoded.extend_from_slice(&block.raw_offset_bytes().to_le_bytes());
+    }
+    encoded.into_boxed_slice()
+}
+
+fn ltf_kind_byte(kind: LtfKind) -> u8 {
+    match kind {
+        LtfKind::Lltf => 1,
+        LtfKind::HtLtf => 2,
+        LtfKind::StbcHtLtf => 3,
+    }
+}
+
+fn secondary_byte(kind: S3SecondaryKind) -> u8 {
+    match kind {
+        S3SecondaryKind::None => 0,
+        S3SecondaryKind::Above => 1,
+        S3SecondaryKind::Below => 2,
+    }
+}
+
+fn phy_byte(kind: S3PhyKind) -> u8 {
+    match kind {
+        S3PhyKind::NonHt => 1,
+        S3PhyKind::Ht => 2,
+    }
+}
+
+fn bandwidth_byte(kind: S3BandwidthKind) -> u8 {
+    match kind {
+        S3BandwidthKind::TwentyMhz => 1,
+        S3BandwidthKind::FortyMhz => 2,
+    }
 }
 
 fn persist_sequence_discontinuity(

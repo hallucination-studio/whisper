@@ -16,7 +16,11 @@ use sha2::{Digest, Sha256};
 
 use crate::admission::AdmissionLimits;
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
-use crate::native_frame::{Header, authenticate_datagram, parse_header};
+use crate::native_csi::{NativeCapabilityFact, NativeCsiFact, NativeFact, NativeHealthFact};
+use crate::native_frame::{
+    AuthenticatedDatagram, Header, Message, authenticate_datagram, decode_authenticated,
+    parse_header,
+};
 use crate::replay::{
     ReplayAdmission, ReplayDecision, ReplayIdentityError, ReplayStateError,
     derive_replay_window_identity,
@@ -438,6 +442,59 @@ impl HostRuntime {
         query_raw_losses(&self.database_path, limit)
     }
 
+    /// Queries at most `limit` committed capability, CSI, and health facts.
+    ///
+    /// Facts are returned oldest first within the newest requested suffix. Each
+    /// typed fact carries the digest of the exact raw datagram from which it was
+    /// derived.
+    ///
+    /// # Errors
+    ///
+    /// The limit must be between one and 1,024, and the Store must remain readable.
+    pub fn query_native_facts(&self, limit: usize) -> Result<Vec<NativeFact>, HostError> {
+        validate_native_query_limit(limit)?;
+        query_native_facts(&self.database_path, limit)
+    }
+
+    /// Queries at most `limit` capability-qualified native CSI observations.
+    ///
+    /// Facts are returned oldest first within the newest requested suffix.
+    ///
+    /// # Errors
+    ///
+    /// The limit must be between one and 1,024, and the Store must remain readable.
+    pub fn query_native_csi(&self, limit: usize) -> Result<Vec<NativeCsiFact>, HostError> {
+        validate_native_query_limit(limit)?;
+        query_native_csi(&self.database_path, limit)
+    }
+
+    /// Queries at most `limit` persisted native capability declarations.
+    ///
+    /// Facts are returned oldest first within the newest requested suffix.
+    ///
+    /// # Errors
+    ///
+    /// The limit must be between one and 1,024, and the Store must remain readable.
+    pub fn query_native_capabilities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<NativeCapabilityFact>, HostError> {
+        validate_native_query_limit(limit)?;
+        query_native_capabilities(&self.database_path, limit)
+    }
+
+    /// Queries at most `limit` persisted native health reports.
+    ///
+    /// Facts are returned oldest first within the newest requested suffix.
+    ///
+    /// # Errors
+    ///
+    /// The limit must be between one and 1,024, and the Store must remain readable.
+    pub fn query_native_health(&self, limit: usize) -> Result<Vec<NativeHealthFact>, HostError> {
+        validate_native_query_limit(limit)?;
+        query_native_health(&self.database_path, limit)
+    }
+
     /// Returns a bounded newest suffix of non-authoritative rejection diagnostics.
     ///
     /// # Errors
@@ -493,7 +550,7 @@ pub struct RawFact {
     datagram: Box<[u8]>,
 }
 
-/// Classification of a datagram excluded from the authoritative raw log.
+/// Classification emitted when ingress or semantic admission rejects a datagram.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RejectReason {
     /// The datagram exceeded the configured receive budget.
@@ -510,6 +567,18 @@ pub enum RejectReason {
     Replay,
     /// The bounded authenticated ingress queue had no available slot.
     IngressQueueFull,
+    /// The authenticated kind byte is not a v1 body kind.
+    UnknownKind,
+    /// The authenticated body failed its selected v1 grammar.
+    MalformedBody,
+    /// A CSI body named no capability persisted earlier in its epoch.
+    CapabilityUnavailable,
+    /// The body capability identity conflicts with the epoch capability pin.
+    CapabilityConflict,
+    /// The authenticated CSI source identity conflicts with the epoch source pin.
+    SourceConflict,
+    /// The authenticated CSI radio channel conflicts with the epoch radio pin.
+    RadioConflict,
 }
 
 /// One bounded operational rejection diagnostic.
@@ -526,7 +595,7 @@ impl RejectedDatagram {
         self.peer
     }
 
-    /// Returns why no authoritative raw fact was committed.
+    /// Returns why this datagram was rejected; semantic rejects retain raw bytes.
     #[must_use]
     pub const fn reason(&self) -> RejectReason {
         self.reason
@@ -821,6 +890,7 @@ struct Completion {
 struct AdmittedDatagram {
     route_index: usize,
     header: Header,
+    authenticated: AuthenticatedDatagram,
     received_utc_ns: u64,
     peer: SocketAddr,
     bytes: Box<[u8]>,
@@ -963,7 +1033,20 @@ use ingress::reader_loop;
 mod persistence;
 use persistence::writer_loop;
 mod query;
-use query::{query_raw, query_raw_losses};
+use query::{
+    query_native_capabilities, query_native_csi, query_native_facts, query_native_health,
+    query_raw, query_raw_losses,
+};
+
+fn validate_native_query_limit(limit: usize) -> Result<(), HostError> {
+    if !(1..=MAXIMUM_RAW_QUERY_FACTS).contains(&limit) {
+        return Err(HostError::message_during(
+            "validate native-fact query",
+            "native-fact query limit must be between 1 and 1024",
+        ));
+    }
+    Ok(())
+}
 fn utc_now_ns(clock: &dyn Clock) -> Result<u64, HostError> {
     let elapsed = clock
         .wall_now()
