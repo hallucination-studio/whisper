@@ -60,10 +60,6 @@ fn public_validation_errors_retain_context_sources_and_backtraces() {
     assert_eq!(limit_error.unit(), "datagram bytes");
     let _ = limit_error.backtrace();
 
-    let limits_error = AdmissionLimits::builder().build().unwrap_err();
-    assert_eq!(limits_error.missing_unit(), "datagram bytes");
-    let _ = limits_error.backtrace();
-
     let parent = temporary_directory("route-error-context");
     let secret_root = parent.join("missing-secret-root");
     let route_error = NativeFrameRoute::load(
@@ -74,8 +70,11 @@ fn public_validation_errors_retain_context_sources_and_backtraces() {
         &secret_root,
     )
     .unwrap_err();
-    assert_eq!(route_error.secret_root(), secret_root);
     assert_eq!(route_error.device_id(), device_id());
+    assert_eq!(route_error.key_epoch(), key_epoch());
+    let secret_text = secret_root.display().to_string();
+    assert!(!route_error.to_string().contains(&secret_text));
+    assert!(!format!("{route_error:?}").contains(&secret_text));
     assert!(std::error::Error::source(&route_error).is_some());
     let _ = route_error.backtrace();
     fs::remove_dir_all(parent).unwrap();
@@ -468,13 +467,12 @@ fn admission_limits(packets_per_second: u32) -> AdmissionLimits {
 }
 
 fn admission_limits_with(packets_per_second: u32, replay_window_packets: u16) -> AdmissionLimits {
-    AdmissionLimits::builder()
-        .datagram_bytes(DatagramBytes::try_from(1_200).unwrap())
-        .packets_per_second(PacketsPerSecond::try_from(packets_per_second).unwrap())
-        .authenticated_bytes_per_second(AuthenticatedBytesPerSecond::try_from(1_200_000).unwrap())
-        .replay_window_packets(ReplayWindowPackets::try_from(replay_window_packets).unwrap())
-        .build()
-        .unwrap()
+    AdmissionLimits::new(
+        DatagramBytes::try_from(1_200).unwrap(),
+        PacketsPerSecond::try_from(packets_per_second).unwrap(),
+        AuthenticatedBytesPerSecond::try_from(1_200_000).unwrap(),
+        ReplayWindowPackets::try_from(replay_window_packets).unwrap(),
+    )
 }
 
 #[cfg(unix)]

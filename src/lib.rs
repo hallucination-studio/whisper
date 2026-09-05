@@ -17,8 +17,8 @@ mod store;
 
 #[doc(inline)]
 pub use admission::{
-    AdmissionLimits, AdmissionLimitsBuilder, AdmissionLimitsError, AuthenticatedBytesPerSecond,
-    DatagramBytes, LimitValueError, PacketsPerSecond, ReplayWindowPackets,
+    AdmissionLimits, AuthenticatedBytesPerSecond, DatagramBytes, LimitValueError, PacketsPerSecond,
+    ReplayWindowPackets,
 };
 #[doc(inline)]
 pub use host::{

@@ -170,6 +170,10 @@ fn wal_schema_objects_and_header_pragmas_are_validated_without_target_writes() {
             "trigger",
             "CREATE TRIGGER unexpected_loss AFTER INSERT ON raw_losses BEGIN SELECT 1; END;",
         ),
+        (
+            "sqlite-sequence",
+            "CREATE TABLE transient_rowid (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE transient_rowid;",
+        ),
     ] {
         let parent = temporary_directory(&format!("store-wal-schema-{label}"));
         let root = parent.join("world-store");

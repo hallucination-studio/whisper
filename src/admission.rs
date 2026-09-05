@@ -181,14 +181,19 @@ pub struct AdmissionLimits {
 }
 
 impl AdmissionLimits {
-    /// Begins coherent construction of all four mandatory route limits.
+    /// Creates a complete route limit set from validated semantic units.
     #[must_use]
-    pub const fn builder() -> AdmissionLimitsBuilder {
-        AdmissionLimitsBuilder {
-            datagram_bytes: None,
-            packets_per_second: None,
-            authenticated_bytes_per_second: None,
-            replay_window_packets: None,
+    pub const fn new(
+        datagram_bytes: DatagramBytes,
+        packets_per_second: PacketsPerSecond,
+        authenticated_bytes_per_second: AuthenticatedBytesPerSecond,
+        replay_window_packets: ReplayWindowPackets,
+    ) -> Self {
+        Self {
+            datagram_bytes,
+            packets_per_second,
+            authenticated_bytes_per_second,
+            replay_window_packets,
         }
     }
 
@@ -216,100 +221,3 @@ impl AdmissionLimits {
         self.replay_window_packets
     }
 }
-
-/// Builder requiring all semantic route-limit units before admission can start.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AdmissionLimitsBuilder {
-    datagram_bytes: Option<DatagramBytes>,
-    packets_per_second: Option<PacketsPerSecond>,
-    authenticated_bytes_per_second: Option<AuthenticatedBytesPerSecond>,
-    replay_window_packets: Option<ReplayWindowPackets>,
-}
-
-impl AdmissionLimitsBuilder {
-    /// Sets the complete native-frame datagram budget.
-    #[must_use]
-    pub const fn datagram_bytes(mut self, value: DatagramBytes) -> Self {
-        self.datagram_bytes = Some(value);
-        self
-    }
-
-    /// Sets the authenticated packet budget per one-second period.
-    #[must_use]
-    pub const fn packets_per_second(mut self, value: PacketsPerSecond) -> Self {
-        self.packets_per_second = Some(value);
-        self
-    }
-
-    /// Sets the authenticated byte budget per one-second period.
-    #[must_use]
-    pub const fn authenticated_bytes_per_second(
-        mut self,
-        value: AuthenticatedBytesPerSecond,
-    ) -> Self {
-        self.authenticated_bytes_per_second = Some(value);
-        self
-    }
-
-    /// Sets the durable replay-window width in packets.
-    #[must_use]
-    pub const fn replay_window_packets(mut self, value: ReplayWindowPackets) -> Self {
-        self.replay_window_packets = Some(value);
-        self
-    }
-
-    /// Builds one complete route limit set.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first missing semantic unit; individual unit constructors
-    /// already enforce nonzero rates and the complete v1 datagram budget.
-    pub fn build(self) -> Result<AdmissionLimits, AdmissionLimitsError> {
-        Ok(AdmissionLimits {
-            datagram_bytes: self
-                .datagram_bytes
-                .ok_or_else(|| AdmissionLimitsError::missing("datagram bytes"))?,
-            packets_per_second: self
-                .packets_per_second
-                .ok_or_else(|| AdmissionLimitsError::missing("packets per second"))?,
-            authenticated_bytes_per_second: self
-                .authenticated_bytes_per_second
-                .ok_or_else(|| AdmissionLimitsError::missing("authenticated bytes per second"))?,
-            replay_window_packets: self
-                .replay_window_packets
-                .ok_or_else(|| AdmissionLimitsError::missing("replay window packets"))?,
-        })
-    }
-}
-
-/// Incomplete semantic route-limit construction.
-#[derive(Debug)]
-pub struct AdmissionLimitsError {
-    missing_unit: &'static str,
-    backtrace: Box<Backtrace>,
-}
-
-impl AdmissionLimitsError {
-    fn missing(missing_unit: &'static str) -> Self {
-        Self { missing_unit, backtrace: Box::new(Backtrace::capture()) }
-    }
-
-    /// Returns the required unit omitted from the builder.
-    #[must_use]
-    pub const fn missing_unit(&self) -> &'static str {
-        self.missing_unit
-    }
-
-    /// Returns the captured builder backtrace.
-    pub fn backtrace(&self) -> &Backtrace {
-        &self.backtrace
-    }
-}
-
-impl fmt::Display for AdmissionLimitsError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "native-frame admission limits are missing {}", self.missing_unit)
-    }
-}
-
-impl std::error::Error for AdmissionLimitsError {}

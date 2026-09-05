@@ -157,14 +157,11 @@ impl NativeFrameRoute {
                 peer,
                 device_id,
                 key_epoch,
-                secret_root,
                 "peer IP address must not be unspecified",
             ));
         }
-        let key =
-            load_epoch_key(secret_root, device_id.get(), key_epoch.get()).map_err(|source| {
-                RouteError::secret(peer, device_id, key_epoch, secret_root, source)
-            })?;
+        let key = load_epoch_key(secret_root, device_id.get(), key_epoch.get())
+            .map_err(|source| RouteError::secret(peer, device_id, key_epoch, source))?;
         Ok(Self { peer, device_id, key_epoch, key, limits })
     }
 }
@@ -176,7 +173,6 @@ pub struct RouteError {
     peer: IpAddr,
     device_id: DeviceId,
     key_epoch: KeyEpoch,
-    secret_root: PathBuf,
     backtrace: Box<Backtrace>,
 }
 
@@ -185,7 +181,6 @@ impl RouteError {
         peer: IpAddr,
         device_id: DeviceId,
         key_epoch: KeyEpoch,
-        secret_root: &Path,
         reason: &'static str,
     ) -> Self {
         Self {
@@ -193,7 +188,6 @@ impl RouteError {
             peer,
             device_id,
             key_epoch,
-            secret_root: secret_root.to_owned(),
             backtrace: Box::new(Backtrace::capture()),
         }
     }
@@ -202,7 +196,6 @@ impl RouteError {
         peer: IpAddr,
         device_id: DeviceId,
         key_epoch: KeyEpoch,
-        secret_root: &Path,
         source: SecretStoreError,
     ) -> Self {
         Self {
@@ -210,15 +203,8 @@ impl RouteError {
             peer,
             device_id,
             key_epoch,
-            secret_root: secret_root.to_owned(),
             backtrace: Box::new(Backtrace::capture()),
         }
-    }
-
-    /// Returns the secret-root path involved in route construction.
-    #[must_use]
-    pub fn secret_root(&self) -> &Path {
-        &self.secret_root
     }
 
     /// Returns the route peer involved in construction.
@@ -257,12 +243,8 @@ impl fmt::Display for RouteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "native-frame route peer {} device {} epoch {} under {}: {}",
-            self.peer,
-            self.device_id,
-            self.key_epoch,
-            self.secret_root.display(),
-            self.kind
+            "native-frame route peer {} device {} epoch {}: {}",
+            self.peer, self.device_id, self.key_epoch, self.kind
         )
     }
 }
@@ -1036,15 +1018,12 @@ mod tests {
     ];
 
     fn limits() -> AdmissionLimits {
-        AdmissionLimits::builder()
-            .datagram_bytes(DatagramBytes::try_from(1_200).unwrap())
-            .packets_per_second(PacketsPerSecond::try_from(1_000).unwrap())
-            .authenticated_bytes_per_second(
-                AuthenticatedBytesPerSecond::try_from(1_200_000).unwrap(),
-            )
-            .replay_window_packets(ReplayWindowPackets::try_from(64).unwrap())
-            .build()
-            .unwrap()
+        AdmissionLimits::new(
+            DatagramBytes::try_from(1_200).unwrap(),
+            PacketsPerSecond::try_from(1_000).unwrap(),
+            AuthenticatedBytesPerSecond::try_from(1_200_000).unwrap(),
+            ReplayWindowPackets::try_from(64).unwrap(),
+        )
     }
 
     fn route() -> NativeFrameRoute {

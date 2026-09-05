@@ -102,6 +102,13 @@ const EXPECTED_SCHEMA: [(&str, &str); 4] = [
     ("raw_facts", RAW_FACTS_SCHEMA),
     ("raw_losses", RAW_LOSSES_SCHEMA),
 ];
+// SQLite owns these implicit indexes for the declared UNIQUE and composite
+// PRIMARY KEY constraints. Their exact names, owning tables, and NULL SQL are
+// part of schema generation 1; any other SQLite-owned object is unrecognized.
+const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 2] = [
+    ("sqlite_autoindex_raw_facts_1", "raw_facts"),
+    ("sqlite_autoindex_replay_windows_1", "replay_windows"),
+];
 
 trait Entropy {
     fn source_path(&self) -> &Path;
@@ -510,27 +517,36 @@ fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
     if application_id != STORE_APPLICATION_ID || user_version != STORE_SCHEMA_VERSION {
         return Err(StoreErrorKind::Unrecognized.into());
     }
-    let total_user_objects: u32 = connection
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema
-             WHERE type IN ('table', 'index', 'view', 'trigger')
-               AND name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
-        )
+    let total_schema_objects: u32 = connection
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
         .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-    if total_user_objects != EXPECTED_SCHEMA.len() as u32 {
+    if total_schema_objects != (EXPECTED_SCHEMA.len() + EXPECTED_SQLITE_AUTO_INDEXES.len()) as u32 {
         return Err(StoreErrorKind::Unrecognized.into());
     }
     for (name, expected_sql) in EXPECTED_SCHEMA {
-        let actual_sql: String = connection
+        let (object_type, owning_table, actual_sql): (String, String, Option<String>) = connection
             .query_row(
-                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                "SELECT type, tbl_name, sql FROM sqlite_schema WHERE name = ?1",
                 [name],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-        if actual_sql != expected_sql {
+        if object_type != "table"
+            || owning_table != name
+            || actual_sql.as_deref() != Some(expected_sql)
+        {
+            return Err(StoreErrorKind::Unrecognized.into());
+        }
+    }
+    for (name, expected_table) in EXPECTED_SQLITE_AUTO_INDEXES {
+        let (object_type, owning_table, actual_sql): (String, String, Option<String>) = connection
+            .query_row(
+                "SELECT type, tbl_name, sql FROM sqlite_schema WHERE name = ?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+        if object_type != "index" || owning_table != expected_table || actual_sql.is_some() {
             return Err(StoreErrorKind::Unrecognized.into());
         }
     }
