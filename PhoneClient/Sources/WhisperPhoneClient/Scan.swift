@@ -656,7 +656,7 @@ public final class RoomPlanCaptureController: NSObject, RoomCaptureSessionDelega
     private var wasTrackingNormally = false
     private let worldCoordinateSystem = "roomplan-arkit-world"
 
-    public init() {
+    public override init() {
         let session = ARSession()
         self.session = session
         captureSession = RoomCaptureSession(arSession: session)
