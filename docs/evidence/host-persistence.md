@@ -14,3 +14,8 @@ evidence.
 The [prior evidence index](https://github.com/hallucination-studio/whisper/blob/671b39d4d518c3b6bbbc173352712b7af32ee7ad/docs/evidence/host-persistence.md) preserves
 the original revision-specific source and evidence claims. Retired ticket
 status and unexecuted targets there do not govern the new implementation.
+
+The [unified-check intentional-failure receipt](receipts/check-entry-a331dd5/README.md)
+records the repository command rejecting a controlled reintroduction of the
+retired Host binary target. It is software check-path evidence only, not an RF
+or device acceptance result.

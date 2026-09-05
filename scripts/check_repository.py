@@ -49,6 +49,9 @@ RETIRED_PRODUCTION_PATHS = (
     "src/timeline.rs",
 )
 PRESERVED_INPUTS = (
+    "docs/evidence/receipts/check-entry-a331dd5/README.md",
+    "docs/evidence/receipts/check-entry-a331dd5/intentional-domain-failure.log",
+    "docs/evidence/receipts/check-entry-a331dd5/receipt.json",
     "docs/evidence/receipts/demo-smoke-e151145/DemoSmokeReceipt.json",
     "docs/evidence/receipts/demo-smoke-e151145/README.md",
     "docs/evidence/receipts/demo-smoke-e151145/chrome.png",
