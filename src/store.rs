@@ -9,6 +9,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, params};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Stable Store database basename from the persistence layout contract.
 const DATABASE_NAME: &str = "facts.sqlite3";
@@ -314,8 +315,27 @@ impl std::error::Error for StoreOpenError {
 pub struct Store {
     root: PathBuf,
     id: StoreId,
-    companion_signing_seed: [u8; 32],
+    companion_signing_seed: Option<CompanionSigningSeed>,
     lease: File,
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub(crate) struct CompanionSigningSeed([u8; 32]);
+
+impl CompanionSigningSeed {
+    pub(crate) const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CompanionSigningSeed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompanionSigningSeed([REDACTED])")
+    }
 }
 
 impl fmt::Debug for Store {
@@ -380,12 +400,17 @@ impl Store {
             set_root_permissions(root)?;
             let lease = acquire_lease(root, true)?;
             let id = random_store_id(entropy)?;
-            let companion_signing_seed = random_bytes(entropy)?;
+            let companion_signing_seed = random_companion_signing_seed(entropy)?;
             write_companion_signing_seed(root, &companion_signing_seed)?;
             let database_path = root.join(DATABASE_NAME);
             initialize_database(&database_path, id)?;
             sync_directory(root)?;
-            Ok(Self { root: root.to_owned(), id, companion_signing_seed, lease })
+            Ok(Self {
+                root: root.to_owned(),
+                id,
+                companion_signing_seed: Some(companion_signing_seed),
+                lease,
+            })
         })();
 
         if result.is_err() {
@@ -426,7 +451,12 @@ impl Store {
             validate_wal_shape(&wal_path)?;
             validate_shm_shape(&shm_path, wal_path.exists())?;
             let id = validate_database_snapshot(&database_path, &wal_path, &shm_path, entropy)?;
-            Ok(Self { root: root.to_owned(), id, companion_signing_seed, lease })
+            Ok(Self {
+                root: root.to_owned(),
+                id,
+                companion_signing_seed: Some(companion_signing_seed),
+                lease,
+            })
         })()
         .map_err(|source| StoreOpenError {
             root: root.to_owned(),
@@ -445,8 +475,10 @@ impl Store {
         self.root.join(DATABASE_NAME)
     }
 
-    pub(crate) const fn companion_signing_seed(&self) -> &[u8; 32] {
-        &self.companion_signing_seed
+    pub(crate) fn take_companion_signing_seed(&mut self) -> CompanionSigningSeed {
+        self.companion_signing_seed
+            .take()
+            .expect("a Store transfers its companion signing seed only once")
     }
 
     pub(crate) fn database_snapshot(&self) -> io::Result<StoreSnapshot> {
@@ -694,7 +726,18 @@ fn random_bytes<const N: usize>(entropy: &dyn Entropy) -> Result<[u8; N], StoreE
     Ok(bytes)
 }
 
-fn write_companion_signing_seed(root: &Path, signing_seed: &[u8; 32]) -> Result<(), StoreError> {
+fn random_companion_signing_seed(
+    entropy: &dyn Entropy,
+) -> Result<CompanionSigningSeed, StoreError> {
+    let mut seed = CompanionSigningSeed::new([0; 32]);
+    entropy.fill(&mut seed.0).map_err(|source| io_error(entropy.source_path(), source))?;
+    Ok(seed)
+}
+
+fn write_companion_signing_seed(
+    root: &Path,
+    signing_seed: &CompanionSigningSeed,
+) -> Result<(), StoreError> {
     let path = root.join(COMPANION_SIGNING_SEED_NAME);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -702,17 +745,17 @@ fn write_companion_signing_seed(root: &Path, signing_seed: &[u8; 32]) -> Result<
     options.mode(FILE_MODE).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     let mut file = options.open(&path).map_err(|source| io_error(&path, source))?;
     use std::io::Write;
-    file.write_all(signing_seed).map_err(|source| io_error(&path, source))?;
+    file.write_all(signing_seed.as_bytes()).map_err(|source| io_error(&path, source))?;
     set_file_permissions(&path)?;
     file.sync_all().map_err(|source| io_error(&path, source))
 }
 
-fn read_companion_signing_seed(root: &Path) -> Result<[u8; 32], StoreError> {
+fn read_companion_signing_seed(root: &Path) -> Result<CompanionSigningSeed, StoreError> {
     let path = root.join(COMPANION_SIGNING_SEED_NAME);
     validate_regular_file(&path)?;
-    let mut signing_seed = [0_u8; 32];
+    let mut signing_seed = CompanionSigningSeed::new([0; 32]);
     let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
-    if let Err(source) = file.read_exact(&mut signing_seed) {
+    if let Err(source) = file.read_exact(&mut signing_seed.0) {
         if source.kind() == io::ErrorKind::UnexpectedEof {
             return Err(StoreErrorKind::Unrecognized.into());
         }
@@ -843,6 +886,12 @@ mod tests {
 
     #[test]
     fn initialization_uses_the_injected_entropy_capability() {
+        assert!(std::mem::needs_drop::<CompanionSigningSeed>());
+        let mut disposable_seed = CompanionSigningSeed::new([0xab; 32]);
+        assert_eq!(format!("{disposable_seed:?}"), "CompanionSigningSeed([REDACTED])");
+        disposable_seed.zeroize();
+        assert_eq!(disposable_seed.as_bytes(), &[0; 32]);
+
         let root = root("fixed");
         let store = Store::initialize_with_entropy(&root, &FixedEntropy(Ok(0x5a))).unwrap();
         assert_eq!(store.id, StoreId([0x5a; STORE_ID_BYTES]));
@@ -885,9 +934,10 @@ mod tests {
     fn signing_seed_open_failure_retains_seed_path_and_io_source() {
         let root = root("signing-seed-open-failure");
         fs::create_dir(&root).unwrap();
-        write_companion_signing_seed(&root, &[1; 32]).unwrap();
+        write_companion_signing_seed(&root, &CompanionSigningSeed::new([1; 32])).unwrap();
 
-        let error = write_companion_signing_seed(&root, &[2; 32]).unwrap_err();
+        let error =
+            write_companion_signing_seed(&root, &CompanionSigningSeed::new([2; 32])).unwrap_err();
         let expected_path = root.join(COMPANION_SIGNING_SEED_NAME);
         assert!(error.to_string().contains(expected_path.to_str().unwrap()));
         assert_eq!(

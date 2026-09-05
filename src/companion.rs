@@ -17,6 +17,7 @@ use crate::artifact::{
     ArtifactImportError, ArtifactRejectReason, ClockErrorNanoseconds, ClockOffsetNanoseconds,
     HostNanoseconds, ImportedArtifact, PhoneNanoseconds, PhoneTimeRelation, UtcNanoseconds,
 };
+use crate::store::CompanionSigningSeed;
 
 /// Maximum clock exchanges admitted by one pairing handshake.
 const MAX_CLOCK_EXCHANGES: usize = 8;
@@ -260,7 +261,7 @@ impl PairingId {
 }
 
 /// One-time secret displayed locally by the Host for companion pairing.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct PairingCode([u8; 16]);
 
 impl fmt::Debug for PairingCode {
@@ -284,7 +285,7 @@ impl PairingCode {
 
     /// Formats the one-time code for the explicit local display surface.
     #[must_use]
-    pub fn format_for_display(self) -> String {
+    pub fn format_for_display(&self) -> String {
         let mut displayed = String::with_capacity(39);
         use std::fmt::Write as _;
         for (index, byte) in self.0.iter().enumerate() {
@@ -350,8 +351,8 @@ impl PairingOffer {
 
     /// Returns the one-time code intended for local display or QR transfer.
     #[must_use]
-    pub const fn display_code(&self) -> PairingCode {
-        self.code
+    pub const fn display_code(&self) -> &PairingCode {
+        &self.code
     }
     /// Returns the server identity the companion must pin before connecting.
     #[must_use]
@@ -501,7 +502,7 @@ impl PairingInvitation {
             code_proof: [0; 32],
             clock_responses,
         };
-        request.code_proof = code_proof(&shared_secret, pairing_code, &request)?;
+        request.code_proof = code_proof(&shared_secret, &pairing_code, &request)?;
         Ok((
             request,
             PendingCompanionConnection {
@@ -851,7 +852,7 @@ impl PendingCompanionConnection {
             client_nonce: self.client_nonce,
             relation: response.clock_relation,
         };
-        let key = session_key(&self.shared_secret, self.pairing_code, &key_context)?;
+        let key = session_key(&self.shared_secret, &self.pairing_code, &key_context)?;
         let connection = CompanionConnection {
             pairing_id: self.pairing_id,
             session_id: response.session_id,
@@ -1197,7 +1198,6 @@ pub(crate) struct CompanionState {
     sessions: BTreeMap<[u8; 16], ServerSession>,
 }
 
-#[derive(Clone)]
 struct RetainedOffer {
     offer: PairingOffer,
     server_ephemeral_secret: ServerEphemeralSecret,
@@ -1285,8 +1285,8 @@ pub(crate) struct AssembledUpload {
 }
 
 impl CompanionState {
-    pub(crate) fn new(signing_seed: [u8; 32]) -> Self {
-        let signing_key = SigningKey::from_bytes(&signing_seed);
+    pub(crate) fn new(signing_seed: CompanionSigningSeed) -> Self {
+        let signing_key = SigningKey::from_bytes(signing_seed.as_bytes());
         let server_identity = CompanionServerIdentity::from_signing_key(&signing_key);
         Self { signing_key, server_identity, offers: BTreeMap::new(), sessions: BTreeMap::new() }
     }
@@ -1299,7 +1299,7 @@ impl CompanionState {
         &mut self,
         now_utc: UtcNanoseconds,
         id: [u8; 16],
-        code: [u8; 16],
+        code: PairingCode,
         server_ephemeral_secret: [u8; 32],
         expires_at_utc: UtcNanoseconds,
     ) -> Result<PairingOffer, CompanionError> {
@@ -1318,7 +1318,7 @@ impl CompanionState {
                 .to_bytes();
         let mut offer = PairingOffer {
             id: PairingId(id),
-            code: PairingCode(code),
+            code,
             server_identity: self.server_identity,
             expires_at_utc,
             server_ephemeral_public,
@@ -1383,7 +1383,7 @@ impl CompanionState {
                 "companion server identity does not match the pinned identity",
             ));
         }
-        let retained = self.offers.get(&request.pairing_id).cloned().ok_or_else(|| {
+        let retained = self.offers.get(&request.pairing_id).ok_or_else(|| {
             CompanionError::new(
                 CompanionRejectReason::PairingUnavailable,
                 "pairing offer is unavailable",
@@ -1400,7 +1400,7 @@ impl CompanionState {
                 .diffie_hellman(&X25519PublicKey::from(request.client_ephemeral_public))
                 .to_bytes(),
         )?;
-        verify_code_proof(&shared_secret, retained.offer.code, &request)?;
+        verify_code_proof(&shared_secret, &retained.offer.code, &request)?;
         let verifying_key =
             VerifyingKey::from_bytes(self.server_identity.as_bytes()).map_err(|source| {
                 CompanionError::signature("decode fixed companion server identity", source)
@@ -1446,7 +1446,8 @@ impl CompanionState {
             client_nonce: request.client_nonce,
             relation: clock_relation,
         };
-        let key = session_key(&shared_secret, retained.offer.code, &key_context)?;
+        let key = session_key(&shared_secret, &retained.offer.code, &key_context)?;
+        let expires_at_utc = retained.offer.expires_at_utc;
         use ed25519_dalek::Signer;
         let server_proof = self
             .signing_key
@@ -1465,7 +1466,7 @@ impl CompanionState {
             ServerSession {
                 key,
                 clock_relation,
-                expires_at_utc: retained.offer.expires_at_utc,
+                expires_at_utc,
                 uploads: BTreeMap::new(),
                 completed: BTreeMap::new(),
             },
@@ -1752,7 +1753,7 @@ struct SessionKeyContext {
 
 fn session_key(
     shared_secret: &SharedSecret,
-    code: PairingCode,
+    code: &PairingCode,
     context: &SessionKeyContext,
 ) -> Result<SessionKey, CompanionError> {
     let hkdf = Hkdf::<Sha256>::new(Some(code.expose_bytes()), shared_secret.0.as_bytes());
@@ -1814,7 +1815,7 @@ fn request_transcript(request: &CompanionHandshakeRequest) -> Vec<u8> {
 
 fn code_proof(
     shared_secret: &SharedSecret,
-    code: PairingCode,
+    code: &PairingCode,
     request: &CompanionHandshakeRequest,
 ) -> Result<[u8; 32], CompanionError> {
     let authentication_key = code_authentication_key(shared_secret, code)?;
@@ -1826,7 +1827,7 @@ fn code_proof(
 
 fn code_authentication_key(
     shared_secret: &SharedSecret,
-    code: PairingCode,
+    code: &PairingCode,
 ) -> Result<AuthenticationKey, CompanionError> {
     let hkdf = Hkdf::<Sha256>::new(Some(code.expose_bytes()), shared_secret.0.as_bytes());
     let mut authentication_key = SecretBytes::new([0; 32]);
@@ -1838,7 +1839,7 @@ fn code_authentication_key(
 
 fn verify_code_proof(
     shared_secret: &SharedSecret,
-    code: PairingCode,
+    code: &PairingCode,
     request: &CompanionHandshakeRequest,
 ) -> Result<(), CompanionError> {
     let authentication_key = code_authentication_key(shared_secret, code)?;
@@ -1990,10 +1991,17 @@ mod tests {
 
     #[test]
     fn pairing_and_connection_debug_output_redacts_secrets() {
-        let mut state = CompanionState::new([2; 32]);
-        let code = [7; 16];
+        assert!(std::mem::needs_drop::<PairingCode>());
+        let mut disposable_code = PairingCode::from_bytes([0xab; 16]);
+        assert_eq!(format!("{disposable_code:?}"), "PairingCode([REDACTED])");
+        disposable_code.zeroize();
+        assert_eq!(disposable_code.expose_bytes(), &[0; 16]);
+
+        let mut state = CompanionState::new(CompanionSigningSeed::new([2; 32]));
+        let code = PairingCode::from_bytes([7; 16]);
+        let code_bytes = *code.expose_bytes();
         let offer = state.offer(10.into(), [3; 16], code, [8; 32], 100.into()).unwrap();
-        assert!(!format!("{offer:?}").contains(&format!("{code:?}")));
+        assert!(!format!("{offer:?}").contains(&format!("{code_bytes:?}")));
         assert_eq!(offer.display_code().to_string(), "[REDACTED]");
         let nonce = ClientNonce::from_bytes([5; 32]);
         let mut responses = Vec::new();
@@ -2017,7 +2025,7 @@ mod tests {
             PairingInvitation::from_wire(&offer.to_wire(), offer.server_identity()).unwrap();
         let (request, pending) = invitation
             .begin_handshake(
-                offer.code,
+                offer.code.clone(),
                 nonce,
                 ClientEphemeralSecret::from_bytes([9; 32]).unwrap(),
                 responses,

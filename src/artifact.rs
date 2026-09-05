@@ -972,21 +972,10 @@ impl Artifact {
                         "calibration error exceeds the conservative position budget",
                     ));
                 }
-                let matrix = &calibration.world_transform.matrix;
-                if matrix[12] != 0.0 || matrix[13] != 0.0 || matrix[14] != 0.0 || matrix[15] != 1.0
-                {
+                if !has_invertible_affine_matrix(&calibration.world_transform.matrix) {
                     return Err(ArtifactImportError::new(
                         ArtifactRejectReason::InvalidRelation,
-                        "coordinate transform is not affine homogeneous",
-                    ));
-                }
-                let determinant = matrix[0] * (matrix[5] * matrix[10] - matrix[6] * matrix[9])
-                    - matrix[1] * (matrix[4] * matrix[10] - matrix[6] * matrix[8])
-                    + matrix[2] * (matrix[4] * matrix[9] - matrix[5] * matrix[8]);
-                if determinant.abs() <= f64::EPSILON {
-                    return Err(ArtifactImportError::new(
-                        ArtifactRejectReason::InvalidRelation,
-                        "coordinate transform is singular",
+                        "coordinate transform is non-finite, non-affine, or singular",
                     ));
                 }
             }
@@ -1345,11 +1334,6 @@ fn validate_calibration(calibration: &CalibrationBundle) -> Result<(), ArtifactE
     validate_metadata(&calibration.metadata)?;
     require_text(&calibration.rf_device_identity)?;
     require_text(&calibration.antenna_reference)?;
-    require_text(&calibration.world_transform.source_coordinate_system)?;
-    require_text(&calibration.world_transform.target_coordinate_system)?;
-    if calibration.world_transform.matrix.iter().any(|value| !value.is_finite()) {
-        return Err(ArtifactError::new("coordinate transform must contain finite values"));
-    }
     validate_affine_transform(&calibration.world_transform)?;
     require_nonnegative_finite(calibration.world_transform.max_error_m)?;
     require_nonnegative_finite(calibration.max_error_m)?;
@@ -1449,11 +1433,6 @@ fn validate_supervision(supervision: &SupervisionSegment) -> Result<(), Artifact
         require_text(&sample.sample_source.namespace)?;
         require_text(&sample.sample_source.identity)?;
         require_nonnegative_finite(sample.joint_error_m)?;
-        require_text(&sample.camera_to_world.source_coordinate_system)?;
-        require_text(&sample.camera_to_world.target_coordinate_system)?;
-        if sample.camera_to_world.matrix.iter().any(|value| !value.is_finite()) {
-            return Err(ArtifactError::new("camera pose transform must contain finite values"));
-        }
         validate_affine_transform(&sample.camera_to_world)?;
         require_nonnegative_finite(sample.camera_to_world.max_error_m)?;
         for time in [sample.rgb_time, sample.depth_time, sample.pose_time] {
@@ -1520,19 +1499,44 @@ fn validate_affine_transform(transform: &CoordinateTransform) -> Result<(), Arti
     let matrix = &transform.matrix;
     require_text(&transform.source_coordinate_system)?;
     require_text(&transform.target_coordinate_system)?;
-    if matrix.iter().any(|value| !value.is_finite()) {
-        return Err(ArtifactError::new("coordinate transform must contain finite values"));
-    }
-    if matrix[12] != 0.0 || matrix[13] != 0.0 || matrix[14] != 0.0 || matrix[15] != 1.0 {
-        return Err(ArtifactError::new("coordinate transform is not affine homogeneous"));
-    }
-    let determinant = matrix[0] * (matrix[5] * matrix[10] - matrix[6] * matrix[9])
-        - matrix[1] * (matrix[4] * matrix[10] - matrix[6] * matrix[8])
-        + matrix[2] * (matrix[4] * matrix[9] - matrix[5] * matrix[8]);
-    if determinant.abs() <= f64::EPSILON {
-        return Err(ArtifactError::new("coordinate transform is singular"));
+    if !has_invertible_affine_matrix(matrix) {
+        return Err(ArtifactError::new(
+            "coordinate transform must be finite, affine homogeneous, and non-singular",
+        ));
     }
     Ok(())
+}
+
+fn has_invertible_affine_matrix(matrix: &[f64; 16]) -> bool {
+    if matrix.iter().any(|value| !value.is_finite())
+        || matrix[12] != 0.0
+        || matrix[13] != 0.0
+        || matrix[14] != 0.0
+        || matrix[15] != 1.0
+    {
+        return false;
+    }
+    let scale = [
+        matrix[0], matrix[1], matrix[2], matrix[4], matrix[5], matrix[6], matrix[8], matrix[9],
+        matrix[10],
+    ]
+    .into_iter()
+    .map(f64::abs)
+    .fold(0.0_f64, f64::max);
+    if scale == 0.0 || !scale.is_finite() {
+        return false;
+    }
+    let a = matrix[0] / scale;
+    let b = matrix[1] / scale;
+    let c = matrix[2] / scale;
+    let d = matrix[4] / scale;
+    let e = matrix[5] / scale;
+    let f = matrix[6] / scale;
+    let g = matrix[8] / scale;
+    let h = matrix[9] / scale;
+    let i = matrix[10] / scale;
+    let scaled_determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    scaled_determinant.is_finite() && scaled_determinant.abs() > f64::EPSILON
 }
 
 fn require_text(value: &str) -> Result<(), ArtifactError> {

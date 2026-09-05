@@ -141,6 +141,14 @@ fn calibration_and_supervision_round_trip_with_conditions_masks_and_joint_uncert
     let mut non_finite_geometry = calibration(scene_digest);
     non_finite_geometry.array_geometry.device_to_array.matrix[3] = f64::NAN;
     assert!(SealedArtifact::seal(Artifact::Calibration(Box::new(non_finite_geometry))).is_err());
+
+    let mut overflow_singular_geometry = calibration(scene_digest);
+    overflow_singular_geometry.array_geometry.device_to_array.matrix[..12].copy_from_slice(&[
+        1.0e308, 1.0e308, 0.0, 0.0, 1.0e308, 1.0e308, 0.0, 0.0, 0.0, 0.0, 1.0e308, 0.0,
+    ]);
+    assert!(
+        SealedArtifact::seal(Artifact::Calibration(Box::new(overflow_singular_geometry))).is_err()
+    );
 }
 
 #[test]
@@ -649,7 +657,7 @@ fn pairing_secret_is_absent_from_wire_and_wrong_tampered_or_replayed_proofs_fail
 
     let (request, pending) = invitation
         .begin_handshake(
-            offer.display_code(),
+            offer.display_code().clone(),
             nonce,
             ClientEphemeralSecret::from_bytes([63; 32]).unwrap(),
             responses,
@@ -703,7 +711,7 @@ fn pair_companion(
     let responses = collect_clock_responses(host, &invitation, nonce);
     let (request, pending) = invitation
         .begin_handshake(
-            displayed_offer.display_code(),
+            displayed_offer.display_code().clone(),
             nonce,
             ClientEphemeralSecret::from_bytes([42; 32]).unwrap(),
             responses.clone(),
@@ -711,7 +719,7 @@ fn pair_companion(
         .unwrap();
     let (_, forged_pending) = invitation
         .begin_handshake(
-            displayed_offer.display_code(),
+            displayed_offer.display_code().clone(),
             nonce,
             ClientEphemeralSecret::from_bytes([42; 32]).unwrap(),
             responses,

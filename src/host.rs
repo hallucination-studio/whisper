@@ -22,8 +22,8 @@ use crate::artifact::{
 use crate::companion::{
     ClockChallengeMeasurement, ClockSampleChallenge, CompanionChunk, CompanionEntropy,
     CompanionError, CompanionHandshakeRequest, CompanionHandshakeResponse, CompanionRejectReason,
-    CompanionServerIdentity, CompanionState, PairingId, PairingOffer, SystemCompanionEntropy,
-    UploadProgress,
+    CompanionServerIdentity, CompanionState, PairingCode, PairingId, PairingOffer,
+    SystemCompanionEntropy, UploadProgress,
 };
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
 use crate::native_frame::{Header, authenticate_datagram, parse_header};
@@ -367,9 +367,9 @@ impl HostBuilder {
     ///
     /// Returns an error for invalid limits, duplicate or missing routes, socket
     /// startup failure, or failure to open the Store writer.
-    pub fn start(self) -> Result<HostRuntime, HostError> {
+    pub fn start(mut self) -> Result<HostRuntime, HostError> {
         validate_builder(&self)?;
-        let companion_signing_seed = *self.store.companion_signing_seed();
+        let companion_signing_seed = self.store.take_companion_signing_seed();
         let database_path = self.store.database_path();
         let replay_snapshot = self.store.database_snapshot().map_err(|source| {
             HostError::io_during(
@@ -630,7 +630,7 @@ impl HostRuntime {
         let duration = u64::try_from(valid_for.as_nanos()).map_err(|_| companion_clock_error())?;
         let expires = now.checked_add(duration).ok_or_else(companion_clock_error)?;
         let id = secure_random::<16>(self.companion_entropy.as_ref())?;
-        let code = secure_random::<16>(self.companion_entropy.as_ref())?;
+        let code = PairingCode::from_bytes(secure_random::<16>(self.companion_entropy.as_ref())?);
         let server_ephemeral_secret = secure_random::<32>(self.companion_entropy.as_ref())?;
         let mut companion = self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         companion.offer(now.into(), id, code, server_ephemeral_secret, expires.into())
