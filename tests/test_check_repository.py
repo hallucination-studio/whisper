@@ -120,6 +120,28 @@ class RepositoryPolicyCheckTests(unittest.TestCase):
             self.assertIn("dual write", result.stderr)
             self.assertIn("shadow old system", result.stderr)
 
+    def test_rejects_forbidden_array_shortcuts_and_static_path_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "shortcuts.rs").write_text(
+                "struct OrdinaryEspAoa;\n"
+                "struct CrossArrayPhaseFusion;\n"
+                "struct ArrayPersonPosition;\n"
+                "fn delete_static_path() {}\n"
+                "struct SecondPathInterpreter;\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_checker(root, "hard-cut")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("ordinary ESP AoA", result.stderr)
+            self.assertIn("cross-array phase fusion", result.stderr)
+            self.assertIn("array path as person position", result.stderr)
+            self.assertIn("permanent static-path deletion", result.stderr)
+            self.assertIn("second path interpreter", result.stderr)
+
     def test_build_named_production_directories_cannot_bypass_hard_cut(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
