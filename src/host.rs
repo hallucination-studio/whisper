@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256};
 use crate::admission::AdmissionLimits;
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
 use crate::native_csi::{
-    NativeCapabilityFact, NativeCsiFact, NativeFact, NativeHealthFact, RadioRxS3, S3BandwidthKind,
-    S3PhyKind, S3SecondaryKind,
+    CapabilityIdentity, ChannelPolicy, FirmwareBuildIdentity, NativeCapabilityFact, NativeCsiFact,
+    NativeFact, NativeHealthFact, RadioRxS3, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
+    SourceMac,
 };
 use crate::native_frame::{
     AuthenticatedDatagram, Header, Message, authenticate_datagram, decode_authenticated,
@@ -203,34 +204,20 @@ impl RadioRouteFacts {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DecodedRoute {
     sensor: SensorId,
-    source_mac: [u8; 6],
-    channel: u8,
-    radio: RadioRouteFacts,
-    firmware_build_digest: [u8; 32],
-    capability_digest: [u8; 32],
+    link: DecodedRouteLink,
+    firmware_build: FirmwareBuildIdentity,
+    capability: CapabilityIdentity,
 }
 
 impl DecodedRoute {
-    /// Creates a decoded route whose sensor, link, radio, build, and capability are all pinned.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the source MAC is all zero or the channel is outside `1..=14`.
-    pub fn try_new(
+    /// Creates a decoded route whose sensor, link, firmware build, and capability are all pinned.
+    pub fn new(
         sensor: SensorId,
-        source_mac: [u8; 6],
-        channel: u8,
-        radio: RadioRouteFacts,
-        firmware_build_digest: [u8; 32],
-        capability_digest: [u8; 32],
-    ) -> Result<Self, DecodedRouteError> {
-        if source_mac == [0; 6] {
-            return Err(DecodedRouteError::new("decoded route source MAC must not be all zero"));
-        }
-        if !(1..=14).contains(&channel) {
-            return Err(DecodedRouteError::new("decoded route channel must be between 1 and 14"));
-        }
-        Ok(Self { sensor, source_mac, channel, radio, firmware_build_digest, capability_digest })
+        link: DecodedRouteLink,
+        firmware_build: FirmwareBuildIdentity,
+        capability: CapabilityIdentity,
+    ) -> Self {
+        Self { sensor, link, firmware_build, capability }
     }
 
     /// Returns the configured sensor identity.
@@ -241,64 +228,76 @@ impl DecodedRoute {
 
     /// Returns the authenticated CSI source MAC that is admitted.
     #[must_use]
-    pub const fn source_mac(&self) -> [u8; 6] {
-        self.source_mac
+    pub const fn source_mac(&self) -> SourceMac {
+        self.link.source_mac()
     }
 
     /// Returns the exact primary channel admitted by this route.
     #[must_use]
-    pub const fn channel(&self) -> u8 {
-        self.channel
+    pub const fn channel(&self) -> ChannelPolicy {
+        self.link.channel()
     }
 
     /// Returns the stable radio identity fields admitted by this route.
     #[must_use]
     pub const fn radio(&self) -> RadioRouteFacts {
-        self.radio
+        self.link.radio()
     }
 
     /// Returns the firmware build digest pinned by this route.
     #[must_use]
-    pub const fn firmware_build_digest(&self) -> [u8; 32] {
-        self.firmware_build_digest
+    pub const fn firmware_build(&self) -> FirmwareBuildIdentity {
+        self.firmware_build
     }
 
     /// Returns the capability digest pinned by this route.
     #[must_use]
-    pub const fn capability_digest(&self) -> [u8; 32] {
-        self.capability_digest
+    pub const fn capability(&self) -> CapabilityIdentity {
+        self.capability
     }
 
     fn admits_radio(&self, radio: RadioRxS3) -> bool {
-        self.channel == radio.channel() && self.radio.matches(radio)
+        self.channel().get() == radio.channel() && self.radio().matches(radio)
     }
 }
 
-/// Invalid post-authentication decoded-route configuration.
-#[derive(Debug)]
-pub struct DecodedRouteError {
-    reason: &'static str,
-    backtrace: Box<Backtrace>,
+/// The authenticated source, channel, and stable radio tuple admitted for one route.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DecodedRouteLink {
+    source_mac: SourceMac,
+    channel: ChannelPolicy,
+    radio: RadioRouteFacts,
 }
 
-impl DecodedRouteError {
-    fn new(reason: &'static str) -> Self {
-        Self { reason, backtrace: Box::new(Backtrace::capture()) }
+impl DecodedRouteLink {
+    /// Creates one route link from already validated semantic identity values.
+    #[must_use]
+    pub const fn new(
+        source_mac: SourceMac,
+        channel: ChannelPolicy,
+        radio: RadioRouteFacts,
+    ) -> Self {
+        Self { source_mac, channel, radio }
     }
 
-    /// Returns the captured configuration backtrace.
-    pub fn backtrace(&self) -> &Backtrace {
-        &self.backtrace
+    /// Returns the admitted authenticated source MAC.
+    #[must_use]
+    pub const fn source_mac(self) -> SourceMac {
+        self.source_mac
+    }
+
+    /// Returns the admitted primary channel policy.
+    #[must_use]
+    pub const fn channel(self) -> ChannelPolicy {
+        self.channel
+    }
+
+    /// Returns the admitted stable radio tuple.
+    #[must_use]
+    pub const fn radio(self) -> RadioRouteFacts {
+        self.radio
     }
 }
-
-impl fmt::Display for DecodedRouteError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.reason.fmt(formatter)
-    }
-}
-
-impl std::error::Error for DecodedRouteError {}
 
 /// One exact peer, device, key epoch, secret key, and decoded identity route.
 #[derive(Clone)]
@@ -366,27 +365,29 @@ impl NativeFrameRoute {
     fn semantic_rejection(&self, message: &Message) -> Option<RejectReason> {
         match message {
             Message::Capabilities(capability)
-                if capability.capability_digest() != self.decoded.capability_digest()
+                if capability.capability_digest() != self.decoded.capability().into_bytes()
                     || capability.descriptor().firmware_build_digest()
-                        != self.decoded.firmware_build_digest()
+                        != self.decoded.firmware_build().into_bytes()
                     || usize::from(capability.descriptor().datagram_budget_bytes())
                         > self.limits.datagram_bytes.get() =>
             {
                 Some(RejectReason::CapabilityConflict)
             }
             Message::CsiData(data)
-                if data.capability_digest() != self.decoded.capability_digest() =>
+                if data.capability_digest() != self.decoded.capability().into_bytes() =>
             {
                 Some(RejectReason::CapabilityConflict)
             }
-            Message::CsiData(data) if data.source_mac() != self.decoded.source_mac() => {
+            Message::CsiData(data)
+                if data.source_mac() != self.decoded.source_mac().into_bytes() =>
+            {
                 Some(RejectReason::SourceConflict)
             }
             Message::CsiData(data) if !self.decoded.admits_radio(data.radio()) => {
                 Some(RejectReason::RadioConflict)
             }
             Message::Health(health)
-                if health.capability_digest() != self.decoded.capability_digest() =>
+                if health.capability_digest() != self.decoded.capability().into_bytes() =>
             {
                 Some(RejectReason::CapabilityConflict)
             }
@@ -1272,7 +1273,7 @@ use supervision::supervise;
 mod ingress;
 use ingress::reader_loop;
 mod persistence;
-use persistence::writer_loop;
+use persistence::{validate_native_route_pins, writer_loop};
 mod query;
 use query::{
     query_native_capabilities, query_native_csi, query_native_facts, query_native_health,
@@ -1370,15 +1371,16 @@ mod tests {
             key_epoch: KeyEpoch::try_from(7).unwrap(),
             key: EpochKey::try_from(KEY.as_slice()).unwrap(),
             limits: limits(),
-            decoded: DecodedRoute::try_new(
+            decoded: DecodedRoute::new(
                 SensorId::try_from("sensor-a").unwrap(),
-                [2, 0, 0, 0, 0, 10],
-                1,
-                RadioRouteFacts::from_radio(radio),
-                [0x11; 32],
-                [0x34; 32],
-            )
-            .unwrap(),
+                DecodedRouteLink::new(
+                    SourceMac::try_from([2, 0, 0, 0, 0, 10]).unwrap(),
+                    ChannelPolicy::try_from(1).unwrap(),
+                    RadioRouteFacts::from_radio(radio),
+                ),
+                FirmwareBuildIdentity::from([0x11; 32]),
+                CapabilityIdentity::from([0x34; 32]),
+            ),
         }
     }
 

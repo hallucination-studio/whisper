@@ -1,5 +1,7 @@
 //! Lossless native-coordinate facts derived from authenticated source bytes.
 
+use std::backtrace::Backtrace;
+use std::fmt;
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
@@ -11,6 +13,307 @@ pub use crate::native_frame::{
     CapabilityDescriptor, HealthV1, IqSample, LtfBlock, LtfKind, RadioRxS3, S3BandwidthKind,
     S3PhyKind, S3SecondaryKind,
 };
+
+/// The authenticated source MAC admitted for one native route.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceMac([u8; 6]);
+
+impl SourceMac {
+    /// Creates an admitted source MAC, rejecting the all-zero sentinel.
+    pub fn try_new(bytes: [u8; 6]) -> Result<Self, SourceMacError> {
+        if bytes == [0; 6] {
+            return Err(SourceMacError::all_zero());
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Borrows the six source-MAC octets in wire order.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 6] {
+        &self.0
+    }
+
+    /// Returns the six source-MAC octets in wire order.
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; 6] {
+        self.0
+    }
+}
+
+impl TryFrom<[u8; 6]> for SourceMac {
+    type Error = SourceMacError;
+
+    fn try_from(bytes: [u8; 6]) -> Result<Self, Self::Error> {
+        Self::try_new(bytes)
+    }
+}
+
+impl TryFrom<&[u8]> for SourceMac {
+    type Error = SourceMacError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let bytes: [u8; 6] = bytes.try_into().map_err(|_| SourceMacError::width(bytes.len()))?;
+        Self::try_new(bytes)
+    }
+}
+
+impl fmt::Display for SourceMac {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+        )
+    }
+}
+
+/// Invalid authenticated source-MAC configuration or persistence.
+#[derive(Debug)]
+pub struct SourceMacError {
+    actual_width: usize,
+    all_zero: bool,
+    backtrace: Box<Backtrace>,
+}
+
+impl SourceMacError {
+    fn width(actual_width: usize) -> Self {
+        Self { actual_width, all_zero: false, backtrace: Box::new(Backtrace::capture()) }
+    }
+
+    fn all_zero() -> Self {
+        Self { actual_width: 6, all_zero: true, backtrace: Box::new(Backtrace::capture()) }
+    }
+
+    /// Returns the rejected source-MAC width in bytes.
+    #[must_use]
+    pub const fn actual_width(&self) -> usize {
+        self.actual_width
+    }
+
+    /// Returns the captured validation backtrace.
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
+    }
+}
+
+impl fmt::Display for SourceMacError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.all_zero {
+            write!(formatter, "native source MAC must not be all zero")
+        } else {
+            write!(formatter, "native source MAC must be 6 bytes (got {})", self.actual_width)
+        }
+    }
+}
+
+impl std::error::Error for SourceMacError {}
+
+/// The exact primary channel policy admitted for one native route.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ChannelPolicy(u8);
+
+impl ChannelPolicy {
+    /// Creates a route channel policy for the supported 2.4 GHz primary channels.
+    pub fn try_new(channel: u8) -> Result<Self, ChannelPolicyError> {
+        if !(1..=14).contains(&channel) {
+            return Err(ChannelPolicyError::new(channel));
+        }
+        Ok(Self(channel))
+    }
+
+    /// Returns the admitted primary channel number.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for ChannelPolicy {
+    type Error = ChannelPolicyError;
+
+    fn try_from(channel: u8) -> Result<Self, Self::Error> {
+        Self::try_new(channel)
+    }
+}
+
+impl fmt::Display for ChannelPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "channel {}", self.0)
+    }
+}
+
+/// Invalid native primary-channel policy.
+#[derive(Debug)]
+pub struct ChannelPolicyError {
+    channel: u8,
+    backtrace: Box<Backtrace>,
+}
+
+impl ChannelPolicyError {
+    fn new(channel: u8) -> Self {
+        Self { channel, backtrace: Box::new(Backtrace::capture()) }
+    }
+
+    /// Returns the rejected primary channel number.
+    #[must_use]
+    pub const fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// Returns the captured validation backtrace.
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
+    }
+}
+
+impl fmt::Display for ChannelPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "native primary channel must be between 1 and 14 (got {})", self.channel)
+    }
+}
+
+impl std::error::Error for ChannelPolicyError {}
+
+/// The fixed-width identity of the firmware build admitted for one route.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FirmwareBuildIdentity([u8; 32]);
+
+impl FirmwareBuildIdentity {
+    /// Borrows the non-secret firmware build digest.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Returns the firmware build digest.
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl From<[u8; 32]> for FirmwareBuildIdentity {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl TryFrom<&[u8]> for FirmwareBuildIdentity {
+    type Error = DigestIdentityError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            DigestIdentityError::new(DigestIdentityKind::FirmwareBuild, bytes.len())
+        })?;
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for FirmwareBuildIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_digest(formatter, &self.0)
+    }
+}
+
+/// The fixed-width capability identity admitted for one route.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CapabilityIdentity([u8; 32]);
+
+impl CapabilityIdentity {
+    /// Borrows the non-secret capability digest.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Returns the capability digest.
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl From<[u8; 32]> for CapabilityIdentity {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl TryFrom<&[u8]> for CapabilityIdentity {
+    type Error = DigestIdentityError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| DigestIdentityError::new(DigestIdentityKind::Capability, bytes.len()))?;
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for CapabilityIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_digest(formatter, &self.0)
+    }
+}
+
+fn write_digest(formatter: &mut fmt::Formatter<'_>, bytes: &[u8; 32]) -> fmt::Result {
+    for byte in bytes {
+        write!(formatter, "{byte:02x}")?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DigestIdentityKind {
+    FirmwareBuild,
+    Capability,
+}
+
+impl fmt::Display for DigestIdentityKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FirmwareBuild => formatter.write_str("firmware-build"),
+            Self::Capability => formatter.write_str("capability"),
+        }
+    }
+}
+
+/// Invalid persisted or byte-slice native digest identity.
+#[derive(Debug)]
+pub struct DigestIdentityError {
+    kind: DigestIdentityKind,
+    actual_width: usize,
+    backtrace: Box<Backtrace>,
+}
+
+impl DigestIdentityError {
+    fn new(kind: DigestIdentityKind, actual_width: usize) -> Self {
+        Self { kind, actual_width, backtrace: Box::new(Backtrace::capture()) }
+    }
+
+    /// Returns the rejected digest width in bytes.
+    #[must_use]
+    pub const fn actual_width(&self) -> usize {
+        self.actual_width
+    }
+
+    /// Returns the captured validation backtrace.
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
+    }
+}
+
+impl fmt::Display for DigestIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "native {} digest must be 32 bytes (got {})",
+            self.kind, self.actual_width
+        )
+    }
+}
+
+impl std::error::Error for DigestIdentityError {}
 
 /// A physical or protocol-native RF path coordinate.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

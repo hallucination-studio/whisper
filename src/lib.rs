@@ -24,18 +24,13 @@ pub use admission::{
 };
 #[doc(inline)]
 pub use host::{
-    DecodedRoute, DecodedRouteError, Host, HostBuilder, HostError, HostRuntime, NativeFrameRoute,
+    DecodedRoute, DecodedRouteLink, Host, HostBuilder, HostError, HostRuntime, NativeFrameRoute,
     RadioRouteFacts, RawFact, RawLoss, RawLossKind, RejectReason, RejectedDatagram, RouteError,
 };
 #[doc(inline)]
 pub use identity::{
     BootGeneration, DeploymentId, DeploymentIdError, DeviceId, IdentityValueError, KeyEpoch,
     MessageSequence, NativeFrameKind, SensorId, SensorIdError,
-};
-#[doc(inline)]
-pub use native_csi::{
-    CsiPath, NativeCapabilityFact, NativeCsi, NativeCsiFact, NativeFact, NativeFactProvenance,
-    NativeHealthFact, SampleAxis,
 };
 #[doc(inline)]
 pub use store::{Store, StoreId, StoreInitError, StoreOpenError};

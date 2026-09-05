@@ -4,6 +4,46 @@ use super::*;
 use crate::native_frame::{
     LTF_BLOCK_BYTES, LtfBlock, LtfKind, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeRoutePin {
+    sensor: SensorId,
+    source_mac: SourceMac,
+    channel: ChannelPolicy,
+    radio: RadioRouteFacts,
+    firmware_build: FirmwareBuildIdentity,
+    capability: CapabilityIdentity,
+}
+
+struct StoredNativeRoutePin {
+    sensor: String,
+    source_mac: Vec<u8>,
+    channel: i64,
+    secondary: i64,
+    phy: i64,
+    bandwidth: i64,
+    stbc: i64,
+    rate: i64,
+    mcs: i64,
+    rx_antenna: i64,
+    firmware_build: Vec<u8>,
+    capability: Vec<u8>,
+}
+
+impl NativeRoutePin {
+    fn from_route(route: &NativeFrameRoute) -> Self {
+        let decoded = route.decoded();
+        Self {
+            sensor: decoded.sensor().clone(),
+            source_mac: decoded.source_mac(),
+            channel: decoded.channel(),
+            radio: decoded.radio(),
+            firmware_build: decoded.firmware_build(),
+            capability: decoded.capability(),
+        }
+    }
+}
+
 pub(super) fn writer_loop(
     config: WriterConfig,
     ingress: mpsc::Receiver<AdmittedDatagram>,
@@ -106,11 +146,21 @@ fn load_replay_states(
     let row_count: usize = connection
         .query_row("SELECT count(*) FROM replay_windows", [], |row| row.get(0))
         .map_err(|error| HostError::database_at(path, error))?;
+    let pin_count: usize = connection
+        .query_row("SELECT count(*) FROM native_route_pins", [], |row| row.get(0))
+        .map_err(|error| HostError::database_at(path, error))?;
     if configured == 0 && row_count != 0 {
         return Err(HostError::message_at(
             "validate retained replay state",
             path,
             "unprovisioned Store contains replay state",
+        ));
+    }
+    if configured == 0 && pin_count != 0 {
+        return Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "unprovisioned Store contains native route identity",
         ));
     }
     if configured == 1 && row_count != routes.len() {
@@ -126,6 +176,9 @@ fn load_replay_states(
             path,
             "persisted admission configuration marker is invalid",
         ));
+    }
+    if configured == 1 {
+        validate_native_route_pins(connection, path, routes)?;
     }
     let states = routes
         .iter()
@@ -190,6 +243,40 @@ fn load_replay_states(
     Ok(ReplayStartup { states, provision: configured == 0 })
 }
 
+pub(super) fn validate_native_route_pins(
+    connection: &Connection,
+    path: &Path,
+    routes: &[NativeFrameRoute],
+) -> Result<(), HostError> {
+    let pin_count: usize = connection
+        .query_row("SELECT count(*) FROM native_route_pins", [], |row| row.get(0))
+        .map_err(|error| HostError::database_at(path, error))?;
+    if pin_count != routes.len() {
+        return Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route identity set does not match configuration",
+        ));
+    }
+    for route in routes {
+        let Some(stored) = load_native_route_pin(connection, path, route)? else {
+            return Err(HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "configured native route is missing persisted identity",
+            ));
+        };
+        if stored != NativeRoutePin::from_route(route) {
+            return Err(HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "persisted native route identity does not match configuration",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn provision_replay_states(
     connection: &mut Connection,
     routes: &[NativeFrameRoute],
@@ -197,6 +284,30 @@ fn provision_replay_states(
 ) -> Result<(), rusqlite::Error> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (route, state) in routes.iter().zip(states) {
+        let decoded = route.decoded();
+        transaction.execute(
+            "INSERT INTO native_route_pins (
+                 device_id, key_epoch, sensor_id, source_mac, channel,
+                 secondary, phy, bandwidth, stbc, rate, mcs, rx_antenna,
+                 firmware_build_digest, capability_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                route.device_id.get().to_be_bytes(),
+                route.key_epoch.get().to_be_bytes(),
+                decoded.sensor().as_str(),
+                decoded.source_mac().into_bytes(),
+                decoded.channel().get(),
+                secondary_byte(decoded.radio().secondary()),
+                phy_byte(decoded.radio().phy()),
+                bandwidth_byte(decoded.radio().bandwidth()),
+                u8::from(decoded.radio().stbc()),
+                decoded.radio().rate(),
+                decoded.radio().mcs(),
+                decoded.radio().rx_antenna(),
+                decoded.firmware_build().into_bytes(),
+                decoded.capability().into_bytes(),
+            ],
+        )?;
         transaction.execute(
             "INSERT INTO replay_windows
                  (device_id, key_epoch, identity, window_packets, state)
@@ -213,6 +324,157 @@ fn provision_replay_states(
     transaction
         .execute("UPDATE store_identity SET admission_configured = 1 WHERE singleton = 1", [])?;
     transaction.commit()
+}
+
+fn load_native_route_pin(
+    connection: &Connection,
+    path: &Path,
+    route: &NativeFrameRoute,
+) -> Result<Option<NativeRoutePin>, HostError> {
+    let stored: Option<StoredNativeRoutePin> = connection
+        .query_row(
+            "SELECT sensor_id, source_mac, channel, secondary, phy, bandwidth,
+                        stbc, rate, mcs, rx_antenna, firmware_build_digest, capability_digest
+                 FROM native_route_pins
+                 WHERE device_id = ?1 AND key_epoch = ?2",
+            params![route.device_id.get().to_be_bytes(), route.key_epoch.get().to_be_bytes()],
+            |row| {
+                Ok(StoredNativeRoutePin {
+                    sensor: row.get(0)?,
+                    source_mac: row.get(1)?,
+                    channel: row.get(2)?,
+                    secondary: row.get(3)?,
+                    phy: row.get(4)?,
+                    bandwidth: row.get(5)?,
+                    stbc: row.get(6)?,
+                    rate: row.get(7)?,
+                    mcs: row.get(8)?,
+                    rx_antenna: row.get(9)?,
+                    firmware_build: row.get(10)?,
+                    capability: row.get(11)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let sensor = SensorId::try_from(stored.sensor.as_str()).map_err(|_| {
+        HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route sensor identity is invalid",
+        )
+    })?;
+    let source_mac = SourceMac::try_from(stored.source_mac.as_slice()).map_err(|_| {
+        HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route source MAC is invalid",
+        )
+    })?;
+    let channel = ChannelPolicy::try_from(native_route_u8(path, "channel", stored.channel)?)
+        .map_err(|_| {
+            HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "persisted native route channel is invalid",
+            )
+        })?;
+    let secondary = native_route_secondary(path, stored.secondary)?;
+    let phy = native_route_phy(path, stored.phy)?;
+    let bandwidth = native_route_bandwidth(path, stored.bandwidth)?;
+    let stbc = match stored.stbc {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "persisted native route STBC flag is invalid",
+            ));
+        }
+    };
+    let rate = native_route_u8(path, "rate", stored.rate)?;
+    let mcs = native_route_u8(path, "MCS", stored.mcs)?;
+    let rx_antenna = native_route_u8(path, "receive antenna", stored.rx_antenna)?;
+    let firmware_build = FirmwareBuildIdentity::try_from(stored.firmware_build.as_slice())
+        .map_err(|_| {
+            HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "persisted native route firmware-build identity is invalid",
+            )
+        })?;
+    let capability = CapabilityIdentity::try_from(stored.capability.as_slice()).map_err(|_| {
+        HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route capability identity is invalid",
+        )
+    })?;
+    Ok(Some(NativeRoutePin {
+        sensor,
+        source_mac,
+        channel,
+        radio: RadioRouteFacts { phy, bandwidth, secondary, stbc, rate, mcs, rx_antenna },
+        firmware_build,
+        capability,
+    }))
+}
+
+fn native_route_u8(path: &Path, field: &'static str, value: i64) -> Result<u8, HostError> {
+    u8::try_from(value).map_err(|_| {
+        HostError::message_at(
+            "validate retained native route identity",
+            path,
+            match field {
+                "channel" => "persisted native route channel is invalid",
+                "rate" => "persisted native route rate is invalid",
+                "MCS" => "persisted native route MCS is invalid",
+                "receive antenna" => "persisted native route receive antenna is invalid",
+                _ => "persisted native route numeric identity is invalid",
+            },
+        )
+    })
+}
+
+fn native_route_secondary(path: &Path, value: i64) -> Result<S3SecondaryKind, HostError> {
+    match value {
+        0 => Ok(S3SecondaryKind::None),
+        1 => Ok(S3SecondaryKind::Above),
+        2 => Ok(S3SecondaryKind::Below),
+        _ => Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route secondary-channel identity is invalid",
+        )),
+    }
+}
+
+fn native_route_phy(path: &Path, value: i64) -> Result<S3PhyKind, HostError> {
+    match value {
+        1 => Ok(S3PhyKind::NonHt),
+        2 => Ok(S3PhyKind::Ht),
+        _ => Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route PHY identity is invalid",
+        )),
+    }
+}
+
+fn native_route_bandwidth(path: &Path, value: i64) -> Result<S3BandwidthKind, HostError> {
+    match value {
+        1 => Ok(S3BandwidthKind::TwentyMhz),
+        2 => Ok(S3BandwidthKind::FortyMhz),
+        _ => Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route bandwidth identity is invalid",
+        )),
+    }
 }
 
 fn persist_admitted(

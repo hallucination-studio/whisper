@@ -116,6 +116,7 @@ pub(super) fn query_native_facts(
     limit: usize,
 ) -> Result<Vec<NativeFact>, HostError> {
     let connection = read_only_connection(path)?;
+    validate_native_route_pins(&connection, path, routes)?;
     let mut rows = query_capability_rows(&connection, path, routes, limit)?;
     rows.extend(query_csi_rows(&connection, path, routes, limit)?);
     rows.extend(query_health_rows(&connection, path, routes, limit)?);
@@ -137,6 +138,7 @@ pub(super) fn query_native_capabilities(
     limit: usize,
 ) -> Result<Vec<NativeCapabilityFact>, HostError> {
     let connection = read_only_connection(path)?;
+    validate_native_route_pins(&connection, path, routes)?;
     let rows = query_capability_rows(&connection, path, routes, limit)?;
     let mut facts = rows
         .into_iter()
@@ -155,6 +157,7 @@ pub(super) fn query_native_csi(
     limit: usize,
 ) -> Result<Vec<NativeCsiFact>, HostError> {
     let connection = read_only_connection(path)?;
+    validate_native_route_pins(&connection, path, routes)?;
     let rows = query_csi_rows(&connection, path, routes, limit)?;
     let mut facts = rows
         .into_iter()
@@ -173,6 +176,7 @@ pub(super) fn query_native_health(
     limit: usize,
 ) -> Result<Vec<NativeHealthFact>, HostError> {
     let connection = read_only_connection(path)?;
+    validate_native_route_pins(&connection, path, routes)?;
     let rows = query_health_rows(&connection, path, routes, limit)?;
     let mut facts = rows
         .into_iter()

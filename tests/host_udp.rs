@@ -13,12 +13,15 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
 };
 use sha2::{Digest, Sha256};
-use whisper::native_csi::{RadioRxS3, S3BandwidthKind, S3PhyKind, S3SecondaryKind};
+use whisper::native_csi::{
+    CapabilityIdentity, ChannelPolicy, CsiPath, FirmwareBuildIdentity, NativeFact, RadioRxS3,
+    S3BandwidthKind, S3PhyKind, S3SecondaryKind, SampleAxis, SourceMac,
+};
 use whisper::{
     AdmissionLimits, AuthenticatedBytesPerSecond, BootGeneration, DatagramBytes, DecodedRoute,
-    DeploymentId, DeviceId, Host, KeyEpoch, MessageSequence, NativeFact, NativeFrameKind,
+    DecodedRouteLink, DeploymentId, DeviceId, Host, KeyEpoch, MessageSequence, NativeFrameKind,
     NativeFrameRoute, PacketsPerSecond, RadioRouteFacts, RawLossKind, RejectReason,
-    ReplayWindowPackets, SampleAxis, SensorId, Store,
+    ReplayWindowPackets, SensorId, Store,
 };
 
 const KEY: [u8; 32] = [
@@ -66,6 +69,21 @@ fn wire_identity_types_support_canonical_checked_conversions() {
     assert!(KeyEpoch::try_from(0).is_err());
     let error = "not-a-sequence".parse::<MessageSequence>().unwrap_err();
     assert!(std::error::Error::source(&error).is_some());
+
+    let source = SourceMac::try_from(SOURCE_MAC).unwrap();
+    assert_eq!(source.to_string(), "02:00:00:00:00:0a");
+    let source_error = SourceMac::try_from([0; 6]).unwrap_err();
+    assert_eq!(source_error.actual_width(), 6);
+    assert!(source_error.to_string().contains("all zero"));
+    let channel = ChannelPolicy::try_from(11).unwrap();
+    assert_eq!(channel.get(), 11);
+    let channel_error = ChannelPolicy::try_from(0).unwrap_err();
+    assert_eq!(channel_error.channel(), 0);
+    let capability = CapabilityIdentity::try_from(CAPABILITY_DIGEST.as_slice()).unwrap();
+    assert_eq!(capability.into_bytes(), CAPABILITY_DIGEST);
+    let digest_error = CapabilityIdentity::try_from(&[0_u8; 31][..]).unwrap_err();
+    assert_eq!(digest_error.actual_width(), 31);
+    assert!(digest_error.to_string().contains("32 bytes"));
 }
 
 #[test]
@@ -379,7 +397,7 @@ fn every_full_production_sender_layout_preserves_exact_native_bytes_and_samples(
         );
         assert_eq!(fact.raw_csi().len(), expected_raw_len);
         assert_eq!(Sha256::digest(fact.raw_csi()).as_slice(), hex_fixture(expected_raw_digest));
-        assert_eq!(fact.csi().path(), whisper::CsiPath::RawPathOrdinal(0));
+        assert_eq!(fact.csi().path(), CsiPath::RawPathOrdinal(0));
         assert_eq!(
             fact.sample_axis(),
             SampleAxis::OpaqueOrdinal { count: expected_blocks.iter().sum() }
@@ -667,7 +685,7 @@ fn restart_replays_capability_csi_and_health_queries_without_derivation_drift() 
 }
 
 #[test]
-fn restart_with_changed_decoded_route_never_returns_old_typed_facts() {
+fn restart_with_changed_sensor_identity_never_relabels_old_typed_facts() {
     let parent = temporary_directory("host-native-route-restart");
     let root = parent.join("world-store");
     let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
@@ -680,12 +698,54 @@ fn restart_with_changed_decoded_route_never_returns_old_typed_facts() {
     wait_for_fact_count(&first, 2);
     first.shutdown().unwrap();
 
-    let restarted =
-        start_host_with_radio(Store::open(&root).unwrap(), &sender, &secret_root, ht20_radio());
-    let error = restarted.query_native_csi(16).unwrap_err();
-    assert!(error.to_string().contains("configured decoded route"));
-    assert_eq!(restarted.query_raw(16).unwrap().len(), 2);
-    restarted.shutdown().unwrap();
+    let database_path = root.join("facts.sqlite3");
+    let before = fs::read(&database_path).unwrap();
+    let changed_sensor = NativeFrameRoute::load(
+        sender.local_addr().unwrap().ip(),
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
+        decoded_route_for_sensor(non_ht_radio(), "sensor-b"),
+        &secret_root,
+    )
+    .unwrap();
+    let error = Host::builder(
+        Store::open(&root).unwrap(),
+        deployment("lab"),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .route(changed_sensor)
+    .start()
+    .expect_err("changed sensor identity must not relabel retained typed facts");
+    assert_eq!(error.operation(), "validate retained native route identity");
+    assert_eq!(error.path(), Some(database_path.as_path()));
+    assert_eq!(fs::read(&database_path).unwrap(), before);
+
+    let reopened = wait_for_store(&root);
+    drop(reopened);
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn typed_query_rejects_persisted_route_identity_tampering() {
+    let parent = temporary_directory("host-native-route-pin-tamper");
+    let root = parent.join("world-store");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let host = start_host(Store::initialize(&root).unwrap(), &sender, &secret_root);
+    let capabilities = hex_fixture(include_str!("fixtures/native-frame/capabilities-v1.hex"));
+    let csi = hex_fixture(include_str!("fixtures/native-frame/csi-non-ht-3-pairs.hex"));
+    sender.send_to(&capabilities, host.local_addr()).unwrap();
+    sender.send_to(&csi, host.local_addr()).unwrap();
+    wait_for_fact_count(&host, 2);
+    let database = rusqlite::Connection::open(root.join("facts.sqlite3")).unwrap();
+    database.execute("UPDATE native_route_pins SET sensor_id = 'sensor-b'", []).unwrap();
+    drop(database);
+
+    let error = host.query_native_csi(16).unwrap_err();
+    assert_eq!(error.operation(), "validate retained native route identity");
+    assert_eq!(host.query_raw(16).unwrap().len(), 2);
+    host.shutdown().unwrap();
     fs::remove_dir_all(parent).unwrap();
 }
 
@@ -1122,15 +1182,20 @@ fn start_host_with_radio(
 }
 
 fn decoded_route(radio: RadioRxS3) -> DecodedRoute {
-    DecodedRoute::try_new(
-        SensorId::try_from("sensor-a").unwrap(),
-        SOURCE_MAC,
-        radio.channel(),
-        RadioRouteFacts::from_radio(radio),
-        [0x11; 32],
-        CAPABILITY_DIGEST,
+    decoded_route_for_sensor(radio, "sensor-a")
+}
+
+fn decoded_route_for_sensor(radio: RadioRxS3, sensor: &str) -> DecodedRoute {
+    DecodedRoute::new(
+        SensorId::try_from(sensor).unwrap(),
+        DecodedRouteLink::new(
+            SourceMac::try_from(SOURCE_MAC).unwrap(),
+            ChannelPolicy::try_from(radio.channel()).unwrap(),
+            RadioRouteFacts::from_radio(radio),
+        ),
+        FirmwareBuildIdentity::from([0x11; 32]),
+        CapabilityIdentity::from(CAPABILITY_DIGEST),
     )
-    .expect("decoded route is valid")
 }
 
 fn non_ht_radio() -> RadioRxS3 {

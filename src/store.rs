@@ -18,8 +18,8 @@ const LEASE_NAME: &str = ".whisper.lease";
 /// it makes all existing Stores intentionally unrecognizable.
 const STORE_APPLICATION_ID: u32 = 0x5752_4631;
 /// Exact SQLite schema generation. Incrementing it requires an explicitly
-/// scoped migration; this ticket recognizes only newly initialized generation 2.
-const STORE_SCHEMA_VERSION: u32 = 2;
+/// scoped migration; this ticket recognizes only newly initialized generation 3.
+const STORE_SCHEMA_VERSION: u32 = 3;
 /// SQLite's fixed database header size in bytes. Changing this file-format
 /// value would shift every recognition offset and misclassify database bytes.
 const SQLITE_HEADER_BYTES: usize = 100;
@@ -72,6 +72,23 @@ const REPLAY_WINDOWS_SCHEMA: &str = "CREATE TABLE replay_windows (
                  identity BLOB NOT NULL CHECK (typeof(identity) = 'blob' AND length(identity) = 32),
                  window_packets INTEGER NOT NULL CHECK (window_packets BETWEEN 1 AND 65535),
                  state BLOB NOT NULL CHECK (typeof(state) = 'blob'),
+                 PRIMARY KEY (device_id, key_epoch)
+             ) STRICT";
+const NATIVE_ROUTE_PINS_SCHEMA: &str = "CREATE TABLE native_route_pins (
+                 device_id BLOB NOT NULL CHECK (typeof(device_id) = 'blob' AND length(device_id) = 8),
+                 key_epoch BLOB NOT NULL CHECK (typeof(key_epoch) = 'blob' AND length(key_epoch) = 2),
+                 sensor_id TEXT NOT NULL CHECK (typeof(sensor_id) = 'text' AND length(sensor_id) > 0),
+                 source_mac BLOB NOT NULL CHECK (typeof(source_mac) = 'blob' AND length(source_mac) = 6),
+                 channel INTEGER NOT NULL CHECK (channel BETWEEN 1 AND 14),
+                 secondary INTEGER NOT NULL CHECK (secondary BETWEEN 0 AND 2),
+                 phy INTEGER NOT NULL CHECK (phy BETWEEN 1 AND 2),
+                 bandwidth INTEGER NOT NULL CHECK (bandwidth BETWEEN 1 AND 2),
+                 stbc INTEGER NOT NULL CHECK (stbc IN (0, 1)),
+                 rate INTEGER NOT NULL CHECK (rate BETWEEN 0 AND 255),
+                 mcs INTEGER NOT NULL CHECK (mcs BETWEEN 0 AND 255),
+                 rx_antenna INTEGER NOT NULL CHECK (rx_antenna BETWEEN 0 AND 1),
+                 firmware_build_digest BLOB NOT NULL CHECK (typeof(firmware_build_digest) = 'blob' AND length(firmware_build_digest) = 32),
+                 capability_digest BLOB NOT NULL CHECK (typeof(capability_digest) = 'blob' AND length(capability_digest) = 32),
                  PRIMARY KEY (device_id, key_epoch)
              ) STRICT";
 const RAW_FACTS_SCHEMA: &str = "CREATE TABLE raw_facts (
@@ -140,9 +157,10 @@ const NATIVE_HEALTH_FACTS_SCHEMA: &str = "CREATE TABLE native_health_facts (
                  callback_max_us INTEGER NOT NULL CHECK (callback_max_us BETWEEN 0 AND 4294967295),
                  encoder_max_us INTEGER NOT NULL CHECK (encoder_max_us BETWEEN 0 AND 4294967295)
              ) STRICT";
-const EXPECTED_SCHEMA: [(&str, &str); 7] = [
+const EXPECTED_SCHEMA: [(&str, &str); 8] = [
     ("store_identity", STORE_IDENTITY_SCHEMA),
     ("replay_windows", REPLAY_WINDOWS_SCHEMA),
+    ("native_route_pins", NATIVE_ROUTE_PINS_SCHEMA),
     ("raw_facts", RAW_FACTS_SCHEMA),
     ("raw_losses", RAW_LOSSES_SCHEMA),
     ("native_capability_facts", NATIVE_CAPABILITY_FACTS_SCHEMA),
@@ -151,10 +169,11 @@ const EXPECTED_SCHEMA: [(&str, &str); 7] = [
 ];
 // SQLite owns these implicit indexes for the declared UNIQUE and composite
 // PRIMARY KEY constraints. Their exact names, owning tables, and NULL SQL are
-// part of schema generation 2; any other SQLite-owned object is unrecognized.
-const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 2] = [
+// part of schema generation 3; any other SQLite-owned object is unrecognized.
+const EXPECTED_SQLITE_AUTO_INDEXES: [(&str, &str); 3] = [
     ("sqlite_autoindex_raw_facts_1", "raw_facts"),
     ("sqlite_autoindex_replay_windows_1", "replay_windows"),
+    ("sqlite_autoindex_native_route_pins_1", "native_route_pins"),
 ];
 
 trait Entropy {
