@@ -10,8 +10,8 @@ use crate::artifact::{
 };
 use crate::measurement::{
     Eligibility, EventIdentity, MeasurementContext, ModelRequirements, NativeEventIdentity,
-    PhysicalOperator, Qualification, QualificationGap, RetransmissionIdentity, SignalPath,
-    SourceInstance, SourceTick, TickRange, TransmitterIdentity,
+    PhaseReferenceIdentity, PhysicalOperator, Qualification, QualificationEpoch, QualificationGap,
+    RetransmissionIdentity, SignalPath, SourceInstance, SourceTick, TickRange, TransmitterIdentity,
 };
 use crate::{BootGeneration, DeviceId, KeyEpoch, SensorId};
 
@@ -34,6 +34,9 @@ const MAX_SIGNAL_PATHS: usize = 256;
 const MAX_IQ_SAMPLES: usize = 4 * 1024 * 1024;
 /// Maximum encoded capture size, including the digest.
 const MAX_CAPTURE_BYTES: usize = 20 * 1024 * 1024;
+/// Exact number of independently qualified local-array views in the RF-08
+/// coverage contract. Changing it changes the downstream view topology.
+const REQUIRED_ARRAY_VIEWS: usize = 3;
 
 /// Opaque native LTF identity retained without assigning unsupported meaning.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -68,6 +71,173 @@ impl NativeArrayPathIdentity {
     #[must_use]
     pub const fn bytes(self) -> [u8; 32] {
         self.0
+    }
+}
+
+/// SHA-256 identity of exact local per-element phase corrections.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ArrayPhaseCalibrationDigest([u8; 32]);
+
+impl ArrayPhaseCalibrationDigest {
+    /// Returns the exact digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ArrayPhaseCalibrationDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ArrayPhaseCalibrationDigest({self})")
+    }
+}
+
+impl fmt::Display for ArrayPhaseCalibrationDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Immutable path-major phase corrections for one local coherent array.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrayPhaseCalibration {
+    array_identity: Box<str>,
+    reference: PhaseReferenceIdentity,
+    epoch: QualificationEpoch,
+    frequencies_hz: Box<[u64]>,
+    paths: Box<[NativeArrayPathIdentity]>,
+    correction_radians: Box<[f64]>,
+    digest: ArrayPhaseCalibrationDigest,
+}
+
+impl ArrayPhaseCalibration {
+    /// Constructs exact per-path, per-frequency phase corrections in path-major order.
+    ///
+    /// A correction is the finite rotation in radians applied to the native IQ sample
+    /// before either delay or angle estimation. The frequency axis and native paths
+    /// are immutable scope, rather than hints that may be reused on another capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, duplicate, unordered, non-finite, mismatched, or
+    /// over-limit inputs. Each iterator is consumed through at most its limit plus one.
+    pub fn new(
+        array_identity: impl Into<Box<str>>,
+        reference: PhaseReferenceIdentity,
+        epoch: QualificationEpoch,
+        frequencies_hz: impl IntoIterator<Item = u64>,
+        paths: impl IntoIterator<Item = NativeArrayPathIdentity>,
+        correction_radians: impl IntoIterator<Item = f64>,
+    ) -> Result<Self, ArrayAdapterError> {
+        let array_identity = array_identity.into();
+        require_text(&array_identity)?;
+        let frequencies_hz = collect_bounded(
+            frequencies_hz,
+            MAX_FREQUENCIES,
+            "array phase calibration frequency axis exceeds its limit",
+        )?;
+        let paths = collect_bounded(
+            paths,
+            MAX_SIGNAL_PATHS,
+            "array phase calibration paths exceed their limit",
+        )?;
+        if frequencies_hz.is_empty()
+            || frequencies_hz.contains(&0)
+            || frequencies_hz.windows(2).any(|pair| pair[0] >= pair[1])
+            || paths.is_empty()
+            || paths.iter().enumerate().any(|(index, path)| paths[..index].contains(path))
+        {
+            return Err(ArrayAdapterError::new("array phase calibration scope is invalid"));
+        }
+        let sample_count = frequencies_hz
+            .len()
+            .checked_mul(paths.len())
+            .filter(|count| *count <= MAX_IQ_SAMPLES)
+            .ok_or_else(|| {
+                ArrayAdapterError::new("array phase calibration shape exceeds its limit")
+            })?;
+        let correction_radians = collect_bounded(
+            correction_radians,
+            sample_count,
+            "array phase corrections exceed their declared shape",
+        )?;
+        if correction_radians.len() != sample_count
+            || correction_radians.iter().any(|correction| !correction.is_finite())
+        {
+            return Err(ArrayAdapterError::new("array phase corrections are invalid"));
+        }
+
+        let mut canonical = Vec::new();
+        canonical.extend_from_slice(b"WPC1");
+        put_text(&mut canonical, &array_identity)?;
+        canonical.extend_from_slice(&reference.bytes());
+        canonical.extend_from_slice(&epoch.get().to_le_bytes());
+        put_count_u16(&mut canonical, frequencies_hz.len())?;
+        for frequency in &frequencies_hz {
+            canonical.extend_from_slice(&frequency.to_le_bytes());
+        }
+        put_count_u16(&mut canonical, paths.len())?;
+        for path in &paths {
+            canonical.extend_from_slice(&path.bytes());
+        }
+        for correction in &correction_radians {
+            canonical.extend_from_slice(&correction.to_bits().to_le_bytes());
+        }
+        let digest = ArrayPhaseCalibrationDigest(Sha256::digest(canonical).into());
+        Ok(Self {
+            array_identity,
+            reference,
+            epoch,
+            frequencies_hz: frequencies_hz.into_boxed_slice(),
+            paths: paths.into_boxed_slice(),
+            correction_radians: correction_radians.into_boxed_slice(),
+            digest,
+        })
+    }
+
+    /// Returns the immutable calibration digest.
+    #[must_use]
+    pub const fn digest(&self) -> ArrayPhaseCalibrationDigest {
+        self.digest
+    }
+
+    /// Returns the exact local array identity.
+    #[must_use]
+    pub fn array_identity(&self) -> &str {
+        &self.array_identity
+    }
+
+    /// Returns the independently qualified phase-reference identity.
+    #[must_use]
+    pub const fn reference(&self) -> PhaseReferenceIdentity {
+        self.reference
+    }
+
+    /// Returns the phase-continuity epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> QualificationEpoch {
+        self.epoch
+    }
+
+    /// Returns the exact frequency axis to which corrections apply.
+    #[must_use]
+    pub fn frequencies_hz(&self) -> &[u64] {
+        &self.frequencies_hz
+    }
+
+    /// Returns native paths in correction-major order.
+    #[must_use]
+    pub fn paths(&self) -> &[NativeArrayPathIdentity] {
+        &self.paths
+    }
+
+    /// Returns the finite path-major rotations applied before estimation.
+    #[must_use]
+    pub fn correction_radians(&self) -> &[f64] {
+        &self.correction_radians
     }
 }
 
@@ -209,7 +379,11 @@ impl ArrayNativeMetadata {
         received_host_monotonic_ns: u64,
         path_facts: impl IntoIterator<Item = ArrayPathRadioFacts>,
     ) -> Result<Self, ArrayAdapterError> {
-        let path_facts = path_facts.into_iter().collect::<Vec<_>>();
+        let path_facts = collect_bounded(
+            path_facts,
+            MAX_SIGNAL_PATHS,
+            "array native metadata exceeds its path limit",
+        )?;
         if bandwidth_hz == 0 || path_facts.is_empty() || path_facts.len() > MAX_SIGNAL_PATHS {
             return Err(ArrayAdapterError::new("array native metadata is invalid"));
         }
@@ -388,7 +562,10 @@ impl ArrayCapture {
     ///
     /// Returns an error for unordered frequency axes, duplicate paths, empty shapes,
     /// inconsistent sample counts, or any configured format limit violation.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the capture boundary names identity, timing, axes, payload, and acquisition state explicitly"
+    )]
     pub fn new(
         identity: ArrayCaptureIdentity,
         ltf: LtfIdentity,
@@ -400,10 +577,16 @@ impl ArrayCapture {
         raw_iq: impl IntoIterator<Item = ComplexI16>,
         sample_states: impl IntoIterator<Item = SampleState>,
     ) -> Result<Self, ArrayAdapterError> {
-        let frequencies_hz = frequencies_hz.into_iter().collect::<Vec<_>>();
-        let signal_paths = signal_paths.into_iter().collect::<Vec<_>>();
-        let raw_iq = raw_iq.into_iter().collect::<Vec<_>>();
-        let sample_states = sample_states.into_iter().collect::<Vec<_>>();
+        let frequencies_hz = collect_bounded(
+            frequencies_hz,
+            MAX_FREQUENCIES,
+            "array frequency axis exceeds its limit",
+        )?;
+        let signal_paths = collect_bounded(
+            signal_paths,
+            MAX_SIGNAL_PATHS,
+            "array signal paths exceed their limit",
+        )?;
         if frequencies_hz.is_empty()
             || frequencies_hz.len() > MAX_FREQUENCIES
             || frequencies_hz.contains(&0)
@@ -426,8 +609,16 @@ impl ArrayCapture {
             .len()
             .checked_mul(signal_paths.len())
             .ok_or_else(|| ArrayAdapterError::new("array sample shape overflows"))?;
-        if samples > MAX_IQ_SAMPLES
-            || raw_iq.len() != samples
+        if samples > MAX_IQ_SAMPLES {
+            return Err(ArrayAdapterError::new("array sample shape exceeds its limit"));
+        }
+        let raw_iq = collect_bounded(raw_iq, samples, "array IQ exceeds its declared shape")?;
+        let sample_states = collect_bounded(
+            sample_states,
+            samples,
+            "array sample state exceeds its declared shape",
+        )?;
+        if raw_iq.len() != samples
             || sample_states.len() != samples
             || native_metadata.path_facts.len() != signal_paths.len()
         {
@@ -656,6 +847,8 @@ pub enum ArrayAdaptReason {
     PortMapping,
     /// Frequency samples lie outside the calibrated array range.
     FrequencyValidity,
+    /// Local per-element phase corrections do not match the qualified capture scope.
+    PhaseCalibration,
     /// The physical array geometry cannot constrain a two-dimensional arrival angle.
     DegenerateGeometry,
     /// Missing, invalid, interpolated, or training-masked samples prevent estimation.
@@ -672,12 +865,37 @@ pub struct ArrayAdaptFailure {
     reason: ArrayAdaptReason,
     disposition: ArrayAdaptDisposition,
     gaps: Box<[QualificationGap]>,
+    context: &'static str,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
     backtrace: Box<Backtrace>,
 }
 
 impl ArrayAdaptFailure {
     fn new(reason: ArrayAdaptReason, disposition: ArrayAdaptDisposition) -> Self {
-        Self { reason, disposition, gaps: Box::new([]), backtrace: Box::new(Backtrace::capture()) }
+        Self {
+            reason,
+            disposition,
+            gaps: Box::new([]),
+            context: "array adaptation rejected",
+            source: None,
+            backtrace: Box::new(Backtrace::capture()),
+        }
+    }
+
+    fn with_source(
+        reason: ArrayAdaptReason,
+        disposition: ArrayAdaptDisposition,
+        context: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            reason,
+            disposition,
+            gaps: Box::new([]),
+            context,
+            source: Some(Box::new(source)),
+            backtrace: Box::new(Backtrace::capture()),
+        }
     }
 
     fn qualification(eligibility: &Eligibility) -> Self {
@@ -690,6 +908,8 @@ impl ArrayAdaptFailure {
             reason: ArrayAdaptReason::PhysicalQualification,
             disposition,
             gaps: eligibility.gaps().into(),
+            context: "array physical qualification rejected",
+            source: None,
             backtrace: Box::new(Backtrace::capture()),
         }
     }
@@ -720,11 +940,15 @@ impl ArrayAdaptFailure {
 
 impl fmt::Display for ArrayAdaptFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "array adaptation rejected: {:?}", self.reason)
+        write!(formatter, "{}: {:?}", self.context, self.reason)
     }
 }
 
-impl std::error::Error for ArrayAdaptFailure {}
+impl std::error::Error for ArrayAdaptFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// Map-safe interpretation of one RF path hypothesis.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -844,6 +1068,7 @@ pub struct ArrayPathRecord {
     array_identity: Box<str>,
     capture_digest: ArrayCaptureDigest,
     calibration_digest: ArtifactDigest,
+    phase_calibration_digest: ArrayPhaseCalibrationDigest,
     static_reference_digest: Option<ArrayCaptureDigest>,
     window: TickRange,
     geometry_error_m: f64,
@@ -874,6 +1099,12 @@ impl ArrayPathRecord {
     #[must_use]
     pub const fn calibration_digest(&self) -> ArtifactDigest {
         self.calibration_digest
+    }
+
+    /// Returns the exact local per-element phase-calibration identity.
+    #[must_use]
+    pub const fn phase_calibration_digest(&self) -> ArrayPhaseCalibrationDigest {
+        self.phase_calibration_digest
     }
 
     /// Returns the immutable static-reference capture digest, when supplied.
@@ -912,6 +1143,7 @@ impl ArrayPathRecord {
 pub struct StaticArrayReference {
     capture: SealedArrayCapture,
     calibration_digest: ArtifactDigest,
+    phase_calibration_digest: ArrayPhaseCalibrationDigest,
     array_identity: Box<str>,
 }
 
@@ -928,10 +1160,12 @@ impl StaticArrayReference {
         record: &ArrayPathRecord,
         capture: &SealedArrayCapture,
     ) -> Result<Self, ArrayAdaptFailure> {
-        let decoded = capture.decode().map_err(|_| {
-            ArrayAdaptFailure::new(
+        let decoded = capture.decode().map_err(|source| {
+            ArrayAdaptFailure::with_source(
                 ArrayAdaptReason::StaticReferenceMismatch,
                 ArrayAdaptDisposition::RejectWindow,
+                "could not decode the static-reference capture",
+                source,
             )
         })?;
         if capture.digest() != record.capture_digest
@@ -945,6 +1179,7 @@ impl StaticArrayReference {
         Ok(Self {
             capture: capture.clone(),
             calibration_digest: record.calibration_digest,
+            phase_calibration_digest: record.phase_calibration_digest,
             array_identity: record.array_identity.clone(),
         })
     }
@@ -959,6 +1194,12 @@ impl StaticArrayReference {
     #[must_use]
     pub const fn calibration_digest(&self) -> ArtifactDigest {
         self.calibration_digest
+    }
+
+    /// Returns the local phase calibration under which the reference was qualified.
+    #[must_use]
+    pub const fn phase_calibration_digest(&self) -> ArrayPhaseCalibrationDigest {
+        self.phase_calibration_digest
     }
 
     /// Returns the local array identity.
@@ -1036,8 +1277,8 @@ impl ThreeArrayCoverage {
     pub fn new<'a>(
         records: impl IntoIterator<Item = &'a ArrayPathRecord>,
     ) -> Result<Self, ArrayCoverageError> {
-        let records = records.into_iter().collect::<Vec<_>>();
-        if records.len() != 3 {
+        let records = records.into_iter().take(REQUIRED_ARRAY_VIEWS + 1).collect::<Vec<_>>();
+        if records.len() != REQUIRED_ARRAY_VIEWS {
             return Err(ArrayCoverageError::new(
                 "three-array coverage requires exactly three records",
             ));
@@ -1120,6 +1361,27 @@ impl std::error::Error for ArrayCoverageError {}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EspargosSourceAdapter;
 
+/// Exact immutable spatial and local-phase calibrations for one adaptation.
+#[derive(Clone, Copy, Debug)]
+pub struct ArrayCalibrationInput<'a> {
+    spatial_bytes: &'a [u8],
+    phase: &'a ArrayPhaseCalibration,
+}
+
+impl<'a> ArrayCalibrationInput<'a> {
+    /// Groups sealed spatial-artifact bytes with exact local phase corrections.
+    #[must_use]
+    pub const fn new(spatial_bytes: &'a [u8], phase: &'a ArrayPhaseCalibration) -> Self {
+        Self { spatial_bytes, phase }
+    }
+
+    /// Groups a validated sealed spatial artifact with exact local phase corrections.
+    #[must_use]
+    pub fn from_sealed(spatial: &'a SealedArtifact, phase: &'a ArrayPhaseCalibration) -> Self {
+        Self::new(spatial.bytes(), phase)
+    }
+}
+
 impl EspargosSourceAdapter {
     /// Creates the fixed bounded first-version array adapter.
     #[must_use]
@@ -1139,7 +1401,7 @@ impl EspargosSourceAdapter {
     pub fn adapt(
         &self,
         sealed_capture: &SealedArrayCapture,
-        sealed_calibration: &SealedArtifact,
+        calibrations: ArrayCalibrationInput<'_>,
         block: &crate::measurement::EvidenceBlock,
         requirements: &ModelRequirements,
         qualification: &Qualification,
@@ -1151,10 +1413,12 @@ impl EspargosSourceAdapter {
                 ArrayAdaptDisposition::RejectWindow,
             ));
         }
-        let capture = sealed_capture.decode().map_err(|_| {
-            ArrayAdaptFailure::new(
+        let capture = sealed_capture.decode().map_err(|source| {
+            ArrayAdaptFailure::with_source(
                 ArrayAdaptReason::InputBinding,
                 ArrayAdaptDisposition::RejectWindow,
+                "could not decode the input array capture",
+                source,
             )
         })?;
         validate_block_binding(&capture, sealed_capture.digest(), block)?;
@@ -1174,11 +1438,27 @@ impl EspargosSourceAdapter {
                 ArrayAdaptDisposition::RejectWindow,
             ));
         }
-        let calibration = decode_calibration(sealed_calibration)?;
+        let sealed_calibration =
+            SealedArtifact::parse(calibrations.spatial_bytes).map_err(|source| {
+                ArrayAdaptFailure::with_source(
+                    ArrayAdaptReason::CalibrationIdentity,
+                    ArrayAdaptDisposition::EndEpoch,
+                    "could not parse the sealed spatial calibration bytes",
+                    source,
+                )
+            })?;
+        let phase_calibration = calibrations.phase;
+        let calibration = decode_calibration(&sealed_calibration)?;
         let ordered_elements = validate_calibration(&capture, &calibration, block, requirements)?;
+        validate_phase_calibration(&capture, phase_calibration, block, requirements)?;
         let static_capture = static_reference
             .map(|reference| {
-                validate_static_reference(&capture, reference, sealed_calibration.digest())
+                validate_static_reference(
+                    &capture,
+                    reference,
+                    sealed_calibration.digest(),
+                    phase_calibration.digest(),
+                )
             })
             .transpose()?;
         let geometry = geometry_metrics(&ordered_elements);
@@ -1188,7 +1468,12 @@ impl EspargosSourceAdapter {
                 ArrayAdaptDisposition::EndEpoch,
             ));
         }
-        let mut candidates = estimate_angle_delay(&capture, &ordered_elements, geometry.aperture)?;
+        let mut candidates = estimate_angle_delay(
+            &capture,
+            phase_calibration,
+            &ordered_elements,
+            geometry.aperture,
+        )?;
         if candidates.is_empty() {
             return Err(ArrayAdaptFailure::new(
                 ArrayAdaptReason::InsufficientSignal,
@@ -1199,7 +1484,14 @@ impl EspargosSourceAdapter {
         candidates[0].kind = PathKind::DirectPathPossible;
         let static_candidates = static_capture
             .as_ref()
-            .map(|reference| estimate_angle_delay(reference, &ordered_elements, geometry.aperture))
+            .map(|reference| {
+                estimate_angle_delay(
+                    reference,
+                    phase_calibration,
+                    &ordered_elements,
+                    geometry.aperture,
+                )
+            })
             .transpose()?
             .unwrap_or_default();
         for candidate in candidates.iter_mut().skip(1) {
@@ -1210,11 +1502,12 @@ impl EspargosSourceAdapter {
                         <= ANGLE_STEP_RADIANS
                     && (candidate.elevation_radians - reference.elevation_radians).abs()
                         <= ANGLE_STEP_RADIANS
-                    && (candidate.normalized_power - reference.normalized_power).abs() <= 0.15
+                    && (candidate.normalized_power - reference.normalized_power).abs()
+                        <= STATIC_POWER_MATCH_TOLERANCE
             });
             candidate.kind = if stable {
                 PathKind::StableStatic
-            } else if candidate.normalized_power >= 0.5 {
+            } else if candidate.normalized_power >= DYNAMIC_CANDIDATE_MINIMUM_POWER {
                 PathKind::DynamicCandidate
             } else {
                 PathKind::Unexplained
@@ -1233,6 +1526,7 @@ impl EspargosSourceAdapter {
             array_identity: capture.identity().array_identity().into(),
             capture_digest: sealed_capture.digest(),
             calibration_digest: sealed_calibration.digest(),
+            phase_calibration_digest: phase_calibration.digest(),
             static_reference_digest: static_reference.map(StaticArrayReference::capture_digest),
             window: capture.window(),
             geometry_error_m,
@@ -1318,9 +1612,15 @@ fn validate_block_binding(
 fn decode_calibration(sealed: &SealedArtifact) -> Result<CalibrationBundle, ArrayAdaptFailure> {
     match sealed.decode() {
         Ok(Artifact::Calibration(calibration)) => Ok(*calibration),
-        Ok(Artifact::Scene(_) | Artifact::Supervision(_)) | Err(_) => Err(ArrayAdaptFailure::new(
+        Ok(Artifact::Scene(_) | Artifact::Supervision(_)) => Err(ArrayAdaptFailure::new(
             ArrayAdaptReason::CalibrationIdentity,
             ArrayAdaptDisposition::EndEpoch,
+        )),
+        Err(source) => Err(ArrayAdaptFailure::with_source(
+            ArrayAdaptReason::CalibrationIdentity,
+            ArrayAdaptDisposition::EndEpoch,
+            "could not decode the sealed spatial calibration",
+            source,
         )),
     }
 }
@@ -1534,11 +1834,14 @@ fn validate_static_reference(
     capture: &ArrayCapture,
     reference: &StaticArrayReference,
     calibration_digest: ArtifactDigest,
+    phase_calibration_digest: ArrayPhaseCalibrationDigest,
 ) -> Result<ArrayCapture, ArrayAdaptFailure> {
-    let decoded = reference.capture.decode().map_err(|_| {
-        ArrayAdaptFailure::new(
+    let decoded = reference.capture.decode().map_err(|source| {
+        ArrayAdaptFailure::with_source(
             ArrayAdaptReason::StaticReferenceMismatch,
             ArrayAdaptDisposition::RejectWindow,
+            "could not decode the validated static-reference capture",
+            source,
         )
     })?;
     let same_paths = capture.signal_paths().len() == decoded.signal_paths().len()
@@ -1549,6 +1852,7 @@ fn validate_static_reference(
                 && left.rx_logical_path() == right.rx_logical_path()
         });
     if reference.calibration_digest != calibration_digest
+        || reference.phase_calibration_digest != phase_calibration_digest
         || capture.identity().array_identity() != decoded.identity().array_identity()
         || capture.identity().rf_device_identity() != decoded.identity().rf_device_identity()
         || capture.identity().context() != decoded.identity().context()
@@ -1563,6 +1867,34 @@ fn validate_static_reference(
         ));
     }
     Ok(decoded)
+}
+
+fn validate_phase_calibration(
+    capture: &ArrayCapture,
+    calibration: &ArrayPhaseCalibration,
+    block: &crate::measurement::EvidenceBlock,
+    requirements: &ModelRequirements,
+) -> Result<(), ArrayAdaptFailure> {
+    let expected_paths =
+        capture.signal_paths().iter().map(ArraySignalPath::native_path).collect::<Vec<_>>();
+    let Some(phase_requirement) = requirements.phase_requirement() else {
+        return Err(ArrayAdaptFailure::new(
+            ArrayAdaptReason::WrongOperator,
+            ArrayAdaptDisposition::RejectWindow,
+        ));
+    };
+    if calibration.array_identity.as_ref() != capture.identity().array_identity()
+        || calibration.reference != phase_requirement.reference()
+        || calibration.epoch != block.identity().scope().epoch()
+        || calibration.frequencies_hz.as_ref() != capture.frequencies_hz()
+        || calibration.paths.as_ref() != expected_paths
+    {
+        return Err(ArrayAdaptFailure::new(
+            ArrayAdaptReason::PhaseCalibration,
+            ArrayAdaptDisposition::EndEpoch,
+        ));
+    }
+    Ok(())
 }
 
 struct GeometryMetrics {
@@ -1582,7 +1914,7 @@ fn geometry_metrics(elements: &[[f64; 3]]) -> GeometryMetrics {
         elements[index + 2..].iter().any(|second| {
             let a = subtract(*first, origin);
             let b = subtract(*second, origin);
-            norm(cross(a, b)) > 1.0e-8
+            norm(cross(a, b)) > MINIMUM_GEOMETRY_CROSS_PRODUCT_M2
         })
     });
     GeometryMetrics { non_degenerate, aperture }
@@ -1679,6 +2011,18 @@ fn rigid_pose(matrix: [f64; 16]) -> Option<crate::measurement::Pose> {
 }
 
 const SPEED_OF_LIGHT_MPS: f64 = 299_792_458.0;
+/// Minimum cross-product magnitude in square metres used to reject numerically
+/// collinear phase centres. This v1 numerical guard is below the documented
+/// millimetre geometry-error budget; changing it changes which arrays qualify.
+const MINIMUM_GEOMETRY_CROSS_PRODUCT_M2: f64 = 1.0e-8;
+/// Maximum unitless normalized-power difference for matching a qualified static
+/// path. The v1 value is an explicit classification policy, not measured RF
+/// accuracy; changing it changes `StableStatic` membership.
+const STATIC_POWER_MATCH_TOLERANCE: f64 = 0.15;
+/// Minimum unitless normalized power for an unmatched path to remain a dynamic
+/// candidate. The v1 midpoint is a conservative policy threshold; changing it
+/// changes downstream dynamic-candidate volume.
+const DYNAMIC_CANDIDATE_MINIMUM_POWER: f64 = 0.5;
 /// Fixed 15-degree angular grid. This is an explicit first-version numerical
 /// resolution, not evidence of physical accuracy.
 const ANGLE_STEP_RADIANS: f64 = std::f64::consts::PI / 12.0;
@@ -1715,6 +2059,7 @@ impl ComplexF64 {
 
 fn estimate_angle_delay(
     capture: &ArrayCapture,
+    phase_calibration: &ArrayPhaseCalibration,
     elements: &[[f64; 3]],
     aperture: f64,
 ) -> Result<Vec<ArrayPathCandidate>, ArrayAdaptFailure> {
@@ -1731,14 +2076,19 @@ fn estimate_angle_delay(
     for (bin, by_path) in delayed.iter_mut().enumerate() {
         let delay = bin as f64 * delay_step;
         for (path, accumulator) in by_path.iter_mut().enumerate() {
-            for (sample, frequency) in capture.raw_iq()
+            for (frequency_index, (sample, frequency)) in capture.raw_iq()
                 [path * frequencies.len()..(path + 1) * frequencies.len()]
                 .iter()
                 .zip(frequencies)
+                .enumerate()
             {
                 let relative_frequency = (*frequency - frequencies[0]) as f64;
-                accumulator
-                    .add_rotated(*sample, 2.0 * std::f64::consts::PI * relative_frequency * delay);
+                let calibration_index = path * frequencies.len() + frequency_index;
+                accumulator.add_rotated(
+                    *sample,
+                    phase_calibration.correction_radians[calibration_index]
+                        + 2.0 * std::f64::consts::PI * relative_frequency * delay,
+                );
             }
         }
     }
@@ -1854,13 +2204,29 @@ fn transform_direction(matrix: [f64; 16], direction: [f64; 3]) -> [f64; 3] {
 /// Invalid array bytes, shape, calibration, or physical qualification.
 #[derive(Debug)]
 pub struct ArrayAdapterError {
-    message: &'static str,
+    kind: Box<ArrayAdapterErrorKind>,
     backtrace: Box<Backtrace>,
+}
+
+#[derive(Debug)]
+enum ArrayAdapterErrorKind {
+    Invalid(&'static str),
+    Measurement { context: &'static str, source: crate::measurement::MeasurementError },
 }
 
 impl ArrayAdapterError {
     fn new(message: &'static str) -> Self {
-        Self { message, backtrace: Box::new(Backtrace::capture()) }
+        Self {
+            kind: Box::new(ArrayAdapterErrorKind::Invalid(message)),
+            backtrace: Box::new(Backtrace::capture()),
+        }
+    }
+
+    fn measurement(context: &'static str, source: crate::measurement::MeasurementError) -> Self {
+        Self {
+            kind: Box::new(ArrayAdapterErrorKind::Measurement { context, source }),
+            backtrace: Box::new(Backtrace::capture()),
+        }
     }
 
     /// Returns the captured construction backtrace.
@@ -1871,11 +2237,23 @@ impl ArrayAdapterError {
 
 impl fmt::Display for ArrayAdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
+        match self.kind.as_ref() {
+            ArrayAdapterErrorKind::Invalid(message) => formatter.write_str(message),
+            ArrayAdapterErrorKind::Measurement { context, source } => {
+                write!(formatter, "{context}: {source}")
+            }
+        }
     }
 }
 
-impl std::error::Error for ArrayAdapterError {}
+impl std::error::Error for ArrayAdapterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.kind.as_ref() {
+            ArrayAdapterErrorKind::Invalid(_) => None,
+            ArrayAdapterErrorKind::Measurement { source, .. } => Some(source),
+        }
+    }
+}
 
 fn encode_capture(output: &mut Vec<u8>, capture: &ArrayCapture) -> Result<(), ArrayAdapterError> {
     let identity = capture.identity();
@@ -2059,6 +2437,18 @@ fn require_text(value: &str) -> Result<(), ArrayAdapterError> {
     Ok(())
 }
 
+fn collect_bounded<T>(
+    values: impl IntoIterator<Item = T>,
+    maximum: usize,
+    message: &'static str,
+) -> Result<Vec<T>, ArrayAdapterError> {
+    let values = values.into_iter().take(maximum.saturating_add(1)).collect::<Vec<_>>();
+    if values.len() > maximum {
+        return Err(ArrayAdapterError::new(message));
+    }
+    Ok(values)
+}
+
 fn put_text(output: &mut Vec<u8>, value: &str) -> Result<(), ArrayAdapterError> {
     require_text(value)?;
     put_count_u16(output, value.len())?;
@@ -2142,7 +2532,7 @@ impl<'a> Reader<'a> {
 }
 
 impl From<crate::measurement::MeasurementError> for ArrayAdapterError {
-    fn from(_: crate::measurement::MeasurementError) -> Self {
-        Self::new("array capture time window is invalid")
+    fn from(source: crate::measurement::MeasurementError) -> Self {
+        Self::measurement("could not reconstruct the array capture time window", source)
     }
 }

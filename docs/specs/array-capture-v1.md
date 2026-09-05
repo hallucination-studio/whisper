@@ -66,6 +66,21 @@ Array-to-world and device-to-array transforms must be finite rigid transforms;
 the array-to-world pose and error budgets must match the operator requirements.
 Collinear or duplicate phase centres cannot produce an angle-delay record.
 
+Angle-delay adaptation also requires one immutable local phase-calibration
+value. Its digest preimage starts with ASCII `WPC1`, followed by the bounded
+array identity, 32-byte qualified phase-reference identity, qualification epoch,
+exact frequency axis, exact source-native path identities, and one finite `f64`
+correction in path-major frequency order. Counts use the WAC1 `u16` convention;
+numeric values use little-endian representation. The SHA-256 digest covers that
+complete preimage. Array, reference, epoch, frequency, path, shape, or digest
+changes therefore name a different calibration and cannot be silently reused.
+
+Each correction is a rotation in radians applied to its native IQ value before
+both the delay transform and angular beam scan. A static spectrum must retain
+the same spatial- and phase-calibration digests as the current interpretation.
+This is one-array-local phase correction only; it establishes no cross-array
+carrier-phase relation.
+
 The bounded estimator performs a per-element delay transform followed by a
 15-degree local azimuth/elevation scan. It evaluates at most 64 delay bins and
 retains at most eight separated candidates. Reported error contains half-bin
@@ -82,7 +97,7 @@ background condition.
 
 Each record retains one array identity, world origin, world-coordinate unit
 directions, local angles, delay, normalized power, uncertainty, sample
-coverage, and the capture/calibration/static-reference digests. Three-view
+coverage, and the capture/spatial-calibration/phase-calibration/static-reference digests. Three-view
 coverage reports each independently qualified array. It does not share or
 combine carrier phase across arrays and does not intersect rays into a person
 position. At least two locally non-degenerate views are reported separately as

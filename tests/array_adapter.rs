@@ -1,11 +1,13 @@
 //! Public locally coherent array-adapter behavior.
 
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use whisper::array_adapter::{
-    ArrayAdaptDisposition, ArrayAdaptReason, ArrayCapture, ArrayCaptureIdentity,
-    ArrayNativeMetadata, ArrayPathRadioFacts, ArrayPathRecord, ArraySignalPath, ComplexI16,
-    EspargosSourceAdapter, LtfIdentity, NativeArrayPathIdentity, PathKind, SampleState,
-    SealedArrayCapture, StaticArrayReference, ThreeArrayCoverage,
+    ArrayAdaptDisposition, ArrayAdaptReason, ArrayCalibrationInput, ArrayCapture,
+    ArrayCaptureIdentity, ArrayNativeMetadata, ArrayPathRadioFacts, ArrayPathRecord,
+    ArrayPhaseCalibration, ArraySignalPath, ComplexI16, EspargosSourceAdapter, LtfIdentity,
+    NativeArrayPathIdentity, PathKind, SampleState, SealedArrayCapture, StaticArrayReference,
+    ThreeArrayCoverage,
 };
 use whisper::artifact::{
     ArrayCondition, ArrayElementGeometry, Artifact, ArtifactMetadata, CalibrationBundle,
@@ -127,6 +129,26 @@ fn native_metadata(path_count: u16) -> ArrayNativeMetadata {
 
 fn sealed_capture() -> SealedArrayCapture {
     SealedArrayCapture::seal(capture()).unwrap()
+}
+
+fn phase_calibration(capture: &SealedArrayCapture) -> ArrayPhaseCalibration {
+    let capture = capture.decode().unwrap();
+    ArrayPhaseCalibration::new(
+        capture.identity().array_identity(),
+        PhaseReferenceIdentity::new([22; 32]),
+        QualificationEpoch::new(4),
+        capture.frequencies_hz().iter().copied(),
+        capture.signal_paths().iter().map(ArraySignalPath::native_path),
+        std::iter::repeat_n(0.0, capture.raw_iq().len()),
+    )
+    .unwrap()
+}
+
+fn rotate_sample(sample: ComplexI16, radians: f64) -> ComplexI16 {
+    let (sin, cos) = radians.sin_cos();
+    let re = f64::from(sample.in_phase());
+    let im = f64::from(sample.quadrature());
+    ComplexI16::new((re * cos - im * sin).round() as i16, (re * sin + im * cos).round() as i16)
 }
 
 fn calibration() -> SealedArtifact {
@@ -487,7 +509,7 @@ fn record_for_view(index: u64, origin: [f64; 3]) -> ArrayPathRecord {
     EspargosSourceAdapter::new()
         .adapt(
             &view_capture,
-            &calibration,
+            ArrayCalibrationInput::from_sealed(&calibration, &phase_calibration(&view_capture)),
             &evidence(&view_capture),
             &requirements_for_pose(8, pose(origin)),
             &qualification,
@@ -590,11 +612,64 @@ fn malformed_digest_shape_axis_and_duplicate_paths_are_rejected() {
 }
 
 #[test]
+fn array_errors_preserve_artifact_and_measurement_sources_with_context() {
+    let capture = sealed_capture();
+    let mut invalid_window = capture.bytes().to_vec();
+    let mut window_bytes = Vec::new();
+    window_bytes.extend_from_slice(&100_u64.to_le_bytes());
+    window_bytes.extend_from_slice(&103_u64.to_le_bytes());
+    window_bytes.extend_from_slice(&1_800_000_000_000_000_000_u64.to_le_bytes());
+    let window_offset = invalid_window
+        .windows(window_bytes.len())
+        .position(|candidate| candidate == window_bytes)
+        .unwrap();
+    invalid_window[window_offset + 8..window_offset + 16].copy_from_slice(&99_u64.to_le_bytes());
+    let digest_offset = invalid_window.len() - 32;
+    let digest = Sha256::digest(&invalid_window[..digest_offset]);
+    invalid_window[digest_offset..].copy_from_slice(&digest);
+    let measurement_error = SealedArrayCapture::parse(&invalid_window).unwrap_err();
+    assert!(measurement_error.to_string().contains("reconstruct the array capture time window"));
+    assert!(
+        std::error::Error::source(&measurement_error)
+            .unwrap()
+            .downcast_ref::<whisper::measurement::MeasurementError>()
+            .is_some()
+    );
+
+    let mut invalid_artifact = calibration().bytes().to_vec();
+    invalid_artifact[20] ^= 1;
+    let failure = EspargosSourceAdapter::new()
+        .adapt(
+            &capture,
+            ArrayCalibrationInput::new(&invalid_artifact, &phase_calibration(&capture)),
+            &evidence(&capture),
+            &requirements(),
+            &qualification(),
+            None,
+        )
+        .unwrap_err();
+    assert!(failure.to_string().contains("parse the sealed spatial calibration bytes"));
+    assert!(
+        std::error::Error::source(&failure)
+            .unwrap()
+            .downcast_ref::<whisper::artifact::ArtifactError>()
+            .is_some()
+    );
+}
+
+#[test]
 fn exact_local_calibration_and_relations_produce_a_qualified_path_record() {
     let capture = sealed_capture();
     let calibration = calibration();
     let record = EspargosSourceAdapter::new()
-        .adapt(&capture, &calibration, &evidence(&capture), &requirements(), &qualification(), None)
+        .adapt(
+            &capture,
+            ArrayCalibrationInput::from_sealed(&calibration, &phase_calibration(&capture)),
+            &evidence(&capture),
+            &requirements(),
+            &qualification(),
+            None,
+        )
         .unwrap();
 
     assert_eq!(record.capture_digest(), capture.digest());
@@ -610,17 +685,336 @@ fn exact_local_calibration_and_relations_produce_a_qualified_path_record() {
 }
 
 #[test]
+fn immutable_local_phase_correction_removes_path_drift_and_rejects_wrong_scope() {
+    let baseline = sealed_capture();
+    let baseline_record = EspargosSourceAdapter::new()
+        .adapt(
+            &baseline,
+            ArrayCalibrationInput::from_sealed(&calibration(), &phase_calibration(&baseline)),
+            &evidence(&baseline),
+            &requirements(),
+            &qualification(),
+            None,
+        )
+        .unwrap();
+    let decoded = baseline.decode().unwrap();
+    let drift = [
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+        -std::f64::consts::FRAC_PI_2,
+        std::f64::consts::FRAC_PI_4,
+        -std::f64::consts::FRAC_PI_4,
+        3.0 * std::f64::consts::FRAC_PI_4,
+        -3.0 * std::f64::consts::FRAC_PI_4,
+    ];
+    let frequency_count = decoded.frequencies_hz().len();
+    let drifted_iq = decoded
+        .raw_iq()
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| rotate_sample(*sample, drift[index / frequency_count]));
+    let drifted = SealedArrayCapture::seal(capture_with(
+        drifted_iq,
+        std::iter::repeat_n(SampleState::Captured, decoded.raw_iq().len()),
+    ))
+    .unwrap();
+    let drifted_decoded = drifted.decode().unwrap();
+    let corrections =
+        drift.into_iter().flat_map(|path_drift| std::iter::repeat_n(-path_drift, frequency_count));
+    let correction = ArrayPhaseCalibration::new(
+        drifted_decoded.identity().array_identity(),
+        PhaseReferenceIdentity::new([22; 32]),
+        QualificationEpoch::new(4),
+        drifted_decoded.frequencies_hz().iter().copied(),
+        drifted_decoded.signal_paths().iter().map(ArraySignalPath::native_path),
+        corrections,
+    )
+    .unwrap();
+    let corrected_record = EspargosSourceAdapter::new()
+        .adapt(
+            &drifted,
+            ArrayCalibrationInput::from_sealed(&calibration(), &correction),
+            &evidence(&drifted),
+            &requirements(),
+            &qualification(),
+            None,
+        )
+        .unwrap();
+    let uncorrected_record = EspargosSourceAdapter::new()
+        .adapt(
+            &drifted,
+            ArrayCalibrationInput::from_sealed(&calibration(), &phase_calibration(&drifted)),
+            &evidence(&drifted),
+            &requirements(),
+            &qualification(),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(corrected_record.phase_calibration_digest(), correction.digest());
+    assert_eq!(corrected_record.candidates().len(), baseline_record.candidates().len());
+    for (corrected, expected) in
+        corrected_record.candidates().iter().zip(baseline_record.candidates())
+    {
+        assert_eq!(corrected.azimuth_radians(), expected.azimuth_radians());
+        assert_eq!(corrected.elevation_radians(), expected.elevation_radians());
+        assert_eq!(corrected.delay_seconds(), expected.delay_seconds());
+        assert!((corrected.normalized_power() - expected.normalized_power()).abs() < 0.002);
+    }
+    assert_ne!(
+        (
+            uncorrected_record.candidates()[0].azimuth_radians(),
+            uncorrected_record.candidates()[0].elevation_radians(),
+        ),
+        (
+            corrected_record.candidates()[0].azimuth_radians(),
+            corrected_record.candidates()[0].elevation_radians(),
+        )
+    );
+
+    let native_paths =
+        drifted_decoded.signal_paths().iter().map(ArraySignalPath::native_path).collect::<Vec<_>>();
+    let mut wrong_frequencies = drifted_decoded.frequencies_hz().to_vec();
+    wrong_frequencies[1] += 1;
+    let mut wrong_paths = native_paths.clone();
+    wrong_paths.swap(0, 1);
+    let cases = [
+        ArrayPhaseCalibration::new(
+            "other-array",
+            PhaseReferenceIdentity::new([22; 32]),
+            QualificationEpoch::new(4),
+            drifted_decoded.frequencies_hz().iter().copied(),
+            native_paths.iter().copied(),
+            std::iter::repeat_n(0.0, drifted_decoded.raw_iq().len()),
+        )
+        .unwrap(),
+        ArrayPhaseCalibration::new(
+            drifted_decoded.identity().array_identity(),
+            PhaseReferenceIdentity::new([99; 32]),
+            QualificationEpoch::new(4),
+            drifted_decoded.frequencies_hz().iter().copied(),
+            native_paths.iter().copied(),
+            std::iter::repeat_n(0.0, drifted_decoded.raw_iq().len()),
+        )
+        .unwrap(),
+        ArrayPhaseCalibration::new(
+            drifted_decoded.identity().array_identity(),
+            PhaseReferenceIdentity::new([22; 32]),
+            QualificationEpoch::new(5),
+            drifted_decoded.frequencies_hz().iter().copied(),
+            native_paths.iter().copied(),
+            std::iter::repeat_n(0.0, drifted_decoded.raw_iq().len()),
+        )
+        .unwrap(),
+        ArrayPhaseCalibration::new(
+            drifted_decoded.identity().array_identity(),
+            PhaseReferenceIdentity::new([22; 32]),
+            QualificationEpoch::new(4),
+            wrong_frequencies,
+            native_paths.iter().copied(),
+            std::iter::repeat_n(0.0, drifted_decoded.raw_iq().len()),
+        )
+        .unwrap(),
+        ArrayPhaseCalibration::new(
+            drifted_decoded.identity().array_identity(),
+            PhaseReferenceIdentity::new([22; 32]),
+            QualificationEpoch::new(4),
+            drifted_decoded.frequencies_hz().iter().copied(),
+            wrong_paths,
+            std::iter::repeat_n(0.0, drifted_decoded.raw_iq().len()),
+        )
+        .unwrap(),
+    ];
+    for wrong_scope in cases {
+        let failure = EspargosSourceAdapter::new()
+            .adapt(
+                &drifted,
+                ArrayCalibrationInput::from_sealed(&calibration(), &wrong_scope),
+                &evidence(&drifted),
+                &requirements(),
+                &qualification(),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(failure.reason(), ArrayAdaptReason::PhaseCalibration);
+        assert_eq!(failure.disposition(), ArrayAdaptDisposition::EndEpoch);
+    }
+}
+
+#[test]
+fn worked_synthetic_path_has_golden_local_world_delay_power_order_and_uncertainty() {
+    const SPEED_OF_LIGHT_MPS: f64 = 299_792_458.0;
+    let frequencies = (0..16_u64).map(|index| 5_180_000_000 + index * 625_000).collect::<Vec<_>>();
+    let positions = (0..8)
+        .map(|index| {
+            [
+                f64::from(index % 4) * 0.03,
+                f64::from(index / 4) * 0.03,
+                f64::from((index + 2 * (index / 4)) % 3) * 0.01,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let azimuth = std::f64::consts::PI / 6.0;
+    let elevation = std::f64::consts::PI / 12.0;
+    let direction =
+        [elevation.cos() * azimuth.cos(), elevation.cos() * azimuth.sin(), elevation.sin()];
+    let expected_delay_seconds = 200.0e-9;
+    let center_frequency = frequencies[frequencies.len() / 2] as f64;
+    let iq = positions
+        .iter()
+        .flat_map(|position| {
+            frequencies.iter().map(|frequency| {
+                let relative_frequency = (*frequency - frequencies[0]) as f64;
+                let phase = -2.0
+                    * std::f64::consts::PI
+                    * (relative_frequency * expected_delay_seconds
+                        + center_frequency
+                            * position.iter().zip(direction).map(|(a, b)| a * b).sum::<f64>()
+                            / SPEED_OF_LIGHT_MPS);
+                ComplexI16::new(
+                    (12_000.0 * phase.cos()).round() as i16,
+                    (12_000.0 * phase.sin()).round() as i16,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let paths = (0_u16..8).map(|rx| {
+        ArraySignalPath::new(
+            SignalPath::new(0, rx),
+            NativeArrayPathIdentity::new([rx as u8 + 1; 32]),
+            "tx/0",
+            format!("rx/{rx}"),
+        )
+        .unwrap()
+    });
+    let capture = ArrayCapture::new(
+        identity(),
+        LtfIdentity::new([16; 32]),
+        range(100, 103),
+        1_800_000_000_000_000_000,
+        native_metadata(8),
+        frequencies,
+        paths,
+        iq,
+        std::iter::repeat_n(SampleState::Captured, 8 * 16),
+    )
+    .unwrap();
+    let capture = SealedArrayCapture::seal(capture).unwrap();
+    let rotation =
+        [0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+    let calibration = calibration_with(|value| {
+        for (element, position) in value.array_geometry.elements.iter_mut().zip(&positions) {
+            element.position_m = *position;
+        }
+        value.world_transform.matrix = rotation;
+    });
+    let rotated_pose = Pose::new([0, 0, 0, 0, 0, 707_107, 707_107]);
+    let validity = |error| {
+        RelationValidity::new(
+            "fixture",
+            source(),
+            error,
+            range(90, 110),
+            QualificationEpoch::new(4),
+        )
+        .unwrap()
+    };
+    let qualification = Qualification::new(
+        Some(time_relation()),
+        Some(phase_relation(30, PhaseReferenceIdentity::new([22; 32]), range(90, 110))),
+        Some(port_mapping(8, false)),
+        Some(
+            Geometry::new(
+                validity(ErrorBound::new(40, ErrorUnit::Millimetres)),
+                "array",
+                "room",
+                rotated_pose,
+            )
+            .unwrap(),
+        ),
+    );
+    let record = EspargosSourceAdapter::new()
+        .adapt(
+            &capture,
+            ArrayCalibrationInput::from_sealed(&calibration, &phase_calibration(&capture)),
+            &evidence(&capture),
+            &requirements_for_pose(8, rotated_pose),
+            &qualification,
+            None,
+        )
+        .unwrap();
+    let candidate = record.candidates()[0];
+
+    assert_eq!(record.candidates().len(), 8);
+    assert_eq!(candidate.azimuth_radians(), azimuth);
+    assert_eq!(candidate.elevation_radians(), elevation);
+    assert!((candidate.delay_seconds() - expected_delay_seconds).abs() < 1.0e-18);
+    assert_eq!(candidate.normalized_power(), 1.0);
+    assert_eq!(candidate.delay_error_seconds(), 50.0e-9);
+    assert!(
+        record
+            .candidates()
+            .windows(2)
+            .all(|pair| pair[0].delay_seconds() <= pair[1].delay_seconds())
+    );
+    assert!(
+        record
+            .candidates()
+            .iter()
+            .skip(1)
+            .all(|other| other.normalized_power() <= candidate.normalized_power())
+    );
+    let aperture = record.coverage().effective_aperture_m();
+    let expected_angular_error =
+        std::f64::consts::PI / 24.0 + (SPEED_OF_LIGHT_MPS / center_frequency / aperture).atan();
+    assert!((candidate.angular_error_radians() - expected_angular_error).abs() < 1.0e-15);
+    let expected_world = [-direction[1], direction[0], direction[2]];
+    for (actual, expected) in candidate.world_direction().iter().zip(expected_world) {
+        assert!((actual - expected).abs() < 1.0e-12);
+    }
+
+    let degenerate_calibration = calibration_with(|value| {
+        for (index, element) in value.array_geometry.elements.iter_mut().enumerate() {
+            element.position_m = [index as f64 * 0.03, 0.0, 0.0];
+        }
+        value.world_transform.matrix = rotation;
+    });
+    let failure = EspargosSourceAdapter::new()
+        .adapt(
+            &capture,
+            ArrayCalibrationInput::from_sealed(
+                &degenerate_calibration,
+                &phase_calibration(&capture),
+            ),
+            &evidence(&capture),
+            &requirements_for_pose(8, rotated_pose),
+            &qualification,
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(failure.reason(), ArrayAdaptReason::DegenerateGeometry);
+}
+
+#[test]
 fn immutable_static_spectrum_is_retained_and_never_erases_dynamic_path_evidence() {
     let capture = sealed_capture();
     let calibration = calibration();
     let seed_record = EspargosSourceAdapter::new()
-        .adapt(&capture, &calibration, &evidence(&capture), &requirements(), &qualification(), None)
+        .adapt(
+            &capture,
+            ArrayCalibrationInput::from_sealed(&calibration, &phase_calibration(&capture)),
+            &evidence(&capture),
+            &requirements(),
+            &qualification(),
+            None,
+        )
         .unwrap();
     let reference = StaticArrayReference::new(&seed_record, &capture).unwrap();
     let record = EspargosSourceAdapter::new()
         .adapt(
             &capture,
-            &calibration,
+            ArrayCalibrationInput::from_sealed(&calibration, &phase_calibration(&capture)),
             &evidence(&capture),
             &requirements(),
             &qualification(),
@@ -629,6 +1023,7 @@ fn immutable_static_spectrum_is_retained_and_never_erases_dynamic_path_evidence(
         .unwrap();
 
     assert_eq!(reference.capture_digest(), capture.digest());
+    assert_eq!(reference.phase_calibration_digest(), seed_record.phase_calibration_digest());
     assert_eq!(record.static_reference_digest(), Some(reference.capture_digest()));
     assert_eq!(record.candidates()[0].kind(), PathKind::DirectPathPossible);
     assert!(record.candidates().iter().skip(1).all(|path| path.kind() == PathKind::StableStatic));
@@ -644,7 +1039,32 @@ fn immutable_static_spectrum_is_retained_and_never_erases_dynamic_path_evidence(
     let failure = EspargosSourceAdapter::new()
         .adapt(
             &capture,
-            &revised_calibration,
+            ArrayCalibrationInput::from_sealed(&revised_calibration, &phase_calibration(&capture)),
+            &evidence(&capture),
+            &requirements(),
+            &qualification(),
+            Some(&reference),
+        )
+        .unwrap_err();
+    assert_eq!(failure.reason(), ArrayAdaptReason::StaticReferenceMismatch);
+    assert_eq!(failure.disposition(), ArrayAdaptDisposition::EndEpoch);
+
+    let decoded = capture.decode().unwrap();
+    let mut revised_corrections = vec![0.0; decoded.raw_iq().len()];
+    revised_corrections[0] = 0.01;
+    let revised_phase = ArrayPhaseCalibration::new(
+        decoded.identity().array_identity(),
+        PhaseReferenceIdentity::new([22; 32]),
+        QualificationEpoch::new(4),
+        decoded.frequencies_hz().iter().copied(),
+        decoded.signal_paths().iter().map(ArraySignalPath::native_path),
+        revised_corrections,
+    )
+    .unwrap();
+    let failure = EspargosSourceAdapter::new()
+        .adapt(
+            &capture,
+            ArrayCalibrationInput::from_sealed(&calibration, &revised_phase),
             &evidence(&capture),
             &requirements(),
             &qualification(),
@@ -666,7 +1086,10 @@ fn unmatched_paths_remain_dynamic_candidates_or_unexplained_rf_not_people() {
     let reference_record = EspargosSourceAdapter::new()
         .adapt(
             &quiet_reference,
-            &calibration(),
+            ArrayCalibrationInput::from_sealed(
+                &calibration(),
+                &phase_calibration(&quiet_reference),
+            ),
             &evidence(&quiet_reference),
             &requirements(),
             &qualification(),
@@ -677,7 +1100,7 @@ fn unmatched_paths_remain_dynamic_candidates_or_unexplained_rf_not_people() {
     let record = EspargosSourceAdapter::new()
         .adapt(
             &capture,
-            &calibration(),
+            ArrayCalibrationInput::from_sealed(&calibration(), &phase_calibration(&capture)),
             &evidence(&capture),
             &requirements(),
             &qualification(),
@@ -829,7 +1252,7 @@ fn every_independent_relation_gap_blocks_angle_delay_without_an_aggregate_bypass
         let failure = EspargosSourceAdapter::new()
             .adapt(
                 &capture,
-                &calibration,
+                ArrayCalibrationInput::from_sealed(&calibration, &phase_calibration(&capture)),
                 &evidence(&capture),
                 &requirements(),
                 &qualification,
@@ -944,7 +1367,7 @@ fn calibration_identity_validity_frequency_ports_and_geometry_fail_closed() {
         let failure = EspargosSourceAdapter::new()
             .adapt(
                 &capture,
-                &calibration,
+                ArrayCalibrationInput::from_sealed(&calibration, &phase_calibration(&capture)),
                 &evidence(&capture),
                 &requirements(),
                 &qualification(),
@@ -973,7 +1396,7 @@ fn every_non_native_sample_state_and_occluded_zero_energy_window_is_rejected() {
         let failure = EspargosSourceAdapter::new()
             .adapt(
                 &capture,
-                &calibration(),
+                ArrayCalibrationInput::from_sealed(&calibration(), &phase_calibration(&capture)),
                 &evidence(&capture),
                 &requirements(),
                 &qualification(),
@@ -992,7 +1415,7 @@ fn every_non_native_sample_state_and_occluded_zero_energy_window_is_rejected() {
     let failure = EspargosSourceAdapter::new()
         .adapt(
             &occluded,
-            &calibration(),
+            ArrayCalibrationInput::from_sealed(&calibration(), &phase_calibration(&occluded)),
             &evidence(&occluded),
             &requirements(),
             &qualification(),
@@ -1014,7 +1437,10 @@ fn non_two_by_four_capture_shape_never_reaches_angle_delay_estimation() {
     let failure = EspargosSourceAdapter::new()
         .adapt(
             &seven_path_capture,
-            &calibration(),
+            ArrayCalibrationInput::from_sealed(
+                &calibration(),
+                &phase_calibration(&seven_path_capture),
+            ),
             &evidence(&seven_path_capture),
             &requirements_for(7),
             &qualification_for(7),
@@ -1046,7 +1472,10 @@ fn non_two_by_four_capture_shape_never_reaches_angle_delay_estimation() {
     let failure = EspargosSourceAdapter::new()
         .adapt(
             &mixed_transmitters,
-            &calibration(),
+            ArrayCalibrationInput::from_sealed(
+                &calibration(),
+                &phase_calibration(&mixed_transmitters),
+            ),
             &evidence(&mixed_transmitters),
             &requirements(),
             &qualification(),
@@ -1073,4 +1502,140 @@ fn three_views_report_each_array_and_at_least_two_non_degenerate_qualifications(
         ["espargos-1", "espargos-2", "espargos-3"]
     );
     assert!(ThreeArrayCoverage::new([&records[0], &records[0], &records[2]]).is_err());
+}
+
+#[test]
+fn public_iterator_boundaries_stop_after_the_first_excess_item() {
+    let metadata_pulls = Cell::new(0);
+    let metadata = ArrayNativeMetadata::new(
+        20_000_000,
+        0x0087,
+        Some(7),
+        4_200_000_000,
+        (0..1_000).map(|index| {
+            metadata_pulls.set(metadata_pulls.get() + 1);
+            ArrayPathRadioFacts::new(index, -4_200, -9_200, None)
+        }),
+    );
+    assert!(metadata.is_err());
+    assert_eq!(metadata_pulls.get(), 257);
+
+    let frequency_pulls = Cell::new(0);
+    let oversized_capture = ArrayCapture::new(
+        identity(),
+        LtfIdentity::new([16; 32]),
+        range(100, 103),
+        1_800_000_000_000_000_000,
+        native_metadata(1),
+        (0..5_000).map(|index| {
+            frequency_pulls.set(frequency_pulls.get() + 1);
+            5_000_000_000 + index
+        }),
+        [ArraySignalPath::new(
+            SignalPath::new(0, 0),
+            NativeArrayPathIdentity::new([1; 32]),
+            "tx/0",
+            "rx/0",
+        )
+        .unwrap()],
+        [ComplexI16::new(1, 1)],
+        [SampleState::Captured],
+    );
+    assert!(oversized_capture.is_err());
+    assert_eq!(frequency_pulls.get(), 4_097);
+
+    let path_pulls = Cell::new(0);
+    let oversized_paths = ArrayCapture::new(
+        identity(),
+        LtfIdentity::new([16; 32]),
+        range(100, 103),
+        1_800_000_000_000_000_000,
+        native_metadata(1),
+        [5_180_000_000],
+        (0..1_000_u16).map(|rx| {
+            path_pulls.set(path_pulls.get() + 1);
+            ArraySignalPath::new(
+                SignalPath::new(0, rx),
+                NativeArrayPathIdentity::new([rx as u8; 32]),
+                "tx/0",
+                format!("rx/{rx}"),
+            )
+            .unwrap()
+        }),
+        [ComplexI16::new(1, 1)],
+        [SampleState::Captured],
+    );
+    assert!(oversized_paths.is_err());
+    assert_eq!(path_pulls.get(), 257);
+
+    let path = ArraySignalPath::new(
+        SignalPath::new(0, 0),
+        NativeArrayPathIdentity::new([1; 32]),
+        "tx/0",
+        "rx/0",
+    )
+    .unwrap();
+    let iq_pulls = Cell::new(0);
+    let oversized_iq = ArrayCapture::new(
+        identity(),
+        LtfIdentity::new([16; 32]),
+        range(100, 103),
+        1_800_000_000_000_000_000,
+        native_metadata(1),
+        [5_180_000_000, 5_180_625_000],
+        [path.clone()],
+        (0..100).map(|_| {
+            iq_pulls.set(iq_pulls.get() + 1);
+            ComplexI16::new(1, 1)
+        }),
+        [SampleState::Captured; 2],
+    );
+    assert!(oversized_iq.is_err());
+    assert_eq!(iq_pulls.get(), 3);
+
+    let state_pulls = Cell::new(0);
+    let oversized_states = ArrayCapture::new(
+        identity(),
+        LtfIdentity::new([16; 32]),
+        range(100, 103),
+        1_800_000_000_000_000_000,
+        native_metadata(1),
+        [5_180_000_000, 5_180_625_000],
+        [path],
+        [ComplexI16::new(1, 1); 2],
+        (0..100).map(|_| {
+            state_pulls.set(state_pulls.get() + 1);
+            SampleState::Captured
+        }),
+    );
+    assert!(oversized_states.is_err());
+    assert_eq!(state_pulls.get(), 3);
+
+    let correction_pulls = Cell::new(0);
+    let oversized_phase = ArrayPhaseCalibration::new(
+        "espargos-west",
+        PhaseReferenceIdentity::new([22; 32]),
+        QualificationEpoch::new(4),
+        [5_180_000_000, 5_180_625_000],
+        [NativeArrayPathIdentity::new([1; 32])],
+        (0..100).map(|_| {
+            correction_pulls.set(correction_pulls.get() + 1);
+            0.0
+        }),
+    );
+    assert!(oversized_phase.is_err());
+    assert_eq!(correction_pulls.get(), 3);
+
+    let records = [
+        record_for_view(1, [0.0, 0.0, 1.2]),
+        record_for_view(2, [4.0, 0.0, 1.2]),
+        record_for_view(3, [2.0, 4.0, 1.2]),
+    ];
+    let coverage_pulls = Cell::new(0);
+    let coverage = ThreeArrayCoverage::new((0..100).map(|index| {
+        coverage_pulls.set(coverage_pulls.get() + 1);
+        &records[index % records.len()]
+    }));
+    assert!(coverage.is_err());
+    assert_eq!(coverage_pulls.get(), 4);
 }
