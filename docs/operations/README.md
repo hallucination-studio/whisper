@@ -14,10 +14,16 @@ need for one belongs in [GitHub Issues](../agents/issue-tracker.md) until a
 bounded documentation ticket creates a concrete owner.
 
 `make check` runs Rust formatting, compilation, behavior tests, Clippy and
-rustdoc; the checked-in Python tests; and deterministic checks for local
-documentation links, the frozen RF design digest, the retired production
-surface, native safety inputs and historical receipts. CI runs that same
-command, so a failing domain behavior test fails the software job visibly.
+rustdoc; the checked-in Python tests; the pinned ESP32-S3 production image
+build; and deterministic checks for local documentation links, the frozen RF
+design digest, the retired production surface, native safety inputs and
+historical receipts. CI runs that same command, so a failing domain behavior
+test fails the job visibly.
+
+The firmware build requires a running Docker service and access to the exact
+`espressif/idf` image digest declared in the Makefile. Missing Docker, an
+unavailable pinned image or any firmware build failure makes `make check` fail;
+there is no skip path. The image supplies the remaining ESP-IDF dependencies.
 
 The command is software evidence only. It does not run or silently pass phone,
 LiDAR, RF-array, ESP hardware, trained-model accuracy, or 14-day acceptance.

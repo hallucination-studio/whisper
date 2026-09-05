@@ -9,15 +9,33 @@ from urllib.parse import unquote
 
 
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\((?:<([^>]+)>|([^\s)]+))(?:\s+[^)]*)?\)")
+# Authoritative source: docs/specs/rf-world-model-v1.md, derived from the
+# unchanged user-frozen design named there. A change requires coordinated
+# specification/ADR review; changing this check alone must never bless a new design.
 FROZEN_RF_DESIGN_DIGEST = "fa485d3e052bbb0444036b2815bef8236147252d98f08d79feca0d612a75991e"
-RETIRED_PRODUCTION_INTERFACES = (
-    "BaselineCommand",
-    "CaptureRuntime",
-    "RelationshipEstimator",
-    "SemanticSession",
-    "WindowProjection",
-    "WorldSnapshot",
+RETIRED_PRODUCTION_PATTERNS = (
+    ("BaselineCommand", r"\bBaselineCommand\b"),
+    ("CaptureRuntime", r"\bCaptureRuntime\b"),
+    ("Engine", r"\bEngine\b"),
+    ("RelationshipEstimator", r"\bRelationshipEstimator\b"),
+    ("Semantic Session", r"\b(?:SemanticSession|semantic_session)\b"),
+    ("Semantic Session handoff", r"\b(?:SessionHandoff|semantic_session_handoff)\b"),
+    ("SessionTime", r"\bSessionTime\b"),
+    ("WindowProjection", r"\bWindowProjection\b"),
+    ("WorldSnapshot", r"\bWorldSnapshot\b"),
+    ("topology endpoint", r"(?:['\"]/(?:api/)?topology(?:[/?'\"]|$))"),
+    ("signals endpoint", r"(?:['\"]/(?:api/)?signals(?:[/?'\"]|$))"),
+    ("projection receipt", r"\b(?:ProjectionReceipt|projection_receipt)\b"),
+    ("Store watermark", r"\b(?:StoreWatermark|store_watermark)\b"),
+    ("legacy reconnect contract", r"\b(?:LegacyReconnect|legacy_reconnect)\b"),
+    ("relationship classification", r"\b(?:RelationshipKnowledge|relationship_classification)\b"),
+    ("Demo classification", r"\b(?:DemoClassification|demo_classification)\b"),
+    ("legacy compatibility alias", r"\b(?:legacy_alias|compatibility_alias)\b"),
+    ("dual write", r"\bdual_write\b"),
+    ("shadow old system", r"\b(?:shadow_legacy|shadow_old_system)\b"),
 )
+PRODUCTION_ROOTS = ("src", "scripts", "firmware", "web", "browser", "app", "mobile")
+PRODUCTION_SUFFIXES = {".c", ".cc", ".cpp", ".css", ".h", ".html", ".js", ".mjs", ".py", ".rs", ".swift", ".ts"}
 RETIRED_PRODUCTION_PATHS = (
     "scripts/evidence-observer.mjs",
     "scripts/strict-json.mjs",
@@ -84,15 +102,26 @@ def check_design_digest(root: Path) -> list[str]:
 
 def check_hard_cut(root: Path) -> list[str]:
     failures = [f"retired production path remains: {path}" for path in RETIRED_PRODUCTION_PATHS if (root / path).exists()]
-    source = root / "src"
-    if source.is_dir():
-        for rust_file in sorted(source.rglob("*.rs")):
-            text = rust_file.read_text(encoding="utf-8")
-            for interface in RETIRED_PRODUCTION_INTERFACES:
-                if re.search(rf"\b{re.escape(interface)}\b", text):
-                    failures.append(
-                        f"{rust_file.relative_to(root)}: retired production interface {interface} remains"
-                    )
+    production_files: list[Path] = []
+    for production_root in PRODUCTION_ROOTS:
+        directory = root / production_root
+        if directory.is_dir():
+            production_files.extend(
+                path
+                for path in directory.rglob("*")
+                if path.is_file()
+                and path.suffix in PRODUCTION_SUFFIXES
+                and "tests" not in path.relative_to(root).parts
+                and "build" not in path.relative_to(root).parts
+                and path != root / "scripts" / "check_repository.py"
+            )
+    for production_file in sorted(production_files):
+        text = production_file.read_text(encoding="utf-8")
+        for label, pattern in RETIRED_PRODUCTION_PATTERNS:
+            if re.search(pattern, text):
+                failures.append(
+                    f"{production_file.relative_to(root)}: retired production interface {label} remains"
+                )
     return failures
 
 

@@ -4,9 +4,11 @@ PROVISION_TOOLS_DIRECTORY := $(FIRMWARE_DIRECTORY)/build/provision-tools
 NVS_PARTITION_TOOL_DIRECTORY := $(PROVISION_TOOLS_DIRECTORY)/nvs-partition-tool
 PROVISION_PYTHON := $(PROVISION_TOOLS_DIRECTORY)/venv/bin/python
 
-.PHONY: check check-policy check-python check-rust esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
+.PHONY: check check-firmware check-policy check-python check-rust esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
 
-check: check-policy check-python check-rust
+check: check-policy check-python check-rust check-firmware
+
+check-firmware: esp32-native-frame-firmware
 
 check-policy:
 	python3 scripts/check_repository.py
