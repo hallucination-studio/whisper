@@ -191,3 +191,16 @@ fn decode_rechecks_identifier_and_numeric_invariants() {
     invalid.extend_from_slice(&payload);
     assert!(ModelRequest::decode(&invalid, &limits).is_err());
 }
+
+#[test]
+fn public_deserialization_preserves_identifier_and_numeric_invariants() {
+    assert!(serde_json::from_str::<ModelRunId>("\"\"").is_err());
+    assert!(serde_json::from_str::<whisper::model_worker::ModelRequestId>("\"\"").is_err());
+
+    for invalid in [
+        r#"{"class":"cpu_baseline","deterministic_algorithms":true,"absolute_tolerance":-1.0,"relative_tolerance":0.0,"environment":"rust-test-f32"}"#,
+        r#"{"class":"cpu_baseline","deterministic_algorithms":true,"absolute_tolerance":0.0,"relative_tolerance":0.0,"environment":""}"#,
+    ] {
+        assert!(serde_json::from_str::<NumericContract>(invalid).is_err());
+    }
+}

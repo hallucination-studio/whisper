@@ -206,6 +206,34 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(response["status"], "deadline_exceeded")
         self.assertEqual(response["candidate_hex"], "")
 
+    def test_operator_cannot_mutate_validated_response_contracts_or_deadline(self) -> None:
+        test_case = self
+
+        class MutatingOperator:
+            @staticmethod
+            def replace(mapping, key, replacement):
+                mapping[key] = replacement
+
+            def evaluate(self, value):
+                mutations = (
+                    lambda: self.replace(value, "deadline_monotonic_ns", 20_000_000_000),
+                    lambda: self.replace(value["model_run"], "output_shape", [1]),
+                    lambda: self.replace(
+                        value["model_run"]["execution"], "environment", "operator-controlled"
+                    ),
+                )
+                for mutate in mutations:
+                    with test_case.assertRaises(TypeError):
+                        mutate()
+                return struct.pack("<ff", 3.0, -4.0), b"successor"
+
+        ticks = iter((1, 10_000_000_000))
+        worker = Worker(MutatingOperator(), Limits(), now_ns=lambda: next(ticks))
+        response = decode_frame(worker.handle_frame(encode_frame(request(), Limits())), Limits())
+        self.assertEqual(response["status"], "deadline_exceeded")
+        self.assertEqual(response["candidate_hex"], "")
+        self.assertIsNone(response["numeric_qualification"])
+
     def test_weak_json_scalar_types_are_rejected(self) -> None:
         mutations = (
             ("protocol_version", lambda value: value.__setitem__("protocol_version", True)),

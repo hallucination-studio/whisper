@@ -73,7 +73,7 @@ impl<'de> Deserialize<'de> for ContentDigest {
 macro_rules! text_id {
     ($name:ident, $label:literal) => {
         #[doc = concat!("Validated ", $label, " carried by the worker protocol.")]
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -91,6 +91,16 @@ macro_rules! text_id {
             fn from_str(value: &str) -> Result<Self, Self::Err> {
                 validate_text(value, $label)?;
                 Ok(Self(value.to_owned()))
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                value.parse().map_err(serde::de::Error::custom)
             }
         }
     };
@@ -158,7 +168,7 @@ pub enum ExecutionClass {
 }
 
 /// Reproducibility and numeric-tolerance declaration for one model run.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct NumericContract {
     #[serde(rename = "class")]
     execution_class: ExecutionClass,
@@ -166,6 +176,33 @@ pub struct NumericContract {
     absolute_tolerance: f32,
     relative_tolerance: f32,
     environment: String,
+}
+
+#[derive(Deserialize)]
+struct NumericContractWire {
+    #[serde(rename = "class")]
+    execution_class: ExecutionClass,
+    deterministic_algorithms: bool,
+    absolute_tolerance: f32,
+    relative_tolerance: f32,
+    environment: String,
+}
+
+impl<'de> Deserialize<'de> for NumericContract {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = NumericContractWire::deserialize(deserializer)?;
+        Self::new(
+            wire.execution_class,
+            wire.deterministic_algorithms,
+            wire.absolute_tolerance,
+            wire.relative_tolerance,
+            wire.environment,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl NumericContract {

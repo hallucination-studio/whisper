@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
@@ -10,6 +11,7 @@ import math
 import socket
 import struct
 import time
+from types import MappingProxyType
 from typing import Callable, Protocol
 
 
@@ -39,8 +41,18 @@ class Limits:
 class Operator(Protocol):
     """Numerical implementation that cannot access persistence or publication."""
 
-    def evaluate(self, request: dict) -> tuple[bytes, bytes]:
+    def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, bytes]:
         """Return candidate bytes and self-contained successor material."""
+
+
+def _immutable(value: object) -> object:
+    """Recursively freeze decoded JSON before it crosses the operator boundary."""
+
+    if isinstance(value, dict):
+        return MappingProxyType({key: _immutable(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_immutable(item) for item in value)
+    return value
 
 
 def _canonical_json(value: dict) -> bytes:
@@ -132,7 +144,7 @@ class ContractFailure(Exception):
 class DeterministicTestOperator:
     """A fixture-only numeric operator used to verify dispatch and restart behavior."""
 
-    def evaluate(self, request: dict) -> tuple[bytes, bytes]:
+    def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, bytes]:
         tensor = bytes.fromhex(request["input_manifest"]["tensor_hex"])
         values = struct.unpack(f"<{len(tensor) // 4}f", tensor)
         candidate = struct.pack(f"<{len(values)}f", *(value * 2.0 for value in values))
@@ -144,10 +156,10 @@ class DeterministicTestOperator:
 class TorchOperator:
     """PyTorch execution adapter with explicit device selection and no fallback."""
 
-    def __init__(self, evaluate: Callable[[object, dict], tuple[object, object]]):
+    def __init__(self, evaluate: Callable[[object, Mapping[str, object]], tuple[object, object]]):
         self._evaluate = evaluate
 
-    def evaluate(self, request: dict) -> tuple[bytes, bytes]:
+    def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, bytes]:
         try:
             import torch
         except ImportError as error:
@@ -207,18 +219,17 @@ class Worker:
             return self._failure(identity, "request_conflict", "request ID was reused with different bytes")
 
         try:
-            tensor = self._validate(request)
-            candidate, successor = self._operator.evaluate(request)
-            if self._now_ns() > request["deadline_monotonic_ns"]:
+            tensor, deadline, output_elements, execution = self._validate(request)
+            candidate, successor = self._operator.evaluate(_immutable(request))
+            if self._now_ns() > deadline:
                 raise ContractFailure("deadline_exceeded", "request deadline elapsed during execution")
             if len(candidate) > self._limits.max_result_bytes or len(successor) > self._limits.max_checkpoint_bytes:
                 raise ContractFailure("limit_exceeded", "operator output exceeds configured limit")
-            output_elements = self._shape_elements(request["model_run"]["output_shape"], None)
             if len(candidate) != output_elements * 4:
                 raise ContractFailure("invalid_shape", "candidate bytes do not match declared output shape")
             if any(not math.isfinite(value) for value in struct.unpack(f"<{len(candidate) // 4}f", candidate)):
                 raise ContractFailure("non_finite", "operator returned NaN or Inf")
-            response = self._success(identity, tensor, candidate, successor, request["model_run"]["execution"])
+            response = self._success(identity, tensor, candidate, successor, execution)
         except MemoryError:
             response = self._failure(identity, "operator_failure", "numerical allocation failed")
         except ContractFailure as error:
@@ -235,7 +246,7 @@ class Worker:
                 self._completed.popitem(last=False)
         return response
 
-    def _validate(self, request: dict) -> bytes:
+    def _validate(self, request: dict) -> tuple[bytes, int, int, dict]:
         if self._integer(request.get("protocol_version"), "protocol version", 16) != PROTOCOL_VERSION:
             raise ContractFailure("unsupported_version", "unsupported protocol version")
         identity = request["identity"]
@@ -295,7 +306,7 @@ class Worker:
         if not isinstance(max_shape, list) or len(shape) != len(max_shape):
             raise ContractFailure("invalid_shape", "model shape rank differs")
         elements = self._shape_elements(shape, max_shape)
-        self._shape_elements(run["output_shape"], None)
+        output_elements = self._shape_elements(run["output_shape"], None)
         if elements * 4 != len(tensor):
             raise ContractFailure("invalid_shape", "tensor byte count does not match float32 shape")
         counts = (manifest["source_count"], manifest["clock_domain_count"])
@@ -318,7 +329,14 @@ class Worker:
             if not math.isfinite(tolerance) or tolerance < 0:
                 raise ContractFailure("contract_mismatch", "numeric tolerance is invalid")
         _text(execution["environment"], "numeric environment")
-        return tensor
+        numeric_qualification = {
+            "class": execution["class"],
+            "deterministic_algorithms": execution["deterministic_algorithms"],
+            "absolute_tolerance": execution["absolute_tolerance"],
+            "relative_tolerance": execution["relative_tolerance"],
+            "environment": execution["environment"],
+        }
+        return tensor, deadline, output_elements, numeric_qualification
 
     def _shape_elements(self, shape: object, maximum_shape: object | None) -> int:
         if not isinstance(shape, list) or not shape or len(shape) > self._limits.max_shape_dimensions:
