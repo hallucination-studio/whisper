@@ -3,8 +3,8 @@
 #![forbid(unsafe_code)]
 
 mod admission;
-mod artifact;
-mod companion;
+pub mod artifact;
+pub mod companion;
 mod host;
 mod identity;
 pub(crate) mod key;
@@ -21,23 +21,6 @@ mod store;
 pub use admission::{
     AdmissionLimits, AuthenticatedBytesPerSecond, DatagramBytes, LimitValueError, PacketsPerSecond,
     ReplayWindowPackets,
-};
-#[doc(inline)]
-pub use artifact::{
-    ArrayCondition, Artifact, ArtifactDigest, ArtifactError, ArtifactImportError, ArtifactKind,
-    ArtifactLimits, ArtifactLimitsBuilder, ArtifactMetadata, ArtifactOrigin, ArtifactRejectReason,
-    CalibrationBundle, CalibrationEpoch, ClockErrorNanoseconds, ClockOffsetNanoseconds,
-    CoherenceScope, CoordinateTransform, CoverageCell, DepthQuality, GeometryElement, GeometryKind,
-    HostNanoseconds, ImportedArtifact, JointLabel, LabelScope, MetersPerSecond, PersonLabel,
-    PhoneNanoseconds, PhoneTimeRelation, PortCondition, SceneSnapshot, SealedArtifact,
-    SourceIdentity, SupervisionSample, SupervisionSegment, TrackingEpoch, TrackingQuality,
-    UtcNanoseconds,
-};
-#[doc(inline)]
-pub use companion::{
-    ClientNonce, ClockExchange, CompanionChunk, CompanionClockRelation, CompanionConnection,
-    CompanionEntropy, CompanionError, CompanionRejectReason, CompanionServerIdentity, PairingCode,
-    PairingId, PairingOffer, SystemCompanionEntropy, UploadId, UploadProgress,
 };
 #[doc(inline)]
 pub use host::{

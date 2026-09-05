@@ -7,15 +7,23 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use whisper::artifact::{
+    ArrayCondition, ArrayElementGeometry, Artifact, ArtifactDigest, ArtifactKind, ArtifactLimits,
+    ArtifactMetadata, ArtifactOrigin, ArtifactRejectReason, CalibrationBundle, CalibrationEpoch,
+    CoherenceScope, CoordinateTransform, CoverageCell, DepthQuality, DeviceArrayGeometry,
+    GeometryElement, GeometryKind, JointLabel, LabelScope, MetersPerSecond, PersonLabel,
+    PhaseRelation, PhoneTimeRelation, RfTimeRelation, SceneSnapshot, SealedArtifact,
+    SignalDirection, SignalPathCondition, SourceIdentity, SupervisionSample, SupervisionSegment,
+    TrackingQuality,
+};
+use whisper::companion::{
+    ClientNonce, ClockSampleChallenge, ClockSampleResponse, CompanionConnection, CompanionEntropy,
+    CompanionHandshakeRequest, CompanionHandshakeResponse, CompanionRejectReason,
+    CompanionServerIdentity, UploadId, UploadProgress,
+};
 use whisper::{
-    AdmissionLimits, ArrayCondition, Artifact, ArtifactLimits, ArtifactMetadata,
-    ArtifactRejectReason, AuthenticatedBytesPerSecond, CalibrationBundle, CalibrationEpoch,
-    ClientNonce, ClockExchange, CoherenceScope, CompanionRejectReason, CompanionServerIdentity,
-    CoordinateTransform, CoverageCell, DatagramBytes, DeploymentId, DepthQuality, DeviceId,
-    GeometryElement, GeometryKind, Host, JointLabel, KeyEpoch, LabelScope, MetersPerSecond,
-    NativeFrameRoute, PacketsPerSecond, PersonLabel, PhoneTimeRelation, PortCondition,
-    ReplayWindowPackets, SceneSnapshot, SealedArtifact, SourceIdentity, Store, SupervisionSample,
-    SupervisionSegment, TrackingQuality, UploadId, UploadProgress,
+    AdmissionLimits, AuthenticatedBytesPerSecond, DatagramBytes, DeploymentId, DeviceId, Host,
+    KeyEpoch, NativeFrameRoute, PacketsPerSecond, ReplayWindowPackets, Store,
 };
 
 const KEY: [u8; 32] = [7; 32];
@@ -23,7 +31,7 @@ const KEY: [u8; 32] = [7; 32];
 #[derive(Debug)]
 struct FailingEntropy;
 
-impl whisper::CompanionEntropy for FailingEntropy {
+impl CompanionEntropy for FailingEntropy {
     fn fill(&self, _output: &mut [u8]) -> std::io::Result<()> {
         Err(std::io::Error::other("injected entropy failure"))
     }
@@ -71,13 +79,52 @@ fn companion_entropy_failure_is_reported_with_its_source() {
     fs::remove_dir_all(parent).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn companion_signing_seed_is_owner_only_and_redacted() {
+    let parent = temporary_directory("companion-signing-seed");
+    let root = parent.join("world-store");
+    let store = Store::initialize(&root).unwrap();
+    let seed_path = root.join(".whisper.companion-signing-seed");
+    let seed = fs::read(&seed_path).unwrap();
+    assert_eq!(fs::metadata(&seed_path).unwrap().permissions().mode() & 0o7777, 0o600);
+    assert!(!format!("{store:?}").contains(&format!("{seed:?}")));
+    drop(store);
+    fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(Store::open(&root).is_err());
+    fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn artifact_database_failure_retains_operation_path_and_source() {
+    use std::error::Error as _;
+
+    let parent = temporary_directory("artifact-database-context");
+    let root = parent.join("world-store");
+    let host = start_host(&parent, &root);
+    let database = root.join("facts.sqlite3");
+    let moved = root.join("facts.sqlite3.hidden");
+    fs::rename(&database, &moved).unwrap();
+    let sealed = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
+    let error = host.import_artifact(sealed.bytes()).unwrap_err();
+    assert!(error.to_string().contains("open artifact receipt query"));
+    assert!(error.to_string().contains(database.to_str().unwrap()));
+    assert!(error.source().and_then(std::error::Error::source).is_some());
+    fs::rename(moved, database).unwrap();
+    host.shutdown().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
+
 #[test]
 fn calibration_and_supervision_round_trip_with_conditions_masks_and_joint_uncertainty() {
     let scene_digest = SealedArtifact::seal(Artifact::Scene(scene())).unwrap().digest();
     let calibration = calibration(scene_digest);
     let supervision = supervision(scene_digest);
 
-    for artifact in [Artifact::Calibration(calibration), Artifact::Supervision(supervision)] {
+    for artifact in
+        [Artifact::Calibration(Box::new(calibration)), Artifact::Supervision(supervision)]
+    {
         let sealed = SealedArtifact::seal(artifact.clone()).unwrap();
         assert_eq!(sealed.decode().unwrap(), artifact);
     }
@@ -127,7 +174,7 @@ fn exact_committed_retry_returns_original_receipt_after_calibration_expires() {
     let mut value = calibration(scene.digest());
     value.valid_from_utc = (now - 1_000_000).into();
     value.valid_until_utc = expires.into();
-    let sealed = SealedArtifact::seal(Artifact::Calibration(value)).unwrap();
+    let sealed = SealedArtifact::seal(Artifact::Calibration(Box::new(value))).unwrap();
     let original = host.import_artifact(sealed.bytes()).unwrap();
     while u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap()
         <= expires
@@ -147,15 +194,16 @@ fn local_import_commits_scene_calibration_and_supervision_as_separate_candidates
     let scene_sealed = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
     host.import_artifact(scene_sealed.bytes()).unwrap();
     let calibration =
-        SealedArtifact::seal(Artifact::Calibration(calibration(scene_sealed.digest()))).unwrap();
+        SealedArtifact::seal(Artifact::Calibration(Box::new(calibration(scene_sealed.digest()))))
+            .unwrap();
     let supervision =
         SealedArtifact::seal(Artifact::Supervision(supervision(scene_sealed.digest()))).unwrap();
 
     let calibration_receipt = host.import_artifact(calibration.bytes()).unwrap();
     let supervision_receipt = host.import_artifact(supervision.bytes()).unwrap();
 
-    assert_eq!(calibration_receipt.kind(), whisper::ArtifactKind::Calibration);
-    assert_eq!(supervision_receipt.kind(), whisper::ArtifactKind::Supervision);
+    assert_eq!(calibration_receipt.kind(), ArtifactKind::Calibration);
+    assert_eq!(supervision_receipt.kind(), ArtifactKind::Supervision);
     assert_eq!(host.query_artifact(calibration.digest()).unwrap().unwrap(), calibration);
     assert_eq!(host.query_artifact(supervision.digest()).unwrap().unwrap(), supervision);
 
@@ -188,7 +236,7 @@ fn invalid_incompatible_and_conflicting_artifacts_fail_closed() {
 
     let mut unknown = calibration(scene_sealed.digest());
     unknown.rf_device_identity = "unregistered-rx".into();
-    let unknown = SealedArtifact::seal(Artifact::Calibration(unknown)).unwrap();
+    let unknown = SealedArtifact::seal(Artifact::Calibration(Box::new(unknown))).unwrap();
     assert_eq!(
         host.import_artifact(unknown.bytes()).unwrap_err().reason(),
         ArtifactRejectReason::UnknownRfIdentity
@@ -196,20 +244,20 @@ fn invalid_incompatible_and_conflicting_artifacts_fail_closed() {
 
     let mut expired = calibration(scene_sealed.digest());
     expired.valid_until_utc = 2_000.into();
-    let expired = SealedArtifact::seal(Artifact::Calibration(expired)).unwrap();
+    let expired = SealedArtifact::seal(Artifact::Calibration(Box::new(expired))).unwrap();
     assert_eq!(
         host.import_artifact(expired.bytes()).unwrap_err().reason(),
         ArtifactRejectReason::Expired
     );
 
-    let missing_scene = SealedArtifact::seal(Artifact::Calibration(calibration(
+    let missing_scene = SealedArtifact::seal(Artifact::Calibration(Box::new(calibration(
         SealedArtifact::seal(Artifact::Scene(SceneSnapshot {
             metadata: metadata("other", 3),
             ..scene()
         }))
         .unwrap()
         .digest(),
-    )))
+    ))))
     .unwrap();
     assert_eq!(
         host.import_artifact(missing_scene.bytes()).unwrap_err().reason(),
@@ -237,6 +285,24 @@ fn invalid_incompatible_and_conflicting_artifacts_fail_closed() {
         SealedArtifact::seal(Artifact::Supervision(unseen_empty)).is_err(),
         "a locally visible region cannot encode an unseen room as empty"
     );
+
+    let mut zero_velocity = supervision(scene_sealed.digest());
+    zero_velocity.metadata.artifact_id = "zero-velocity".into();
+    zero_velocity.maximum_person_velocity = MetersPerSecond::new(0.0).unwrap();
+    let zero_velocity = SealedArtifact::seal(Artifact::Supervision(zero_velocity)).unwrap();
+    assert_eq!(
+        host.import_artifact(zero_velocity.bytes()).unwrap_err().reason(),
+        ArtifactRejectReason::InvalidRelation,
+    );
+
+    let mut singular_camera = supervision(scene_sealed.digest());
+    singular_camera.samples[0].camera_to_world.matrix[0] = 0.0;
+    assert!(SealedArtifact::seal(Artifact::Supervision(singular_camera)).is_err());
+
+    let mut outside_relation = supervision(scene_sealed.digest());
+    outside_relation.samples[0].rgb_time = 999.into();
+    outside_relation.samples[0].maximum_time_error = 2_000.into();
+    assert!(SealedArtifact::seal(Artifact::Supervision(outside_relation)).is_err());
 
     assert_eq!(host.query_artifact(scene_sealed.digest()).unwrap().unwrap(), scene_sealed);
     host.shutdown().unwrap();
@@ -281,16 +347,10 @@ fn artifact_and_companion_chunk_counts_are_bounded() {
 
     let offer = host.begin_companion_pairing(std::time::Duration::from_secs(30)).unwrap();
     assert!(!offer.pairing_id().as_bytes().iter().all(|byte| *byte == 0));
-    assert_eq!(offer.display_code().to_string().len(), 39);
+    assert_eq!(offer.display_code().to_string(), "[REDACTED]");
+    assert_eq!(offer.display_code().format_for_display().len(), 39);
     offer.verify_server_proof(offer.server_identity()).unwrap();
-    let connection = host
-        .connect_companion(
-            &offer,
-            offer.server_identity(),
-            ClientNonce::from_bytes([1; 32]),
-            &bounded_clocks(),
-        )
-        .unwrap();
+    let connection = pair_companion(&host, &offer, ClientNonce::from_bytes([1; 32]));
     assert_eq!(
         connection
             .seal_upload(UploadId::from_bytes([3; 16]), &vec![0; 1_025], 1)
@@ -317,30 +377,25 @@ fn paired_encrypted_companion_upload_resumes_and_uses_shared_candidate_import() 
     let host = start_host(&parent, &root);
     let offer = host.begin_companion_pairing(std::time::Duration::from_secs(30)).unwrap();
     let wrong_pin = CompanionServerIdentity::from_bytes([0; 32]);
-    let clocks = bounded_clocks();
     assert_eq!(
-        host.connect_companion(&offer, wrong_pin, ClientNonce::from_bytes([10; 32]), &clocks,)
-            .unwrap_err()
-            .reason(),
+        host.begin_companion_clock_sample(
+            offer.pairing_id(),
+            wrong_pin,
+            ClientNonce::from_bytes([10; 32]),
+            1.into(),
+        )
+        .unwrap_err()
+        .reason(),
         CompanionRejectReason::ServerIdentityMismatch
     );
-    let connection = host
-        .connect_companion(
-            &offer,
-            offer.server_identity(),
-            ClientNonce::from_bytes([11; 32]),
-            &clocks,
-        )
-        .expect("correct pin and bounded clocks pair");
+    let connection = pair_companion(&host, &offer, ClientNonce::from_bytes([11; 32]));
     connection.verify_server_proof().unwrap();
-    assert_eq!(connection.clock_relation().offset_at_reference().get(), -2);
-    assert_eq!(connection.clock_relation().maximum_error().get(), 23);
     assert_eq!(
-        host.connect_companion(
-            &offer,
+        host.begin_companion_clock_sample(
+            offer.pairing_id(),
             offer.server_identity(),
             ClientNonce::from_bytes([12; 32]),
-            &clocks,
+            1.into(),
         )
         .unwrap_err()
         .reason(),
@@ -362,7 +417,7 @@ fn paired_encrypted_companion_upload_resumes_and_uses_shared_candidate_import() 
         panic!("resumed upload did not import its completed artifact");
     };
     assert_eq!(receipt.digest(), sealed.digest());
-    assert_eq!(receipt.origin(), whisper::ArtifactOrigin::Companion);
+    assert_eq!(receipt.origin(), ArtifactOrigin::Companion);
     assert_eq!(host.export_artifact(sealed.digest()).unwrap().unwrap().as_ref(), sealed.bytes());
     assert_eq!(
         host.upload_companion_bytes(chunks.last().unwrap().bytes()).unwrap(),
@@ -373,7 +428,7 @@ fn paired_encrypted_companion_upload_resumes_and_uses_shared_candidate_import() 
     let mut invalid_calibration = calibration(sealed.digest());
     invalid_calibration.rf_device_identity = "unknown-rx".into();
     let invalid_calibration =
-        SealedArtifact::seal(Artifact::Calibration(invalid_calibration)).unwrap();
+        SealedArtifact::seal(Artifact::Calibration(Box::new(invalid_calibration))).unwrap();
     let invalid_chunks = connection
         .seal_upload(
             UploadId::from_bytes([10; 16]),
@@ -404,15 +459,7 @@ fn companion_transport_rejects_tampered_ciphertext_without_importing() {
     let root = parent.join("world-store");
     let host = start_host(&parent, &root);
     let offer = host.begin_companion_pairing(std::time::Duration::from_secs(30)).unwrap();
-    let clocks = bounded_clocks();
-    let connection = host
-        .connect_companion(
-            &offer,
-            offer.server_identity(),
-            ClientNonce::from_bytes([20; 32]),
-            &clocks,
-        )
-        .unwrap();
+    let connection = pair_companion(&host, &offer, ClientNonce::from_bytes([20; 32]));
     let sealed = SealedArtifact::seal(Artifact::Scene(scene())).unwrap();
     let chunk = connection
         .seal_upload(UploadId::from_bytes([4; 16]), sealed.bytes(), sealed.bytes().len())
@@ -436,23 +483,22 @@ fn companion_pairing_expires_and_clock_round_trip_is_bounded() {
     let parent = temporary_directory("artifact-companion-expiry");
     let root = parent.join("world-store");
     let host = start_host(&parent, &root);
-    let invalid_clock = [ClockExchange {
-        client_send: 1.into(),
-        host_receive: 2.into(),
-        host_send: 3.into(),
-        client_receive: 1_000_000_004.into(),
-    }];
     let offer = host.begin_companion_pairing(std::time::Duration::from_secs(30)).unwrap();
-    assert_eq!(
-        host.connect_companion(
-            &offer,
+    let challenge = host
+        .begin_companion_clock_sample(
+            offer.pairing_id(),
             offer.server_identity(),
             ClientNonce::from_bytes([30; 32]),
-            &invalid_clock,
+            1.into(),
         )
-        .unwrap_err()
-        .reason(),
-        CompanionRejectReason::InvalidClockRelation
+        .unwrap();
+    let mut forged_host_time = challenge.to_wire().into_vec();
+    forged_host_time[60] ^= 1;
+    assert_eq!(
+        ClockSampleChallenge::from_wire(&forged_host_time, offer.server_identity())
+            .unwrap_err()
+            .reason(),
+        CompanionRejectReason::AuthenticationFailed
     );
 
     let expired = host.begin_companion_pairing(std::time::Duration::from_nanos(1)).unwrap();
@@ -461,13 +507,12 @@ fn companion_pairing_expires_and_clock_round_trip_is_bounded() {
     {
         std::hint::spin_loop();
     }
-    let valid_clock = bounded_clocks();
     assert_eq!(
-        host.connect_companion(
-            &expired,
+        host.begin_companion_clock_sample(
+            expired.pairing_id(),
             expired.server_identity(),
             ClientNonce::from_bytes([31; 32]),
-            &valid_clock,
+            1.into(),
         )
         .unwrap_err()
         .reason(),
@@ -494,30 +539,56 @@ fn scene() -> SceneSnapshot {
     }
 }
 
-fn bounded_clocks() -> [ClockExchange; 3] {
-    [
-        ClockExchange {
-            client_send: 100.into(),
-            host_receive: 120.into(),
-            host_send: 125.into(),
-            client_receive: 150.into(),
-        },
-        ClockExchange {
-            client_send: 1_000_000_100.into(),
-            host_receive: 1_000_000_120.into(),
-            host_send: 1_000_000_125.into(),
-            client_receive: 1_000_000_150.into(),
-        },
-        ClockExchange {
-            client_send: 2_000_000_100.into(),
-            host_receive: 2_000_000_120.into(),
-            host_send: 2_000_000_125.into(),
-            client_receive: 2_000_000_150.into(),
-        },
-    ]
+fn pair_companion(
+    host: &whisper::HostRuntime,
+    displayed_offer: &whisper::companion::PairingOffer,
+    nonce: ClientNonce,
+) -> CompanionConnection {
+    let offer = whisper::companion::PairingOffer::from_wire(
+        &displayed_offer.to_wire(),
+        displayed_offer.server_identity(),
+    )
+    .unwrap();
+    let phone_origin = std::time::Instant::now();
+    let phone_base = 1_000_000_000_u64;
+    let mut responses = Vec::new();
+    for sample in 0..3 {
+        if sample != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let client_send = phone_base + u64::try_from(phone_origin.elapsed().as_nanos()).unwrap();
+        let challenge = host
+            .begin_companion_clock_sample(
+                offer.pairing_id(),
+                offer.server_identity(),
+                nonce,
+                client_send.into(),
+            )
+            .unwrap();
+        let challenge =
+            ClockSampleChallenge::from_wire(&challenge.to_wire(), offer.server_identity()).unwrap();
+        let client_receive = phone_base + u64::try_from(phone_origin.elapsed().as_nanos()).unwrap();
+        let response = ClockSampleResponse::new(challenge, client_receive.into());
+        responses.push(
+            ClockSampleResponse::from_wire(&response.to_wire(), offer.server_identity()).unwrap(),
+        );
+    }
+    let request = offer.handshake_request(nonce, responses);
+    let request = CompanionHandshakeRequest::from_wire(&request.to_wire()).unwrap();
+    let response = host.connect_companion(request).unwrap();
+    let response_wire = response.to_wire();
+    let mut forged_valid_from = response_wire.clone().into_vec();
+    forged_valid_from[68] ^= 1;
+    let forged = CompanionHandshakeResponse::from_wire(&forged_valid_from).unwrap();
+    assert_eq!(
+        CompanionConnection::from_handshake(&offer, nonce, forged).unwrap_err().reason(),
+        CompanionRejectReason::AuthenticationFailed,
+    );
+    let response = CompanionHandshakeResponse::from_wire(&response_wire).unwrap();
+    CompanionConnection::from_handshake(&offer, nonce, response).unwrap()
 }
 
-fn calibration(scene_digest: whisper::ArtifactDigest) -> CalibrationBundle {
+fn calibration(scene_digest: ArtifactDigest) -> CalibrationBundle {
     CalibrationBundle {
         metadata: metadata("calibration-a", 2),
         scene_digest,
@@ -531,20 +602,59 @@ fn calibration(scene_digest: whisper::ArtifactDigest) -> CalibrationBundle {
             ],
             max_error_m: 0.08,
         },
-        ports: vec![PortCondition { port: 0, antenna_identity: "element-0".into() }],
-        coherence_scope: CoherenceScope::Packet,
+        signal_paths: vec![SignalPathCondition {
+            logical_path: "rx-stream-0".into(),
+            direction: SignalDirection::Receive,
+            device_chain: "rx-chain-0".into(),
+            antenna_identity: "element-0".into(),
+        }],
         array_condition: ArrayCondition {
             array_identity: "array-1".into(),
             physical_element_count: 1,
         },
-        calibration_epoch: CalibrationEpoch::new(9),
+        array_geometry: DeviceArrayGeometry {
+            device_to_array: CoordinateTransform {
+                source_coordinate_system: "rx-device-1".into(),
+                target_coordinate_system: "array-1".into(),
+                matrix: [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ],
+                max_error_m: 0.01,
+            },
+            elements: vec![ArrayElementGeometry {
+                antenna_identity: "element-0".into(),
+                position_m: [0.0, 0.0, 0.0],
+            }],
+        },
+        phase_relation: PhaseRelation {
+            source: SourceIdentity {
+                namespace: "rf-calibrator".into(),
+                identity: "phase-run-9".into(),
+            },
+            scope: CoherenceScope::Packet,
+            maximum_error_radians: 0.05,
+            valid_from_utc: 1_000.into(),
+            valid_until_utc: 9_000_000_000_000_000_000.into(),
+            epoch: CalibrationEpoch::new(9),
+        },
+        time_relation: RfTimeRelation {
+            source: SourceIdentity {
+                namespace: "rf-calibrator".into(),
+                identity: "time-run-4".into(),
+            },
+            offset: 12_i64.into(),
+            maximum_error: 20_u64.into(),
+            valid_from_utc: 1_000.into(),
+            valid_until_utc: 9_000_000_000_000_000_000.into(),
+            epoch: CalibrationEpoch::new(4),
+        },
         max_error_m: 0.14,
         valid_from_utc: 1_000.into(),
         valid_until_utc: 9_000_000_000_000_000_000.into(),
     }
 }
 
-fn supervision(scene_digest: whisper::ArtifactDigest) -> SupervisionSegment {
+fn supervision(scene_digest: ArtifactDigest) -> SupervisionSegment {
     SupervisionSegment {
         metadata: metadata("labels-a", 4),
         scene_digest,
@@ -594,7 +704,7 @@ fn supervision(scene_digest: whisper::ArtifactDigest) -> SupervisionSegment {
             3_000.into(),
         )
         .unwrap(),
-        maximum_person_velocity: MetersPerSecond::new(2.0).unwrap(),
+        maximum_person_velocity: MetersPerSecond::new(12.0).unwrap(),
     }
 }
 

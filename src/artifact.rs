@@ -26,6 +26,9 @@ const DEFAULT_MAX_GEOMETRY_ELEMENTS: usize = 100_000;
 const DEFAULT_MAX_SUPERVISION_SAMPLES: usize = 100_000;
 /// Conservative first-room position-error ceiling in metres.
 const DEFAULT_MAX_POSITION_ERROR_M: f64 = 0.75;
+/// Deployment floor for person motion uncertainty (12 m/s), conservatively
+/// above ordinary indoor movement and fast human sprint speeds.
+const DEFAULT_MINIMUM_PERSON_VELOCITY_MPS: f64 = 12.0;
 
 macro_rules! unsigned_unit {
     ($name:ident, $doc:literal) => {
@@ -130,7 +133,7 @@ impl PhoneTimeRelation {
     /// # Errors
     ///
     /// Returns an error for an empty validity interval, a reference outside it,
-    /// or drift beyond 100,000 parts per billion.
+    /// or drift beyond 10,000,000 parts per billion (one percent).
     pub fn new(
         relation_id: [u8; 16],
         offset_at_reference: ClockOffsetNanoseconds,
@@ -143,7 +146,7 @@ impl PhoneTimeRelation {
         if valid_from_phone_time >= valid_until_phone_time
             || reference_phone_time < valid_from_phone_time
             || reference_phone_time > valid_until_phone_time
-            || drift_parts_per_billion.unsigned_abs() > 100_000
+            || drift_parts_per_billion.unsigned_abs() > 10_000_000
         {
             return Err(ArtifactError::new("phone time relation range or drift is invalid"));
         }
@@ -269,6 +272,7 @@ pub struct ArtifactLimits {
     max_geometry_elements: usize,
     max_supervision_samples: usize,
     max_position_error_m: f64,
+    minimum_person_velocity: MetersPerSecond,
 }
 
 impl Default for ArtifactLimits {
@@ -279,6 +283,7 @@ impl Default for ArtifactLimits {
             max_geometry_elements: DEFAULT_MAX_GEOMETRY_ELEMENTS,
             max_supervision_samples: DEFAULT_MAX_SUPERVISION_SAMPLES,
             max_position_error_m: DEFAULT_MAX_POSITION_ERROR_M,
+            minimum_person_velocity: MetersPerSecond(DEFAULT_MINIMUM_PERSON_VELOCITY_MPS),
         }
     }
 }
@@ -300,6 +305,10 @@ impl ArtifactLimits {
 
     pub(crate) const fn max_position_error_m(self) -> f64 {
         self.max_position_error_m
+    }
+
+    pub(crate) const fn minimum_person_velocity(self) -> MetersPerSecond {
+        self.minimum_person_velocity
     }
 }
 
@@ -338,7 +347,18 @@ impl ArtifactLimitsBuilder {
         self.0.max_position_error_m = value;
         self
     }
+    /// Sets the minimum admissible person-velocity bound in metres per second.
+    #[must_use]
+    pub const fn minimum_person_velocity(mut self, value: MetersPerSecond) -> Self {
+        self.0.minimum_person_velocity = value;
+        self
+    }
     /// Validates and builds the limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a count or byte limit is zero, or if the position
+    /// uncertainty limit is negative or non-finite.
     pub fn build(self) -> Result<ArtifactLimits, ArtifactError> {
         if self.0.max_artifact_bytes == 0
             || self.0.max_artifacts == 0
@@ -388,8 +408,13 @@ enum ArtifactImportErrorKind {
     Rejected { reason: ArtifactRejectReason, message: &'static str },
     #[error("sealed artifact validation failed: {0}")]
     Artifact(#[source] ArtifactError),
-    #[error("artifact Store operation failed: {0}")]
-    Database(#[source] rusqlite::Error),
+    #[error("could not {operation} at {path}: {source}")]
+    Database {
+        operation: &'static str,
+        path: std::path::PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 impl ArtifactImportError {
@@ -407,9 +432,17 @@ impl ArtifactImportError {
         }
     }
 
-    pub(crate) fn database(source: rusqlite::Error) -> Self {
+    pub(crate) fn database(
+        operation: &'static str,
+        path: &std::path::Path,
+        source: rusqlite::Error,
+    ) -> Self {
         Self {
-            kind: Box::new(ArtifactImportErrorKind::Database(source)),
+            kind: Box::new(ArtifactImportErrorKind::Database {
+                operation,
+                path: path.to_owned(),
+                source,
+            }),
             backtrace: Box::new(Backtrace::capture()),
         }
     }
@@ -420,7 +453,7 @@ impl ArtifactImportError {
         match self.kind.as_ref() {
             ArtifactImportErrorKind::Rejected { reason, .. } => *reason,
             ArtifactImportErrorKind::Artifact(_) => ArtifactRejectReason::InvalidArtifact,
-            ArtifactImportErrorKind::Database(_) => ArtifactRejectReason::Persistence,
+            ArtifactImportErrorKind::Database { .. } => ArtifactRejectReason::Persistence,
         }
     }
 
@@ -577,13 +610,44 @@ pub struct CoordinateTransform {
     pub max_error_m: f64,
 }
 
-/// One RF port-to-physical-antenna condition.
+/// Direction of one logical RF signal path.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SignalDirection {
+    /// Transmit stream driven by the device.
+    Transmit,
+    /// Receive chain sampled by the device.
+    Receive,
+}
+
+/// Explicit logical stream or receive-chain mapping to one physical antenna.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PortCondition {
-    /// Source-native port number.
-    pub port: u16,
-    /// Physical antenna identity.
+pub struct SignalPathCondition {
+    /// Tx stream or Rx chain identity in the device contract.
+    pub logical_path: String,
+    /// Direction of this path.
+    pub direction: SignalDirection,
+    /// Physical device chain identity feeding the antenna.
+    pub device_chain: String,
+    /// Physical antenna reached by this path.
     pub antenna_identity: String,
+}
+
+/// One physical antenna position in array coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrayElementGeometry {
+    /// Physical antenna identity shared with signal-path mappings.
+    pub antenna_identity: String,
+    /// Phase-centre position in metres.
+    pub position_m: [f64; 3],
+}
+
+/// Device-to-array relation and qualified physical element geometry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceArrayGeometry {
+    /// Transform from device coordinates into array coordinates.
+    pub device_to_array: CoordinateTransform,
+    /// Physical antenna phase centres in array coordinates.
+    pub elements: Vec<ArrayElementGeometry>,
 }
 
 /// A versioned RF device, antenna, transform, port, and phase calibration.
@@ -599,14 +663,16 @@ pub struct CalibrationBundle {
     pub antenna_reference: String,
     /// Transform from device reference coordinates to scene coordinates.
     pub world_transform: CoordinateTransform,
-    /// Explicit port-to-antenna conditions.
-    pub ports: Vec<PortCondition>,
-    /// Separately established phase/coherence condition.
-    pub coherence_scope: CoherenceScope,
+    /// Explicit Tx-stream/Rx-chain mappings to physical antennas.
+    pub signal_paths: Vec<SignalPathCondition>,
     /// Array geometry and element condition.
     pub array_condition: ArrayCondition,
-    /// Calibration continuity epoch.
-    pub calibration_epoch: CalibrationEpoch,
+    /// Device and physical array geometry.
+    pub array_geometry: DeviceArrayGeometry,
+    /// Independently qualified RF phase relation.
+    pub phase_relation: PhaseRelation,
+    /// Independently qualified RF sampling-time relation.
+    pub time_relation: RfTimeRelation,
     /// Conservative combined calibration error in metres.
     pub max_error_m: f64,
     /// First UTC nanosecond for which the calibration is valid.
@@ -651,6 +717,40 @@ pub struct ArrayCondition {
     pub array_identity: String,
     /// Number of physical elements established by this calibration.
     pub physical_element_count: u16,
+}
+
+/// Independently sourced phase-coherence qualification.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhaseRelation {
+    /// Source that measured this phase relation.
+    pub source: SourceIdentity,
+    /// Scope over which coherence was established.
+    pub scope: CoherenceScope,
+    /// Conservative phase error in radians.
+    pub maximum_error_radians: f64,
+    /// First UTC instant for which the relation is qualified.
+    pub valid_from_utc: UtcNanoseconds,
+    /// Last UTC instant for which the relation is qualified.
+    pub valid_until_utc: UtcNanoseconds,
+    /// Independent phase continuity epoch.
+    pub epoch: CalibrationEpoch,
+}
+
+/// Independently sourced RF device-to-array sampling-time qualification.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RfTimeRelation {
+    /// Source that measured this timing relation.
+    pub source: SourceIdentity,
+    /// Array-clock minus device-clock offset.
+    pub offset: ClockOffsetNanoseconds,
+    /// Conservative timing error.
+    pub maximum_error: ClockErrorNanoseconds,
+    /// First UTC instant for which the relation is qualified.
+    pub valid_from_utc: UtcNanoseconds,
+    /// Last UTC instant for which the relation is qualified.
+    pub valid_until_utc: UtcNanoseconds,
+    /// Independent timing continuity epoch.
+    pub epoch: CalibrationEpoch,
 }
 
 /// Camera tracking quality associated with one supervision sample.
@@ -770,7 +870,7 @@ pub enum Artifact {
     /// Spatial scene snapshot.
     Scene(SceneSnapshot),
     /// RF device and antenna calibration bundle.
-    Calibration(CalibrationBundle),
+    Calibration(Box<CalibrationBundle>),
     /// Camera-derived supervision segment.
     Supervision(SupervisionSegment),
 }
@@ -846,6 +946,8 @@ impl Artifact {
                 }
                 if calibration.max_error_m > limits.max_position_error_m
                     || calibration.world_transform.max_error_m > limits.max_position_error_m
+                    || calibration.array_geometry.device_to_array.max_error_m
+                        > limits.max_position_error_m
                 {
                     return Err(ArtifactImportError::new(
                         ArtifactRejectReason::InvalidRelation,
@@ -871,6 +973,12 @@ impl Artifact {
                 }
             }
             Self::Supervision(supervision) => {
+                if supervision.maximum_person_velocity < limits.minimum_person_velocity() {
+                    return Err(ArtifactImportError::new(
+                        ArtifactRejectReason::InvalidRelation,
+                        "supervision person velocity is below the deployment uncertainty floor",
+                    ));
+                }
                 if supervision.samples.len() > limits.max_supervision_samples {
                     return Err(ArtifactImportError::new(
                         ArtifactRejectReason::LimitExceeded,
@@ -929,6 +1037,7 @@ impl Artifact {
                 }
                 if scene.map_error_m
                     + calibration.world_transform.max_error_m
+                    + calibration.array_geometry.device_to_array.max_error_m
                     + calibration.max_error_m
                     > limits.max_position_error_m()
                 {
@@ -937,12 +1046,12 @@ impl Artifact {
                         "combined scene and calibration error exceeds the position budget",
                     ));
                 }
-                if calibration.ports.len()
-                    > usize::from(calibration.array_condition.physical_element_count)
+                if calibration.array_geometry.elements.len()
+                    != usize::from(calibration.array_condition.physical_element_count)
                 {
                     return Err(ArtifactImportError::new(
                         ArtifactRejectReason::InvalidRelation,
-                        "calibration ports exceed the declared physical array elements",
+                        "calibration geometry differs from the declared physical element count",
                     ));
                 }
                 Ok(())
@@ -1140,7 +1249,7 @@ impl SealedArtifact {
         let mut reader = Reader::new(&self.bytes[HEADER_BYTES..payload_end]);
         let artifact = match self.bytes[6] {
             1 => Artifact::Scene(decode_scene(&mut reader)?),
-            2 => Artifact::Calibration(decode_calibration(&mut reader)?),
+            2 => Artifact::Calibration(Box::new(decode_calibration(&mut reader)?)),
             3 => Artifact::Supervision(decode_supervision(&mut reader)?),
             _ => return Err(ArtifactError::new("artifact kind is unsupported")),
         };
@@ -1222,24 +1331,64 @@ fn validate_calibration(calibration: &CalibrationBundle) -> Result<(), ArtifactE
     if calibration.world_transform.matrix.iter().any(|value| !value.is_finite()) {
         return Err(ArtifactError::new("coordinate transform must contain finite values"));
     }
+    validate_affine_transform(&calibration.world_transform)?;
     require_nonnegative_finite(calibration.world_transform.max_error_m)?;
     require_nonnegative_finite(calibration.max_error_m)?;
     if calibration.valid_from_utc >= calibration.valid_until_utc {
         return Err(ArtifactError::new("calibration validity interval is empty"));
     }
-    if calibration.ports.is_empty() {
-        return Err(ArtifactError::new("calibration port conditions must not be empty"));
+    if calibration.signal_paths.is_empty() {
+        return Err(ArtifactError::new("calibration signal paths must not be empty"));
     }
     require_text(&calibration.array_condition.array_identity)?;
     if calibration.array_condition.physical_element_count == 0 {
         return Err(ArtifactError::new("array physical element count must be non-zero"));
     }
-    let mut ports = std::collections::BTreeSet::new();
-    for port in &calibration.ports {
-        require_text(&port.antenna_identity)?;
-        if !ports.insert(port.port) {
-            return Err(ArtifactError::new("calibration port conditions must be unique"));
+    validate_affine_transform(&calibration.array_geometry.device_to_array)?;
+    require_nonnegative_finite(calibration.array_geometry.device_to_array.max_error_m)?;
+    if calibration.array_geometry.device_to_array.target_coordinate_system
+        != calibration.world_transform.source_coordinate_system
+    {
+        return Err(ArtifactError::new(
+            "device-to-array and array-to-world coordinates do not join",
+        ));
+    }
+    if calibration.array_geometry.elements.is_empty() {
+        return Err(ArtifactError::new("array geometry must contain physical elements"));
+    }
+    let mut antennas = std::collections::BTreeSet::new();
+    for element in &calibration.array_geometry.elements {
+        require_text(&element.antenna_identity)?;
+        if element.position_m.iter().any(|value| !value.is_finite())
+            || !antennas.insert(element.antenna_identity.as_str())
+        {
+            return Err(ArtifactError::new("array elements must be unique with finite geometry"));
         }
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for path in &calibration.signal_paths {
+        require_text(&path.logical_path)?;
+        require_text(&path.device_chain)?;
+        require_text(&path.antenna_identity)?;
+        if !antennas.contains(path.antenna_identity.as_str())
+            || !paths.insert((path.direction, path.logical_path.as_str()))
+        {
+            return Err(ArtifactError::new(
+                "signal paths must be unique and reference physical antennas",
+            ));
+        }
+    }
+    validate_source(&calibration.phase_relation.source)?;
+    require_nonnegative_finite(calibration.phase_relation.maximum_error_radians)?;
+    validate_source(&calibration.time_relation.source)?;
+    if calibration.phase_relation.valid_from_utc >= calibration.phase_relation.valid_until_utc
+        || calibration.time_relation.valid_from_utc >= calibration.time_relation.valid_until_utc
+        || calibration.valid_from_utc < calibration.phase_relation.valid_from_utc
+        || calibration.valid_until_utc > calibration.phase_relation.valid_until_utc
+        || calibration.valid_from_utc < calibration.time_relation.valid_from_utc
+        || calibration.valid_until_utc > calibration.time_relation.valid_until_utc
+    {
+        return Err(ArtifactError::new("calibration exceeds its phase or time relation validity"));
     }
     Ok(())
 }
@@ -1272,7 +1421,15 @@ fn validate_supervision(supervision: &SupervisionSegment) -> Result<(), Artifact
         if sample.camera_to_world.matrix.iter().any(|value| !value.is_finite()) {
             return Err(ArtifactError::new("camera pose transform must contain finite values"));
         }
+        validate_affine_transform(&sample.camera_to_world)?;
         require_nonnegative_finite(sample.camera_to_world.max_error_m)?;
+        for time in [sample.rgb_time, sample.depth_time, sample.pose_time] {
+            if supervision.time_relation.error_at(time).is_none() {
+                return Err(ArtifactError::new(
+                    "supervision sample time is outside its phone time relation",
+                ));
+            }
+        }
         let minimum = sample.rgb_time.min(sample.depth_time).min(sample.pose_time);
         let maximum = sample.rgb_time.max(sample.depth_time).max(sample.pose_time);
         if maximum.get() - minimum.get() > sample.maximum_time_error.get() {
@@ -1319,6 +1476,25 @@ fn validate_supervision(supervision: &SupervisionSegment) -> Result<(), Artifact
 fn validate_metadata(metadata: &ArtifactMetadata) -> Result<(), ArtifactError> {
     require_text(&metadata.artifact_id)?;
     validate_sources(&metadata.provenance)
+}
+
+fn validate_source(source: &SourceIdentity) -> Result<(), ArtifactError> {
+    require_text(&source.namespace)?;
+    require_text(&source.identity)
+}
+
+fn validate_affine_transform(transform: &CoordinateTransform) -> Result<(), ArtifactError> {
+    let matrix = &transform.matrix;
+    if matrix[12] != 0.0 || matrix[13] != 0.0 || matrix[14] != 0.0 || matrix[15] != 1.0 {
+        return Err(ArtifactError::new("coordinate transform is not affine homogeneous"));
+    }
+    let determinant = matrix[0] * (matrix[5] * matrix[10] - matrix[6] * matrix[9])
+        - matrix[1] * (matrix[4] * matrix[10] - matrix[6] * matrix[8])
+        + matrix[2] * (matrix[4] * matrix[9] - matrix[5] * matrix[8]);
+    if determinant.abs() <= f64::EPSILON {
+        return Err(ArtifactError::new("coordinate transform is singular"));
+    }
+    Ok(())
 }
 
 fn require_text(value: &str) -> Result<(), ArtifactError> {
@@ -1461,19 +1637,38 @@ fn encode_calibration(
         output.extend_from_slice(&value.to_le_bytes());
     }
     output.extend_from_slice(&calibration.world_transform.max_error_m.to_le_bytes());
-    put_len(output, calibration.ports.len())?;
-    for port in &calibration.ports {
-        output.extend_from_slice(&port.port.to_le_bytes());
-        put_string(output, &port.antenna_identity)?;
-    }
-    output.push(match calibration.coherence_scope {
-        CoherenceScope::None => 0,
-        CoherenceScope::Packet => 1,
-        CoherenceScope::CaptureInterval => 2,
-    });
     put_string(output, &calibration.array_condition.array_identity)?;
     output.extend_from_slice(&calibration.array_condition.physical_element_count.to_le_bytes());
-    output.extend_from_slice(&calibration.calibration_epoch.get().to_le_bytes());
+    encode_transform(output, &calibration.array_geometry.device_to_array)?;
+    put_len(output, calibration.array_geometry.elements.len())?;
+    for element in &calibration.array_geometry.elements {
+        put_string(output, &element.antenna_identity)?;
+        for coordinate in element.position_m {
+            output.extend_from_slice(&coordinate.to_le_bytes());
+        }
+    }
+    put_len(output, calibration.signal_paths.len())?;
+    for path in &calibration.signal_paths {
+        put_string(output, &path.logical_path)?;
+        output.push(match path.direction {
+            SignalDirection::Transmit => 1,
+            SignalDirection::Receive => 2,
+        });
+        put_string(output, &path.device_chain)?;
+        put_string(output, &path.antenna_identity)?;
+    }
+    encode_source(output, &calibration.phase_relation.source)?;
+    output.push(coherence_code(calibration.phase_relation.scope));
+    output.extend_from_slice(&calibration.phase_relation.maximum_error_radians.to_le_bytes());
+    output.extend_from_slice(&calibration.phase_relation.valid_from_utc.get().to_le_bytes());
+    output.extend_from_slice(&calibration.phase_relation.valid_until_utc.get().to_le_bytes());
+    output.extend_from_slice(&calibration.phase_relation.epoch.get().to_le_bytes());
+    encode_source(output, &calibration.time_relation.source)?;
+    output.extend_from_slice(&calibration.time_relation.offset.get().to_le_bytes());
+    output.extend_from_slice(&calibration.time_relation.maximum_error.get().to_le_bytes());
+    output.extend_from_slice(&calibration.time_relation.valid_from_utc.get().to_le_bytes());
+    output.extend_from_slice(&calibration.time_relation.valid_until_utc.get().to_le_bytes());
+    output.extend_from_slice(&calibration.time_relation.epoch.get().to_le_bytes());
     output.extend_from_slice(&calibration.max_error_m.to_le_bytes());
     output.extend_from_slice(&calibration.valid_from_utc.get().to_le_bytes());
     output.extend_from_slice(&calibration.valid_until_utc.get().to_le_bytes());
@@ -1492,16 +1687,48 @@ fn decode_calibration(reader: &mut Reader<'_>) -> Result<CalibrationBundle, Arti
         *value = reader.f64()?;
     }
     let max_transform_error = reader.f64()?;
-    let ports_len = reader.len()?;
-    let mut ports = Vec::with_capacity(ports_len);
-    for _ in 0..ports_len {
-        ports.push(PortCondition { port: reader.u16()?, antenna_identity: reader.string()? });
+    let array_condition =
+        ArrayCondition { array_identity: reader.string()?, physical_element_count: reader.u16()? };
+    let device_to_array = decode_transform(reader)?;
+    let element_count = reader.len()?;
+    let mut elements = Vec::with_capacity(element_count);
+    for _ in 0..element_count {
+        elements.push(ArrayElementGeometry {
+            antenna_identity: reader.string()?,
+            position_m: [reader.f64()?, reader.f64()?, reader.f64()?],
+        });
     }
-    let coherence_scope = match reader.u8()? {
-        0 => CoherenceScope::None,
-        1 => CoherenceScope::Packet,
-        2 => CoherenceScope::CaptureInterval,
-        _ => return Err(ArtifactError::new("calibration phase condition is unsupported")),
+    let path_count = reader.len()?;
+    let mut signal_paths = Vec::with_capacity(path_count);
+    for _ in 0..path_count {
+        let logical_path = reader.string()?;
+        let direction = match reader.u8()? {
+            1 => SignalDirection::Transmit,
+            2 => SignalDirection::Receive,
+            _ => return Err(ArtifactError::new("calibration signal direction is unsupported")),
+        };
+        signal_paths.push(SignalPathCondition {
+            logical_path,
+            direction,
+            device_chain: reader.string()?,
+            antenna_identity: reader.string()?,
+        });
+    }
+    let phase_relation = PhaseRelation {
+        source: decode_source(reader)?,
+        scope: decode_coherence(reader)?,
+        maximum_error_radians: reader.f64()?,
+        valid_from_utc: reader.u64()?.into(),
+        valid_until_utc: reader.u64()?.into(),
+        epoch: CalibrationEpoch::new(reader.u32()?),
+    };
+    let time_relation = RfTimeRelation {
+        source: decode_source(reader)?,
+        offset: i64::from_le_bytes(reader.take(8)?.try_into().expect("fixed offset")).into(),
+        maximum_error: reader.u64()?.into(),
+        valid_from_utc: reader.u64()?.into(),
+        valid_until_utc: reader.u64()?.into(),
+        epoch: CalibrationEpoch::new(reader.u32()?),
     };
     Ok(CalibrationBundle {
         metadata,
@@ -1514,13 +1741,11 @@ fn decode_calibration(reader: &mut Reader<'_>) -> Result<CalibrationBundle, Arti
             matrix,
             max_error_m: max_transform_error,
         },
-        ports,
-        coherence_scope,
-        array_condition: ArrayCondition {
-            array_identity: reader.string()?,
-            physical_element_count: reader.u16()?,
-        },
-        calibration_epoch: CalibrationEpoch::new(reader.u32()?),
+        signal_paths,
+        array_condition,
+        array_geometry: DeviceArrayGeometry { device_to_array, elements },
+        phase_relation,
+        time_relation,
         max_error_m: reader.f64()?,
         valid_from_utc: reader.u64()?.into(),
         valid_until_utc: reader.u64()?.into(),
@@ -1738,6 +1963,23 @@ fn encode_source(output: &mut Vec<u8>, source: &SourceIdentity) -> Result<(), Ar
 
 fn decode_source(reader: &mut Reader<'_>) -> Result<SourceIdentity, ArtifactError> {
     Ok(SourceIdentity { namespace: reader.string()?, identity: reader.string()? })
+}
+
+const fn coherence_code(scope: CoherenceScope) -> u8 {
+    match scope {
+        CoherenceScope::None => 0,
+        CoherenceScope::Packet => 1,
+        CoherenceScope::CaptureInterval => 2,
+    }
+}
+
+fn decode_coherence(reader: &mut Reader<'_>) -> Result<CoherenceScope, ArtifactError> {
+    match reader.u8()? {
+        0 => Ok(CoherenceScope::None),
+        1 => Ok(CoherenceScope::Packet),
+        2 => Ok(CoherenceScope::CaptureInterval),
+        _ => Err(ArtifactError::new("calibration coherence scope is unsupported")),
+    }
 }
 
 fn encode_time_relation(output: &mut Vec<u8>, relation: PhoneTimeRelation) {

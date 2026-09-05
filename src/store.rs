@@ -15,7 +15,7 @@ const DATABASE_NAME: &str = "facts.sqlite3";
 /// Cooperative process-ownership marker beside the database.
 const LEASE_NAME: &str = ".whisper.lease";
 /// Store-private Ed25519 signing seed for the companion server identity.
-const COMPANION_IDENTITY_NAME: &str = ".whisper.companion-identity";
+const COMPANION_SIGNING_SEED_NAME: &str = ".whisper.companion-signing-seed";
 /// SQLite application identifier (`WRF1`) written at header offset 68. Changing
 /// it makes all existing Stores intentionally unrecognizable.
 const STORE_APPLICATION_ID: u32 = 0x5752_4631;
@@ -314,7 +314,7 @@ impl std::error::Error for StoreOpenError {
 pub struct Store {
     root: PathBuf,
     id: StoreId,
-    companion_identity: [u8; 32],
+    companion_signing_seed: [u8; 32],
     lease: File,
 }
 
@@ -324,7 +324,7 @@ impl fmt::Debug for Store {
             .debug_struct("Store")
             .field("root", &self.root)
             .field("id", &self.id)
-            .field("companion_identity", &"[REDACTED]")
+            .field("companion_signing_seed", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
@@ -380,12 +380,12 @@ impl Store {
             set_root_permissions(root)?;
             let lease = acquire_lease(root, true)?;
             let id = random_store_id(entropy)?;
-            let companion_identity = random_bytes(entropy)?;
-            write_companion_identity(root, &companion_identity)?;
+            let companion_signing_seed = random_bytes(entropy)?;
+            write_companion_signing_seed(root, &companion_signing_seed)?;
             let database_path = root.join(DATABASE_NAME);
             initialize_database(&database_path, id)?;
             sync_directory(root)?;
-            Ok(Self { root: root.to_owned(), id, companion_identity, lease })
+            Ok(Self { root: root.to_owned(), id, companion_signing_seed, lease })
         })();
 
         if result.is_err() {
@@ -417,7 +417,7 @@ impl Store {
             validate_root(root)?;
             let database_path = root.join(DATABASE_NAME);
             recognize_database_header(&database_path)?;
-            let companion_identity = read_companion_identity(root)?;
+            let companion_signing_seed = read_companion_signing_seed(root)?;
             let lease = acquire_lease(root, false)?;
             let wal_path = database_path.with_extension("sqlite3-wal");
             let shm_path = database_path.with_extension("sqlite3-shm");
@@ -426,7 +426,7 @@ impl Store {
             validate_wal_shape(&wal_path)?;
             validate_shm_shape(&shm_path, wal_path.exists())?;
             let id = validate_database_snapshot(&database_path, &wal_path, &shm_path, entropy)?;
-            Ok(Self { root: root.to_owned(), id, companion_identity, lease })
+            Ok(Self { root: root.to_owned(), id, companion_signing_seed, lease })
         })()
         .map_err(|source| StoreOpenError {
             root: root.to_owned(),
@@ -445,8 +445,8 @@ impl Store {
         self.root.join(DATABASE_NAME)
     }
 
-    pub(crate) const fn companion_identity(&self) -> &[u8; 32] {
-        &self.companion_identity
+    pub(crate) const fn companion_signing_seed(&self) -> &[u8; 32] {
+        &self.companion_signing_seed
     }
 
     pub(crate) fn database_snapshot(&self) -> io::Result<StoreSnapshot> {
@@ -694,30 +694,31 @@ fn random_bytes<const N: usize>(entropy: &dyn Entropy) -> Result<[u8; N], StoreE
     Ok(bytes)
 }
 
-fn write_companion_identity(root: &Path, identity: &[u8; 32]) -> Result<(), StoreError> {
-    let path = root.join(COMPANION_IDENTITY_NAME);
+fn write_companion_signing_seed(root: &Path, signing_seed: &[u8; 32]) -> Result<(), StoreError> {
+    let path = root.join(COMPANION_SIGNING_SEED_NAME);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(FILE_MODE).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    let mut file = options.open(&path).map_err(|source| io_error(&path, source))?;
+    let mut file = options.open(&path).map_err(|source| io_error(root, source))?;
     use std::io::Write;
-    file.write_all(identity).map_err(|source| io_error(&path, source))?;
-    set_file_permissions(&path)?;
-    file.sync_all().map_err(|source| io_error(&path, source))
+    file.write_all(signing_seed).map_err(|source| io_error(root, source))?;
+    set_file_permissions(&path).map_err(|_| StoreError::from(StoreErrorKind::Untrusted))?;
+    file.sync_all().map_err(|source| io_error(root, source))
 }
 
-fn read_companion_identity(root: &Path) -> Result<[u8; 32], StoreError> {
-    let path = root.join(COMPANION_IDENTITY_NAME);
+fn read_companion_signing_seed(root: &Path) -> Result<[u8; 32], StoreError> {
+    let path = root.join(COMPANION_SIGNING_SEED_NAME);
     validate_regular_file(&path)?;
-    let mut identity = [0_u8; 32];
-    let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
-    file.read_exact(&mut identity).map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+    let mut signing_seed = [0_u8; 32];
+    let mut file = File::open(&path).map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+    file.read_exact(&mut signing_seed)
+        .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
     let mut trailing = [0_u8; 1];
     match file.read(&mut trailing) {
-        Ok(0) => Ok(identity),
+        Ok(0) => Ok(signing_seed),
         Ok(_) => Err(StoreErrorKind::Unrecognized.into()),
-        Err(source) => Err(io_error(&path, source)),
+        Err(_) => Err(StoreErrorKind::Unrecognized.into()),
     }
 }
 

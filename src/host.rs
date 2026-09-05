@@ -20,9 +20,10 @@ use crate::artifact::{
     ArtifactRejectReason, ImportedArtifact, SealedArtifact,
 };
 use crate::companion::{
-    ClockExchange, CompanionChunk, CompanionConnection, CompanionEntropy, CompanionError,
-    CompanionRejectReason, CompanionServerIdentity, CompanionState, PairingOffer,
-    SystemCompanionEntropy, UploadProgress,
+    ClockChallengeMeasurement, ClockSampleChallenge, CompanionChunk, CompanionEntropy,
+    CompanionError, CompanionHandshakeRequest, CompanionHandshakeResponse, CompanionRejectReason,
+    CompanionServerIdentity, CompanionState, PairingId, PairingOffer, SystemCompanionEntropy,
+    UploadProgress,
 };
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
 use crate::native_frame::{Header, authenticate_datagram, parse_header};
@@ -54,6 +55,9 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RATE_PERIOD: Duration = Duration::from_secs(1);
 /// Maximum lifetime of a displayed one-time pairing offer.
 const MAX_PAIRING_LIFETIME: Duration = Duration::from_secs(10 * 60);
+/// Maximum time an import caller waits for the sole writer response. This
+/// bounds API latency without claiming that an interrupted transaction committed.
+const ARTIFACT_IMPORT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 trait Network: Send + Sync {
     fn bind(&self, address: SocketAddr) -> io::Result<Box<dyn DatagramSocket>>;
@@ -365,7 +369,7 @@ impl HostBuilder {
     /// startup failure, or failure to open the Store writer.
     pub fn start(self) -> Result<HostRuntime, HostError> {
         validate_builder(&self)?;
-        let companion_identity = *self.store.companion_identity();
+        let companion_signing_seed = *self.store.companion_signing_seed();
         let database_path = self.store.database_path();
         let replay_snapshot = self.store.database_snapshot().map_err(|source| {
             HostError::io_during(
@@ -443,8 +447,9 @@ impl HostBuilder {
             artifact_limits,
             known_rf_identities,
             clock: runtime_clock,
-            companion: Arc::new(Mutex::new(CompanionState::new(companion_identity))),
+            companion: Arc::new(Mutex::new(CompanionState::new(companion_signing_seed))),
             companion_entropy,
+            companion_monotonic_origin: Mutex::new(None),
         })
     }
 }
@@ -462,6 +467,7 @@ pub struct HostRuntime {
     clock: Arc<dyn Clock>,
     companion: Arc<Mutex<CompanionState>>,
     companion_entropy: Arc<dyn CompanionEntropy>,
+    companion_monotonic_origin: Mutex<Option<Instant>>,
 }
 
 impl fmt::Debug for HostRuntime {
@@ -561,7 +567,7 @@ impl HostRuntime {
         )?;
         let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
         self.artifact_sender
-            .send(ArtifactCommand {
+            .try_send(ArtifactCommand {
                 sealed,
                 artifact,
                 imported_utc_ns,
@@ -572,13 +578,13 @@ impl HostRuntime {
             .map_err(|_| {
                 ArtifactImportError::new(
                     ArtifactRejectReason::Persistence,
-                    "Store writer is unavailable",
+                    "Store writer queue is unavailable or full",
                 )
             })?;
-        reply_receiver.recv().map_err(|_| {
+        reply_receiver.recv_timeout(ARTIFACT_IMPORT_RESPONSE_TIMEOUT).map_err(|_| {
             ArtifactImportError::new(
                 ArtifactRejectReason::Persistence,
-                "Store writer exited before completing artifact import",
+                "Store writer did not complete artifact import before the response deadline",
             )
         })?
     }
@@ -635,29 +641,56 @@ impl HostRuntime {
         self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).server_identity()
     }
 
-    /// Consumes one pairing offer after pin and bounded clock validation.
+    /// Measures and signs one Host-owned half of a two-way clock sample.
     ///
     /// # Errors
     ///
-    /// Returns an error for a wrong pin, expired or reused offer, invalid clock
-    /// exchanges, or failure to obtain a fresh session identity.
-    pub fn connect_companion(
+    /// Returns an error for a wrong pin, expired offer, or unrepresentable Host time.
+    pub fn begin_companion_clock_sample(
         &self,
-        offer: &PairingOffer,
+        pairing_id: PairingId,
         pinned_server_identity: CompanionServerIdentity,
         client_nonce: crate::companion::ClientNonce,
-        clock_exchanges: &[ClockExchange],
-    ) -> Result<CompanionConnection, CompanionError> {
+        client_send: crate::artifact::PhoneNanoseconds,
+    ) -> Result<ClockSampleChallenge, CompanionError> {
+        let host_receive = self.companion_monotonic_now()?;
+        let now = utc_now_ns(self.clock.as_ref()).map_err(|_| companion_clock_error())?;
+        let host_send = self.companion_monotonic_now()?;
+        self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clock_challenge(
+            pairing_id,
+            pinned_server_identity,
+            client_nonce,
+            ClockChallengeMeasurement { now_utc: now.into(), client_send, host_receive, host_send },
+        )
+    }
+
+    /// Consumes one wire-reconstructable request after signed clock validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a wrong pin or code, expired/reused offer, forged or
+    /// invalid clock samples, or failure to obtain a fresh session identity.
+    pub fn connect_companion(
+        &self,
+        request: CompanionHandshakeRequest,
+    ) -> Result<CompanionHandshakeResponse, CompanionError> {
         let now = utc_now_ns(self.clock.as_ref()).map_err(|_| companion_clock_error())?;
         let session_id = secure_random::<16>(self.companion_entropy.as_ref())?;
         self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).connect(
-            offer,
-            pinned_server_identity,
-            client_nonce,
-            clock_exchanges,
+            request,
             now.into(),
             session_id,
         )
+    }
+
+    fn companion_monotonic_now(&self) -> Result<crate::artifact::HostNanoseconds, CompanionError> {
+        let now = self.clock.monotonic_now();
+        let mut origin =
+            self.companion_monotonic_origin.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let origin = *origin.get_or_insert(now);
+        let nanos = u64::try_from(now.saturating_duration_since(origin).as_nanos())
+            .map_err(|_| companion_clock_error())?;
+        Ok(nanos.into())
     }
 
     /// Accepts one authenticated companion chunk and imports completed bytes.

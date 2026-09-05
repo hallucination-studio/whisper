@@ -39,7 +39,7 @@ pub(super) fn query_artifact_receipt(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(ArtifactImportError::database)?;
+    .map_err(|error| ArtifactImportError::database("open artifact receipt query", path, error))?;
     let row: Option<(u8, String, u32, String)> = connection
         .query_row(
             "SELECT kind, artifact_id, revision, origin FROM spatial_artifacts WHERE digest = ?1",
@@ -47,7 +47,7 @@ pub(super) fn query_artifact_receipt(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
-        .map_err(ArtifactImportError::database)?;
+        .map_err(|error| ArtifactImportError::database("query artifact receipt", path, error))?;
     row.map(|(kind, artifact_id, revision, origin)| {
         let kind = ArtifactKind::from_code(kind).ok_or_else(|| {
             ArtifactImportError::new(

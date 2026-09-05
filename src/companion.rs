@@ -36,6 +36,15 @@ const CHUNK_MAGIC: &[u8; 4] = b"WSC1";
 const CHUNK_HEADER_BYTES: usize = 88;
 /// Maximum plaintext carried by one independently authenticated chunk (64 KiB).
 const MAX_COMPANION_CHUNK_BYTES: usize = 64 * 1024;
+const OFFER_WIRE_MAGIC: &[u8; 4] = b"WSO1";
+const CHALLENGE_WIRE_MAGIC: &[u8; 4] = b"WSH1";
+const CLOCK_RESPONSE_WIRE_MAGIC: &[u8; 4] = b"WSR1";
+const HANDSHAKE_REQUEST_WIRE_MAGIC: &[u8; 4] = b"WSQ1";
+const HANDSHAKE_RESPONSE_WIRE_MAGIC: &[u8; 4] = b"WSK1";
+const OFFER_WIRE_BYTES: usize = 140;
+const CHALLENGE_WIRE_BYTES: usize = 140;
+const CLOCK_RESPONSE_WIRE_BYTES: usize = 152;
+const HANDSHAKE_RESPONSE_WIRE_BYTES: usize = 148;
 
 /// Injectable cryptographic entropy boundary for companion pairing and sessions.
 pub trait CompanionEntropy: Send + Sync {
@@ -118,17 +127,24 @@ impl fmt::Debug for PairingCode {
 
 impl fmt::Display for PairingCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, byte) in self.0.iter().enumerate() {
-            if index != 0 && index.is_multiple_of(2) {
-                formatter.write_str("-")?;
-            }
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        formatter.write_str("[REDACTED]")
     }
 }
 
 impl PairingCode {
+    /// Formats the one-time code for the explicit local display surface.
+    #[must_use]
+    pub fn format_for_display(self) -> String {
+        let mut displayed = String::with_capacity(39);
+        use std::fmt::Write as _;
+        for (index, byte) in self.0.iter().enumerate() {
+            if index != 0 && index.is_multiple_of(2) {
+                displayed.push('-');
+            }
+            write!(displayed, "{byte:02x}").expect("writing to String is infallible");
+        }
+        displayed
+    }
     /// Returns the one-time secret bytes for a client-side key derivation.
     ///
     /// Callers must avoid logging or persisting this value after pairing.
@@ -217,11 +233,245 @@ impl PairingOffer {
         key.verify_strict(&offer_transcript(self), &Signature::from_bytes(&self.server_proof))
             .map_err(CompanionError::signature)
     }
+
+    /// Encodes the complete signed offer for an arbitrary byte transport.
+    #[must_use]
+    pub fn to_wire(&self) -> Box<[u8]> {
+        let mut bytes = Vec::with_capacity(OFFER_WIRE_BYTES);
+        bytes.extend_from_slice(OFFER_WIRE_MAGIC);
+        bytes.extend_from_slice(&self.id.0);
+        bytes.extend_from_slice(&self.code.0);
+        bytes.extend_from_slice(&self.server_identity.0);
+        bytes.extend_from_slice(&self.expires_at_utc.get().to_le_bytes());
+        bytes.extend_from_slice(&self.server_proof);
+        bytes.into_boxed_slice()
+    }
+
+    /// Reconstructs and authenticates a signed offer received over any transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed encoding, wrong pin, or invalid proof.
+    pub fn from_wire(
+        bytes: &[u8],
+        pinned: CompanionServerIdentity,
+    ) -> Result<Self, CompanionError> {
+        if bytes.len() != OFFER_WIRE_BYTES || &bytes[..4] != OFFER_WIRE_MAGIC {
+            return Err(authentication_error("pairing offer wire encoding is malformed"));
+        }
+        let offer = Self {
+            id: PairingId(bytes[4..20].try_into().expect("fixed pairing id")),
+            code: PairingCode(bytes[20..36].try_into().expect("fixed pairing code")),
+            server_identity: CompanionServerIdentity(
+                bytes[36..68].try_into().expect("fixed identity"),
+            ),
+            expires_at_utc: u64::from_le_bytes(bytes[68..76].try_into().expect("fixed expiry"))
+                .into(),
+            server_proof: bytes[76..140].try_into().expect("fixed offer proof"),
+        };
+        offer.verify_server_proof(pinned)?;
+        Ok(offer)
+    }
+
+    /// Builds the authenticated client request after collecting clock responses.
+    #[must_use]
+    pub fn handshake_request(
+        &self,
+        client_nonce: ClientNonce,
+        clock_responses: Vec<ClockSampleResponse>,
+    ) -> CompanionHandshakeRequest {
+        CompanionHandshakeRequest {
+            pairing_id: self.id,
+            pairing_code: self.code,
+            pinned_server_identity: self.server_identity,
+            client_nonce,
+            clock_responses,
+        }
+    }
 }
 
-/// One bounded four-timestamp companion-to-Host clock exchange.
+/// Signed Host timing challenge returned for one client send timestamp.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ClockSampleChallenge {
+    pairing_id: PairingId,
+    client_nonce: ClientNonce,
+    client_send: PhoneNanoseconds,
+    host_receive: HostNanoseconds,
+    host_send: HostNanoseconds,
+    server_proof: [u8; 64],
+}
+
+impl fmt::Debug for ClockSampleChallenge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClockSampleChallenge")
+            .field("pairing_id", &self.pairing_id)
+            .field("client_nonce", &self.client_nonce)
+            .field("client_send", &self.client_send)
+            .field("host_receive", &self.host_receive)
+            .field("host_send", &self.host_send)
+            .field("server_proof", &self.server_proof)
+            .finish()
+    }
+}
+
+impl ClockSampleChallenge {
+    /// Encodes this signed challenge for an arbitrary byte transport.
+    #[must_use]
+    pub fn to_wire(&self) -> Box<[u8]> {
+        let mut bytes = Vec::with_capacity(CHALLENGE_WIRE_BYTES);
+        bytes.extend_from_slice(CHALLENGE_WIRE_MAGIC);
+        bytes.extend_from_slice(&self.pairing_id.0);
+        bytes.extend_from_slice(&self.client_nonce.0);
+        bytes.extend_from_slice(&self.client_send.get().to_le_bytes());
+        bytes.extend_from_slice(&self.host_receive.get().to_le_bytes());
+        bytes.extend_from_slice(&self.host_send.get().to_le_bytes());
+        bytes.extend_from_slice(&self.server_proof);
+        bytes.into_boxed_slice()
+    }
+
+    /// Reconstructs and authenticates a signed challenge from any byte transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed bytes, a wrong pin, or a forged Host time.
+    pub fn from_wire(
+        bytes: &[u8],
+        pinned: CompanionServerIdentity,
+    ) -> Result<Self, CompanionError> {
+        if bytes.len() != CHALLENGE_WIRE_BYTES || &bytes[..4] != CHALLENGE_WIRE_MAGIC {
+            return Err(authentication_error("clock challenge wire encoding is malformed"));
+        }
+        let challenge = Self {
+            pairing_id: PairingId(bytes[4..20].try_into().expect("fixed pairing id")),
+            client_nonce: ClientNonce(bytes[20..52].try_into().expect("fixed client nonce")),
+            client_send: u64::from_le_bytes(bytes[52..60].try_into().expect("fixed phone time"))
+                .into(),
+            host_receive: u64::from_le_bytes(bytes[60..68].try_into().expect("fixed Host time"))
+                .into(),
+            host_send: u64::from_le_bytes(bytes[68..76].try_into().expect("fixed Host time"))
+                .into(),
+            server_proof: bytes[76..140].try_into().expect("fixed challenge proof"),
+        };
+        let key = VerifyingKey::from_bytes(pinned.as_bytes()).map_err(CompanionError::signature)?;
+        key.verify_strict(
+            &challenge_transcript(&challenge),
+            &Signature::from_bytes(&challenge.server_proof),
+        )
+        .map_err(CompanionError::signature)?;
+        Ok(challenge)
+    }
+}
+
+/// Client completion of one signed two-way clock sample.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClockSampleResponse {
+    challenge: ClockSampleChallenge,
+    client_receive: PhoneNanoseconds,
+}
+
+impl ClockSampleResponse {
+    /// Completes a challenge with the independently measured phone receive time.
+    #[must_use]
+    pub const fn new(challenge: ClockSampleChallenge, client_receive: PhoneNanoseconds) -> Self {
+        Self { challenge, client_receive }
+    }
+
+    /// Encodes the complete sample for an arbitrary byte transport.
+    #[must_use]
+    pub fn to_wire(&self) -> Box<[u8]> {
+        let mut bytes = Vec::with_capacity(CLOCK_RESPONSE_WIRE_BYTES);
+        bytes.extend_from_slice(CLOCK_RESPONSE_WIRE_MAGIC);
+        bytes.extend_from_slice(&self.challenge.to_wire());
+        bytes.extend_from_slice(&self.client_receive.get().to_le_bytes());
+        bytes.into_boxed_slice()
+    }
+
+    /// Reconstructs a clock response received over any transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed canonical encoding.
+    pub fn from_wire(
+        bytes: &[u8],
+        pinned: CompanionServerIdentity,
+    ) -> Result<Self, CompanionError> {
+        if bytes.len() != CLOCK_RESPONSE_WIRE_BYTES || &bytes[..4] != CLOCK_RESPONSE_WIRE_MAGIC {
+            return Err(authentication_error("clock response wire encoding is malformed"));
+        }
+        Ok(Self {
+            challenge: ClockSampleChallenge::from_wire(&bytes[4..144], pinned)?,
+            client_receive: u64::from_le_bytes(
+                bytes[144..152].try_into().expect("fixed phone time"),
+            )
+            .into(),
+        })
+    }
+}
+
+/// Canonical client request that proves code possession and carries signed samples.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompanionHandshakeRequest {
+    pairing_id: PairingId,
+    pairing_code: PairingCode,
+    pinned_server_identity: CompanionServerIdentity,
+    client_nonce: ClientNonce,
+    clock_responses: Vec<ClockSampleResponse>,
+}
+
+impl CompanionHandshakeRequest {
+    /// Encodes the request for an arbitrary byte transport.
+    #[must_use]
+    pub fn to_wire(&self) -> Box<[u8]> {
+        let mut bytes =
+            Vec::with_capacity(88 + self.clock_responses.len() * CLOCK_RESPONSE_WIRE_BYTES);
+        bytes.extend_from_slice(HANDSHAKE_REQUEST_WIRE_MAGIC);
+        bytes.extend_from_slice(&self.pairing_id.0);
+        bytes.extend_from_slice(&self.pairing_code.0);
+        bytes.extend_from_slice(&self.pinned_server_identity.0);
+        bytes.extend_from_slice(&self.client_nonce.0);
+        bytes.extend_from_slice(&(self.clock_responses.len() as u32).to_le_bytes());
+        for response in &self.clock_responses {
+            bytes.extend_from_slice(&response.to_wire());
+        }
+        bytes.into_boxed_slice()
+    }
+
+    /// Reconstructs a bounded handshake request from any byte transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed lengths or an out-of-bounds sample count.
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, CompanionError> {
+        const HEADER: usize = 104;
+        if bytes.len() < HEADER || &bytes[..4] != HANDSHAKE_REQUEST_WIRE_MAGIC {
+            return Err(authentication_error("handshake request wire encoding is malformed"));
+        }
+        let count =
+            u32::from_le_bytes(bytes[100..104].try_into().expect("fixed sample count")) as usize;
+        if !(MIN_CLOCK_EXCHANGES..=MAX_CLOCK_EXCHANGES).contains(&count)
+            || bytes.len() != HEADER + count * CLOCK_RESPONSE_WIRE_BYTES
+        {
+            return Err(clock_error());
+        }
+        let pinned_server_identity =
+            CompanionServerIdentity(bytes[36..68].try_into().expect("fixed identity"));
+        let mut clock_responses = Vec::with_capacity(count);
+        for chunk in bytes[HEADER..].chunks_exact(CLOCK_RESPONSE_WIRE_BYTES) {
+            clock_responses.push(ClockSampleResponse::from_wire(chunk, pinned_server_identity)?);
+        }
+        Ok(Self {
+            pairing_id: PairingId(bytes[4..20].try_into().expect("fixed pairing id")),
+            pairing_code: PairingCode(bytes[20..36].try_into().expect("fixed pairing code")),
+            pinned_server_identity,
+            client_nonce: ClientNonce(bytes[68..100].try_into().expect("fixed client nonce")),
+            clock_responses,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClockExchange {
+struct ClockExchange {
     /// Client send timestamp.
     pub client_send: PhoneNanoseconds,
     /// Host receive timestamp.
@@ -232,8 +482,12 @@ pub struct ClockExchange {
     pub client_receive: PhoneNanoseconds,
 }
 
-/// Bounded companion-phone clock relation to Host monotonic time.
-pub type CompanionClockRelation = PhoneTimeRelation;
+pub(crate) struct ClockChallengeMeasurement {
+    pub(crate) now_utc: UtcNanoseconds,
+    pub(crate) client_send: PhoneNanoseconds,
+    pub(crate) host_receive: HostNanoseconds,
+    pub(crate) host_send: HostNanoseconds,
+}
 
 /// Stable caller-chosen identity for one resumable upload.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -247,12 +501,51 @@ impl UploadId {
     }
 }
 
+/// Signed server response from which the phone independently constructs its session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompanionHandshakeResponse {
+    session_id: [u8; 16],
+    clock_relation: PhoneTimeRelation,
+    server_proof: [u8; 64],
+}
+
+impl CompanionHandshakeResponse {
+    /// Encodes the signed response for an arbitrary byte transport.
+    #[must_use]
+    pub fn to_wire(&self) -> Box<[u8]> {
+        let mut bytes = Vec::with_capacity(HANDSHAKE_RESPONSE_WIRE_BYTES);
+        bytes.extend_from_slice(HANDSHAKE_RESPONSE_WIRE_MAGIC);
+        bytes.extend_from_slice(&self.session_id);
+        encode_relation(&mut bytes, self.clock_relation);
+        bytes.extend_from_slice(&self.server_proof);
+        bytes.into_boxed_slice()
+    }
+
+    /// Reconstructs the canonical response from any byte transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed bytes or an invalid clock relation.
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, CompanionError> {
+        if bytes.len() != HANDSHAKE_RESPONSE_WIRE_BYTES
+            || &bytes[..4] != HANDSHAKE_RESPONSE_WIRE_MAGIC
+        {
+            return Err(authentication_error("handshake response wire encoding is malformed"));
+        }
+        Ok(Self {
+            session_id: bytes[4..20].try_into().expect("fixed session id"),
+            clock_relation: decode_relation(&bytes[20..84])?,
+            server_proof: bytes[84..148].try_into().expect("fixed response proof"),
+        })
+    }
+}
+
 /// Client half of a paired encrypted companion session.
 pub struct CompanionConnection {
     session_id: [u8; 16],
     key: [u8; 32],
     server_identity: CompanionServerIdentity,
-    clock_relation: CompanionClockRelation,
+    clock_relation: PhoneTimeRelation,
     client_nonce: ClientNonce,
     server_proof: [u8; 64],
 }
@@ -272,6 +565,34 @@ impl fmt::Debug for CompanionConnection {
 }
 
 impl CompanionConnection {
+    /// Independently constructs the phone session from a signed wire response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixed server proof or response relation is invalid.
+    pub fn from_handshake(
+        offer: &PairingOffer,
+        client_nonce: ClientNonce,
+        response: CompanionHandshakeResponse,
+    ) -> Result<Self, CompanionError> {
+        let key = session_key(
+            offer.code.expose_bytes(),
+            &offer.id,
+            offer.server_identity,
+            &response.session_id,
+            client_nonce,
+        );
+        let connection = Self {
+            session_id: response.session_id,
+            key,
+            server_identity: offer.server_identity,
+            clock_relation: response.clock_relation,
+            client_nonce,
+            server_proof: response.server_proof,
+        };
+        connection.verify_server_proof()?;
+        Ok(connection)
+    }
     /// Verifies the persistent server's client-nonce-bound handshake proof.
     ///
     /// # Errors
@@ -293,7 +614,7 @@ impl CompanionConnection {
     }
     /// Returns the bounded clock relation established during pairing.
     #[must_use]
-    pub const fn clock_relation(&self) -> CompanionClockRelation {
+    pub const fn clock_relation(&self) -> PhoneTimeRelation {
         self.clock_relation
     }
 
@@ -549,7 +870,6 @@ impl std::error::Error for CompanionError {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct CompanionState {
     signing_key: SigningKey,
     server_identity: CompanionServerIdentity,
@@ -557,13 +877,37 @@ pub(crate) struct CompanionState {
     sessions: BTreeMap<[u8; 16], ServerSession>,
 }
 
-#[derive(Debug)]
 struct ServerSession {
     key: [u8; 32],
-    clock_relation: CompanionClockRelation,
+    clock_relation: PhoneTimeRelation,
     expires_at_utc: UtcNanoseconds,
     uploads: BTreeMap<UploadId, IncompleteUpload>,
     completed: BTreeMap<UploadId, CompletedUpload>,
+}
+
+impl fmt::Debug for CompanionState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompanionState")
+            .field("signing_key", &"[REDACTED]")
+            .field("server_identity", &self.server_identity)
+            .field("offer_count", &self.offers.len())
+            .field("session_count", &self.sessions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for ServerSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerSession")
+            .field("key", &"[REDACTED]")
+            .field("clock_relation", &self.clock_relation)
+            .field("expires_at_utc", &self.expires_at_utc)
+            .field("incomplete_upload_count", &self.uploads.len())
+            .field("completed_upload_count", &self.completed.len())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -590,7 +934,7 @@ pub(crate) struct AssembledUpload {
     pub(crate) upload_id: UploadId,
     pub(crate) full_digest: [u8; 32],
     pub(crate) completed_receipt: Option<ImportedArtifact>,
-    pub(crate) clock_relation: CompanionClockRelation,
+    pub(crate) clock_relation: PhoneTimeRelation,
 }
 
 impl CompanionState {
@@ -632,35 +976,95 @@ impl CompanionState {
         Ok(offer)
     }
 
-    pub(crate) fn connect(
+    pub(crate) fn clock_challenge(
         &mut self,
-        offered: &PairingOffer,
+        pairing_id: PairingId,
         pinned: CompanionServerIdentity,
         client_nonce: ClientNonce,
-        exchanges: &[ClockExchange],
-        now_utc: UtcNanoseconds,
-        session_id: [u8; 16],
-    ) -> Result<CompanionConnection, CompanionError> {
-        if pinned != self.server_identity || offered.server_identity != self.server_identity {
+        measurement: ClockChallengeMeasurement,
+    ) -> Result<ClockSampleChallenge, CompanionError> {
+        if pinned != self.server_identity {
             return Err(CompanionError::new(
                 CompanionRejectReason::ServerIdentityMismatch,
                 "companion server identity does not match the pinned identity",
             ));
         }
-        offered.verify_server_proof(pinned)?;
-        let retained = self.offers.get(&offered.id).ok_or_else(|| {
+        let offer = self.offers.get(&pairing_id).ok_or_else(|| {
             CompanionError::new(
                 CompanionRejectReason::PairingUnavailable,
                 "pairing offer is unavailable",
             )
         })?;
-        if retained != offered || retained.expires_at_utc < now_utc {
+        if offer.expires_at_utc < measurement.now_utc {
+            return Err(CompanionError::new(
+                CompanionRejectReason::PairingUnavailable,
+                "pairing offer is expired",
+            ));
+        }
+        let mut challenge = ClockSampleChallenge {
+            pairing_id,
+            client_nonce,
+            client_send: measurement.client_send,
+            host_receive: measurement.host_receive,
+            host_send: measurement.host_send,
+            server_proof: [0; 64],
+        };
+        use ed25519_dalek::Signer;
+        challenge.server_proof =
+            self.signing_key.sign(&challenge_transcript(&challenge)).to_bytes();
+        Ok(challenge)
+    }
+
+    pub(crate) fn connect(
+        &mut self,
+        request: CompanionHandshakeRequest,
+        now_utc: UtcNanoseconds,
+        session_id: [u8; 16],
+    ) -> Result<CompanionHandshakeResponse, CompanionError> {
+        if request.pinned_server_identity != self.server_identity {
+            return Err(CompanionError::new(
+                CompanionRejectReason::ServerIdentityMismatch,
+                "companion server identity does not match the pinned identity",
+            ));
+        }
+        let offered = self.offers.get(&request.pairing_id).cloned().ok_or_else(|| {
+            CompanionError::new(
+                CompanionRejectReason::PairingUnavailable,
+                "pairing offer is unavailable",
+            )
+        })?;
+        if offered.code != request.pairing_code || offered.expires_at_utc < now_utc {
             return Err(CompanionError::new(
                 CompanionRejectReason::PairingUnavailable,
                 "pairing offer is invalid or expired",
             ));
         }
-        let clock_relation = estimate_clock_relation(exchanges, session_id)?;
+        let verifying_key = VerifyingKey::from_bytes(self.server_identity.as_bytes())
+            .map_err(CompanionError::signature)?;
+        let mut exchanges = Vec::with_capacity(request.clock_responses.len());
+        let mut client_sends = std::collections::BTreeSet::new();
+        for response in &request.clock_responses {
+            let challenge = &response.challenge;
+            if challenge.pairing_id != request.pairing_id
+                || challenge.client_nonce != request.client_nonce
+                || !client_sends.insert(challenge.client_send)
+            {
+                return Err(clock_error());
+            }
+            verifying_key
+                .verify_strict(
+                    &challenge_transcript(challenge),
+                    &Signature::from_bytes(&challenge.server_proof),
+                )
+                .map_err(CompanionError::signature)?;
+            exchanges.push(ClockExchange {
+                client_send: challenge.client_send,
+                host_receive: challenge.host_receive,
+                host_send: challenge.host_send,
+                client_receive: response.client_receive,
+            });
+        }
+        let clock_relation = estimate_clock_relation(&exchanges, session_id)?;
         self.sessions.retain(|_, session| session.expires_at_utc >= now_utc);
         if self.sessions.len() >= MAX_COMPANION_SESSIONS {
             return Err(CompanionError::new(
@@ -669,11 +1073,11 @@ impl CompanionState {
             ));
         }
         let key = session_key(
-            offered.code.expose_bytes(),
-            &offered.id,
+            request.pairing_code.expose_bytes(),
+            &request.pairing_id,
             self.server_identity,
             &session_id,
-            client_nonce,
+            request.client_nonce,
         );
         use ed25519_dalek::Signer;
         let server_proof = self
@@ -681,11 +1085,11 @@ impl CompanionState {
             .sign(&connection_transcript(
                 self.server_identity,
                 &session_id,
-                client_nonce,
+                request.client_nonce,
                 clock_relation,
             ))
             .to_bytes();
-        self.offers.remove(&offered.id);
+        self.offers.remove(&request.pairing_id);
         self.sessions.insert(
             session_id,
             ServerSession {
@@ -696,14 +1100,7 @@ impl CompanionState {
                 completed: BTreeMap::new(),
             },
         );
-        Ok(CompanionConnection {
-            session_id,
-            key,
-            server_identity: self.server_identity,
-            clock_relation,
-            client_nonce,
-            server_proof,
-        })
+        Ok(CompanionHandshakeResponse { session_id, clock_relation, server_proof })
     }
 
     pub(crate) fn accept_chunk(
@@ -873,7 +1270,7 @@ impl CompanionState {
 fn estimate_clock_relation(
     exchanges: &[ClockExchange],
     relation_id: [u8; 16],
-) -> Result<CompanionClockRelation, CompanionError> {
+) -> Result<PhoneTimeRelation, CompanionError> {
     if exchanges.len() < MIN_CLOCK_EXCHANGES || exchanges.len() > MAX_CLOCK_EXCHANGES {
         return Err(clock_error());
     }
@@ -908,10 +1305,13 @@ fn estimate_clock_relation(
     let first = samples.first().ok_or_else(clock_error)?;
     let last = samples.last().ok_or_else(clock_error)?;
     let elapsed = i128::from(last.0 - first.0);
-    let drift = (i128::from(last.1) - i128::from(first.1))
-        .checked_mul(1_000_000_000)
-        .ok_or_else(clock_error)?
-        / elapsed;
+    let offset_delta = i128::from(last.1) - i128::from(first.1);
+    let endpoint_uncertainty = i128::from(first.2) + i128::from(last.2);
+    let drift = if offset_delta.abs() <= endpoint_uncertainty {
+        0
+    } else {
+        offset_delta.checked_mul(1_000_000_000).ok_or_else(clock_error)? / elapsed
+    };
     let drift = i64::try_from(drift).map_err(|_| clock_error())?;
     let mut maximum_error = 0_u64;
     for (time, offset, sample_error) in &samples {
@@ -977,7 +1377,7 @@ fn connection_transcript(
     server: CompanionServerIdentity,
     session_id: &[u8; 16],
     client_nonce: ClientNonce,
-    relation: CompanionClockRelation,
+    relation: PhoneTimeRelation,
 ) -> Vec<u8> {
     let mut transcript = Vec::with_capacity(128);
     transcript.extend_from_slice(b"whisper companion handshake response v1\0");
@@ -989,6 +1389,45 @@ fn connection_transcript(
     transcript.extend_from_slice(&relation.drift_parts_per_billion().to_le_bytes());
     transcript.extend_from_slice(&relation.reference_phone_time().get().to_le_bytes());
     transcript.extend_from_slice(&relation.maximum_error().get().to_le_bytes());
+    transcript.extend_from_slice(&relation.valid_from_phone_time().get().to_le_bytes());
+    transcript.extend_from_slice(&relation.valid_until_phone_time().get().to_le_bytes());
+    transcript
+}
+
+fn encode_relation(output: &mut Vec<u8>, relation: PhoneTimeRelation) {
+    output.extend_from_slice(&relation.relation_id());
+    output.extend_from_slice(&relation.offset_at_reference().get().to_le_bytes());
+    output.extend_from_slice(&relation.drift_parts_per_billion().to_le_bytes());
+    output.extend_from_slice(&relation.reference_phone_time().get().to_le_bytes());
+    output.extend_from_slice(&relation.maximum_error().get().to_le_bytes());
+    output.extend_from_slice(&relation.valid_from_phone_time().get().to_le_bytes());
+    output.extend_from_slice(&relation.valid_until_phone_time().get().to_le_bytes());
+}
+
+fn decode_relation(bytes: &[u8]) -> Result<PhoneTimeRelation, CompanionError> {
+    if bytes.len() != 64 {
+        return Err(clock_error());
+    }
+    PhoneTimeRelation::new(
+        bytes[..16].try_into().expect("fixed relation id"),
+        i64::from_le_bytes(bytes[16..24].try_into().expect("fixed offset")).into(),
+        i64::from_le_bytes(bytes[24..32].try_into().expect("fixed drift")),
+        u64::from_le_bytes(bytes[32..40].try_into().expect("fixed phone time")).into(),
+        u64::from_le_bytes(bytes[40..48].try_into().expect("fixed error")).into(),
+        u64::from_le_bytes(bytes[48..56].try_into().expect("fixed phone time")).into(),
+        u64::from_le_bytes(bytes[56..64].try_into().expect("fixed phone time")).into(),
+    )
+    .map_err(|_| clock_error())
+}
+
+fn challenge_transcript(challenge: &ClockSampleChallenge) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(128);
+    transcript.extend_from_slice(b"whisper companion clock challenge v1\0");
+    transcript.extend_from_slice(&challenge.pairing_id.0);
+    transcript.extend_from_slice(&challenge.client_nonce.0);
+    transcript.extend_from_slice(&challenge.client_send.get().to_le_bytes());
+    transcript.extend_from_slice(&challenge.host_receive.get().to_le_bytes());
+    transcript.extend_from_slice(&challenge.host_send.get().to_le_bytes());
     transcript
 }
 
@@ -1035,6 +1474,10 @@ fn crypto_error() -> CompanionError {
     )
 }
 
+fn authentication_error(message: &'static str) -> CompanionError {
+    CompanionError::new(CompanionRejectReason::AuthenticationFailed, message)
+}
+
 fn limit_error() -> CompanionError {
     CompanionError::new(CompanionRejectReason::LimitExceeded, "companion upload limit exceeded")
 }
@@ -1056,36 +1499,32 @@ mod tests {
         let code = [7; 16];
         let offer = state.offer(10.into(), [3; 16], code, 100.into()).unwrap();
         assert!(!format!("{offer:?}").contains(&format!("{code:?}")));
-        let connection = state
-            .connect(
-                &offer,
-                offer.server_identity(),
-                ClientNonce::from_bytes([5; 32]),
-                &[
-                    ClockExchange {
-                        client_send: 10.into(),
-                        host_receive: 20.into(),
-                        host_send: 21.into(),
-                        client_receive: 31.into(),
+        assert_eq!(offer.display_code().to_string(), "[REDACTED]");
+        let nonce = ClientNonce::from_bytes([5; 32]);
+        let mut responses = Vec::new();
+        for start in [10_u64, 110, 210] {
+            let challenge = state
+                .clock_challenge(
+                    offer.id,
+                    offer.server_identity(),
+                    nonce,
+                    ClockChallengeMeasurement {
+                        now_utc: 11.into(),
+                        client_send: start.into(),
+                        host_receive: (start + 10).into(),
+                        host_send: (start + 11).into(),
                     },
-                    ClockExchange {
-                        client_send: 110.into(),
-                        host_receive: 120.into(),
-                        host_send: 121.into(),
-                        client_receive: 131.into(),
-                    },
-                    ClockExchange {
-                        client_send: 210.into(),
-                        host_receive: 220.into(),
-                        host_send: 221.into(),
-                        client_receive: 231.into(),
-                    },
-                ],
-                11.into(),
-                [4; 16],
-            )
-            .unwrap();
+                )
+                .unwrap();
+            responses.push(ClockSampleResponse::new(challenge, (start + 21).into()));
+        }
+        let response =
+            state.connect(offer.handshake_request(nonce, responses), 11.into(), [4; 16]).unwrap();
+        let connection = CompanionConnection::from_handshake(&offer, nonce, response).unwrap();
         assert!(!format!("{connection:?}").contains(&format!("{:?}", connection.key)));
+        assert!(!format!("{state:?}").contains(&format!("{:?}", state.signing_key.to_bytes())));
+        let session = state.sessions.values().next().unwrap();
+        assert!(!format!("{session:?}").contains(&format!("{:?}", session.key)));
     }
 
     #[test]

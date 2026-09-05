@@ -96,7 +96,7 @@ fn persist_artifact(connection: &mut Connection, path: &Path, command: ArtifactC
 
 fn persist_artifact_inner(
     connection: &mut Connection,
-    _path: &Path,
+    path: &Path,
     sealed: &SealedArtifact,
     artifact: &Artifact,
     imported_utc_ns: u64,
@@ -111,7 +111,7 @@ fn persist_artifact_inner(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
-        .map_err(ArtifactImportError::database)?;
+        .map_err(|error| ArtifactImportError::database("query artifact retry", path, error))?;
     if let Some((kind, artifact_id, revision, retained_origin)) = existing {
         let kind = ArtifactKind::from_code(kind).ok_or_else(|| {
             ArtifactImportError::new(
@@ -133,7 +133,7 @@ fn persist_artifact_inner(
     }
     let count: usize = connection
         .query_row("SELECT count(*) FROM spatial_artifacts", [], |row| row.get(0))
-        .map_err(ArtifactImportError::database)?;
+        .map_err(|error| ArtifactImportError::database("count artifacts", path, error))?;
     if count >= limits.max_artifacts() {
         return Err(ArtifactImportError::new(
             ArtifactRejectReason::LimitExceeded,
@@ -148,7 +148,9 @@ fn persist_artifact_inner(
                 |row| row.get(0),
             )
             .optional()
-            .map_err(ArtifactImportError::database)?;
+            .map_err(|error| {
+                ArtifactImportError::database("query referenced scene", path, error)
+            })?;
         let Some(scene_bytes) = scene_bytes else {
             return Err(ArtifactImportError::new(
                 ArtifactRejectReason::MissingScene,
@@ -203,7 +205,7 @@ fn persist_artifact_inner(
                 "artifact identity and revision already contain different bytes",
             ))
         }
-        Err(error) => Err(ArtifactImportError::database(error)),
+        Err(error) => Err(ArtifactImportError::database("insert artifact", path, error)),
     }
 }
 
