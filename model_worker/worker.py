@@ -153,21 +153,21 @@ class TorchOperator:
         except ImportError as error:
             raise ContractFailure("backend_unavailable", "PyTorch is not installed") from error
 
-        execution = request["model_run"]["execution"]
-        execution_class = execution["class"]
-        if execution_class == "production_gpu":
-            if not torch.cuda.is_available():
-                raise ContractFailure("backend_unavailable", "requested GPU is unavailable")
-            device = torch.device("cuda")
-        elif execution_class == "cpu_baseline":
-            device = torch.device("cpu")
-        else:
-            raise ContractFailure("contract_mismatch", "execution class is not declared")
-
-        torch.use_deterministic_algorithms(bool(execution["deterministic_algorithms"]))
-        tensor_bytes = bytes.fromhex(request["input_manifest"]["tensor_hex"])
-        tensor = torch.frombuffer(bytearray(tensor_bytes), dtype=torch.float32).clone().to(device)
         try:
+            execution = request["model_run"]["execution"]
+            execution_class = execution["class"]
+            if execution_class == "production_gpu":
+                if not torch.cuda.is_available():
+                    raise ContractFailure("backend_unavailable", "requested GPU is unavailable")
+                device = torch.device("cuda")
+            elif execution_class == "cpu_baseline":
+                device = torch.device("cpu")
+            else:
+                raise ContractFailure("contract_mismatch", "execution class is not declared")
+
+            torch.use_deterministic_algorithms(execution["deterministic_algorithms"])
+            tensor_bytes = bytes.fromhex(request["input_manifest"]["tensor_hex"])
+            tensor = torch.frombuffer(bytearray(tensor_bytes), dtype=torch.float32).clone().to(device)
             candidate, successor = self._evaluate(tensor, request)
             candidate = candidate.detach().to("cpu").contiguous()
             if not torch.isfinite(candidate).all().item():
@@ -193,11 +193,11 @@ class Worker:
 
         try:
             request = decode_frame(frame, self._limits)
-        except (ValueError, json.JSONDecodeError) as error:
+        except (ValueError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
             return self._failure({}, "malformed_request", str(error))
 
-        identity = request.get("identity") if isinstance(request.get("identity"), dict) else {}
-        request_id = identity.get("request_id") if isinstance(identity.get("request_id"), str) else ""
+        identity = self._safe_identity(request.get("identity"))
+        request_id = identity.get("request_id", "")
         request_payload_digest = _digest(frame)
         completed = self._completed.get(request_id)
         if completed is not None:
@@ -209,6 +209,8 @@ class Worker:
         try:
             tensor = self._validate(request)
             candidate, successor = self._operator.evaluate(request)
+            if self._now_ns() > request["deadline_monotonic_ns"]:
+                raise ContractFailure("deadline_exceeded", "request deadline elapsed during execution")
             if len(candidate) > self._limits.max_result_bytes or len(successor) > self._limits.max_checkpoint_bytes:
                 raise ContractFailure("limit_exceeded", "operator output exceeds configured limit")
             output_elements = self._shape_elements(request["model_run"]["output_shape"], None)
@@ -234,7 +236,7 @@ class Worker:
         return response
 
     def _validate(self, request: dict) -> bytes:
-        if request.get("protocol_version") != PROTOCOL_VERSION:
+        if self._integer(request.get("protocol_version"), "protocol version", 16) != PROTOCOL_VERSION:
             raise ContractFailure("unsupported_version", "unsupported protocol version")
         identity = request["identity"]
         run = request["model_run"]
@@ -242,15 +244,29 @@ class Worker:
         checkpoint = request["checkpoint"]
         for value, field in ((identity["run_id"], "run_id"), (identity["request_id"], "request_id")):
             _text(value, field)
-        if run["schema_version"] != 1 or manifest["schema_version"] != 1:
+        for owner, field in (
+            (run, "model run_id"),
+            (manifest, "manifest run_id"),
+            (checkpoint, "checkpoint run_id"),
+        ):
+            _text(owner["run_id"], field)
+        if self._integer(run["schema_version"], "model schema version", 16) != 1 or self._integer(
+            manifest["schema_version"], "manifest schema version", 16
+        ) != 1:
             raise ContractFailure("unsupported_version", "unsupported artifact schema")
-        if self._now_ns() > request["deadline_monotonic_ns"]:
+        deadline = self._integer(request["deadline_monotonic_ns"], "deadline", 64)
+        identity_epoch = self._integer(identity["epoch"], "identity epoch", 64)
+        identity_cutoff = self._integer(identity["cutoff_ns"], "identity cutoff", 64)
+        manifest_epoch = self._integer(manifest["epoch"], "manifest epoch", 64)
+        manifest_cutoff = self._integer(manifest["cutoff_ns"], "manifest cutoff", 64)
+        checkpoint_epoch = self._integer(checkpoint["epoch"], "checkpoint epoch", 64)
+        if self._now_ns() > deadline:
             raise ContractFailure("deadline_exceeded", "request deadline elapsed")
         if not all(owner["run_id"] == identity["run_id"] for owner in (run, manifest, checkpoint)):
             raise ContractFailure("contract_mismatch", "run identity differs across request")
-        if manifest["epoch"] != identity["epoch"] or checkpoint["epoch"] != identity["epoch"]:
+        if manifest_epoch != identity_epoch or checkpoint_epoch != identity_epoch:
             raise ContractFailure("epoch_mismatch", "epoch differs across request")
-        if manifest["cutoff_ns"] != identity["cutoff_ns"]:
+        if manifest_cutoff != identity_cutoff:
             raise ContractFailure("contract_mismatch", "causal cutoff differs across request")
         if manifest["predecessor_digest"] != identity["predecessor_digest"]:
             raise ContractFailure("contract_mismatch", "manifest predecessor differs")
@@ -279,6 +295,7 @@ class Worker:
         if not isinstance(max_shape, list) or len(shape) != len(max_shape):
             raise ContractFailure("invalid_shape", "model shape rank differs")
         elements = self._shape_elements(shape, max_shape)
+        self._shape_elements(run["output_shape"], None)
         if elements * 4 != len(tensor):
             raise ContractFailure("invalid_shape", "tensor byte count does not match float32 shape")
         counts = (manifest["source_count"], manifest["clock_domain_count"])
@@ -296,7 +313,9 @@ class Worker:
             raise ContractFailure("contract_mismatch", "determinism setting is invalid")
         for name in ("absolute_tolerance", "relative_tolerance"):
             tolerance = execution[name]
-            if not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance) or tolerance < 0:
+            if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+                raise ContractFailure("malformed_request", "numeric tolerance has a weak scalar type")
+            if not math.isfinite(tolerance) or tolerance < 0:
                 raise ContractFailure("contract_mismatch", "numeric tolerance is invalid")
         _text(execution["environment"], "numeric environment")
         return tensor
@@ -309,7 +328,13 @@ class Worker:
         elements = 1
         maxima = maximum_shape if maximum_shape is not None else [self._limits.max_dimension] * len(shape)
         for actual, maximum in zip(shape, maxima):
-            if not isinstance(actual, int) or not isinstance(maximum, int) or actual <= 0 or actual > maximum or actual > self._limits.max_dimension:
+            if isinstance(actual, bool) or isinstance(maximum, bool) or not isinstance(actual, int) or not isinstance(maximum, int):
+                raise ContractFailure("malformed_request", "shape dimensions must be integers")
+            if (
+                actual <= 0
+                or actual > maximum
+                or actual > self._limits.max_dimension
+            ):
                 raise ContractFailure("invalid_shape", "tensor dimension is outside model bounds")
             elements *= actual
             if elements > self._limits.max_elements:
@@ -335,11 +360,11 @@ class Worker:
         )
 
     def _failure(self, identity: dict, status: str, detail: str) -> bytes:
-        safe_detail = detail[:256]
-        return encode_frame(
-            {
+        safe_identity = self._safe_identity(identity)
+        safe_detail = detail.encode("utf-8", errors="replace")[:256].decode("utf-8", errors="ignore")
+        full = {
                 "protocol_version": PROTOCOL_VERSION,
-                "identity": identity,
+                "identity": safe_identity,
                 "status": status,
                 "detail": safe_detail,
                 "candidate_hex": "",
@@ -348,9 +373,58 @@ class Worker:
                 "output_numeric_digest": "",
                 "return_payload_digest": "",
                 "numeric_qualification": None,
-            },
-            self._limits,
+        }
+        candidates = (
+            full,
+            {**full, "identity": {}, "detail": ""},
+            {"protocol_version": PROTOCOL_VERSION, "identity": {}, "status": status, "detail": ""},
         )
+        for candidate in candidates:
+            try:
+                return encode_frame(candidate, self._limits)
+            except ValueError:
+                continue
+        raise ValueError("configured frame limit cannot encode a minimal failure")
+
+    @staticmethod
+    def _integer(value: object, field: str, bits: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value >= 1 << bits:
+            raise ContractFailure("malformed_request", f"{field} must be an unsigned {bits}-bit integer")
+        return value
+
+    @classmethod
+    def _safe_identity(cls, value: object) -> dict:
+        if not isinstance(value, dict):
+            return {}
+        try:
+            run_id = _text(value["run_id"], "run_id")
+            request_id = _text(value["request_id"], "request_id")
+            epoch = cls._integer(value["epoch"], "epoch", 64)
+            cutoff = cls._integer(value["cutoff_ns"], "cutoff", 64)
+            predecessor = value["predecessor_digest"]
+            if not isinstance(predecessor, str) or len(predecessor) != HEX_DIGEST_CHARS:
+                return {}
+            bytes.fromhex(predecessor)
+            return {
+                "run_id": run_id,
+                "epoch": epoch,
+                "request_id": request_id,
+                "cutoff_ns": cutoff,
+                "predecessor_digest": predecessor,
+            }
+        except (ContractFailure, KeyError, TypeError, ValueError):
+            return {}
+
+
+def serve_connection(connection: socket.socket, worker: Worker) -> None:
+    """Serve one connection and return an explicit frame for malformed input."""
+
+    try:
+        frame = read_frame(connection, worker._limits)
+        response = worker.handle_frame(frame)
+    except (EOFError, OSError, ValueError, UnicodeError, RecursionError) as error:
+        response = worker._failure({}, "malformed_request", str(error))
+    connection.sendall(response)
 
 
 def serve_unix(socket_path: str, worker: Worker, *, request_timeout_seconds: float = 1.0) -> None:
@@ -364,7 +438,6 @@ def serve_unix(socket_path: str, worker: Worker, *, request_timeout_seconds: flo
             with connection:
                 connection.settimeout(request_timeout_seconds)
                 try:
-                    frame = read_frame(connection, worker._limits)
-                    connection.sendall(worker.handle_frame(frame))
-                except (EOFError, OSError, ValueError):
+                    serve_connection(connection, worker)
+                except OSError:
                     continue

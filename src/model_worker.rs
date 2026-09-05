@@ -177,23 +177,29 @@ impl NumericContract {
         relative_tolerance: f32,
         environment: String,
     ) -> Result<Self, ModelWorkerError> {
-        validate_text(&environment, "numeric environment")?;
-        if !absolute_tolerance.is_finite()
-            || absolute_tolerance < 0.0
-            || !relative_tolerance.is_finite()
-            || relative_tolerance < 0.0
-        {
-            return Err(ModelWorkerError::invalid(
-                "numeric tolerances must be finite and non-negative",
-            ));
-        }
-        Ok(Self {
+        let value = Self {
             execution_class,
             deterministic_algorithms,
             absolute_tolerance,
             relative_tolerance,
             environment,
-        })
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ModelWorkerError> {
+        validate_text(&self.environment, "numeric environment")?;
+        if !self.absolute_tolerance.is_finite()
+            || self.absolute_tolerance < 0.0
+            || !self.relative_tolerance.is_finite()
+            || self.relative_tolerance < 0.0
+        {
+            return Err(ModelWorkerError::invalid(
+                "numeric tolerances must be finite and non-negative",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -353,41 +359,126 @@ pub struct InputManifest {
 }
 
 impl InputManifest {
-    /// Creates a frozen manifest binding from already canonical bytes.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "all frozen bindings are independently security-relevant"
-    )]
+    /// Starts a builder with the immutable manifest and causal identity binding.
     #[must_use]
-    pub fn new(
+    pub fn builder(
         manifest: Vec<u8>,
         run_id: ModelRunId,
         epoch: u64,
         cutoff_ns: u64,
         predecessor_digest: ContentDigest,
-        preprocessing: String,
-        input_semantics: String,
-        shape: Vec<u32>,
-        tensor: Vec<u8>,
-        source_count: u32,
-        clock_domain_count: u32,
-    ) -> Self {
-        Self {
-            schema_version: ARTIFACT_SCHEMA_VERSION,
-            manifest_digest: ContentDigest::of(&manifest),
-            manifest_hex: manifest,
+    ) -> InputManifestBuilder {
+        InputManifestBuilder {
+            manifest,
             run_id,
             epoch,
             cutoff_ns,
             predecessor_digest,
+            preprocessing: None,
+            input_semantics: None,
+            shape: None,
+            tensor: None,
+            source_count: None,
+            clock_domain_count: None,
+        }
+    }
+}
+
+/// Builder that names every semantically distinct manifest field.
+#[derive(Debug)]
+pub struct InputManifestBuilder {
+    manifest: Vec<u8>,
+    run_id: ModelRunId,
+    epoch: u64,
+    cutoff_ns: u64,
+    predecessor_digest: ContentDigest,
+    preprocessing: Option<String>,
+    input_semantics: Option<String>,
+    shape: Option<Vec<u32>>,
+    tensor: Option<Vec<u8>>,
+    source_count: Option<u32>,
+    clock_domain_count: Option<u32>,
+}
+
+impl InputManifestBuilder {
+    /// Sets the preprocessing identity bound by the manifest.
+    #[must_use]
+    pub fn preprocessing(mut self, value: impl Into<String>) -> Self {
+        self.preprocessing = Some(value.into());
+        self
+    }
+
+    /// Sets the input semantics identity bound by the manifest.
+    #[must_use]
+    pub fn input_semantics(mut self, value: impl Into<String>) -> Self {
+        self.input_semantics = Some(value.into());
+        self
+    }
+
+    /// Sets the materialized tensor shape.
+    #[must_use]
+    pub fn shape(mut self, value: Vec<u32>) -> Self {
+        self.shape = Some(value);
+        self
+    }
+
+    /// Sets the exact canonical packed tensor bytes.
+    #[must_use]
+    pub fn tensor(mut self, value: Vec<u8>) -> Self {
+        self.tensor = Some(value);
+        self
+    }
+
+    /// Sets the number of frozen source references.
+    #[must_use]
+    pub fn source_count(mut self, value: u32) -> Self {
+        self.source_count = Some(value);
+        self
+    }
+
+    /// Sets the number of independently frozen raw clock domains.
+    #[must_use]
+    pub fn clock_domain_count(mut self, value: u32) -> Self {
+        self.clock_domain_count = Some(value);
+        self
+    }
+
+    /// Validates required semantic fields and builds the immutable binding.
+    pub fn build(self) -> Result<InputManifest, ModelWorkerError> {
+        let preprocessing = self
+            .preprocessing
+            .ok_or_else(|| ModelWorkerError::invalid("missing manifest preprocessing"))?;
+        let input_semantics = self
+            .input_semantics
+            .ok_or_else(|| ModelWorkerError::invalid("missing manifest input semantics"))?;
+        validate_text(&preprocessing, "manifest preprocessing")?;
+        validate_text(&input_semantics, "manifest input semantics")?;
+        let shape = self.shape.ok_or_else(|| ModelWorkerError::invalid("missing tensor shape"))?;
+        if shape.is_empty() || shape.contains(&0) {
+            return Err(ModelWorkerError::invalid("tensor shape dimensions must be non-zero"));
+        }
+        let tensor =
+            self.tensor.ok_or_else(|| ModelWorkerError::invalid("missing tensor bytes"))?;
+        Ok(InputManifest {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            manifest_digest: ContentDigest::of(&self.manifest),
+            manifest_hex: self.manifest,
+            run_id: self.run_id,
+            epoch: self.epoch,
+            cutoff_ns: self.cutoff_ns,
+            predecessor_digest: self.predecessor_digest,
             preprocessing,
             input_semantics,
             shape,
             tensor_digest: ContentDigest::of(&tensor),
             tensor_hex: tensor,
-            source_count,
-            clock_domain_count,
-        }
+            source_count: self
+                .source_count
+                .ok_or_else(|| ModelWorkerError::invalid("missing source count"))?,
+            clock_domain_count: self
+                .clock_domain_count
+                .ok_or_else(|| ModelWorkerError::invalid("missing clock-domain count"))?,
+        })
     }
 }
 
@@ -502,6 +593,32 @@ impl ModelRequest {
         {
             return Err(ModelWorkerError::invalid("unsupported request or artifact version"));
         }
+        for (value, field) in [
+            (&self.identity.run_id.0, "identity run ID"),
+            (&self.identity.request_id.0, "request ID"),
+            (&self.model_run.run_id.0, "model run ID"),
+            (&self.input_manifest.run_id.0, "manifest run ID"),
+            (&self.checkpoint.run_id.0, "checkpoint run ID"),
+        ] {
+            validate_text(value, field)?;
+        }
+        for (value, field) in [
+            (&self.model_run.algorithm, "algorithm"),
+            (&self.model_run.preprocessing, "preprocessing"),
+            (&self.model_run.normalization, "normalization"),
+            (&self.model_run.input_semantics, "input semantics"),
+            (&self.model_run.output_semantics, "output semantics"),
+            (&self.model_run.label_semantics, "label semantics"),
+            (&self.model_run.calibration_policy, "calibration policy"),
+            (&self.model_run.tolerance_policy, "tolerance policy"),
+            (&self.model_run.fusion_policy, "fusion policy"),
+            (&self.model_run.state_format, "state format"),
+            (&self.input_manifest.preprocessing, "manifest preprocessing"),
+            (&self.input_manifest.input_semantics, "manifest input semantics"),
+        ] {
+            validate_text(value, field)?;
+        }
+        self.model_run.execution.validate()?;
         if self.identity.run_id != self.model_run.run_id
             || self.identity.run_id != self.input_manifest.run_id
             || self.identity.run_id != self.checkpoint.run_id
@@ -651,6 +768,8 @@ impl ModelResponse {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(ModelWorkerError::invalid("unsupported response version"));
         }
+        validate_text(&self.identity.run_id.0, "response run ID")?;
+        validate_text(&self.identity.request_id.0, "response request ID")?;
         check_limit(self.candidate_hex.len(), limits.max_result_bytes, "candidate")?;
         check_limit(self.successor_hex.len(), limits.max_checkpoint_bytes, "successor checkpoint")?;
         if self.detail.len() > 256 {
@@ -669,6 +788,10 @@ impl ModelResponse {
                     "successful response digest or qualification mismatch",
                 ));
             }
+            self.numeric_qualification
+                .as_ref()
+                .expect("qualification presence checked above")
+                .validate()?;
         } else if !self.candidate_hex.is_empty()
             || !self.successor_hex.is_empty()
             || self.input_tensor_digest.is_some()

@@ -1,8 +1,12 @@
 import hashlib
 import json
 import math
+import socket
 import struct
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 from model_worker.worker import (
     ContractFailure,
@@ -12,6 +16,7 @@ from model_worker.worker import (
     Worker,
     decode_frame,
     encode_frame,
+    serve_connection,
 )
 
 
@@ -193,6 +198,77 @@ class WorkerProtocolTests(unittest.TestCase):
         value["model_run"]["execution"]["class"] = "production_gpu"
         response = decode_frame(worker.handle_frame(encode_frame(value, Limits())), Limits())
         self.assertEqual(response["status"], "backend_unavailable")
+
+    def test_deadline_is_rechecked_after_numerical_execution(self) -> None:
+        ticks = iter((1, 10_000_000_000))
+        worker = Worker(DeterministicTestOperator(), Limits(), now_ns=lambda: next(ticks))
+        response = decode_frame(worker.handle_frame(encode_frame(request(), Limits())), Limits())
+        self.assertEqual(response["status"], "deadline_exceeded")
+        self.assertEqual(response["candidate_hex"], "")
+
+    def test_weak_json_scalar_types_are_rejected(self) -> None:
+        mutations = (
+            ("protocol_version", lambda value: value.__setitem__("protocol_version", True)),
+            ("epoch", lambda value: value["identity"].__setitem__("epoch", 7.5)),
+            ("cutoff", lambda value: value["identity"].__setitem__("cutoff_ns", True)),
+            ("dimension", lambda value: value["input_manifest"].__setitem__("shape", [True])),
+            (
+                "tolerance",
+                lambda value: value["model_run"]["execution"].__setitem__("absolute_tolerance", True),
+            ),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                value = request(request_id=f"weak-{name}")
+                mutate(value)
+                worker = Worker(DeterministicTestOperator(), Limits(), now_ns=lambda: 1)
+                response = decode_frame(worker.handle_frame(encode_frame(value, Limits())), Limits())
+                self.assertEqual(response["status"], "malformed_request")
+
+    def test_malformed_identity_and_unicode_detail_always_fit_failure_frame(self) -> None:
+        limits = Limits(max_frame_bytes=1024)
+        malformed = {
+            "protocol_version": 1,
+            "identity": {"request_id": "界" * 100},
+            "unexpected": "x" * 40,
+        }
+        frame = encode_frame(malformed, limits)
+        response_frame = Worker(DeterministicTestOperator(), limits).handle_frame(frame)
+        self.assertLessEqual(len(response_frame), limits.max_frame_bytes)
+        response = decode_frame(response_frame, limits)
+        self.assertEqual(response["identity"], {})
+        self.assertLessEqual(len(response["detail"].encode("utf-8")), 256)
+
+    def test_connection_returns_failure_frame_for_invalid_input(self) -> None:
+        worker_side, client_side = socket.socketpair()
+        try:
+            worker_side.settimeout(1)
+            client_side.settimeout(1)
+            client_side.sendall(b"BAD!" + struct.pack(">I", 0))
+            serve_connection(worker_side, Worker(DeterministicTestOperator(), Limits()))
+            response = decode_frame(client_side.recv(Limits().max_frame_bytes), Limits())
+            self.assertEqual(response["status"], "malformed_request")
+        finally:
+            worker_side.close()
+            client_side.close()
+
+    def test_cuda_oom_during_tensor_materialization_is_mapped(self) -> None:
+        class FakeOutOfMemoryError(Exception):
+            pass
+
+        fake_torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: True, OutOfMemoryError=FakeOutOfMemoryError),
+            device=lambda name: name,
+            use_deterministic_algorithms=lambda _enabled: None,
+            frombuffer=lambda *_args, **_kwargs: (_ for _ in ()).throw(FakeOutOfMemoryError()),
+            float32=object(),
+        )
+        value = request(request_id="materialize-oom")
+        value["model_run"]["execution"]["class"] = "production_gpu"
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            worker = Worker(TorchOperator(lambda _tensor, _request: None), Limits(), now_ns=lambda: 1)
+            response = decode_frame(worker.handle_frame(encode_frame(value, Limits())), Limits())
+        self.assertEqual(response["status"], "gpu_oom")
 
 
 if __name__ == "__main__":

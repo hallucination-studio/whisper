@@ -45,19 +45,21 @@ fn request(id: &str, tensor: Vec<u8>) -> ModelRequest {
             .output_shape(vec![2])
             .build()
             .unwrap();
-    let manifest = InputManifest::new(
+    let manifest = InputManifest::builder(
         b"frozen-input-manifest-v1".to_vec(),
         run_id,
         7,
         250_000_000,
         checkpoint.digest(),
-        "f32-le-v1".to_owned(),
-        "qualified-rf-test-values-v1".to_owned(),
-        vec![tensor.len() as u32 / 4],
-        tensor,
-        2,
-        2,
-    );
+    )
+    .preprocessing("f32-le-v1")
+    .input_semantics("qualified-rf-test-values-v1")
+    .shape(vec![tensor.len() as u32 / 4])
+    .tensor(tensor)
+    .source_count(2)
+    .clock_domain_count(2)
+    .build()
+    .unwrap();
     ModelRequest::new(identity, u64::MAX, run, manifest, checkpoint)
 }
 
@@ -167,4 +169,25 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     std::fs::remove_file(temporary).unwrap();
+}
+
+#[test]
+fn decode_rechecks_identifier_and_numeric_invariants() {
+    let limits = WorkerLimits::default();
+    let frame = request("request-1", vec![0; 4]).encode(&limits).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&frame[8..]).unwrap();
+    value["identity"]["request_id"] = serde_json::Value::String(String::new());
+    let payload = serde_json::to_vec(&value).unwrap();
+    let mut invalid = b"WMW1".to_vec();
+    invalid.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    invalid.extend_from_slice(&payload);
+    assert!(ModelRequest::decode(&invalid, &limits).is_err());
+
+    let mut value: serde_json::Value = serde_json::from_slice(&frame[8..]).unwrap();
+    value["model_run"]["execution"]["environment"] = serde_json::Value::String(String::new());
+    let payload = serde_json::to_vec(&value).unwrap();
+    let mut invalid = b"WMW1".to_vec();
+    invalid.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    invalid.extend_from_slice(&payload);
+    assert!(ModelRequest::decode(&invalid, &limits).is_err());
 }
