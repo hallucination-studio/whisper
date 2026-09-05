@@ -4,12 +4,9 @@ PROVISION_TOOLS_DIRECTORY := $(FIRMWARE_DIRECTORY)/build/provision-tools
 NVS_PARTITION_TOOL_DIRECTORY := $(PROVISION_TOOLS_DIRECTORY)/nvs-partition-tool
 PROVISION_PYTHON := $(PROVISION_TOOLS_DIRECTORY)/venv/bin/python
 
-.PHONY: esp32-native-frame esp32-native-frame-development-config esp32-native-frame-firmware esp32-native-frame-host esp32-native-frame-provision-tools
+.PHONY: esp32-native-frame esp32-native-frame-firmware esp32-native-frame-provision-tools
 
-esp32-native-frame: esp32-native-frame-development-config esp32-native-frame-host
-
-esp32-native-frame-development-config: esp32-native-frame-firmware esp32-native-frame-provision-tools
-	"$(PROVISION_PYTHON)" "$(FIRMWARE_DIRECTORY)/prepare_development_config.py"
+esp32-native-frame: esp32-native-frame-firmware
 
 esp32-native-frame-firmware:
 	docker run --rm \
@@ -17,9 +14,6 @@ esp32-native-frame-firmware:
 		--workdir /project/firmware/esp32-native-frame \
 		"$(IDF_IMAGE)" \
 		bash -lc 'idf.py set-target esp32s3 && idf.py build'
-
-esp32-native-frame-host:
-	cargo build --release --features development-fixture
 
 esp32-native-frame-provision-tools:
 	mkdir -p "$(NVS_PARTITION_TOOL_DIRECTORY)"
