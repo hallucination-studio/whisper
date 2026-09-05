@@ -133,6 +133,62 @@ fn legitimate_new_store_wal_and_shm_are_not_mistaken_for_a_legacy_store() {
     fs::remove_dir_all(parent).expect("temporary Store removed");
 }
 
+#[cfg(unix)]
+#[test]
+fn checkpoint_truncated_zero_byte_wal_with_live_shm_reopens_read_only() {
+    let parent = temporary_directory("store-truncated-wal");
+    let root = parent.join("world-store");
+    let initialized = Store::initialize(&root).unwrap();
+    let store_id = initialized.id();
+    drop(initialized);
+    let database_path = root.join("facts.sqlite3");
+    let writer = rusqlite::Connection::open(&database_path).unwrap();
+    writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    let wal = root.join("facts.sqlite3-wal");
+    let shm = root.join("facts.sqlite3-shm");
+    assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+    assert!(shm.exists());
+    let before = snapshot(&root);
+
+    let reopened = Store::open(&root).expect("SQLite's empty-WAL/live-SHM state is valid");
+    assert_eq!(reopened.id(), store_id);
+    assert_eq!(snapshot(&root), before);
+
+    drop(reopened);
+    drop(writer);
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn wal_schema_objects_and_header_pragmas_are_validated_without_target_writes() {
+    for (label, mutation) in [
+        ("application-id", "PRAGMA application_id=1;"),
+        ("user-version", "PRAGMA user_version=2;"),
+        ("view", "CREATE VIEW unexpected_facts AS SELECT * FROM raw_facts;"),
+        (
+            "trigger",
+            "CREATE TRIGGER unexpected_loss AFTER INSERT ON raw_losses BEGIN SELECT 1; END;",
+        ),
+    ] {
+        let parent = temporary_directory(&format!("store-wal-schema-{label}"));
+        let root = parent.join("world-store");
+        drop(Store::initialize(&root).unwrap());
+        let database_path = root.join("facts.sqlite3");
+        let writer = rusqlite::Connection::open(&database_path).unwrap();
+        writer.execute_batch(&format!("PRAGMA journal_mode=WAL; {mutation}")).unwrap();
+        assert!(root.join("facts.sqlite3-wal").exists());
+        let before = snapshot(&root);
+
+        let error = Store::open(&root).expect_err(label);
+        assert!(error.is_unrecognized_format(), "mutation {label} was not rejected as schema");
+        assert_eq!(snapshot(&root), before, "mutation {label} changed target bytes");
+
+        drop(writer);
+        fs::remove_dir_all(parent).unwrap();
+    }
+}
+
 #[test]
 fn store_lease_allows_only_one_cooperative_owner() {
     let parent = temporary_directory("store-lease");

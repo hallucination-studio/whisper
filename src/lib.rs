@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admission;
 mod host;
 mod identity;
 pub(crate) mod key;
@@ -15,14 +16,19 @@ pub(crate) mod replay;
 mod store;
 
 #[doc(inline)]
+pub use admission::{
+    AdmissionLimits, AdmissionLimitsBuilder, AdmissionLimitsError, AuthenticatedBytesPerSecond,
+    DatagramBytes, LimitValueError, PacketsPerSecond, ReplayWindowPackets,
+};
+#[doc(inline)]
 pub use host::{
-    AdmissionLimits, AdmissionLimitsError, Host, HostBuilder, HostError, HostRuntime,
-    NativeFrameRoute, RawFact, RawLoss, RawLossKind, RejectReason, RejectedDatagram, RouteError,
+    Host, HostBuilder, HostError, HostRuntime, NativeFrameRoute, RawFact, RawLoss, RawLossKind,
+    RejectReason, RejectedDatagram, RouteError,
 };
 #[doc(inline)]
 pub use identity::{
-    BootGeneration, DeploymentId, DeploymentIdError, DeviceId, KeyEpoch, MessageSequence,
-    NativeFrameKind,
+    BootGeneration, DeploymentId, DeploymentIdError, DeviceId, IdentityValueError, KeyEpoch,
+    MessageSequence, NativeFrameKind,
 };
 #[doc(inline)]
 pub use store::{Store, StoreId, StoreInitError, StoreOpenError};

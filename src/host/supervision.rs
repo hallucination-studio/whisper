@@ -4,6 +4,7 @@ use super::*;
 pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
     let SupervisorContext {
         socket,
+        local_addr,
         threads,
         replay_snapshot,
         stop,
@@ -40,26 +41,59 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
             exit.complete(result);
         }),
     );
-    let Ok(writer) = writer else {
-        let error = HostError::message("could not spawn the Store writer");
-        let _ = ready.send(Err(error));
-        finish_completion(&completion, Some("could not spawn the Store writer".to_owned()));
-        return;
+    let writer = match writer {
+        Ok(writer) => writer,
+        Err(source) => {
+            let error = HostError::io_during(
+                "spawn Store writer",
+                Some(&builder.store.database_path()),
+                None,
+                Some("whisper-fact-writer"),
+                source,
+            );
+            let _ = ready.send(Err(error));
+            finish_completion(
+                &completion,
+                Some(HostError::message_on_thread(
+                    "spawn Store writer",
+                    "whisper-fact-writer",
+                    "could not spawn the Store writer",
+                )),
+            );
+            return;
+        }
     };
     match writer_ready_receiver.recv() {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            let message = error.to_string();
             let _ = ready.send(Err(error));
             let _ = writer.join();
-            finish_completion(&completion, Some(message));
+            finish_completion(
+                &completion,
+                Some(HostError::message_on_thread(
+                    "start Store writer",
+                    "whisper-fact-writer",
+                    "Store writer rejected startup",
+                )),
+            );
             return;
         }
         Err(_) => {
-            let message = "Store writer exited during startup".to_owned();
-            let _ = ready.send(Err(HostError::worker(message.clone())));
+            let error = HostError::message_on_thread(
+                "start Store writer",
+                "whisper-fact-writer",
+                "Store writer exited during startup",
+            );
+            let _ = ready.send(Err(error));
             let _ = writer.join();
-            finish_completion(&completion, Some(message));
+            finish_completion(
+                &completion,
+                Some(HostError::message_on_thread(
+                    "start Store writer",
+                    "whisper-fact-writer",
+                    "Store writer exited during startup",
+                )),
+            );
             return;
         }
     }
@@ -67,7 +101,8 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
     let reader_stop = Arc::clone(&stop);
     let reader_overflow = Arc::clone(&overflow);
     let reader_exit = worker_exit_sender;
-    let reader_config = ReaderConfig { socket, routes, clock: Arc::clone(&builder.clock) };
+    let reader_config =
+        ReaderConfig { socket, local_addr, routes, clock: Arc::clone(&builder.clock) };
     let reader = threads.spawn(
         "whisper-udp-reader",
         Box::new(move || {
@@ -82,13 +117,29 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
             exit.complete(result);
         }),
     );
-    let Ok(reader) = reader else {
-        stop.store(true, Ordering::Release);
-        let _ = writer.join();
-        let error = HostError::message("could not spawn the UDP reader");
-        let _ = ready.send(Err(error));
-        finish_completion(&completion, Some("could not spawn the UDP reader".to_owned()));
-        return;
+    let reader = match reader {
+        Ok(reader) => reader,
+        Err(source) => {
+            stop.store(true, Ordering::Release);
+            let _ = writer.join();
+            let error = HostError::io_during(
+                "spawn UDP reader",
+                None,
+                Some(local_addr),
+                Some("whisper-udp-reader"),
+                source,
+            );
+            let _ = ready.send(Err(error));
+            finish_completion(
+                &completion,
+                Some(HostError::message_on_thread(
+                    "spawn UDP reader",
+                    "whisper-udp-reader",
+                    "could not spawn the UDP reader",
+                )),
+            );
+            return;
+        }
     };
     if ready.send(Ok(())).is_err() {
         stop.store(true, Ordering::Release);
@@ -107,13 +158,24 @@ pub(super) fn supervise(builder: HostBuilder, context: SupervisorContext) {
     stop.store(true, Ordering::Release);
     let reader_join = reader.join();
     let writer_join = writer.join();
-    let mut failure = first_exit
-        .and_then(|(worker, result)| result.err().map(|error| format!("{worker}: {error}")));
+    let mut failure = first_exit.and_then(|(_, result)| result.err());
     if reader_join.is_err() {
-        failure.get_or_insert_with(|| "UDP reader panicked".to_owned());
+        failure.get_or_insert_with(|| {
+            HostError::message_on_thread(
+                "join UDP reader",
+                "whisper-udp-reader",
+                "UDP reader panicked",
+            )
+        });
     }
     if writer_join.is_err() {
-        failure.get_or_insert_with(|| "Store writer panicked".to_owned());
+        failure.get_or_insert_with(|| {
+            HostError::message_on_thread(
+                "join Store writer",
+                "whisper-fact-writer",
+                "Store writer panicked",
+            )
+        });
     }
     drop(builder.store);
     finish_completion(&completion, failure);

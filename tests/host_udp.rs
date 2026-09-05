@@ -10,8 +10,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use whisper::{
-    AdmissionLimits, BootGeneration, DeploymentId, DeviceId, Host, KeyEpoch, MessageSequence,
-    NativeFrameKind, NativeFrameRoute, RawLossKind, RejectReason, Store,
+    AdmissionLimits, AuthenticatedBytesPerSecond, BootGeneration, DatagramBytes, DeploymentId,
+    DeviceId, Host, KeyEpoch, MessageSequence, NativeFrameKind, NativeFrameRoute, PacketsPerSecond,
+    RawLossKind, RejectReason, ReplayWindowPackets, Store,
 };
 
 const KEY: [u8; 32] = [
@@ -20,6 +21,65 @@ const KEY: [u8; 32] = [
 ];
 const DEVICE_ID: u64 = 0x0102_0304_0506_0708;
 const KEY_EPOCH: u16 = 7;
+
+#[test]
+fn route_budget_carries_every_supported_native_frame_v1_message() {
+    assert!(DatagramBytes::try_from(752).is_err());
+    let minimum = DatagramBytes::try_from(753).expect("specified v1 minimum is accepted");
+    for fixture in [
+        include_str!("fixtures/native-frame/capabilities-v1.hex"),
+        include_str!("fixtures/native-frame/csi-non-ht-3-pairs.hex"),
+        include_str!("fixtures/native-frame/csi-ht-5-pairs-first-invalid.hex"),
+        include_str!("fixtures/native-frame/csi-ht-stbc-7-pairs.hex"),
+        include_str!("fixtures/native-frame/health-v1.hex"),
+    ] {
+        assert!(hex_fixture(fixture).len() <= minimum.get());
+    }
+}
+
+#[test]
+fn wire_identity_types_support_canonical_checked_conversions() {
+    assert_eq!(KeyEpoch::try_from(7).unwrap().get(), 7);
+    assert_eq!("7".parse::<KeyEpoch>().unwrap().get(), 7);
+    assert_eq!(BootGeneration::try_from(9).unwrap().get(), 9);
+    assert_eq!("9".parse::<BootGeneration>().unwrap().get(), 9);
+    assert_eq!(MessageSequence::try_from(12).unwrap().get(), 12);
+    assert_eq!("12".parse::<MessageSequence>().unwrap().get(), 12);
+    assert!(KeyEpoch::try_from(0).is_err());
+    let error = "not-a-sequence".parse::<MessageSequence>().unwrap_err();
+    assert!(std::error::Error::source(&error).is_some());
+}
+
+#[test]
+fn public_validation_errors_retain_context_sources_and_backtraces() {
+    let deployment_error = DeploymentId::try_from("").unwrap_err();
+    assert_eq!(deployment_error.input_length(), 0);
+    let _ = deployment_error.backtrace();
+
+    let limit_error = DatagramBytes::try_from(752).unwrap_err();
+    assert_eq!(limit_error.unit(), "datagram bytes");
+    let _ = limit_error.backtrace();
+
+    let limits_error = AdmissionLimits::builder().build().unwrap_err();
+    assert_eq!(limits_error.missing_unit(), "datagram bytes");
+    let _ = limits_error.backtrace();
+
+    let parent = temporary_directory("route-error-context");
+    let secret_root = parent.join("missing-secret-root");
+    let route_error = NativeFrameRoute::load(
+        "127.0.0.1".parse().unwrap(),
+        device_id(),
+        key_epoch(),
+        admission_limits(1_000),
+        &secret_root,
+    )
+    .unwrap_err();
+    assert_eq!(route_error.secret_root(), secret_root);
+    assert_eq!(route_error.device_id(), device_id());
+    assert!(std::error::Error::source(&route_error).is_some());
+    let _ = route_error.backtrace();
+    fs::remove_dir_all(parent).unwrap();
+}
 
 #[test]
 fn authenticated_production_udp_datagram_is_queryable_as_exact_raw_bytes() {
@@ -118,17 +178,23 @@ fn restart_rejects_changed_replay_identity_or_window_without_touching_facts() {
         &secret_root,
     )
     .unwrap();
-    Host::builder(Store::open(&root).unwrap(), deployment("other"), "127.0.0.1:0".parse().unwrap())
-        .route(changed_deployment)
-        .start()
-        .expect_err("changed deployment must not reset replay state");
+    let mismatch = Host::builder(
+        Store::open(&root).unwrap(),
+        deployment("other"),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .route(changed_deployment)
+    .start()
+    .expect_err("changed deployment must not reset replay state");
+    assert_eq!(mismatch.operation(), "validate retained replay state");
+    assert_eq!(mismatch.path(), Some(database_path.as_path()));
     assert_eq!(fs::read(&database_path).unwrap(), before);
 
     let changed_window = NativeFrameRoute::load(
         sender.local_addr().unwrap().ip(),
         device_id(),
         key_epoch(),
-        AdmissionLimits::new(1_200, 1_000, 1_200_000, 32).unwrap(),
+        admission_limits_with(1_000, 32),
         &secret_root,
     )
     .unwrap();
@@ -398,7 +464,17 @@ fn deployment(value: &str) -> DeploymentId {
 }
 
 fn admission_limits(packets_per_second: u32) -> AdmissionLimits {
-    AdmissionLimits::new(1_200, packets_per_second, 1_200_000, 64).unwrap()
+    admission_limits_with(packets_per_second, 64)
+}
+
+fn admission_limits_with(packets_per_second: u32, replay_window_packets: u16) -> AdmissionLimits {
+    AdmissionLimits::builder()
+        .datagram_bytes(DatagramBytes::try_from(1_200).unwrap())
+        .packets_per_second(PacketsPerSecond::try_from(packets_per_second).unwrap())
+        .authenticated_bytes_per_second(AuthenticatedBytesPerSecond::try_from(1_200_000).unwrap())
+        .replay_window_packets(ReplayWindowPackets::try_from(replay_window_packets).unwrap())
+        .build()
+        .unwrap()
 }
 
 #[cfg(unix)]

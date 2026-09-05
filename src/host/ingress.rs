@@ -11,7 +11,7 @@ pub(super) fn reader_loop(
     let largest_route_datagram = config
         .routes
         .iter()
-        .map(|route| route.limits.datagram_bytes)
+        .map(|route| route.limits.datagram_bytes.get())
         .max()
         .expect("validated Host has a route");
     let mut buffer = vec![0_u8; largest_route_datagram.saturating_add(1)];
@@ -24,8 +24,19 @@ pub(super) fn reader_loop(
             {
                 continue;
             }
-            Err(error) => return Err(HostError::io(error)),
+            Err(error) => {
+                return Err(HostError::io_during(
+                    "receive UDP datagram",
+                    None,
+                    Some(config.local_addr),
+                    Some("whisper-udp-reader"),
+                    error,
+                ));
+            }
         };
+        // Receive time is a fact about kernel delivery, so sample it before any
+        // parsing, authentication, rate admission, or queue work can delay it.
+        let received_utc_ns = utc_now_ns(config.clock.as_ref())?;
         if length > largest_route_datagram {
             record_rejection(rejections, peer, RejectReason::DatagramTooLarge);
             continue;
@@ -43,7 +54,7 @@ pub(super) fn reader_loop(
             record_rejection(rejections, peer, RejectReason::UnknownRoute);
             continue;
         };
-        if length > route.limits.datagram_bytes {
+        if length > route.limits.datagram_bytes.get() {
             record_rejection(rejections, peer, RejectReason::DatagramTooLarge);
             continue;
         }
@@ -54,8 +65,8 @@ pub(super) fn reader_loop(
         if !rates[route_index].admit(
             config.clock.monotonic_now(),
             length,
-            route.limits.packets_per_second,
-            route.limits.authenticated_bytes_per_second,
+            route.limits.packets_per_second.get(),
+            route.limits.authenticated_bytes_per_second.get(),
         ) {
             record_rejection(rejections, peer, RejectReason::AuthenticatedRateLimited);
             continue;
@@ -63,7 +74,7 @@ pub(super) fn reader_loop(
         let item = AdmittedDatagram {
             route_index,
             header: authenticated.header(),
-            received_utc_ns: utc_now_ns(config.clock.as_ref())?,
+            received_utc_ns,
             peer,
             bytes: bytes.into(),
         };

@@ -20,31 +20,41 @@ const STORE_APPLICATION_ID: u32 = 0x5752_4631;
 /// Exact SQLite schema generation. Incrementing it requires an explicitly
 /// scoped migration; this ticket recognizes only newly initialized generation 1.
 const STORE_SCHEMA_VERSION: u32 = 1;
-/// SQLite's fixed database header size in bytes, defined by the file format.
+/// SQLite's fixed database header size in bytes. Changing this file-format
+/// value would shift every recognition offset and misclassify database bytes.
 const SQLITE_HEADER_BYTES: usize = 100;
+/// SQLite's exact 16-byte database-header magic. Changing it would make valid
+/// SQLite Stores unrecognizable or admit a different persistence format.
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 /// Persistent Store identity width in bytes; 128 random bits are enough to make
 /// accidental identity collision negligible without treating this as a secret.
 const STORE_ID_BYTES: usize = 16;
-/// Owner-only directory mode required by the host secret-adjacent trust policy.
+/// Owner-only Unix directory permission bits required by the host
+/// secret-adjacent trust policy. Changing them alters which Stores are trusted.
 const ROOT_MODE: u32 = 0o700;
-/// Owner read/write file mode required for every Store-owned mutable file.
+/// Owner read/write Unix file permission bits required by the host trust
+/// policy. Changing them alters which Store-owned mutable files are trusted.
 const FILE_MODE: u32 = 0o600;
 /// Kernel CSPRNG byte source on supported Unix hosts. Replacing it changes the
 /// Store-identity entropy trust boundary and must preserve blocking/error semantics.
 const RANDOM_SOURCE: &str = "/dev/urandom";
-/// SQLite WAL header width in bytes, defined by the SQLite WAL file format.
+/// SQLite WAL header width in bytes. Changing this file-format value would
+/// shift frame validation and misclassify WAL companions.
 const WAL_HEADER_BYTES: usize = 32;
-/// Per-page WAL frame-header width in bytes, defined by the SQLite WAL format.
+/// SQLite's per-page WAL frame-header width in bytes. Changing it would alter
+/// frame boundaries and admit corrupt or reject valid recovery state.
 const WAL_FRAME_HEADER_BYTES: usize = 24;
-/// Smallest legal SQLite database page in bytes.
+/// Smallest legal SQLite database page in bytes. Changing this format boundary
+/// alters which WAL page sizes Store recognition accepts.
 const SQLITE_MINIMUM_PAGE_BYTES: usize = 512;
-/// SQLite's encoded page-size sentinel `1` represents this 64 KiB page size.
+/// SQLite's page-size sentinel `1` denotes 65,536 bytes. Changing this mapping
+/// would compute the wrong WAL frame boundaries for 64-KiB databases.
 const SQLITE_SENTINEL_PAGE_BYTES: usize = 65_536;
 /// SQLite wal-index shared-memory regions are fixed at 32 KiB. Changing this
 /// would accept companion layouts SQLite itself cannot consume.
 const WAL_INDEX_REGION_BYTES: u64 = 32_768;
-/// Big- and little-checksum-endian SQLite WAL file magic values.
+/// SQLite's two WAL magic values for big- and little-endian checksums. Changing
+/// this set alters which companion format Store recognition trusts.
 const WAL_MAGIC_VALUES: [u32; 2] = [0x377f_0682, 0x377f_0683];
 
 // These canonical DDL strings are both creation input and exact recognition
@@ -94,6 +104,7 @@ const EXPECTED_SCHEMA: [(&str, &str); 4] = [
 ];
 
 trait Entropy {
+    fn source_path(&self) -> &Path;
     fn fill(&self, bytes: &mut [u8]) -> io::Result<()>;
 }
 
@@ -101,6 +112,10 @@ trait Entropy {
 struct SystemEntropy;
 
 impl Entropy for SystemEntropy {
+    fn source_path(&self) -> &Path {
+        Path::new(RANDOM_SOURCE)
+    }
+
     fn fill(&self, bytes: &mut [u8]) -> io::Result<()> {
         File::open(RANDOM_SOURCE)?.read_exact(bytes)
     }
@@ -198,6 +213,12 @@ pub struct StoreInitError {
 }
 
 impl StoreInitError {
+    /// Returns the initialization root involved in the failure.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Reports that initialization refused to replace an existing target.
     #[must_use]
     pub const fn is_existing_target(&self) -> bool {
@@ -231,6 +252,12 @@ pub struct StoreOpenError {
 }
 
 impl StoreOpenError {
+    /// Returns the Store root involved in the failed open.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Reports that existing bytes do not identify the exact Store format.
     #[must_use]
     pub const fn is_unrecognized_format(&self) -> bool {
@@ -294,7 +321,10 @@ impl Store {
     /// Returns an error without replacing any object when `root` already exists,
     /// or when the new Store cannot be durably created and exclusively leased.
     pub fn initialize(root: impl AsRef<Path>) -> Result<Self, StoreInitError> {
-        let root = root.as_ref();
+        Self::initialize_with_entropy(root.as_ref(), &SystemEntropy)
+    }
+
+    fn initialize_with_entropy(root: &Path, entropy: &dyn Entropy) -> Result<Self, StoreInitError> {
         match fs::create_dir(root) {
             Ok(()) => {}
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
@@ -316,7 +346,7 @@ impl Store {
         let result = (|| {
             set_root_permissions(root)?;
             let lease = acquire_lease(root, true)?;
-            let id = random_store_id()?;
+            let id = random_store_id(entropy)?;
             let database_path = root.join(DATABASE_NAME);
             initialize_database(&database_path, id)?;
             sync_directory(root)?;
@@ -344,7 +374,10 @@ impl Store {
     /// Returns an error when the format or filesystem identity is not trusted,
     /// another process holds the lease, or SQLite validation fails.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreOpenError> {
-        let root = root.as_ref();
+        Self::open_with_entropy(root.as_ref(), &SystemEntropy)
+    }
+
+    fn open_with_entropy(root: &Path, entropy: &dyn Entropy) -> Result<Self, StoreOpenError> {
         (|| {
             validate_root(root)?;
             let database_path = root.join(DATABASE_NAME);
@@ -356,7 +389,7 @@ impl Store {
             validate_optional_regular_file(&shm_path)?;
             validate_wal_shape(&wal_path)?;
             validate_shm_shape(&shm_path, wal_path.exists())?;
-            let id = validate_database_snapshot(&database_path, &wal_path, &shm_path)?;
+            let id = validate_database_snapshot(&database_path, &wal_path, &shm_path, entropy)?;
             Ok(Self { root: root.to_owned(), id, lease })
         })()
         .map_err(|source| StoreOpenError {
@@ -377,8 +410,12 @@ impl Store {
     }
 
     pub(crate) fn database_snapshot(&self) -> io::Result<StoreSnapshot> {
+        self.database_snapshot_with_entropy(&SystemEntropy)
+    }
+
+    fn database_snapshot_with_entropy(&self, entropy: &dyn Entropy) -> io::Result<StoreSnapshot> {
         let mut nonce = [0_u8; 16];
-        SystemEntropy.fill(&mut nonce)?;
+        entropy.fill(&mut nonce)?;
         let name = nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let root = std::env::temp_dir().join(format!("whisper-store-read-{name}"));
         fs::create_dir(&root)?;
@@ -464,15 +501,25 @@ fn validate_database_read_only(path: &Path) -> Result<StoreId, StoreError> {
     if integrity != "ok" {
         return Err(StoreErrorKind::Unrecognized.into());
     }
-    let total_user_tables: u32 = connection
+    let application_id: u32 = connection
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+    let user_version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+    if application_id != STORE_APPLICATION_ID || user_version != STORE_SCHEMA_VERSION {
+        return Err(StoreErrorKind::Unrecognized.into());
+    }
+    let total_user_objects: u32 = connection
         .query_row(
             "SELECT count(*) FROM sqlite_schema
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+             WHERE type IN ('table', 'index', 'view', 'trigger')
+               AND name NOT LIKE 'sqlite_%'",
             [],
             |row| row.get(0),
         )
         .map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
-    if total_user_tables != EXPECTED_SCHEMA.len() as u32 {
+    if total_user_objects != EXPECTED_SCHEMA.len() as u32 {
         return Err(StoreErrorKind::Unrecognized.into());
     }
     for (name, expected_sql) in EXPECTED_SCHEMA {
@@ -499,8 +546,9 @@ fn validate_database_snapshot(
     database: &Path,
     wal: &Path,
     shm: &Path,
+    entropy: &dyn Entropy,
 ) -> Result<StoreId, StoreError> {
-    let nonce = random_bytes::<16>()?;
+    let nonce = random_bytes::<16>(entropy)?;
     let name = nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     let root = std::env::temp_dir().join(format!("whisper-store-validation-{name}"));
     fs::create_dir(&root).map_err(|source| io_error(&root, source))?;
@@ -525,6 +573,12 @@ fn validate_wal_shape(path: &Path) -> Result<(), StoreError> {
     let Ok(bytes) = fs::read(path) else {
         return if path.exists() { Err(StoreErrorKind::Unrecognized.into()) } else { Ok(()) };
     };
+    // `PRAGMA wal_checkpoint(TRUNCATE)` leaves an empty WAL while a live
+    // connection can retain the derived SHM index. SQLite accepts that crash
+    // recovery state, and the snapshot validation below rebuilds it safely.
+    if bytes.is_empty() {
+        return Ok(());
+    }
     if bytes.len() < WAL_HEADER_BYTES {
         return Err(StoreErrorKind::Unrecognized.into());
     }
@@ -581,14 +635,13 @@ fn acquire_lease(root: &Path, create: bool) -> Result<File, StoreError> {
     Ok(lease)
 }
 
-fn random_store_id() -> Result<StoreId, StoreError> {
-    Ok(StoreId(random_bytes()?))
+fn random_store_id(entropy: &dyn Entropy) -> Result<StoreId, StoreError> {
+    Ok(StoreId(random_bytes(entropy)?))
 }
 
-fn random_bytes<const N: usize>() -> Result<[u8; N], StoreError> {
-    let path = Path::new(RANDOM_SOURCE);
+fn random_bytes<const N: usize>(entropy: &dyn Entropy) -> Result<[u8; N], StoreError> {
     let mut bytes = [0_u8; N];
-    SystemEntropy.fill(&mut bytes).map_err(|source| io_error(path, source))?;
+    entropy.fill(&mut bytes).map_err(|source| io_error(entropy.source_path(), source))?;
     Ok(bytes)
 }
 
@@ -671,4 +724,78 @@ fn io_error(path: &Path, source: io::Error) -> StoreError {
 
 fn database_error(source: rusqlite::Error) -> StoreError {
     StoreErrorKind::Database(source).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct FixedEntropy(Result<u8, io::ErrorKind>);
+
+    impl Entropy for FixedEntropy {
+        fn source_path(&self) -> &Path {
+            Path::new("fixed-test-entropy")
+        }
+
+        fn fill(&self, bytes: &mut [u8]) -> io::Result<()> {
+            match self.0 {
+                Ok(value) => {
+                    bytes.fill(value);
+                    Ok(())
+                }
+                Err(kind) => Err(io::Error::from(kind)),
+            }
+        }
+    }
+
+    fn root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "whisper-store-capability-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn initialization_uses_the_injected_entropy_capability() {
+        let root = root("fixed");
+        let store = Store::initialize_with_entropy(&root, &FixedEntropy(Ok(0x5a))).unwrap();
+        assert_eq!(store.id, StoreId([0x5a; STORE_ID_BYTES]));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn injected_entropy_failure_retains_its_source_and_cleans_the_new_root() {
+        let root = root("failure");
+        let error = Store::initialize_with_entropy(
+            &root,
+            &FixedEntropy(Err(io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        let store_source = std::error::Error::source(&error).unwrap();
+        assert!(store_source.source().is_some());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn open_uses_the_injected_entropy_capability_without_changing_store_bytes() {
+        let root = root("open-entropy-failure");
+        drop(Store::initialize_with_entropy(&root, &FixedEntropy(Ok(0x5a))).unwrap());
+        let database = root.join(DATABASE_NAME);
+        let before = fs::read(&database).unwrap();
+
+        let error =
+            Store::open_with_entropy(&root, &FixedEntropy(Err(io::ErrorKind::PermissionDenied)))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("fixed-test-entropy"));
+        let store_source = std::error::Error::source(&error).unwrap();
+        assert!(store_source.source().is_some());
+        assert_eq!(fs::read(database).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

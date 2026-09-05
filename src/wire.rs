@@ -1293,9 +1293,9 @@ impl CapabilityDescriptor {
         idf_wifi_abi_digest: [u8; 32],
         datagram_budget_bytes: u16,
     ) -> Result<Self, BodyError> {
-        if datagram_budget_bytes < minimum_datagram_budget_bytes() {
+        if datagram_budget_bytes < MINIMUM_NATIVE_FRAME_V1_DATAGRAM_BYTES {
             return Err(BodyError::InvalidDatagramBudget {
-                minimum: minimum_datagram_budget_bytes(),
+                minimum: MINIMUM_NATIVE_FRAME_V1_DATAGRAM_BYTES,
             });
         }
         Ok(Self { firmware_build_digest, idf_wifi_abi_digest, datagram_budget_bytes })
@@ -2213,9 +2213,8 @@ fn csi_body_len(block_count: usize, raw_bytes: usize) -> usize {
     CSI_FIXED_BODY_BYTES + block_count * LTF_BLOCK_BYTES + raw_bytes
 }
 
-const fn minimum_datagram_budget_bytes() -> u16 {
-    (HEADER_BYTES + TAG_BYTES + MAX_CSI_PLAINTEXT_BYTES) as u16
-}
+pub(crate) const MINIMUM_NATIVE_FRAME_V1_DATAGRAM_BYTES: u16 =
+    (HEADER_BYTES + TAG_BYTES + MAX_CSI_PLAINTEXT_BYTES) as u16;
 
 fn kind_name(kind: MessageKind) -> &'static str {
     match kind {

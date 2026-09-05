@@ -14,9 +14,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
+use crate::admission::AdmissionLimits;
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
 use crate::native_frame::{Header, authenticate_datagram, parse_header};
-use crate::replay::{ReplayAdmission, ReplayDecision, derive_replay_window_identity};
+use crate::replay::{
+    ReplayAdmission, ReplayDecision, ReplayIdentityError, ReplayStateError,
+    derive_replay_window_identity,
+};
 use crate::store::{Store, StoreSnapshot};
 use crate::{BootGeneration, DeploymentId, DeviceId, KeyEpoch, MessageSequence, NativeFrameKind};
 
@@ -24,10 +28,6 @@ use crate::{BootGeneration, DeploymentId, DeviceId, KeyEpoch, MessageSequence, N
 /// deployment value is a local memory/back-pressure budget; changing it alters
 /// the maximum loss burst summarized when the SQLite writer falls behind.
 const DEFAULT_INGRESS_CAPACITY: usize = 256;
-/// Conservative allocation ceiling in bytes for one route's UDP payload. The
-/// 65,507-byte IPv4 UDP maximum also safely bounds IPv6 routes; changing it
-/// changes accepted route configurations and worst-case ingress allocation.
-const UDP_PAYLOAD_BYTES: usize = 65_507;
 /// Local query result ceiling in facts. It bounds allocations made from an
 /// untrusted caller-supplied limit; changing it changes the public query contract.
 const MAXIMUM_RAW_QUERY_FACTS: usize = 1_024;
@@ -116,50 +116,6 @@ impl Clock for SystemClock {
     }
 }
 
-/// Exact per-route native-frame admission limits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AdmissionLimits {
-    datagram_bytes: usize,
-    packets_per_second: u32,
-    authenticated_bytes_per_second: u64,
-    replay_window_packets: u16,
-}
-
-impl AdmissionLimits {
-    /// Creates one route's datagram, packet-rate, byte-rate, and replay limits.
-    ///
-    /// # Errors
-    ///
-    /// Every limit must be nonzero and the datagram limit must fit a UDP payload.
-    pub fn new(
-        datagram_bytes: usize,
-        packets_per_second: u32,
-        authenticated_bytes_per_second: u64,
-        replay_window_packets: u16,
-    ) -> Result<Self, AdmissionLimitsError> {
-        if datagram_bytes == 0 || datagram_bytes > UDP_PAYLOAD_BYTES {
-            return Err(AdmissionLimitsError);
-        }
-        if packets_per_second == 0
-            || authenticated_bytes_per_second == 0
-            || replay_window_packets == 0
-        {
-            return Err(AdmissionLimitsError);
-        }
-        Ok(Self {
-            datagram_bytes,
-            packets_per_second,
-            authenticated_bytes_per_second,
-            replay_window_packets,
-        })
-    }
-}
-
-/// Invalid zero or out-of-range route admission limits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("native-frame admission limits must be nonzero and fit one UDP payload")]
-pub struct AdmissionLimitsError;
-
 /// One exact peer, device, key epoch, and secret key admission route.
 pub struct NativeFrameRoute {
     peer: IpAddr,
@@ -195,11 +151,20 @@ impl NativeFrameRoute {
         limits: AdmissionLimits,
         secret_root: impl AsRef<Path>,
     ) -> Result<Self, RouteError> {
+        let secret_root = secret_root.as_ref();
         if peer.is_unspecified() {
-            return Err(RouteError::new("peer IP address must not be unspecified"));
+            return Err(RouteError::invalid(
+                peer,
+                device_id,
+                key_epoch,
+                secret_root,
+                "peer IP address must not be unspecified",
+            ));
         }
-        let key = load_epoch_key(secret_root.as_ref(), device_id.get(), key_epoch.get())
-            .map_err(RouteError::secret)?;
+        let key =
+            load_epoch_key(secret_root, device_id.get(), key_epoch.get()).map_err(|source| {
+                RouteError::secret(peer, device_id, key_epoch, secret_root, source)
+            })?;
         Ok(Self { peer, device_id, key_epoch, key, limits })
     }
 }
@@ -208,15 +173,75 @@ impl NativeFrameRoute {
 #[derive(Debug)]
 pub struct RouteError {
     kind: RouteErrorKind,
+    peer: IpAddr,
+    device_id: DeviceId,
+    key_epoch: KeyEpoch,
+    secret_root: PathBuf,
+    backtrace: Box<Backtrace>,
 }
 
 impl RouteError {
-    const fn new(reason: &'static str) -> Self {
-        Self { kind: RouteErrorKind::Invalid(reason) }
+    fn invalid(
+        peer: IpAddr,
+        device_id: DeviceId,
+        key_epoch: KeyEpoch,
+        secret_root: &Path,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            kind: RouteErrorKind::Invalid(reason),
+            peer,
+            device_id,
+            key_epoch,
+            secret_root: secret_root.to_owned(),
+            backtrace: Box::new(Backtrace::capture()),
+        }
     }
 
-    fn secret(source: SecretStoreError) -> Self {
-        Self { kind: RouteErrorKind::Secret(source) }
+    fn secret(
+        peer: IpAddr,
+        device_id: DeviceId,
+        key_epoch: KeyEpoch,
+        secret_root: &Path,
+        source: SecretStoreError,
+    ) -> Self {
+        Self {
+            kind: RouteErrorKind::Secret(source),
+            peer,
+            device_id,
+            key_epoch,
+            secret_root: secret_root.to_owned(),
+            backtrace: Box::new(Backtrace::capture()),
+        }
+    }
+
+    /// Returns the secret-root path involved in route construction.
+    #[must_use]
+    pub fn secret_root(&self) -> &Path {
+        &self.secret_root
+    }
+
+    /// Returns the route peer involved in construction.
+    #[must_use]
+    pub const fn peer(&self) -> IpAddr {
+        self.peer
+    }
+
+    /// Returns the route device involved in construction.
+    #[must_use]
+    pub const fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    /// Returns the route key epoch involved in construction.
+    #[must_use]
+    pub const fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+
+    /// Returns the captured construction backtrace.
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
     }
 }
 
@@ -230,7 +255,15 @@ enum RouteErrorKind {
 
 impl fmt::Display for RouteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.kind.fmt(formatter)
+        write!(
+            formatter,
+            "native-frame route peer {} device {} epoch {} under {}: {}",
+            self.peer,
+            self.device_id,
+            self.key_epoch,
+            self.secret_root.display(),
+            self.kind
+        )
     }
 }
 
@@ -309,12 +342,25 @@ impl HostBuilder {
     /// startup failure, or failure to open the Store writer.
     pub fn start(self) -> Result<HostRuntime, HostError> {
         validate_builder(&self)?;
-        let replay_snapshot = self.store.database_snapshot().map_err(HostError::io)?;
-        let socket = self.network.bind(self.bind).map_err(HostError::io)?;
-        let local_addr = socket.local_addr().map_err(HostError::io)?;
-        socket.set_read_timeout(Some(SOCKET_POLL_INTERVAL)).map_err(HostError::io)?;
-
         let database_path = self.store.database_path();
+        let replay_snapshot = self.store.database_snapshot().map_err(|source| {
+            HostError::io_during(
+                "create read-only Store snapshot",
+                Some(&database_path),
+                None,
+                None,
+                source,
+            )
+        })?;
+        let socket = self.network.bind(self.bind).map_err(|source| {
+            HostError::io_during("bind UDP socket", None, Some(self.bind), None, source)
+        })?;
+        let local_addr = socket.local_addr().map_err(|source| {
+            HostError::io_during("read bound UDP address", None, Some(self.bind), None, source)
+        })?;
+        socket.set_read_timeout(Some(SOCKET_POLL_INTERVAL)).map_err(|source| {
+            HostError::io_during("set UDP read timeout", None, Some(local_addr), None, source)
+        })?;
         let stop = Arc::new(AtomicBool::new(false));
         let completion = Arc::new((Mutex::new(Completion::default()), Condvar::new()));
         let rejections =
@@ -333,6 +379,7 @@ impl HostBuilder {
                         self,
                         SupervisorContext {
                             socket,
+                            local_addr,
                             threads: supervisor_threads,
                             replay_snapshot,
                             stop: supervisor_stop,
@@ -343,11 +390,19 @@ impl HostBuilder {
                     );
                 }),
             )
-            .map_err(HostError::io)?;
+            .map_err(|source| {
+                HostError::io_during(
+                    "spawn Host supervisor",
+                    None,
+                    Some(local_addr),
+                    Some("whisper-host-supervisor"),
+                    source,
+                )
+            })?;
 
-        ready_receiver
-            .recv()
-            .map_err(|_| HostError::message("Host supervisor exited during startup"))??;
+        ready_receiver.recv().map_err(|_| {
+            HostError::message_during("await Host startup", "Host supervisor exited during startup")
+        })??;
         Ok(HostRuntime { local_addr, database_path, stop, completion, rejections })
     }
 }
@@ -378,7 +433,10 @@ impl HostRuntime {
     /// The limit must be between one and 1,024, and the Store must remain readable.
     pub fn query_raw(&self, limit: usize) -> Result<Vec<RawFact>, HostError> {
         if !(1..=MAXIMUM_RAW_QUERY_FACTS).contains(&limit) {
-            return Err(HostError::message("raw query limit must be between 1 and 1024"));
+            return Err(HostError::message_during(
+                "validate raw query",
+                "raw query limit must be between 1 and 1024",
+            ));
         }
         query_raw(&self.database_path, limit)
     }
@@ -390,7 +448,10 @@ impl HostRuntime {
     /// The limit must be between one and 1,024, and the Store must remain readable.
     pub fn query_raw_losses(&self, limit: usize) -> Result<Vec<RawLoss>, HostError> {
         if !(1..=MAXIMUM_RAW_QUERY_FACTS).contains(&limit) {
-            return Err(HostError::message("raw-loss query limit must be between 1 and 1024"));
+            return Err(HostError::message_during(
+                "validate raw-loss query",
+                "raw-loss query limit must be between 1 and 1024",
+            ));
         }
         query_raw_losses(&self.database_path, limit)
     }
@@ -402,7 +463,10 @@ impl HostRuntime {
     /// The limit must be between one and the diagnostic capacity of 64.
     pub fn query_rejections(&self, limit: usize) -> Result<Vec<RejectedDatagram>, HostError> {
         if !(1..=REJECTION_DIAGNOSTIC_CAPACITY).contains(&limit) {
-            return Err(HostError::message("rejection query limit must be between 1 and 64"));
+            return Err(HostError::message_during(
+                "validate rejection query",
+                "rejection query limit must be between 1 and 64",
+            ));
         }
         let rejections = self.rejections.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(rejections
@@ -613,9 +677,11 @@ impl RawLoss {
 /// Failure to configure, start, query, or shut down the Host.
 #[derive(Debug)]
 pub struct HostError {
-    kind: HostErrorKind,
+    kind: Box<HostErrorKind>,
     operation: &'static str,
     path: Option<PathBuf>,
+    address: Option<SocketAddr>,
+    thread: Option<&'static str>,
     backtrace: Box<Backtrace>,
 }
 
@@ -627,8 +693,10 @@ enum HostErrorKind {
     Io(#[source] io::Error),
     #[error("Host database operation failed: {0}")]
     Database(#[source] rusqlite::Error),
-    #[error("Host worker failed: {0}")]
-    Worker(String),
+    #[error("Host replay identity failed: {0}")]
+    ReplayIdentity(#[source] ReplayIdentityError),
+    #[error("Host replay state failed: {0}")]
+    ReplayState(#[source] ReplayStateError),
 }
 
 impl fmt::Display for HostError {
@@ -636,6 +704,12 @@ impl fmt::Display for HostError {
         write!(formatter, "Host {}", self.operation)?;
         if let Some(path) = &self.path {
             write!(formatter, " at {}", path.display())?;
+        }
+        if let Some(address) = self.address {
+            write!(formatter, " for {address}")?;
+        }
+        if let Some(thread) = self.thread {
+            write!(formatter, " on thread {thread}")?;
         }
         write!(formatter, ": {}", self.kind)
     }
@@ -649,37 +723,104 @@ impl std::error::Error for HostError {
 
 impl HostError {
     fn message(message: &'static str) -> Self {
-        Self::new("operation", None, HostErrorKind::Message(message))
+        Self::message_during("validate or decode Host state", message)
     }
 
-    fn io(source: io::Error) -> Self {
-        Self::new("network or thread I/O", None, HostErrorKind::Io(source))
+    fn message_during(operation: &'static str, message: &'static str) -> Self {
+        Self::new(operation, None, None, None, HostErrorKind::Message(message))
     }
 
-    fn database(source: rusqlite::Error) -> Self {
-        Self::new("Store database operation", None, HostErrorKind::Database(source))
+    fn message_at(operation: &'static str, path: &Path, message: &'static str) -> Self {
+        Self::new(operation, Some(path.to_owned()), None, None, HostErrorKind::Message(message))
+    }
+
+    fn message_on_thread(
+        operation: &'static str,
+        thread: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self::new(operation, None, None, Some(thread), HostErrorKind::Message(message))
+    }
+
+    fn io_during(
+        operation: &'static str,
+        path: Option<&Path>,
+        address: Option<SocketAddr>,
+        thread: Option<&'static str>,
+        source: io::Error,
+    ) -> Self {
+        Self::new(operation, path.map(Path::to_owned), address, thread, HostErrorKind::Io(source))
     }
 
     fn database_at(path: &Path, source: rusqlite::Error) -> Self {
         Self::new(
-            "Store database operation",
+            "access Store database",
             Some(path.to_owned()),
+            None,
+            None,
             HostErrorKind::Database(source),
         )
     }
 
-    fn worker(message: impl Into<String>) -> Self {
-        Self::new("worker supervision", None, HostErrorKind::Worker(message.into()))
+    fn replay_identity(path: &Path, source: ReplayIdentityError) -> Self {
+        Self::new(
+            "derive replay identity",
+            Some(path.to_owned()),
+            None,
+            None,
+            HostErrorKind::ReplayIdentity(source),
+        )
     }
 
-    fn new(operation: &'static str, path: Option<PathBuf>, kind: HostErrorKind) -> Self {
-        Self { kind, operation, path, backtrace: Box::new(Backtrace::capture()) }
+    fn replay_state(path: &Path, source: ReplayStateError) -> Self {
+        Self::new(
+            "validate replay state",
+            Some(path.to_owned()),
+            None,
+            None,
+            HostErrorKind::ReplayState(source),
+        )
+    }
+
+    fn new(
+        operation: &'static str,
+        path: Option<PathBuf>,
+        address: Option<SocketAddr>,
+        thread: Option<&'static str>,
+        kind: HostErrorKind,
+    ) -> Self {
+        Self {
+            kind: Box::new(kind),
+            operation,
+            path,
+            address,
+            thread,
+            backtrace: Box::new(Backtrace::capture()),
+        }
     }
 
     /// Returns the filesystem path involved in the failed operation, when applicable.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Returns the operation that failed.
+    #[must_use]
+    pub const fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// Returns the network address involved in the failed operation, when applicable.
+    #[must_use]
+    pub const fn address(&self) -> Option<SocketAddr> {
+        self.address
+    }
+
+    /// Returns the named worker involved in the failed operation, when applicable.
+    #[must_use]
+    pub const fn thread(&self) -> Option<&'static str> {
+        self.thread
     }
 
     /// Returns the captured failure backtrace.
@@ -691,7 +832,7 @@ impl HostError {
 #[derive(Default, Debug)]
 struct Completion {
     done: bool,
-    failure: Option<String>,
+    failure: Option<HostError>,
 }
 
 #[derive(Debug)]
@@ -730,12 +871,14 @@ struct WriterConfig {
 
 struct ReaderConfig {
     socket: Box<dyn DatagramSocket>,
+    local_addr: SocketAddr,
     routes: Arc<Vec<NativeFrameRoute>>,
     clock: Arc<dyn Clock>,
 }
 
 struct SupervisorContext {
     socket: Box<dyn DatagramSocket>,
+    local_addr: SocketAddr,
     threads: Arc<dyn Threads>,
     replay_snapshot: StoreSnapshot,
     stop: Arc<AtomicBool>,
@@ -787,23 +930,28 @@ impl RouteRateState {
 
 struct WorkerExitNotifier {
     worker: &'static str,
-    sender: mpsc::Sender<(&'static str, Result<(), String>)>,
-    result: Option<Result<(), String>>,
+    sender: mpsc::Sender<(&'static str, Result<(), HostError>)>,
+    result: Option<Result<(), HostError>>,
 }
 
 impl WorkerExitNotifier {
-    fn new(worker: &'static str, sender: mpsc::Sender<(&'static str, Result<(), String>)>) -> Self {
+    fn new(
+        worker: &'static str,
+        sender: mpsc::Sender<(&'static str, Result<(), HostError>)>,
+    ) -> Self {
         Self { worker, sender, result: None }
     }
 
     fn complete(&mut self, result: Result<(), HostError>) {
-        self.result = Some(result.map_err(|error| error.to_string()));
+        self.result = Some(result);
     }
 }
 
 impl Drop for WorkerExitNotifier {
     fn drop(&mut self) {
-        let result = self.result.take().unwrap_or_else(|| Err(format!("{} panicked", self.worker)));
+        let result = self.result.take().unwrap_or_else(|| {
+            Err(HostError::message_on_thread("run Host worker", self.worker, "worker panicked"))
+        });
         let _ = self.sender.send((self.worker, result));
     }
 }
@@ -846,16 +994,13 @@ fn utc_now_ns(clock: &dyn Clock) -> Result<u64, HostError> {
 fn wait_for_completion(completion: &(Mutex<Completion>, Condvar)) -> Result<(), HostError> {
     let (state, changed) = completion;
     let state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let state = changed
+    let mut state = changed
         .wait_while(state, |state| !state.done)
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match &state.failure {
-        Some(failure) => Err(HostError::worker(failure.clone())),
-        None => Ok(()),
-    }
+    state.failure.take().map_or(Ok(()), Err)
 }
 
-fn finish_completion(completion: &(Mutex<Completion>, Condvar), failure: Option<String>) {
+fn finish_completion(completion: &(Mutex<Completion>, Condvar), failure: Option<HostError>) {
     let (state, changed) = completion;
     let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     state.done = true;
@@ -873,4 +1018,245 @@ fn record_rejection(
         diagnostics.pop_front();
     }
     diagnostics.push_back(RejectedDatagram { peer, reason });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admission::{
+        AuthenticatedBytesPerSecond, DatagramBytes, PacketsPerSecond, ReplayWindowPackets,
+    };
+    use std::fs;
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    const KEY: [u8; 32] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31,
+    ];
+
+    fn limits() -> AdmissionLimits {
+        AdmissionLimits::builder()
+            .datagram_bytes(DatagramBytes::try_from(1_200).unwrap())
+            .packets_per_second(PacketsPerSecond::try_from(1_000).unwrap())
+            .authenticated_bytes_per_second(
+                AuthenticatedBytesPerSecond::try_from(1_200_000).unwrap(),
+            )
+            .replay_window_packets(ReplayWindowPackets::try_from(64).unwrap())
+            .build()
+            .unwrap()
+    }
+
+    fn route() -> NativeFrameRoute {
+        NativeFrameRoute {
+            peer: "127.0.0.1".parse().unwrap(),
+            device_id: DeviceId::new(0x0102_0304_0506_0708),
+            key_epoch: KeyEpoch::try_from(7).unwrap(),
+            key: EpochKey::try_from(KEY.as_slice()).unwrap(),
+            limits: limits(),
+        }
+    }
+
+    fn store_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "whisper-host-system-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    struct FailedNetwork;
+
+    impl Network for FailedNetwork {
+        fn bind(&self, _address: SocketAddr) -> io::Result<Box<dyn DatagramSocket>> {
+            Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "injected bind failure"))
+        }
+    }
+
+    struct FailedThreads;
+
+    impl Threads for FailedThreads {
+        fn spawn(
+            &self,
+            _name: &'static str,
+            _task: Box<dyn FnOnce() + Send>,
+        ) -> io::Result<thread::JoinHandle<()>> {
+            Err(io::Error::other("injected spawn failure"))
+        }
+    }
+
+    struct TimeoutFailedNetwork;
+
+    impl Network for TimeoutFailedNetwork {
+        fn bind(&self, _address: SocketAddr) -> io::Result<Box<dyn DatagramSocket>> {
+            Ok(Box::new(TimeoutFailedSocket))
+        }
+    }
+
+    struct TimeoutFailedSocket;
+
+    impl DatagramSocket for TimeoutFailedSocket {
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:4321".parse().unwrap())
+        }
+
+        fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Err(io::Error::other("injected timeout failure"))
+        }
+
+        fn recv_from(&self, _buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            unreachable!("timeout setup fails before receive")
+        }
+    }
+
+    #[test]
+    fn injected_network_failure_retains_bind_address_and_source() {
+        let root = store_root("network");
+        let store = Store::initialize(&root).unwrap();
+        let bind = "127.0.0.1:0".parse().unwrap();
+        let mut builder = Host::builder(store, DeploymentId::try_from("lab").unwrap(), bind);
+        builder.routes.push(route());
+        builder.network = Arc::new(FailedNetwork);
+
+        let error = builder.start().unwrap_err();
+        assert_eq!(error.operation(), "bind UDP socket");
+        assert_eq!(error.address(), Some(bind));
+        assert!(std::error::Error::source(&error).is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn injected_timeout_failure_retains_bound_address_and_source() {
+        let root = store_root("timeout");
+        let store = Store::initialize(&root).unwrap();
+        let mut builder = Host::builder(
+            store,
+            DeploymentId::try_from("lab").unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        builder.routes.push(route());
+        builder.network = Arc::new(TimeoutFailedNetwork);
+
+        let error = builder.start().unwrap_err();
+        assert_eq!(error.operation(), "set UDP read timeout");
+        assert_eq!(error.address(), Some("127.0.0.1:4321".parse().unwrap()));
+        assert!(std::error::Error::source(&error).is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn injected_thread_failure_retains_thread_name_and_source() {
+        let root = store_root("threads");
+        let store = Store::initialize(&root).unwrap();
+        let mut builder = Host::builder(
+            store,
+            DeploymentId::try_from("lab").unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        builder.routes.push(route());
+        builder.threads = Arc::new(FailedThreads);
+
+        let error = builder.start().unwrap_err();
+        assert_eq!(error.operation(), "spawn Host supervisor");
+        assert_eq!(error.thread(), Some("whisper-host-supervisor"));
+        assert!(std::error::Error::source(&error).is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_failure_retains_store_path_and_source() {
+        let path = Path::new("/test/store/facts.sqlite3");
+        let error = HostError::database_at(path, rusqlite::Error::InvalidQuery);
+        assert_eq!(error.path(), Some(path));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    struct OrderedClock {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        monotonic: Instant,
+    }
+
+    impl Clock for OrderedClock {
+        fn monotonic_now(&self) -> Instant {
+            self.events.lock().unwrap().push("monotonic");
+            self.monotonic
+        }
+
+        fn wall_now(&self) -> SystemTime {
+            self.events.lock().unwrap().push("wall");
+            UNIX_EPOCH + Duration::from_nanos(123)
+        }
+    }
+
+    struct OneDatagram {
+        bytes: Box<[u8]>,
+        delivered: AtomicBool,
+        stop: Arc<AtomicBool>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl DatagramSocket for OneDatagram {
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:9000".parse().unwrap())
+        }
+
+        fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            if !self.delivered.swap(true, Ordering::AcqRel) {
+                self.events.lock().unwrap().push("receive");
+                buffer[..self.bytes.len()].copy_from_slice(&self.bytes);
+                return Ok((self.bytes.len(), "127.0.0.1:7000".parse().unwrap()));
+            }
+            self.stop.store(true, Ordering::Release);
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
+    fn hex_fixture(text: &str) -> Box<[u8]> {
+        text.bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16).unwrap() as u8;
+                let low = (pair[1] as char).to_digit(16).unwrap() as u8;
+                (high << 4) | low
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    #[test]
+    fn injected_clock_samples_receive_time_before_admission_work() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let socket = OneDatagram {
+            bytes: hex_fixture(include_str!(
+                "../tests/fixtures/native-frame/csi-non-ht-3-pairs.hex"
+            )),
+            delivered: AtomicBool::new(false),
+            stop: Arc::clone(&stop),
+            events: Arc::clone(&events),
+        };
+        let config = ReaderConfig {
+            socket: Box::new(socket),
+            local_addr: "127.0.0.1:9000".parse().unwrap(),
+            routes: Arc::new(vec![route()]),
+            clock: Arc::new(OrderedClock {
+                events: Arc::clone(&events),
+                monotonic: Instant::now(),
+            }),
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let overflow = OverflowSummary { count: AtomicU64::new(0) };
+        let rejections = Mutex::new(VecDeque::new());
+
+        reader_loop(config, sender, &overflow, &rejections, &stop).unwrap();
+
+        assert_eq!(receiver.recv().unwrap().received_utc_ns, 123);
+        assert_eq!(&*events.lock().unwrap(), &["monotonic", "receive", "wall", "monotonic"]);
+    }
 }

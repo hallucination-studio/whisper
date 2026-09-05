@@ -10,6 +10,7 @@ pub(super) fn writer_loop(
 ) -> Result<(), HostError> {
     let startup = match load_replay_states_from_path(
         config.replay_snapshot.database_path(),
+        &config.database_path,
         &config.deployment,
         &config.routes,
     ) {
@@ -34,14 +35,14 @@ pub(super) fn writer_loop(
         && let Err(error) =
             provision_replay_states(&mut connection, &config.routes, &startup.states)
     {
-        let error = HostError::database(error);
+        let error = HostError::database_at(&config.database_path, error);
         let _ = ready.send(Err(error));
         return Ok(());
     }
     if let Err(error) =
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
     {
-        let error = HostError::database(error);
+        let error = HostError::database_at(&config.database_path, error);
         let _ = ready.send(Err(error));
         return Ok(());
     }
@@ -51,35 +52,44 @@ pub(super) fn writer_loop(
     }
 
     loop {
-        persist_overflow(&mut connection, overflow, config.clock.as_ref())?;
+        persist_overflow(&mut connection, &config.database_path, overflow, config.clock.as_ref())?;
         match ingress.recv_timeout(SOCKET_POLL_INTERVAL) {
-            Ok(item) => {
-                persist_admitted(&mut connection, &config.routes, &mut replay, rejections, item)?
-            }
+            Ok(item) => persist_admitted(
+                &mut connection,
+                &config.database_path,
+                &config.routes,
+                &mut replay,
+                rejections,
+                item,
+            )?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    persist_overflow(&mut connection, overflow, config.clock.as_ref())?;
-    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").map_err(HostError::database)?;
+    persist_overflow(&mut connection, &config.database_path, overflow, config.clock.as_ref())?;
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| HostError::database_at(&config.database_path, error))?;
     Ok(())
 }
 
 fn load_replay_states_from_path(
-    path: &Path,
+    snapshot_path: &Path,
+    store_path: &Path,
     deployment: &DeploymentId,
     routes: &[NativeFrameRoute],
 ) -> Result<ReplayStartup, HostError> {
     let connection = Connection::open_with_flags(
-        path,
+        snapshot_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|error| HostError::database_at(path, error))?;
-    load_replay_states(&connection, deployment, routes)
+    .map_err(|error| HostError::database_at(store_path, error))?;
+    load_replay_states(&connection, store_path, deployment, routes)
 }
 
 fn load_replay_states(
     connection: &Connection,
+    path: &Path,
     deployment: &DeploymentId,
     routes: &[NativeFrameRoute],
 ) -> Result<ReplayStartup, HostError> {
@@ -89,18 +99,30 @@ fn load_replay_states(
             [],
             |row| row.get(0),
         )
-        .map_err(HostError::database)?;
+        .map_err(|error| HostError::database_at(path, error))?;
     let row_count: usize = connection
         .query_row("SELECT count(*) FROM replay_windows", [], |row| row.get(0))
-        .map_err(HostError::database)?;
+        .map_err(|error| HostError::database_at(path, error))?;
     if configured == 0 && row_count != 0 {
-        return Err(HostError::message("unprovisioned Store contains replay state"));
+        return Err(HostError::message_at(
+            "validate retained replay state",
+            path,
+            "unprovisioned Store contains replay state",
+        ));
     }
     if configured == 1 && row_count != routes.len() {
-        return Err(HostError::message("persisted replay route set does not match configuration"));
+        return Err(HostError::message_at(
+            "validate retained replay state",
+            path,
+            "persisted replay route set does not match configuration",
+        ));
     }
     if configured > 1 {
-        return Err(HostError::message("persisted admission configuration marker is invalid"));
+        return Err(HostError::message_at(
+            "validate retained replay state",
+            path,
+            "persisted admission configuration marker is invalid",
+        ));
     }
     let states = routes
         .iter()
@@ -111,7 +133,7 @@ fn load_replay_states(
                 route.key_epoch.get(),
                 &route.key,
             )
-            .map_err(|error| HostError::worker(error.to_string()))?;
+            .map_err(|error| HostError::replay_identity(path, error))?;
             let persisted: Option<(Vec<u8>, u16, Vec<u8>)> = connection
                 .query_row(
                     "SELECT identity, window_packets, state FROM replay_windows
@@ -123,29 +145,41 @@ fn load_replay_states(
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
-                .map_err(HostError::database)?;
+                .map_err(|error| HostError::database_at(path, error))?;
             let admission = match persisted {
                 Some((stored_identity, stored_window, state)) => {
                     if configured == 0
                         || stored_identity.as_slice() != identity.as_bytes()
-                        || stored_window != route.limits.replay_window_packets
+                        || stored_window != route.limits.replay_window_packets.get()
                     {
-                        return Err(HostError::message(
+                        return Err(HostError::message_at(
+                            "validate retained replay state",
+                            path,
                             "persisted replay identity or window does not match configuration",
                         ));
                     }
                     let admission = ReplayAdmission::decode_state(&state)
-                        .map_err(|error| HostError::worker(error.to_string()))?;
+                        .map_err(|error| HostError::replay_state(path, error))?;
                     if admission.window_packets() != stored_window {
-                        return Err(HostError::message(
+                        return Err(HostError::message_at(
+                            "validate retained replay state",
+                            path,
                             "persisted replay state window does not match configuration",
                         ));
                     }
                     admission
                 }
-                None if configured == 0 => ReplayAdmission::new(route.limits.replay_window_packets)
-                    .map_err(|error| HostError::worker(error.to_string()))?,
-                None => return Err(HostError::message("configured replay route is missing")),
+                None if configured == 0 => {
+                    ReplayAdmission::new(route.limits.replay_window_packets.get())
+                        .map_err(|error| HostError::replay_state(path, error))?
+                }
+                None => {
+                    return Err(HostError::message_at(
+                        "validate retained replay state",
+                        path,
+                        "configured replay route is missing",
+                    ));
+                }
             };
             Ok(ReplayWriterState { identity: *identity.as_bytes(), admission })
         })
@@ -168,7 +202,7 @@ fn provision_replay_states(
                 route.device_id.get().to_be_bytes(),
                 route.key_epoch.get().to_be_bytes(),
                 state.identity,
-                route.limits.replay_window_packets,
+                route.limits.replay_window_packets.get(),
                 state.admission.encode_state(),
             ],
         )?;
@@ -180,6 +214,7 @@ fn provision_replay_states(
 
 fn persist_admitted(
     connection: &mut Connection,
+    path: &Path,
     routes: &[NativeFrameRoute],
     replay: &mut [ReplayWriterState],
     rejections: &Mutex<VecDeque<RejectedDatagram>>,
@@ -201,7 +236,7 @@ fn persist_admitted(
     }
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(HostError::database)?;
+        .map_err(|error| HostError::database_at(path, error))?;
     let digest: [u8; 32] = Sha256::digest(&item.bytes).into();
     transaction
         .execute(
@@ -221,8 +256,8 @@ fn persist_admitted(
                 &item.bytes,
             ],
         )
-        .map_err(HostError::database)?;
-    persist_sequence_discontinuity(&transaction, previous, &item)?;
+        .map_err(|error| HostError::database_at(path, error))?;
+    persist_sequence_discontinuity(&transaction, path, previous, &item)?;
     transaction
         .execute(
             "UPDATE replay_windows SET state = ?1
@@ -232,17 +267,18 @@ fn persist_admitted(
                 route.device_id.get().to_be_bytes(),
                 route.key_epoch.get().to_be_bytes(),
                 state.identity,
-                route.limits.replay_window_packets,
+                route.limits.replay_window_packets.get(),
             ],
         )
-        .map_err(HostError::database)?;
-    transaction.commit().map_err(HostError::database)?;
+        .map_err(|error| HostError::database_at(path, error))?;
+    transaction.commit().map_err(|error| HostError::database_at(path, error))?;
     state.admission = next;
     Ok(())
 }
 
 fn persist_sequence_discontinuity(
     connection: &Connection,
+    path: &Path,
     previous: Option<u64>,
     item: &AdmittedDatagram,
 ) -> Result<(), HostError> {
@@ -272,12 +308,13 @@ fn persist_sequence_discontinuity(
                 last.to_be_bytes(),
             ],
         )
-        .map_err(HostError::database)?;
+        .map_err(|error| HostError::database_at(path, error))?;
     Ok(())
 }
 
 fn persist_overflow(
     connection: &mut Connection,
+    path: &Path,
     overflow: &OverflowSummary,
     clock: &dyn Clock,
 ) -> Result<(), HostError> {
@@ -292,6 +329,6 @@ fn persist_overflow(
              VALUES (?1, 'ingress_queue_overflow', ?2)",
             params![utc_now_ns(clock)?, count],
         )
-        .map_err(HostError::database)?;
+        .map_err(|error| HostError::database_at(path, error))?;
     Ok(())
 }
