@@ -5,7 +5,8 @@ use std::net::UdpSocket;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,11 @@ use whisper::measurement::{
     PhaseReferenceIdentity, PhaseRelation, PortMapEntry, PortMapping, Pose, ProfileIdentity,
     QualificationEpoch, QualificationRelation, RadioIdentity, RelationValidity, SourceInstance,
     SourceTick, TickRange, TimeRelation, TransmitterIdentity, WaitTicks,
+};
+use whisper::model_worker::{
+    Checkpoint, DispatchDecision, DispatchQueue, ExecutionClass, InputManifest, ModelRequest,
+    ModelResponse, ModelRun, ModelRunId, NumericContract, RequestIdentity, ResponseStatus,
+    WorkerClient, WorkerLimits,
 };
 use whisper::native_csi::{
     CapabilityIdentity, ChannelPolicy, CsiPath, FirmwareBuildIdentity, NativeFact, RadioRxS3,
@@ -44,6 +50,105 @@ const CAPABILITY_DIGEST: [u8; 32] = [
     0x34, 0x93, 0x9e, 0x35, 0xea, 0xbe, 0x30, 0x4c, 0xa5, 0x66, 0x14, 0x4f, 0x25, 0x8c, 0x1e, 0x52,
     0x2c, 0x88, 0x7f, 0x1e, 0xc5, 0x39, 0x5e, 0xdb, 0xbc, 0x22, 0x68, 0xe1, 0xfc, 0x54, 0x08, 0x43,
 ];
+
+#[test]
+fn authenticated_raw_ingress_continues_while_model_failure_is_in_flight() {
+    let parent = temporary_directory("host-worker-failure");
+    let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let secret_root = create_secret_root(&parent);
+    let host =
+        start_host(Store::initialize(parent.join("world-store")).unwrap(), &sender, &secret_root);
+    let worker_socket = PathBuf::from(format!("/tmp/ww-ingress-{}.sock", std::process::id()));
+    let release_marker = PathBuf::from(format!("/tmp/ww-ingress-release-{}", std::process::id()));
+    let ready_marker = PathBuf::from(format!("/tmp/ww-ingress-ready-{}", std::process::id()));
+    let _ = fs::remove_file(&worker_socket);
+    let _ = fs::remove_file(&release_marker);
+    let _ = fs::remove_file(&ready_marker);
+    let script = r#"
+import os, socket, sys, time
+from model_worker.worker import ContractFailure, Limits, Worker, read_frame
+class BoundedFailureOperator:
+    def evaluate(self, _request):
+        deadline = time.monotonic() + 10
+        while not os.path.exists(sys.argv[2]):
+            if time.monotonic() > deadline:
+                raise RuntimeError("test release marker did not arrive")
+            time.sleep(0.005)
+        raise ContractFailure("operator_failure", "fixture failure")
+worker = Worker(BoundedFailureOperator(), Limits(), now_ns=lambda: 1)
+assert not hasattr(worker, "store") and not hasattr(worker, "fact_log")
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+    listener.bind(sys.argv[1])
+    listener.listen(1)
+    with open(sys.argv[3], "xb"):
+        pass
+    connection, _ = listener.accept()
+    with connection:
+        connection.sendall(worker.handle_frame(read_frame(connection, Limits())))
+assert not hasattr(worker, "store") and not hasattr(worker, "fact_log")
+"#;
+    let child = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&worker_socket)
+        .arg(&release_marker)
+        .arg(&ready_marker)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let socket_deadline = Instant::now() + Duration::from_secs(2);
+    while !ready_marker.exists() {
+        assert!(Instant::now() < socket_deadline, "Python worker did not bind");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let request = worker_request("raw-ingress-worker");
+    let request_id = request.identity().request_id().clone();
+    let mut queue = DispatchQueue::new(WorkerLimits::default());
+    let DispatchDecision::Dispatch(request) = queue.submit(request).unwrap() else {
+        panic!("empty model queue must dispatch immediately");
+    };
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+    let client_socket = worker_socket.clone();
+    let client = thread::spawn(move || {
+        let result = WorkerClient::new(WorkerLimits::default(), Duration::from_secs(12))
+            .execute(client_socket, &request);
+        result_sender.send(result).unwrap();
+    });
+
+    sender
+        .send_to(
+            &hex_fixture(include_str!("fixtures/native-frame/capabilities-v1.hex")),
+            host.local_addr(),
+        )
+        .unwrap();
+    sender
+        .send_to(
+            &hex_fixture(include_str!("fixtures/native-frame/csi-non-ht-3-pairs.hex")),
+            host.local_addr(),
+        )
+        .unwrap();
+    wait_for_fact_count(&host, 2);
+    assert!(matches!(result_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+    fs::write(&release_marker, b"release").unwrap();
+    let response: ModelResponse =
+        result_receiver.recv_timeout(Duration::from_secs(12)).unwrap().unwrap();
+    assert_eq!(response.status(), ResponseStatus::OperatorFailure);
+    assert!(queue.complete(request_id).unwrap().is_none());
+    client.join().unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(host.query_raw(4).unwrap().len(), 2);
+
+    host.shutdown().unwrap();
+    fs::remove_file(worker_socket).unwrap();
+    fs::remove_file(release_marker).unwrap();
+    fs::remove_file(ready_marker).unwrap();
+    fs::remove_dir_all(parent).unwrap();
+}
 
 #[test]
 fn native_csi_closes_one_persisted_measurement_and_relations_round_trip() {
@@ -2011,6 +2116,57 @@ fn start_host(
     secret_root: &std::path::Path,
 ) -> whisper::HostRuntime {
     start_host_with_radio(store, sender, secret_root, non_ht_radio())
+}
+
+fn worker_request(request_id: &str) -> ModelRequest {
+    let run_id: ModelRunId = "raw-ingress-run".parse().unwrap();
+    let checkpoint = Checkpoint::new(run_id.clone(), 1, b"checkpoint".to_vec());
+    let identity = RequestIdentity::new(
+        run_id.clone(),
+        1,
+        request_id.parse().unwrap(),
+        1,
+        checkpoint.digest(),
+    );
+    let execution = NumericContract::new(
+        ExecutionClass::CpuBaseline,
+        true,
+        0.0,
+        0.0,
+        "host-ingress-fixture".to_owned(),
+    )
+    .unwrap();
+    let run = ModelRun::builder(run_id.clone(), b"weights".to_vec(), vec![1], execution)
+        .algorithm("bounded-failure-fixture")
+        .preprocessing("f32-le-v1")
+        .normalization("identity-v1")
+        .input_semantics("qualified-rf-fixture-v1")
+        .output_semantics("candidate-f32-le-v1")
+        .label_semantics("fixture-label-v1")
+        .calibration_policy("fixture-calibration-v1")
+        .tolerance_policy("fixture-tolerance-v1")
+        .fusion_policy("fixture-fusion-v1")
+        .state_format("fixture-state-v1")
+        .output_shape(vec![1])
+        .build()
+        .unwrap();
+    let tensor = 1.0_f32.to_le_bytes().to_vec();
+    let manifest = InputManifest::builder(
+        b"host-ingress-manifest".to_vec(),
+        run_id,
+        1,
+        1,
+        checkpoint.digest(),
+    )
+    .preprocessing("f32-le-v1")
+    .input_semantics("qualified-rf-fixture-v1")
+    .shape(vec![1])
+    .tensor(tensor)
+    .source_count(1)
+    .clock_domain_count(1)
+    .build()
+    .unwrap();
+    ModelRequest::new(identity, u64::MAX, run, manifest, checkpoint)
 }
 
 fn start_host_with_radio(

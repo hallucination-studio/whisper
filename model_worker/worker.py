@@ -20,7 +20,7 @@ PROTOCOL_VERSION = 1
 HEX_DIGEST_CHARS = 64
 # Smallest complete WMW1 failure frame, using the canonical fallback identity,
 # the longest known failure status, and an empty detail string.
-MIN_FRAME_BYTES = 386
+MIN_FRAME_BYTES = 404
 FAILURE_STATUSES = frozenset(
     {
         "unsupported_version",
@@ -74,8 +74,8 @@ class Limits:
 class Operator(Protocol):
     """Numerical implementation that cannot access persistence or publication."""
 
-    def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, bytes]:
-        """Return candidate bytes and self-contained successor material."""
+    def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, tuple[int, ...], bytes]:
+        """Return candidate bytes, exact output shape, and successor material."""
 
 
 def _immutable(value: object) -> object:
@@ -144,8 +144,12 @@ def _digest(data: bytes) -> str:
 
 
 def _hex_bytes(value: object, maximum: int, field: str) -> bytes:
-    if not isinstance(value, str) or len(value) % 2:
-        raise ContractFailure("malformed_request", f"{field} is not even-length hex")
+    if (
+        not isinstance(value, str)
+        or len(value) % 2
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ContractFailure("malformed_request", f"{field} is not canonical lowercase hex")
     if len(value) // 2 > maximum:
         raise ContractFailure("limit_exceeded", f"{field} exceeds its byte limit")
     try:
@@ -177,13 +181,13 @@ class ContractFailure(Exception):
 class DeterministicTestOperator:
     """A fixture-only numeric operator used to verify dispatch and restart behavior."""
 
-    def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, bytes]:
+    def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, tuple[int, ...], bytes]:
         tensor = bytes.fromhex(request["input_manifest"]["tensor_hex"])
         values = struct.unpack(f"<{len(tensor) // 4}f", tensor)
         candidate = struct.pack(f"<{len(values)}f", *(value * 2.0 for value in values))
         checkpoint = bytes.fromhex(request["checkpoint"]["bytes_hex"])
         successor = hashlib.sha256(b"successor-v1" + checkpoint + tensor).digest()
-        return candidate, successor
+        return candidate, (len(values),), successor
 
 
 class TorchOperator:
@@ -192,7 +196,7 @@ class TorchOperator:
     def __init__(self, evaluate: Callable[[object, Mapping[str, object]], tuple[object, object]]):
         self._evaluate = evaluate
 
-    def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, bytes]:
+    def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, tuple[int, ...], bytes]:
         try:
             import torch
         except ImportError as error:
@@ -217,9 +221,10 @@ class TorchOperator:
             candidate = candidate.detach().to("cpu").contiguous()
             if not torch.isfinite(candidate).all().item():
                 raise ContractFailure("non_finite", "operator returned NaN or Inf")
+            output_shape = tuple(candidate.shape)
             candidate_bytes = candidate.numpy().tobytes(order="C")
             successor_bytes = bytes(successor)
-            return candidate_bytes, successor_bytes
+            return candidate_bytes, output_shape, successor_bytes
         except torch.cuda.OutOfMemoryError as error:
             raise ContractFailure("gpu_oom", "GPU allocation failed") from error
 
@@ -253,16 +258,18 @@ class Worker:
 
         try:
             tensor, deadline, output_elements, execution = self._validate(request)
-            candidate, successor = self._operator.evaluate(_immutable(request))
+            candidate, output_shape, successor = self._operator.evaluate(_immutable(request))
             if self._now_ns() > deadline:
                 raise ContractFailure("deadline_exceeded", "request deadline elapsed during execution")
             if len(candidate) > self._limits.max_result_bytes or len(successor) > self._limits.max_checkpoint_bytes:
                 raise ContractFailure("limit_exceeded", "operator output exceeds configured limit")
             if len(candidate) != output_elements * 4:
                 raise ContractFailure("invalid_shape", "candidate bytes do not match declared output shape")
+            if not isinstance(output_shape, tuple) or output_shape != tuple(request["model_run"]["output_shape"]):
+                raise ContractFailure("invalid_shape", "candidate shape differs from declared output shape")
             if any(not math.isfinite(value) for value in struct.unpack(f"<{len(candidate) // 4}f", candidate)):
                 raise ContractFailure("non_finite", "operator returned NaN or Inf")
-            response = self._success(identity, tensor, candidate, successor, execution)
+            response = self._success(identity, tensor, candidate, output_shape, successor, execution)
         except MemoryError:
             response = self._failure(identity, "operator_failure", "numerical allocation failed")
         except ContractFailure as error:
@@ -392,7 +399,15 @@ class Worker:
                 raise ContractFailure("limit_exceeded", "tensor element count exceeds limit")
         return elements
 
-    def _success(self, identity: dict, tensor: bytes, candidate: bytes, successor: bytes, execution: dict) -> bytes:
+    def _success(
+        self,
+        identity: dict,
+        tensor: bytes,
+        candidate: bytes,
+        output_shape: tuple[int, ...],
+        successor: bytes,
+        execution: dict,
+    ) -> bytes:
         payload = candidate + successor
         return encode_frame(
             {
@@ -402,6 +417,7 @@ class Worker:
                 "detail": "",
                 "candidate_hex": candidate.hex(),
                 "successor_hex": successor.hex(),
+                "output_shape": list(output_shape),
                 "input_tensor_digest": _digest(tensor),
                 "output_numeric_digest": _digest(candidate),
                 "return_payload_digest": _digest(payload),
@@ -421,6 +437,7 @@ class Worker:
                 "detail": safe_detail,
                 "candidate_hex": "",
                 "successor_hex": "",
+                "output_shape": [],
                 "input_tensor_digest": "",
                 "output_numeric_digest": "",
                 "return_payload_digest": "",
@@ -453,7 +470,11 @@ class Worker:
             epoch = cls._integer(value["epoch"], "epoch", 64)
             cutoff = cls._integer(value["cutoff_ns"], "cutoff", 64)
             predecessor = value["predecessor_digest"]
-            if not isinstance(predecessor, str) or len(predecessor) != HEX_DIGEST_CHARS:
+            if (
+                not isinstance(predecessor, str)
+                or len(predecessor) != HEX_DIGEST_CHARS
+                or any(character not in "0123456789abcdef" for character in predecessor)
+            ):
                 return dict(FALLBACK_IDENTITY)
             bytes.fromhex(predecessor)
             return {

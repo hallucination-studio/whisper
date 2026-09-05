@@ -16,7 +16,7 @@ const PROTOCOL_VERSION: u16 = 1;
 const ARTIFACT_SCHEMA_VERSION: u16 = 1;
 const MAX_TEXT_BYTES: usize = 128;
 /// Smallest frame that can carry a complete schema-valid WMW1 failure response.
-pub const MIN_FRAME_BYTES: usize = 386;
+pub const MIN_FRAME_BYTES: usize = 404;
 
 /// SHA-256 digest used for immutable worker inputs and outputs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,6 +62,9 @@ impl<'de> Deserialize<'de> for ContentDigest {
         let value = String::deserialize(deserializer)?;
         if value.len() != 64 {
             return Err(serde::de::Error::custom("digest must contain 64 hex characters"));
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+            return Err(serde::de::Error::custom("digest must use canonical lowercase hex"));
         }
         let mut bytes = [0_u8; 32];
         for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
@@ -958,6 +961,7 @@ pub struct ModelResponse {
     candidate_hex: Vec<u8>,
     #[serde(with = "hex_bytes")]
     successor_hex: Vec<u8>,
+    output_shape: Vec<u32>,
     #[serde(default, with = "optional_digest")]
     input_tensor_digest: Option<ContentDigest>,
     #[serde(default, with = "optional_digest")]
@@ -977,6 +981,7 @@ struct ModelResponseWire {
     candidate_hex: Vec<u8>,
     #[serde(with = "hex_bytes")]
     successor_hex: Vec<u8>,
+    output_shape: Vec<u32>,
     #[serde(default, with = "optional_digest")]
     input_tensor_digest: Option<ContentDigest>,
     #[serde(default, with = "optional_digest")]
@@ -999,6 +1004,7 @@ impl<'de> Deserialize<'de> for ModelResponse {
             detail: wire.detail,
             candidate_hex: wire.candidate_hex,
             successor_hex: wire.successor_hex,
+            output_shape: wire.output_shape,
             input_tensor_digest: wire.input_tensor_digest,
             output_numeric_digest: wire.output_numeric_digest,
             return_payload_digest: wire.return_payload_digest,
@@ -1027,6 +1033,7 @@ impl ModelResponse {
             detail: detail.into(),
             candidate_hex: Vec::new(),
             successor_hex: Vec::new(),
+            output_shape: Vec::new(),
             input_tensor_digest: None,
             output_numeric_digest: None,
             return_payload_digest: None,
@@ -1066,7 +1073,11 @@ impl ModelResponse {
     fn validate(&self, limits: &WorkerLimits) -> Result<(), ModelWorkerError> {
         self.validate_contract()?;
         check_limit(self.candidate_hex.len(), limits.max_result_bytes, "candidate")?;
-        check_limit(self.successor_hex.len(), limits.max_checkpoint_bytes, "successor checkpoint")
+        check_limit(self.successor_hex.len(), limits.max_checkpoint_bytes, "successor checkpoint")?;
+        if self.status == ResponseStatus::Success {
+            validate_shape_dimensions(&self.output_shape, limits)?;
+        }
+        Ok(())
     }
 
     fn validate_contract(&self) -> Result<(), ModelWorkerError> {
@@ -1079,6 +1090,12 @@ impl ModelResponse {
             return Err(ModelWorkerError::invalid("response detail exceeds 256 bytes"));
         }
         if self.status == ResponseStatus::Success {
+            let output_elements = shape_elements(&self.output_shape, "response output shape")?;
+            if output_elements.checked_mul(size_of::<f32>()) != Some(self.candidate_hex.len()) {
+                return Err(ModelWorkerError::invalid(
+                    "candidate byte count does not match response output shape",
+                ));
+            }
             let candidate_digest = ContentDigest::of(&self.candidate_hex);
             let mut payload = self.candidate_hex.clone();
             payload.extend_from_slice(&self.successor_hex);
@@ -1097,6 +1114,7 @@ impl ModelResponse {
                 .validate()?;
         } else if !self.candidate_hex.is_empty()
             || !self.successor_hex.is_empty()
+            || !self.output_shape.is_empty()
             || self.input_tensor_digest.is_some()
             || self.output_numeric_digest.is_some()
             || self.return_payload_digest.is_some()
@@ -1232,6 +1250,7 @@ impl ModelResponse {
             .checked_mul(size_of::<f32>())
             .ok_or_else(|| ModelWorkerError::invalid("candidate byte count overflow"))?;
         if self.candidate_hex.len() != expected_bytes
+            || self.output_shape != request.model_run.output_shape
             || self.input_tensor_digest != Some(request.input_manifest.tensor_digest)
             || self.numeric_qualification.as_ref() != Some(&request.model_run.execution)
         {
@@ -1482,8 +1501,12 @@ mod hex_bytes {
         D: Deserializer<'de>,
     {
         let text = String::deserialize(deserializer)?;
-        if text.len() % 2 != 0 {
-            return Err(serde::de::Error::custom("hex bytes require an even character count"));
+        if text.len() % 2 != 0
+            || !text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(serde::de::Error::custom(
+                "hex bytes require an even count of canonical lowercase characters",
+            ));
         }
         text.as_bytes()
             .chunks_exact(2)

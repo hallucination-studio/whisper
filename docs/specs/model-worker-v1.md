@@ -11,12 +11,15 @@ One request and one response use a local Unix-domain stream. Each message is
 exactly `WMW1`, a four-byte unsigned big-endian JSON byte count, and one UTF-8
 JSON object. The count excludes the eight-byte header. Implementations reject a
 declared frame exceeding their configured ceiling before allocating its body.
-There is no HTTP or WebSocket endpoint.
+The configured ceiling is at least 404 bytes, the size required for a complete
+failure response with the canonical fallback identity. There is no HTTP or
+WebSocket endpoint.
 
 JSON is emitted without insignificant whitespace. Binary material and SHA-256
-digests use lowercase hexadecimal strings. Protocol and artifact schema version
-`1` are the only accepted versions. Text identities are non-empty and no longer
-than 128 UTF-8 bytes.
+digests use canonical lowercase hexadecimal strings; uppercase or otherwise
+non-canonical encodings are rejected rather than normalized. Protocol and
+artifact schema version `1` are the only accepted versions. Text identities are
+non-empty and no longer than 128 UTF-8 bytes.
 
 ## Request
 
@@ -55,11 +58,13 @@ qualification follows the declared settings and tolerances.
 Every response repeats protocol version and request identity. Success returns
 bounded candidate and successor-checkpoint bytes plus three distinct digests:
 the input tensor digest, numerical output digest, and digest of the exact
-candidate-plus-successor return payload. It repeats the numerical qualification.
+candidate-plus-successor return payload. It also returns the operator's exact
+output shape and repeats the numerical qualification.
 The Rust client rejects an identity, input digest, output shape, payload digest,
 or numerical qualification that differs from the request.
 
-Failures carry no candidate, checkpoint, or qualification. Status is one of
+Failures carry an empty output shape and no candidate, checkpoint, or
+qualification. Status is one of
 `unsupported_version`, `malformed_request`, `contract_mismatch`,
 `digest_mismatch`, `invalid_shape`, `limit_exceeded`, `deadline_exceeded`,
 `epoch_mismatch`, `non_finite`, `gpu_oom`, `backend_unavailable`, or
@@ -79,6 +84,12 @@ The Rust per-state-stream queue has at most one in-flight request and one latest
 pending context. Submitting while busy replaces only that pending context and
 returns immediately, so numerical backpressure does not block raw ingress.
 Frames and retained pending context each have explicit byte ceilings.
+
+The cross-language fixture holds a model request in flight, admits authenticated
+native capability and CSI datagrams through the production Host UDP seam, and
+observes their raw transaction-A facts before releasing a bounded worker
+failure. The worker is checked before and after execution for the absence of any
+Store or fact-log handle.
 
 The worker is a replaceable calculator. It has no Store handle, fact log,
 artifact registry, predecessor selection, activation, current-world or history

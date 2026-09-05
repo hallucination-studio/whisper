@@ -105,6 +105,7 @@ class WorkerProtocolTests(unittest.TestCase):
         response_bytes, response = self.run_request(request())
         self.assertEqual(response["status"], "success")
         self.assertEqual(struct.unpack("<ff", bytes.fromhex(response["candidate_hex"])), (3.0, -4.0))
+        self.assertEqual(response["output_shape"], [2])
         self.assertEqual(response["input_tensor_digest"], digest(struct.pack("<ff", 1.5, -2.0)))
         self.assertEqual(response["output_numeric_digest"], digest(struct.pack("<ff", 3.0, -4.0)))
         payload = bytes.fromhex(response["candidate_hex"]) + bytes.fromhex(response["successor_hex"])
@@ -184,11 +185,21 @@ class WorkerProtocolTests(unittest.TestCase):
     def test_wrong_result_shape_is_a_bounded_failure(self) -> None:
         class WrongShapeOperator:
             def evaluate(self, _request):
-                return struct.pack("<f", 1.0), b"successor"
+                return struct.pack("<f", 1.0), (1,), b"successor"
 
         worker = Worker(WrongShapeOperator(), Limits(), now_ns=lambda: 1)
         response = decode_frame(worker.handle_frame(encode_frame(request(), Limits())), Limits())
         self.assertEqual(response["status"], "invalid_shape")
+
+    def test_same_element_wrong_output_shape_is_rejected(self) -> None:
+        class WrongShapeOperator:
+            def evaluate(self, _request):
+                return struct.pack("<ff", 1.0, 2.0), (1, 2), b"successor"
+
+        worker = Worker(WrongShapeOperator(), Limits(), now_ns=lambda: 1)
+        response = decode_frame(worker.handle_frame(encode_frame(request(), Limits())), Limits())
+        self.assertEqual(response["status"], "invalid_shape")
+        self.assertEqual(response["output_shape"], [])
 
     def test_negative_reference_counts_and_unexpected_operator_faults_are_bounded(self) -> None:
         negative = request(request_id="negative-count")
@@ -241,7 +252,7 @@ class WorkerProtocolTests(unittest.TestCase):
                 for mutate in mutations:
                     with test_case.assertRaises(TypeError):
                         mutate()
-                return struct.pack("<ff", 3.0, -4.0), b"successor"
+                return struct.pack("<ff", 3.0, -4.0), (2,), b"successor"
 
         ticks = iter((1, 10_000_000_000))
         worker = Worker(MutatingOperator(), Limits(), now_ns=lambda: next(ticks))
@@ -269,6 +280,25 @@ class WorkerProtocolTests(unittest.TestCase):
                 response = decode_frame(worker.handle_frame(encode_frame(value, Limits())), Limits())
                 self.assertEqual(response["status"], "malformed_request")
 
+    def test_uppercase_binary_and_digest_hex_are_rejected_as_bounded_failures(self) -> None:
+        mutations = (
+            ("weights bytes", "malformed_request", lambda value: value["model_run"].__setitem__("weights_hex", value["model_run"]["weights_hex"].upper())),
+            ("manifest bytes", "malformed_request", lambda value: value["input_manifest"].__setitem__("manifest_hex", value["input_manifest"]["manifest_hex"].upper())),
+            ("tensor bytes", "malformed_request", lambda value: value["input_manifest"].__setitem__("tensor_hex", "0A00000000000000")),
+            ("checkpoint bytes", "malformed_request", lambda value: value["checkpoint"].__setitem__("bytes_hex", value["checkpoint"]["bytes_hex"].upper())),
+            ("weights digest", "digest_mismatch", lambda value: value["model_run"].__setitem__("weights_digest", value["model_run"]["weights_digest"].upper())),
+            ("manifest digest", "digest_mismatch", lambda value: value["input_manifest"].__setitem__("manifest_digest", value["input_manifest"]["manifest_digest"].upper())),
+            ("tensor digest", "digest_mismatch", lambda value: value["input_manifest"].__setitem__("tensor_digest", value["input_manifest"]["tensor_digest"].upper())),
+            ("checkpoint digest", "digest_mismatch", lambda value: value["checkpoint"].__setitem__("digest", value["checkpoint"]["digest"].upper())),
+        )
+        for index, (name, expected, mutate) in enumerate(mutations):
+            with self.subTest(name=name):
+                value = request(request_id=f"uppercase-{index}")
+                mutate(value)
+                response = decode_frame(self.worker.handle_frame(encode_frame(value, Limits())), Limits())
+                self.assertEqual(response["status"], expected)
+                self.assertEqual(response["candidate_hex"], "")
+
     def test_malformed_identity_and_unicode_detail_always_fit_failure_frame(self) -> None:
         limits = Limits(max_frame_bytes=1024)
         malformed = {
@@ -293,6 +323,7 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(response["identity"], dict(FALLBACK_IDENTITY))
         self.assertEqual(response["candidate_hex"], "")
         self.assertEqual(response["successor_hex"], "")
+        self.assertEqual(response["output_shape"], [])
         self.assertEqual(response["input_tensor_digest"], "")
         self.assertEqual(response["output_numeric_digest"], "")
         self.assertEqual(response["return_payload_digest"], "")

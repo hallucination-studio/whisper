@@ -63,6 +63,35 @@ fn request(id: &str, tensor: Vec<u8>) -> ModelRequest {
     ModelRequest::new(identity, u64::MAX, run, manifest, checkpoint)
 }
 
+fn success_response_value(model_request: &ModelRequest) -> serde_json::Value {
+    let request_value = serde_json::to_value(model_request).unwrap();
+    let candidate = [1.0_f32.to_le_bytes(), 2.0_f32.to_le_bytes()].concat();
+    let successor = b"successor".to_vec();
+    let mut payload = candidate.clone();
+    payload.extend_from_slice(&successor);
+    serde_json::json!({
+        "protocol_version": 1,
+        "identity": request_value["identity"],
+        "status": "success",
+        "detail": "",
+        "candidate_hex": candidate.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "successor_hex": successor.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "output_shape": [2],
+        "input_tensor_digest": request_value["input_manifest"]["tensor_digest"],
+        "output_numeric_digest": ContentDigest::of(&candidate),
+        "return_payload_digest": ContentDigest::of(&payload),
+        "numeric_qualification": request_value["model_run"]["execution"],
+    })
+}
+
+fn frame_from_value(value: &serde_json::Value) -> Vec<u8> {
+    let payload = serde_json::to_vec(value).unwrap();
+    let mut frame = b"WMW1".to_vec();
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
 #[test]
 fn codec_preserves_frozen_request_identity_and_bytes() {
     let limits = WorkerLimits::default();
@@ -162,6 +191,34 @@ fn local_client_sends_and_receives_one_bounded_frame() {
 }
 
 #[test]
+fn local_client_rejects_same_element_wrong_output_shape() {
+    let temporary =
+        std::env::temp_dir().join(format!("whisper-worker-shape-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    let listener = UnixListener::bind(&temporary).unwrap();
+    let model_request = request("request-shape", vec![0; 4]);
+    let mut response = success_response_value(&model_request);
+    response["output_shape"] = serde_json::json!([1, 2]);
+    let response_frame = frame_from_value(&response);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut header = [0; 8];
+        stream.read_exact(&mut header).unwrap();
+        let length = u32::from_be_bytes(header[4..].try_into().unwrap()) as usize;
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).unwrap();
+        stream.write_all(&response_frame).unwrap();
+    });
+
+    let error = WorkerClient::new(WorkerLimits::default(), Duration::from_secs(1))
+        .execute(&temporary, &model_request)
+        .unwrap_err();
+    assert!(error.to_string().contains("shape"));
+    server.join().unwrap();
+    std::fs::remove_file(temporary).unwrap();
+}
+
+#[test]
 fn rust_client_interoperates_with_python_worker() {
     let temporary = std::path::PathBuf::from(format!("/tmp/ww-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&temporary);
@@ -229,6 +286,9 @@ fn decode_rechecks_identifier_and_numeric_invariants() {
 fn public_deserialization_preserves_identifier_and_numeric_invariants() {
     assert!(serde_json::from_str::<ModelRunId>("\"\"").is_err());
     assert!(serde_json::from_str::<whisper::model_worker::ModelRequestId>("\"\"").is_err());
+    let uppercase_digest =
+        serde_json::to_string(&ContentDigest::of(b"canonical-hex")).unwrap().to_uppercase();
+    assert!(serde_json::from_str::<ContentDigest>(&uppercase_digest).is_err());
 
     for invalid in [
         r#"{"class":"cpu_baseline","deterministic_algorithms":true,"absolute_tolerance":-1.0,"relative_tolerance":0.0,"environment":"rust-test-f32"}"#,
@@ -248,6 +308,10 @@ fn model_run_deserialization_rejects_invalid_schema_digest_text_and_shapes() {
         ("algorithm", serde_json::json!("")),
         ("max_shape", serde_json::json!([])),
         ("output_shape", serde_json::json!([0])),
+        (
+            "weights_hex",
+            serde_json::json!(model_run["weights_hex"].as_str().unwrap().to_uppercase()),
+        ),
     ] {
         let mut mutated = model_run.clone();
         mutated[field] = invalid;
@@ -268,6 +332,11 @@ fn input_manifest_deserialization_rejects_invalid_schema_digests_text_and_shape(
         ("tensor_digest", serde_json::json!("00".repeat(32))),
         ("preprocessing", serde_json::json!("")),
         ("shape", serde_json::json!([2])),
+        (
+            "manifest_hex",
+            serde_json::json!(manifest["manifest_hex"].as_str().unwrap().to_uppercase()),
+        ),
+        ("tensor_hex", serde_json::json!("0A000000")),
     ] {
         let mut mutated = manifest.clone();
         mutated[field] = invalid;
@@ -283,6 +352,11 @@ fn checkpoint_deserialization_rejects_digest_mutation() {
     let value = serde_json::to_value(request("request-1", vec![0; 4])).unwrap();
     let mut checkpoint = value["checkpoint"].clone();
     checkpoint["digest"] = serde_json::json!("00".repeat(32));
+    assert!(serde_json::from_value::<Checkpoint>(checkpoint).is_err());
+
+    let mut checkpoint = value["checkpoint"].clone();
+    checkpoint["bytes_hex"] =
+        serde_json::json!(checkpoint["bytes_hex"].as_str().unwrap().to_uppercase());
     assert!(serde_json::from_value::<Checkpoint>(checkpoint).is_err());
 }
 
@@ -333,26 +407,15 @@ fn model_response_deserialization_rejects_invalid_success_and_failure_invariants
     failure["candidate_hex"] = serde_json::json!("00000000");
     assert!(serde_json::from_value::<ModelResponse>(failure).is_err());
 
-    let request_value = serde_json::to_value(&model_request).unwrap();
-    let candidate = [1.0_f32.to_le_bytes(), 2.0_f32.to_le_bytes()].concat();
-    let successor = b"successor".to_vec();
-    let mut payload = candidate.clone();
-    payload.extend_from_slice(&successor);
-    let mut success = serde_json::json!({
-        "protocol_version": 1,
-        "identity": request_value["identity"],
-        "status": "success",
-        "detail": "",
-        "candidate_hex": candidate.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-        "successor_hex": successor.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-        "input_tensor_digest": request_value["input_manifest"]["tensor_digest"],
-        "output_numeric_digest": ContentDigest::of(&candidate),
-        "return_payload_digest": ContentDigest::of(&payload),
-        "numeric_qualification": request_value["model_run"]["execution"],
-    });
+    let mut success = success_response_value(&model_request);
     assert!(serde_json::from_value::<ModelResponse>(success.clone()).is_ok());
     success["output_numeric_digest"] = serde_json::json!("00".repeat(32));
     assert!(serde_json::from_value::<ModelResponse>(success).is_err());
+
+    let mut uppercase = success_response_value(&model_request);
+    uppercase["candidate_hex"] =
+        serde_json::json!(uppercase["candidate_hex"].as_str().unwrap().to_uppercase());
+    assert!(serde_json::from_value::<ModelResponse>(uppercase).is_err());
 }
 
 #[test]
