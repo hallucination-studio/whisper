@@ -1,6 +1,49 @@
 //! Sole-writer transaction A and durable replay-state persistence.
 
 use super::*;
+use crate::native_frame::{
+    LTF_BLOCK_BYTES, LtfBlock, LtfKind, S3BandwidthKind, S3PhyKind, S3SecondaryKind,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeRoutePin {
+    sensor: SensorId,
+    source_mac: SourceMac,
+    channel: ChannelPolicy,
+    radio: RadioRouteFacts,
+    firmware_build: FirmwareBuildIdentity,
+    capability: CapabilityIdentity,
+}
+
+struct StoredNativeRoutePin {
+    sensor: String,
+    source_mac: Vec<u8>,
+    channel: i64,
+    secondary: i64,
+    phy: i64,
+    bandwidth: i64,
+    stbc: i64,
+    rate: i64,
+    mcs: i64,
+    rx_antenna: i64,
+    firmware_build: Vec<u8>,
+    capability: Vec<u8>,
+}
+
+impl NativeRoutePin {
+    fn from_route(route: &NativeFrameRoute) -> Self {
+        let decoded = route.decoded();
+        Self {
+            sensor: decoded.sensor().clone(),
+            source_mac: decoded.source_mac(),
+            channel: decoded.channel(),
+            radio: decoded.radio(),
+            firmware_build: decoded.firmware_build(),
+            capability: decoded.capability(),
+        }
+    }
+}
+
 pub(super) fn writer_loop(
     config: WriterConfig,
     ingress: mpsc::Receiver<AdmittedDatagram>,
@@ -103,11 +146,21 @@ fn load_replay_states(
     let row_count: usize = connection
         .query_row("SELECT count(*) FROM replay_windows", [], |row| row.get(0))
         .map_err(|error| HostError::database_at(path, error))?;
+    let pin_count: usize = connection
+        .query_row("SELECT count(*) FROM native_route_pins", [], |row| row.get(0))
+        .map_err(|error| HostError::database_at(path, error))?;
     if configured == 0 && row_count != 0 {
         return Err(HostError::message_at(
             "validate retained replay state",
             path,
             "unprovisioned Store contains replay state",
+        ));
+    }
+    if configured == 0 && pin_count != 0 {
+        return Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "unprovisioned Store contains native route identity",
         ));
     }
     if configured == 1 && row_count != routes.len() {
@@ -123,6 +176,9 @@ fn load_replay_states(
             path,
             "persisted admission configuration marker is invalid",
         ));
+    }
+    if configured == 1 {
+        validate_native_route_pins(connection, path, routes)?;
     }
     let states = routes
         .iter()
@@ -187,6 +243,40 @@ fn load_replay_states(
     Ok(ReplayStartup { states, provision: configured == 0 })
 }
 
+pub(super) fn validate_native_route_pins(
+    connection: &Connection,
+    path: &Path,
+    routes: &[NativeFrameRoute],
+) -> Result<(), HostError> {
+    let pin_count: usize = connection
+        .query_row("SELECT count(*) FROM native_route_pins", [], |row| row.get(0))
+        .map_err(|error| HostError::database_at(path, error))?;
+    if pin_count != routes.len() {
+        return Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route identity set does not match configuration",
+        ));
+    }
+    for route in routes {
+        let Some(stored) = load_native_route_pin(connection, path, route)? else {
+            return Err(HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "configured native route is missing persisted identity",
+            ));
+        };
+        if stored != NativeRoutePin::from_route(route) {
+            return Err(HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "persisted native route identity does not match configuration",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn provision_replay_states(
     connection: &mut Connection,
     routes: &[NativeFrameRoute],
@@ -194,6 +284,30 @@ fn provision_replay_states(
 ) -> Result<(), rusqlite::Error> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (route, state) in routes.iter().zip(states) {
+        let decoded = route.decoded();
+        transaction.execute(
+            "INSERT INTO native_route_pins (
+                 device_id, key_epoch, sensor_id, source_mac, channel,
+                 secondary, phy, bandwidth, stbc, rate, mcs, rx_antenna,
+                 firmware_build_digest, capability_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                route.device_id.get().to_be_bytes(),
+                route.key_epoch.get().to_be_bytes(),
+                decoded.sensor().as_str(),
+                decoded.source_mac().into_bytes(),
+                decoded.channel().get(),
+                secondary_byte(decoded.radio().secondary()),
+                phy_byte(decoded.radio().phy()),
+                bandwidth_byte(decoded.radio().bandwidth()),
+                u8::from(decoded.radio().stbc()),
+                decoded.radio().rate(),
+                decoded.radio().mcs(),
+                decoded.radio().rx_antenna(),
+                decoded.firmware_build().into_bytes(),
+                decoded.capability().into_bytes(),
+            ],
+        )?;
         transaction.execute(
             "INSERT INTO replay_windows
                  (device_id, key_epoch, identity, window_packets, state)
@@ -210,6 +324,157 @@ fn provision_replay_states(
     transaction
         .execute("UPDATE store_identity SET admission_configured = 1 WHERE singleton = 1", [])?;
     transaction.commit()
+}
+
+fn load_native_route_pin(
+    connection: &Connection,
+    path: &Path,
+    route: &NativeFrameRoute,
+) -> Result<Option<NativeRoutePin>, HostError> {
+    let stored: Option<StoredNativeRoutePin> = connection
+        .query_row(
+            "SELECT sensor_id, source_mac, channel, secondary, phy, bandwidth,
+                        stbc, rate, mcs, rx_antenna, firmware_build_digest, capability_digest
+                 FROM native_route_pins
+                 WHERE device_id = ?1 AND key_epoch = ?2",
+            params![route.device_id.get().to_be_bytes(), route.key_epoch.get().to_be_bytes()],
+            |row| {
+                Ok(StoredNativeRoutePin {
+                    sensor: row.get(0)?,
+                    source_mac: row.get(1)?,
+                    channel: row.get(2)?,
+                    secondary: row.get(3)?,
+                    phy: row.get(4)?,
+                    bandwidth: row.get(5)?,
+                    stbc: row.get(6)?,
+                    rate: row.get(7)?,
+                    mcs: row.get(8)?,
+                    rx_antenna: row.get(9)?,
+                    firmware_build: row.get(10)?,
+                    capability: row.get(11)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let sensor = SensorId::try_from(stored.sensor.as_str()).map_err(|_| {
+        HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route sensor identity is invalid",
+        )
+    })?;
+    let source_mac = SourceMac::try_from(stored.source_mac.as_slice()).map_err(|_| {
+        HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route source MAC is invalid",
+        )
+    })?;
+    let channel = ChannelPolicy::try_from(native_route_u8(path, "channel", stored.channel)?)
+        .map_err(|_| {
+            HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "persisted native route channel is invalid",
+            )
+        })?;
+    let secondary = native_route_secondary(path, stored.secondary)?;
+    let phy = native_route_phy(path, stored.phy)?;
+    let bandwidth = native_route_bandwidth(path, stored.bandwidth)?;
+    let stbc = match stored.stbc {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "persisted native route STBC flag is invalid",
+            ));
+        }
+    };
+    let rate = native_route_u8(path, "rate", stored.rate)?;
+    let mcs = native_route_u8(path, "MCS", stored.mcs)?;
+    let rx_antenna = native_route_u8(path, "receive antenna", stored.rx_antenna)?;
+    let firmware_build = FirmwareBuildIdentity::try_from(stored.firmware_build.as_slice())
+        .map_err(|_| {
+            HostError::message_at(
+                "validate retained native route identity",
+                path,
+                "persisted native route firmware-build identity is invalid",
+            )
+        })?;
+    let capability = CapabilityIdentity::try_from(stored.capability.as_slice()).map_err(|_| {
+        HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route capability identity is invalid",
+        )
+    })?;
+    Ok(Some(NativeRoutePin {
+        sensor,
+        source_mac,
+        channel,
+        radio: RadioRouteFacts { phy, bandwidth, secondary, stbc, rate, mcs, rx_antenna },
+        firmware_build,
+        capability,
+    }))
+}
+
+fn native_route_u8(path: &Path, field: &'static str, value: i64) -> Result<u8, HostError> {
+    u8::try_from(value).map_err(|_| {
+        HostError::message_at(
+            "validate retained native route identity",
+            path,
+            match field {
+                "channel" => "persisted native route channel is invalid",
+                "rate" => "persisted native route rate is invalid",
+                "MCS" => "persisted native route MCS is invalid",
+                "receive antenna" => "persisted native route receive antenna is invalid",
+                _ => "persisted native route numeric identity is invalid",
+            },
+        )
+    })
+}
+
+fn native_route_secondary(path: &Path, value: i64) -> Result<S3SecondaryKind, HostError> {
+    match value {
+        0 => Ok(S3SecondaryKind::None),
+        1 => Ok(S3SecondaryKind::Above),
+        2 => Ok(S3SecondaryKind::Below),
+        _ => Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route secondary-channel identity is invalid",
+        )),
+    }
+}
+
+fn native_route_phy(path: &Path, value: i64) -> Result<S3PhyKind, HostError> {
+    match value {
+        1 => Ok(S3PhyKind::NonHt),
+        2 => Ok(S3PhyKind::Ht),
+        _ => Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route PHY identity is invalid",
+        )),
+    }
+}
+
+fn native_route_bandwidth(path: &Path, value: i64) -> Result<S3BandwidthKind, HostError> {
+    match value {
+        1 => Ok(S3BandwidthKind::TwentyMhz),
+        2 => Ok(S3BandwidthKind::FortyMhz),
+        _ => Err(HostError::message_at(
+            "validate retained native route identity",
+            path,
+            "persisted native route bandwidth identity is invalid",
+        )),
+    }
 }
 
 fn persist_admitted(
@@ -257,6 +522,23 @@ fn persist_admitted(
             ],
         )
         .map_err(|error| HostError::database_at(path, error))?;
+    let fact_id = transaction.last_insert_rowid();
+    let semantic_rejection = match decode_authenticated(&item.authenticated) {
+        Ok(decoded) => {
+            persist_typed_fact(&transaction, path, fact_id, route, &item, decoded.message())?
+        }
+        Err(error) => Some(match error {
+            crate::native_frame::WireError::UnknownKind { .. } => RejectReason::UnknownKind,
+            crate::native_frame::WireError::MalformedBody { .. } => RejectReason::MalformedBody,
+            _ => {
+                return Err(HostError::message_at(
+                    "decode authenticated native-frame",
+                    path,
+                    "authenticated datagram failed after ingress authentication",
+                ));
+            }
+        }),
+    };
     persist_sequence_discontinuity(&transaction, path, previous, &item)?;
     transaction
         .execute(
@@ -273,7 +555,283 @@ fn persist_admitted(
         .map_err(|error| HostError::database_at(path, error))?;
     transaction.commit().map_err(|error| HostError::database_at(path, error))?;
     state.admission = next;
+    if let Some(reason) = semantic_rejection {
+        record_rejection(rejections, item.peer, reason);
+    }
     Ok(())
+}
+
+fn persist_typed_fact(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &Path,
+    fact_id: i64,
+    route: &NativeFrameRoute,
+    item: &AdmittedDatagram,
+    message: &Message,
+) -> Result<Option<RejectReason>, HostError> {
+    if let Some(reason) = route.semantic_rejection(message) {
+        return Ok(Some(reason));
+    }
+    match message {
+        Message::Capabilities(capability) => {
+            if let Some(expected) =
+                previous_capability_digest(transaction, path, &item.header, fact_id)?
+                && expected != capability.capability_digest()
+            {
+                return Ok(Some(RejectReason::CapabilityConflict));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO native_capability_facts (
+                         fact_id, capability_digest, firmware_build_digest,
+                         idf_wifi_abi_digest, datagram_budget_bytes
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        fact_id,
+                        capability.capability_digest(),
+                        capability.descriptor().firmware_build_digest(),
+                        capability.descriptor().idf_wifi_abi_digest(),
+                        capability.descriptor().datagram_budget_bytes(),
+                    ],
+                )
+                .map_err(|error| HostError::database_at(path, error))?;
+            Ok(None)
+        }
+        Message::CsiData(data) => {
+            let Some(expected) =
+                previous_capability_digest(transaction, path, &item.header, fact_id)?
+            else {
+                return Ok(Some(RejectReason::CapabilityUnavailable));
+            };
+            if expected != data.capability_digest() {
+                return Ok(Some(RejectReason::CapabilityConflict));
+            }
+            if let Some(source_mac) = previous_csi_source(transaction, path, &item.header, fact_id)?
+                && source_mac != data.source_mac()
+            {
+                return Ok(Some(RejectReason::SourceConflict));
+            }
+            if let Some(channel) = previous_csi_channel(transaction, path, &item.header, fact_id)?
+                && channel != data.radio().channel()
+            {
+                return Ok(Some(RejectReason::RadioConflict));
+            }
+            let blocks = encode_blocks(data.blocks());
+            transaction
+                .execute(
+                    "INSERT INTO native_csi_facts (
+                         fact_id, capability_digest, capture_sequence,
+                         driver_rx_timestamp_us, callback_tick_us, source_mac,
+                         channel, secondary, phy, bandwidth, stbc, rssi_dbm,
+                         noise_floor_dbm, rate, mcs, rx_antenna,
+                         first_invalid_bytes, trailing_invalid_bytes,
+                         complex_sample_count, blocks, raw_csi
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                         ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                     )",
+                    params![
+                        fact_id,
+                        data.capability_digest(),
+                        data.capture_sequence().to_be_bytes(),
+                        data.driver_rx_timestamp_us(),
+                        data.callback_tick_us().to_be_bytes(),
+                        data.source_mac(),
+                        data.radio().channel(),
+                        secondary_byte(data.radio().secondary()),
+                        phy_byte(data.radio().phy()),
+                        bandwidth_byte(data.radio().bandwidth()),
+                        u8::from(data.radio().stbc()),
+                        data.radio().rssi_dbm(),
+                        data.radio().noise_floor_dbm(),
+                        data.radio().rate(),
+                        data.radio().mcs(),
+                        data.radio().rx_antenna(),
+                        data.first_invalid_bytes(),
+                        data.trailing_invalid_bytes(),
+                        data.complex_sample_count(),
+                        blocks,
+                        data.raw_csi(),
+                    ],
+                )
+                .map_err(|error| HostError::database_at(path, error))?;
+            Ok(None)
+        }
+        Message::Health(health) => {
+            if let Some(expected) =
+                previous_capability_digest(transaction, path, &item.header, fact_id)?
+                && expected != health.capability_digest()
+            {
+                return Ok(Some(RejectReason::CapabilityConflict));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO native_health_facts (
+                         fact_id, capability_digest, callback_tick_us, capture_seen,
+                         queue_drop_no_slot, queue_drop_full, oversize_reject,
+                         encode_reject, send_failure, pool_high_water_slots,
+                         callback_max_us, encoder_max_us
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        fact_id,
+                        health.capability_digest(),
+                        health.callback_tick_us().to_be_bytes(),
+                        health.capture_seen().to_be_bytes(),
+                        health.queue_drop_no_slot().to_be_bytes(),
+                        health.queue_drop_full().to_be_bytes(),
+                        health.oversize_reject().to_be_bytes(),
+                        health.encode_reject().to_be_bytes(),
+                        health.send_failure().to_be_bytes(),
+                        health.pool_high_water_slots(),
+                        health.callback_max_us(),
+                        health.encoder_max_us(),
+                    ],
+                )
+                .map_err(|error| HostError::database_at(path, error))?;
+            Ok(None)
+        }
+    }
+}
+
+fn previous_capability_digest(
+    connection: &rusqlite::Transaction<'_>,
+    path: &Path,
+    header: &Header,
+    fact_id: i64,
+) -> Result<Option<[u8; 32]>, HostError> {
+    let value: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT c.capability_digest
+             FROM native_capability_facts AS c
+             JOIN raw_facts AS f ON f.fact_id = c.fact_id
+             WHERE f.device_id = ?1 AND f.key_epoch = ?2
+               AND f.boot_generation = ?3 AND c.fact_id < ?4
+             ORDER BY c.fact_id DESC LIMIT 1",
+            params![
+                header.device_id().to_be_bytes(),
+                header.key_epoch().to_be_bytes(),
+                header.boot_generation().to_be_bytes(),
+                fact_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))?;
+    value
+        .map(|bytes| {
+            bytes.try_into().map_err(|_| {
+                HostError::message_at(
+                    "validate persisted native capability state",
+                    path,
+                    "persisted capability digest width is invalid",
+                )
+            })
+        })
+        .transpose()
+}
+
+fn previous_csi_source(
+    connection: &rusqlite::Transaction<'_>,
+    path: &Path,
+    header: &Header,
+    fact_id: i64,
+) -> Result<Option<[u8; 6]>, HostError> {
+    let value: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT c.source_mac
+             FROM native_csi_facts AS c
+             JOIN raw_facts AS f ON f.fact_id = c.fact_id
+             WHERE f.device_id = ?1 AND f.key_epoch = ?2
+               AND f.boot_generation = ?3 AND c.fact_id < ?4
+             ORDER BY c.fact_id DESC LIMIT 1",
+            params![
+                header.device_id().to_be_bytes(),
+                header.key_epoch().to_be_bytes(),
+                header.boot_generation().to_be_bytes(),
+                fact_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))?;
+    value
+        .map(|bytes| {
+            bytes.try_into().map_err(|_| {
+                HostError::message_at(
+                    "validate persisted native CSI state",
+                    path,
+                    "persisted CSI source MAC width is invalid",
+                )
+            })
+        })
+        .transpose()
+}
+
+fn previous_csi_channel(
+    connection: &rusqlite::Transaction<'_>,
+    path: &Path,
+    header: &Header,
+    fact_id: i64,
+) -> Result<Option<u8>, HostError> {
+    connection
+        .query_row(
+            "SELECT c.channel
+             FROM native_csi_facts AS c
+             JOIN raw_facts AS f ON f.fact_id = c.fact_id
+             WHERE f.device_id = ?1 AND f.key_epoch = ?2
+               AND f.boot_generation = ?3 AND c.fact_id < ?4
+             ORDER BY c.fact_id DESC LIMIT 1",
+            params![
+                header.device_id().to_be_bytes(),
+                header.key_epoch().to_be_bytes(),
+                header.boot_generation().to_be_bytes(),
+                fact_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| HostError::database_at(path, error))
+}
+
+fn encode_blocks(blocks: &[LtfBlock]) -> Box<[u8]> {
+    let mut encoded = Vec::with_capacity(blocks.len() * LTF_BLOCK_BYTES);
+    for block in blocks {
+        encoded.push(ltf_kind_byte(block.kind()));
+        encoded.push(0);
+        encoded.extend_from_slice(&block.sample_count().to_le_bytes());
+        encoded.extend_from_slice(&block.raw_offset_bytes().to_le_bytes());
+    }
+    encoded.into_boxed_slice()
+}
+
+fn ltf_kind_byte(kind: LtfKind) -> u8 {
+    match kind {
+        LtfKind::Lltf => 1,
+        LtfKind::HtLtf => 2,
+        LtfKind::StbcHtLtf => 3,
+    }
+}
+
+fn secondary_byte(kind: S3SecondaryKind) -> u8 {
+    match kind {
+        S3SecondaryKind::None => 0,
+        S3SecondaryKind::Above => 1,
+        S3SecondaryKind::Below => 2,
+    }
+}
+
+fn phy_byte(kind: S3PhyKind) -> u8 {
+    match kind {
+        S3PhyKind::NonHt => 1,
+        S3PhyKind::Ht => 2,
+    }
+}
+
+fn bandwidth_byte(kind: S3BandwidthKind) -> u8 {
+    match kind {
+        S3BandwidthKind::TwentyMhz => 1,
+        S3BandwidthKind::FortyMhz => 2,
+    }
 }
 
 fn persist_sequence_discontinuity(

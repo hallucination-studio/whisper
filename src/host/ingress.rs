@@ -62,6 +62,7 @@ pub(super) fn reader_loop(
             record_rejection(rejections, peer, RejectReason::AuthenticationFailed);
             continue;
         };
+        let header = authenticated.header();
         if !rates[route_index].admit(
             config.clock.monotonic_now(),
             length,
@@ -73,7 +74,8 @@ pub(super) fn reader_loop(
         }
         let item = AdmittedDatagram {
             route_index,
-            header: authenticated.header(),
+            header,
+            authenticated,
             received_utc_ns,
             peer,
             bytes: bytes.into(),

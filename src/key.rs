@@ -6,6 +6,7 @@ use std::io::{self, Read};
 use std::path::Path;
 
 /// One validated AES-256 key selected by a native-frame key epoch.
+#[derive(Clone)]
 pub(crate) struct EpochKey([u8; 32]);
 
 impl EpochKey {
