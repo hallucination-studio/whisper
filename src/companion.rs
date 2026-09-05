@@ -6,18 +6,26 @@ use std::fmt;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use crate::artifact::{ArtifactImportError, ArtifactRejectReason, ImportedArtifact};
+use crate::artifact::{
+    ArtifactImportError, ArtifactRejectReason, ClockErrorNanoseconds, ClockOffsetNanoseconds,
+    HostNanoseconds, ImportedArtifact, PhoneNanoseconds, PhoneTimeRelation, UtcNanoseconds,
+};
 
 /// Maximum clock exchanges admitted by one pairing handshake.
 const MAX_CLOCK_EXCHANGES: usize = 8;
+/// Minimum separated samples needed to estimate both offset and drift.
+const MIN_CLOCK_EXCHANGES: usize = 3;
 /// Maximum client-observed round-trip uncertainty admitted in nanoseconds.
 const MAX_CLOCK_ROUND_TRIP_NS: u64 = 1_000_000_000;
 /// Maximum chunks in one bounded upload.
 const MAX_UPLOAD_CHUNKS: usize = 1_024;
 /// Maximum simultaneous incomplete uploads in one companion session.
 const MAX_INCOMPLETE_UPLOADS: usize = 4;
+/// Maximum acknowledged uploads retained for lost-final-response retries.
+const MAX_COMPLETED_UPLOADS: usize = 16;
 /// Maximum outstanding one-time offers retained by one Host.
 const MAX_PAIRING_OFFERS: usize = 4;
 /// Maximum simultaneously paired companion sessions retained by one Host.
@@ -26,17 +34,36 @@ const MAX_COMPANION_SESSIONS: usize = 8;
 const CHUNK_MAGIC: &[u8; 4] = b"WSC1";
 /// Fixed companion chunk header before ciphertext.
 const CHUNK_HEADER_BYTES: usize = 88;
+/// Maximum plaintext carried by one independently authenticated chunk (64 KiB).
+const MAX_COMPANION_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Injectable cryptographic entropy boundary for companion pairing and sessions.
+pub trait CompanionEntropy: Send + Sync {
+    /// Fills the complete output buffer with cryptographically secure random bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform or injected entropy failure without partial success.
+    fn fill(&self, output: &mut [u8]) -> std::io::Result<()>;
+}
+
+/// Tier-1 platform cryptographic entropy used by default.
+#[derive(Debug)]
+pub struct SystemCompanionEntropy;
+
+impl CompanionEntropy for SystemCompanionEntropy {
+    fn fill(&self, output: &mut [u8]) -> std::io::Result<()> {
+        getrandom::fill(output).map_err(std::io::Error::other)
+    }
+}
 
 /// Stable public identity pinned by a companion client.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CompanionServerIdentity([u8; 32]);
 
 impl CompanionServerIdentity {
-    pub(crate) fn derive(store_id: &[u8]) -> Self {
-        let mut digest = Sha256::new();
-        digest.update(b"whisper companion server identity v1\0");
-        digest.update(store_id);
-        Self(digest.finalize().into())
+    pub(crate) fn from_signing_key(key: &SigningKey) -> Self {
+        Self(key.verifying_key().to_bytes())
     }
 
     /// Returns the stable public identity bytes.
@@ -71,13 +98,66 @@ impl fmt::Display for CompanionServerIdentity {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PairingId([u8; 16]);
 
+impl PairingId {
+    /// Returns the opaque pairing identity bytes for a transport handshake.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+/// One-time secret displayed locally by the Host for companion pairing.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct PairingCode([u8; 16]);
+
+impl fmt::Debug for PairingCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingCode([REDACTED])")
+    }
+}
+
+impl fmt::Display for PairingCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, byte) in self.0.iter().enumerate() {
+            if index != 0 && index.is_multiple_of(2) {
+                formatter.write_str("-")?;
+            }
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl PairingCode {
+    /// Returns the one-time secret bytes for a client-side key derivation.
+    ///
+    /// Callers must avoid logging or persisting this value after pairing.
+    #[must_use]
+    pub const fn expose_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+/// Client-generated nonce binding one authenticated handshake response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientNonce([u8; 32]);
+
+impl ClientNonce {
+    /// Creates a nonce from client-generated random bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 /// Host-displayed one-time companion pairing information.
 #[derive(Clone, Eq, PartialEq)]
 pub struct PairingOffer {
     pub(crate) id: PairingId,
-    pub(crate) code: [u8; 16],
+    pub(crate) code: PairingCode,
     pub(crate) server_identity: CompanionServerIdentity,
-    pub(crate) expires_utc_ns: u64,
+    pub(crate) expires_at_utc: UtcNanoseconds,
+    pub(crate) server_proof: [u8; 64],
 }
 
 impl fmt::Debug for PairingOffer {
@@ -87,12 +167,24 @@ impl fmt::Debug for PairingOffer {
             .field("id", &self.id)
             .field("code", &"[REDACTED]")
             .field("server_identity", &self.server_identity)
-            .field("expires_utc_ns", &self.expires_utc_ns)
+            .field("expires_at_utc", &self.expires_at_utc)
+            .field("server_proof", &self.server_proof)
             .finish()
     }
 }
 
 impl PairingOffer {
+    /// Returns the public pairing identity sent in the handshake request.
+    #[must_use]
+    pub const fn pairing_id(&self) -> PairingId {
+        self.id
+    }
+
+    /// Returns the one-time code intended for local display or QR transfer.
+    #[must_use]
+    pub const fn display_code(&self) -> PairingCode {
+        self.code
+    }
     /// Returns the server identity the companion must pin before connecting.
     #[must_use]
     pub const fn server_identity(&self) -> CompanionServerIdentity {
@@ -101,8 +193,29 @@ impl PairingOffer {
 
     /// Returns the UTC nanosecond at which this offer expires.
     #[must_use]
-    pub const fn expires_utc_ns(&self) -> u64 {
-        self.expires_utc_ns
+    pub const fn expires_at_utc(&self) -> UtcNanoseconds {
+        self.expires_at_utc
+    }
+
+    /// Verifies that the pinned persistent server signed this complete offer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pin differs or the Ed25519 proof is invalid.
+    pub fn verify_server_proof(
+        &self,
+        pinned: CompanionServerIdentity,
+    ) -> Result<(), CompanionError> {
+        if pinned != self.server_identity {
+            return Err(CompanionError::new(
+                CompanionRejectReason::ServerIdentityMismatch,
+                "pairing offer server identity differs from the pin",
+            ));
+        }
+        let key = VerifyingKey::from_bytes(self.server_identity.as_bytes())
+            .map_err(CompanionError::signature)?;
+        key.verify_strict(&offer_transcript(self), &Signature::from_bytes(&self.server_proof))
+            .map_err(CompanionError::signature)
     }
 }
 
@@ -110,35 +223,17 @@ impl PairingOffer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClockExchange {
     /// Client send timestamp.
-    pub client_send_ns: u64,
+    pub client_send: PhoneNanoseconds,
     /// Host receive timestamp.
-    pub host_receive_ns: u64,
+    pub host_receive: HostNanoseconds,
     /// Host reply timestamp.
-    pub host_send_ns: u64,
+    pub host_send: HostNanoseconds,
     /// Client receive timestamp.
-    pub client_receive_ns: u64,
+    pub client_receive: PhoneNanoseconds,
 }
 
-/// Bounded client-clock relation to Host time.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CompanionClockRelation {
-    offset_ns: i64,
-    error_ns: u64,
-}
-
-impl CompanionClockRelation {
-    /// Returns the estimated Host-minus-client offset in nanoseconds.
-    #[must_use]
-    pub const fn offset_ns(self) -> i64 {
-        self.offset_ns
-    }
-
-    /// Returns the conservative half-round-trip error in nanoseconds.
-    #[must_use]
-    pub const fn error_ns(self) -> u64 {
-        self.error_ns
-    }
-}
+/// Bounded companion-phone clock relation to Host monotonic time.
+pub type CompanionClockRelation = PhoneTimeRelation;
 
 /// Stable caller-chosen identity for one resumable upload.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -158,6 +253,8 @@ pub struct CompanionConnection {
     key: [u8; 32],
     server_identity: CompanionServerIdentity,
     clock_relation: CompanionClockRelation,
+    client_nonce: ClientNonce,
+    server_proof: [u8; 64],
 }
 
 impl fmt::Debug for CompanionConnection {
@@ -168,11 +265,32 @@ impl fmt::Debug for CompanionConnection {
             .field("key", &"[REDACTED]")
             .field("server_identity", &self.server_identity)
             .field("clock_relation", &self.clock_relation)
+            .field("client_nonce", &self.client_nonce)
+            .field("server_proof", &self.server_proof)
             .finish()
     }
 }
 
 impl CompanionConnection {
+    /// Verifies the persistent server's client-nonce-bound handshake proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fixed identity or response proof is invalid.
+    pub fn verify_server_proof(&self) -> Result<(), CompanionError> {
+        let key = VerifyingKey::from_bytes(self.server_identity.as_bytes())
+            .map_err(CompanionError::signature)?;
+        key.verify_strict(
+            &connection_transcript(
+                self.server_identity,
+                &self.session_id,
+                self.client_nonce,
+                self.clock_relation,
+            ),
+            &Signature::from_bytes(&self.server_proof),
+        )
+        .map_err(CompanionError::signature)
+    }
     /// Returns the bounded clock relation established during pairing.
     #[must_use]
     pub const fn clock_relation(&self) -> CompanionClockRelation {
@@ -191,7 +309,7 @@ impl CompanionConnection {
         sealed_bytes: &[u8],
         chunk_bytes: usize,
     ) -> Result<Vec<CompanionChunk>, CompanionError> {
-        if sealed_bytes.is_empty() || chunk_bytes == 0 {
+        if sealed_bytes.is_empty() || chunk_bytes == 0 || chunk_bytes > MAX_COMPANION_CHUNK_BYTES {
             return Err(CompanionError::new(
                 CompanionRejectReason::LimitExceeded,
                 "upload and chunk sizes must be non-zero",
@@ -274,7 +392,7 @@ impl CompanionChunk {
 
     pub(crate) fn parse(bytes: &[u8], max_artifact_bytes: usize) -> Result<Self, CompanionError> {
         let maximum_frame = CHUNK_HEADER_BYTES
-            .checked_add(max_artifact_bytes)
+            .checked_add(max_artifact_bytes.min(MAX_COMPANION_CHUNK_BYTES))
             .and_then(|length| length.checked_add(16))
             .ok_or_else(limit_error)?;
         if bytes.len() < CHUNK_HEADER_BYTES
@@ -345,36 +463,72 @@ pub enum CompanionRejectReason {
 /// Failure to pair, authenticate, or assemble a companion upload.
 #[derive(Debug)]
 pub struct CompanionError {
-    reason: CompanionRejectReason,
-    message: &'static str,
+    kind: Box<CompanionErrorKind>,
     backtrace: Box<Backtrace>,
-    artifact_reason: Option<ArtifactRejectReason>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CompanionErrorKind {
+    #[error("{message}")]
+    Rejected { reason: CompanionRejectReason, message: &'static str },
+    #[error("companion entropy failed: {0}")]
+    Entropy(#[source] std::io::Error),
+    #[error("companion server proof failed: {0}")]
+    Signature(#[source] ed25519_dalek::SignatureError),
+    #[error("companion artifact import failed: {0}")]
+    Artifact(#[source] ArtifactImportError),
 }
 
 impl CompanionError {
     pub(crate) fn new(reason: CompanionRejectReason, message: &'static str) -> Self {
-        Self { reason, message, backtrace: Box::new(Backtrace::capture()), artifact_reason: None }
+        Self {
+            kind: Box::new(CompanionErrorKind::Rejected { reason, message }),
+            backtrace: Box::new(Backtrace::capture()),
+        }
+    }
+
+    pub(crate) fn entropy(source: std::io::Error) -> Self {
+        Self {
+            kind: Box::new(CompanionErrorKind::Entropy(source)),
+            backtrace: Box::new(Backtrace::capture()),
+        }
+    }
+
+    fn signature(source: ed25519_dalek::SignatureError) -> Self {
+        Self {
+            kind: Box::new(CompanionErrorKind::Signature(source)),
+            backtrace: Box::new(Backtrace::capture()),
+        }
     }
 
     pub(crate) fn from_artifact(source: ArtifactImportError) -> Self {
         Self {
-            reason: CompanionRejectReason::ArtifactRejected,
-            message: "assembled companion artifact was rejected",
+            kind: Box::new(CompanionErrorKind::Artifact(source)),
             backtrace: Box::new(Backtrace::capture()),
-            artifact_reason: Some(source.reason()),
         }
     }
 
     /// Returns the fail-closed rejection classification.
     #[must_use]
-    pub const fn reason(&self) -> CompanionRejectReason {
-        self.reason
+    pub fn reason(&self) -> CompanionRejectReason {
+        match self.kind.as_ref() {
+            CompanionErrorKind::Rejected { reason, .. } => *reason,
+            CompanionErrorKind::Entropy(_) | CompanionErrorKind::Signature(_) => {
+                CompanionRejectReason::AuthenticationFailed
+            }
+            CompanionErrorKind::Artifact(_) => CompanionRejectReason::ArtifactRejected,
+        }
     }
 
     /// Returns the shared artifact rejection when assembly reached import.
     #[must_use]
-    pub const fn artifact_reason(&self) -> Option<ArtifactRejectReason> {
-        self.artifact_reason
+    pub fn artifact_reason(&self) -> Option<ArtifactRejectReason> {
+        match self.kind.as_ref() {
+            CompanionErrorKind::Artifact(source) => Some(source.reason()),
+            CompanionErrorKind::Rejected { .. }
+            | CompanionErrorKind::Entropy(_)
+            | CompanionErrorKind::Signature(_) => None,
+        }
     }
 
     /// Returns the captured construction backtrace.
@@ -385,14 +539,19 @@ impl CompanionError {
 
 impl fmt::Display for CompanionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
+        self.kind.fmt(formatter)
     }
 }
 
-impl std::error::Error for CompanionError {}
+impl std::error::Error for CompanionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.kind.as_ref())
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct CompanionState {
+    signing_key: SigningKey,
     server_identity: CompanionServerIdentity,
     offers: BTreeMap<PairingId, PairingOffer>,
     sessions: BTreeMap<[u8; 16], ServerSession>,
@@ -401,8 +560,18 @@ pub(crate) struct CompanionState {
 #[derive(Debug)]
 struct ServerSession {
     key: [u8; 32],
-    expires_utc_ns: u64,
+    clock_relation: CompanionClockRelation,
+    expires_at_utc: UtcNanoseconds,
     uploads: BTreeMap<UploadId, IncompleteUpload>,
+    completed: BTreeMap<UploadId, CompletedUpload>,
+}
+
+#[derive(Debug)]
+struct CompletedUpload {
+    chunk_count: u32,
+    total_bytes: u64,
+    full_digest: [u8; 32],
+    receipt: ImportedArtifact,
 }
 
 #[derive(Debug)]
@@ -417,11 +586,18 @@ pub(crate) struct AssembledUpload {
     pub(crate) bytes: Box<[u8]>,
     pub(crate) received_chunks: usize,
     pub(crate) total_chunks: usize,
+    pub(crate) session_id: [u8; 16],
+    pub(crate) upload_id: UploadId,
+    pub(crate) full_digest: [u8; 32],
+    pub(crate) completed_receipt: Option<ImportedArtifact>,
+    pub(crate) clock_relation: CompanionClockRelation,
 }
 
 impl CompanionState {
-    pub(crate) fn new(server_identity: CompanionServerIdentity) -> Self {
-        Self { server_identity, offers: BTreeMap::new(), sessions: BTreeMap::new() }
+    pub(crate) fn new(signing_seed: [u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(&signing_seed);
+        let server_identity = CompanionServerIdentity::from_signing_key(&signing_key);
+        Self { signing_key, server_identity, offers: BTreeMap::new(), sessions: BTreeMap::new() }
     }
 
     pub(crate) const fn server_identity(&self) -> CompanionServerIdentity {
@@ -430,25 +606,28 @@ impl CompanionState {
 
     pub(crate) fn offer(
         &mut self,
-        now_utc_ns: u64,
+        now_utc: UtcNanoseconds,
         id: [u8; 16],
         code: [u8; 16],
-        expires_utc_ns: u64,
+        expires_at_utc: UtcNanoseconds,
     ) -> Result<PairingOffer, CompanionError> {
-        self.offers.retain(|_, offer| offer.expires_utc_ns >= now_utc_ns);
-        self.sessions.retain(|_, session| session.expires_utc_ns >= now_utc_ns);
+        self.offers.retain(|_, offer| offer.expires_at_utc >= now_utc);
+        self.sessions.retain(|_, session| session.expires_at_utc >= now_utc);
         if self.offers.len() >= MAX_PAIRING_OFFERS {
             return Err(CompanionError::new(
                 CompanionRejectReason::LimitExceeded,
                 "outstanding companion pairing offer limit exceeded",
             ));
         }
-        let offer = PairingOffer {
+        let mut offer = PairingOffer {
             id: PairingId(id),
-            code,
+            code: PairingCode(code),
             server_identity: self.server_identity,
-            expires_utc_ns,
+            expires_at_utc,
+            server_proof: [0; 64],
         };
+        use ed25519_dalek::Signer;
+        offer.server_proof = self.signing_key.sign(&offer_transcript(&offer)).to_bytes();
         self.offers.insert(offer.id, offer.clone());
         Ok(offer)
     }
@@ -457,8 +636,9 @@ impl CompanionState {
         &mut self,
         offered: &PairingOffer,
         pinned: CompanionServerIdentity,
+        client_nonce: ClientNonce,
         exchanges: &[ClockExchange],
-        now_utc_ns: u64,
+        now_utc: UtcNanoseconds,
         session_id: [u8; 16],
     ) -> Result<CompanionConnection, CompanionError> {
         if pinned != self.server_identity || offered.server_identity != self.server_identity {
@@ -467,44 +647,69 @@ impl CompanionState {
                 "companion server identity does not match the pinned identity",
             ));
         }
+        offered.verify_server_proof(pinned)?;
         let retained = self.offers.get(&offered.id).ok_or_else(|| {
             CompanionError::new(
                 CompanionRejectReason::PairingUnavailable,
                 "pairing offer is unavailable",
             )
         })?;
-        if retained != offered || retained.expires_utc_ns < now_utc_ns {
+        if retained != offered || retained.expires_at_utc < now_utc {
             return Err(CompanionError::new(
                 CompanionRejectReason::PairingUnavailable,
                 "pairing offer is invalid or expired",
             ));
         }
-        let clock_relation = estimate_clock_relation(exchanges)?;
-        self.sessions.retain(|_, session| session.expires_utc_ns >= now_utc_ns);
+        let clock_relation = estimate_clock_relation(exchanges, session_id)?;
+        self.sessions.retain(|_, session| session.expires_at_utc >= now_utc);
         if self.sessions.len() >= MAX_COMPANION_SESSIONS {
             return Err(CompanionError::new(
                 CompanionRejectReason::LimitExceeded,
                 "paired companion session limit exceeded",
             ));
         }
-        let key = session_key(&offered.code, &offered.id, self.server_identity, &session_id);
+        let key = session_key(
+            offered.code.expose_bytes(),
+            &offered.id,
+            self.server_identity,
+            &session_id,
+            client_nonce,
+        );
+        use ed25519_dalek::Signer;
+        let server_proof = self
+            .signing_key
+            .sign(&connection_transcript(
+                self.server_identity,
+                &session_id,
+                client_nonce,
+                clock_relation,
+            ))
+            .to_bytes();
         self.offers.remove(&offered.id);
         self.sessions.insert(
             session_id,
-            ServerSession { key, expires_utc_ns: offered.expires_utc_ns, uploads: BTreeMap::new() },
+            ServerSession {
+                key,
+                clock_relation,
+                expires_at_utc: offered.expires_at_utc,
+                uploads: BTreeMap::new(),
+                completed: BTreeMap::new(),
+            },
         );
         Ok(CompanionConnection {
             session_id,
             key,
             server_identity: self.server_identity,
             clock_relation,
+            client_nonce,
+            server_proof,
         })
     }
 
     pub(crate) fn accept_chunk(
         &mut self,
         chunk: CompanionChunk,
-        now_utc_ns: u64,
+        now_utc: UtcNanoseconds,
         max_bytes: usize,
     ) -> Result<AssembledUpload, CompanionError> {
         let session = self.sessions.get_mut(&chunk.session_id).ok_or_else(|| {
@@ -513,7 +718,7 @@ impl CompanionState {
                 "companion session is unavailable",
             )
         })?;
-        if session.expires_utc_ns < now_utc_ns {
+        if session.expires_at_utc < now_utc {
             self.sessions.remove(&chunk.session_id);
             return Err(CompanionError::new(
                 CompanionRejectReason::SessionUnavailable,
@@ -543,6 +748,27 @@ impl CompanionState {
             .decrypt(Nonce::from_slice(&nonce), Payload { msg: &chunk.ciphertext, aad: &aad })
             .map_err(|_| crypto_error())?
             .into_boxed_slice();
+        if plaintext.len() > MAX_COMPANION_CHUNK_BYTES || plaintext.len() > total {
+            return Err(limit_error());
+        }
+        if let Some(completed) = session.completed.get(&chunk.upload_id) {
+            if completed.chunk_count != chunk.chunk_count
+                || completed.total_bytes != chunk.total_bytes
+                || completed.full_digest != chunk.full_digest
+            {
+                return Err(conflict_error());
+            }
+            return Ok(AssembledUpload {
+                bytes: Box::new([]),
+                received_chunks: count,
+                total_chunks: count,
+                session_id: chunk.session_id,
+                upload_id: chunk.upload_id,
+                full_digest: chunk.full_digest,
+                completed_receipt: Some(completed.receipt.clone()),
+                clock_relation: session.clock_relation,
+            });
+        }
         if !session.uploads.contains_key(&chunk.upload_id)
             && session.uploads.len() >= MAX_INCOMPLETE_UPLOADS
         {
@@ -566,6 +792,15 @@ impl CompanionState {
                 upload
             }
         };
+        let retained_bytes = upload
+            .chunks
+            .values()
+            .try_fold(0_usize, |sum, part| sum.checked_add(part.len()).ok_or_else(limit_error))?;
+        if !upload.chunks.contains_key(&chunk.index)
+            && retained_bytes.checked_add(plaintext.len()).ok_or_else(limit_error)? > total
+        {
+            return Err(limit_error());
+        }
         match upload.chunks.entry(chunk.index) {
             Entry::Vacant(entry) => {
                 entry.insert(plaintext);
@@ -579,6 +814,11 @@ impl CompanionState {
                 bytes: Box::new([]),
                 received_chunks,
                 total_chunks: count,
+                session_id: chunk.session_id,
+                upload_id: chunk.upload_id,
+                full_digest: chunk.full_digest,
+                completed_receipt: None,
+                clock_relation: session.clock_relation,
             });
         }
         let mut bytes = Vec::with_capacity(total);
@@ -594,25 +834,58 @@ impl CompanionState {
             bytes: bytes.into_boxed_slice(),
             received_chunks,
             total_chunks: count,
+            session_id: chunk.session_id,
+            upload_id: chunk.upload_id,
+            full_digest: chunk.full_digest,
+            completed_receipt: None,
+            clock_relation: session.clock_relation,
         })
+    }
+
+    pub(crate) fn record_completed(
+        &mut self,
+        assembled: &AssembledUpload,
+        receipt: ImportedArtifact,
+    ) -> Result<(), CompanionError> {
+        let session = self.sessions.get_mut(&assembled.session_id).ok_or_else(|| {
+            CompanionError::new(
+                CompanionRejectReason::SessionUnavailable,
+                "companion session is unavailable",
+            )
+        })?;
+        if session.completed.len() >= MAX_COMPLETED_UPLOADS {
+            let oldest = *session.completed.keys().next().expect("nonempty completed upload set");
+            session.completed.remove(&oldest);
+        }
+        session.completed.insert(
+            assembled.upload_id,
+            CompletedUpload {
+                chunk_count: u32::try_from(assembled.total_chunks).expect("bounded chunk count"),
+                total_bytes: u64::try_from(assembled.bytes.len()).expect("bounded upload length"),
+                full_digest: assembled.full_digest,
+                receipt,
+            },
+        );
+        Ok(())
     }
 }
 
 fn estimate_clock_relation(
     exchanges: &[ClockExchange],
+    relation_id: [u8; 16],
 ) -> Result<CompanionClockRelation, CompanionError> {
-    if exchanges.is_empty() || exchanges.len() > MAX_CLOCK_EXCHANGES {
+    if exchanges.len() < MIN_CLOCK_EXCHANGES || exchanges.len() > MAX_CLOCK_EXCHANGES {
         return Err(clock_error());
     }
-    let mut best = None;
+    let mut samples = Vec::with_capacity(exchanges.len());
     for exchange in exchanges {
-        if exchange.client_receive_ns < exchange.client_send_ns
-            || exchange.host_send_ns < exchange.host_receive_ns
+        if exchange.client_receive < exchange.client_send
+            || exchange.host_send < exchange.host_receive
         {
             return Err(clock_error());
         }
-        let client_elapsed = exchange.client_receive_ns - exchange.client_send_ns;
-        let host_elapsed = exchange.host_send_ns - exchange.host_receive_ns;
+        let client_elapsed = exchange.client_receive.get() - exchange.client_send.get();
+        let host_elapsed = exchange.host_send.get() - exchange.host_receive.get();
         if host_elapsed > client_elapsed {
             return Err(clock_error());
         }
@@ -620,17 +893,57 @@ fn estimate_clock_relation(
         if network_round_trip > MAX_CLOCK_ROUND_TRIP_NS {
             return Err(clock_error());
         }
-        let left = i128::from(exchange.host_receive_ns) - i128::from(exchange.client_send_ns);
-        let right = i128::from(exchange.host_send_ns) - i128::from(exchange.client_receive_ns);
+        let left = i128::from(exchange.host_receive.get()) - i128::from(exchange.client_send.get());
+        let right =
+            i128::from(exchange.host_send.get()) - i128::from(exchange.client_receive.get());
         let offset = (left + right) / 2;
         let offset = i64::try_from(offset).map_err(|_| clock_error())?;
-        let relation =
-            CompanionClockRelation { offset_ns: offset, error_ns: network_round_trip.div_ceil(2) };
-        if best.is_none_or(|current: CompanionClockRelation| relation.error_ns < current.error_ns) {
-            best = Some(relation);
-        }
+        let midpoint = exchange.client_send.get() + client_elapsed / 2;
+        samples.push((midpoint, offset, network_round_trip.div_ceil(2)));
     }
-    best.ok_or_else(clock_error)
+    samples.sort_unstable_by_key(|sample| sample.0);
+    if samples.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(clock_error());
+    }
+    let first = samples.first().ok_or_else(clock_error)?;
+    let last = samples.last().ok_or_else(clock_error)?;
+    let elapsed = i128::from(last.0 - first.0);
+    let drift = (i128::from(last.1) - i128::from(first.1))
+        .checked_mul(1_000_000_000)
+        .ok_or_else(clock_error)?
+        / elapsed;
+    let drift = i64::try_from(drift).map_err(|_| clock_error())?;
+    let mut maximum_error = 0_u64;
+    for (time, offset, sample_error) in &samples {
+        let predicted =
+            i128::from(first.1) + i128::from(drift) * i128::from(*time - first.0) / 1_000_000_000;
+        let residual = predicted.abs_diff(i128::from(*offset));
+        let residual = u64::try_from(residual).map_err(|_| clock_error())?;
+        let cross_sample_bound = first
+            .2
+            .checked_add(*sample_error)
+            .and_then(|value| value.checked_add(last.2))
+            .ok_or_else(clock_error)?;
+        if residual > cross_sample_bound {
+            return Err(clock_error());
+        }
+        maximum_error =
+            maximum_error.max(sample_error.checked_add(residual).ok_or_else(clock_error)?);
+    }
+    PhoneTimeRelation::new(
+        relation_id,
+        ClockOffsetNanoseconds::from(first.1),
+        drift,
+        PhoneNanoseconds::from(first.0),
+        ClockErrorNanoseconds::from(maximum_error),
+        PhoneNanoseconds::from(
+            exchanges.iter().map(|e| e.client_send.get()).min().ok_or_else(clock_error)?,
+        ),
+        PhoneNanoseconds::from(
+            exchanges.iter().map(|e| e.client_receive.get()).max().ok_or_else(clock_error)?,
+        ),
+    )
+    .map_err(|_| clock_error())
 }
 
 fn session_key(
@@ -638,6 +951,7 @@ fn session_key(
     pairing_id: &PairingId,
     server: CompanionServerIdentity,
     session_id: &[u8; 16],
+    client_nonce: ClientNonce,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"whisper companion session key v1\0");
@@ -645,7 +959,37 @@ fn session_key(
     digest.update(pairing_id.0);
     digest.update(server.0);
     digest.update(session_id);
+    digest.update(client_nonce.0);
     digest.finalize().into()
+}
+
+fn offer_transcript(offer: &PairingOffer) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(96);
+    transcript.extend_from_slice(b"whisper companion pairing offer v1\0");
+    transcript.extend_from_slice(&offer.id.0);
+    transcript.extend_from_slice(offer.code.expose_bytes());
+    transcript.extend_from_slice(offer.server_identity.as_bytes());
+    transcript.extend_from_slice(&offer.expires_at_utc.get().to_le_bytes());
+    transcript
+}
+
+fn connection_transcript(
+    server: CompanionServerIdentity,
+    session_id: &[u8; 16],
+    client_nonce: ClientNonce,
+    relation: CompanionClockRelation,
+) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(128);
+    transcript.extend_from_slice(b"whisper companion handshake response v1\0");
+    transcript.extend_from_slice(server.as_bytes());
+    transcript.extend_from_slice(session_id);
+    transcript.extend_from_slice(&client_nonce.0);
+    transcript.extend_from_slice(&relation.relation_id());
+    transcript.extend_from_slice(&relation.offset_at_reference().get().to_le_bytes());
+    transcript.extend_from_slice(&relation.drift_parts_per_billion().to_le_bytes());
+    transcript.extend_from_slice(&relation.reference_phone_time().get().to_le_bytes());
+    transcript.extend_from_slice(&relation.maximum_error().get().to_le_bytes());
+    transcript
 }
 
 fn chunk_nonce(session_id: &[u8; 16], upload_id: UploadId, index: u32) -> [u8; 12] {
@@ -708,24 +1052,67 @@ mod tests {
 
     #[test]
     fn pairing_and_connection_debug_output_redacts_secrets() {
-        let mut state = CompanionState::new(CompanionServerIdentity::from_bytes([2; 32]));
+        let mut state = CompanionState::new([2; 32]);
         let code = [7; 16];
-        let offer = state.offer(10, [3; 16], code, 100).unwrap();
+        let offer = state.offer(10.into(), [3; 16], code, 100.into()).unwrap();
         assert!(!format!("{offer:?}").contains(&format!("{code:?}")));
         let connection = state
             .connect(
                 &offer,
                 offer.server_identity(),
-                &[ClockExchange {
-                    client_send_ns: 10,
-                    host_receive_ns: 20,
-                    host_send_ns: 21,
-                    client_receive_ns: 31,
-                }],
-                11,
+                ClientNonce::from_bytes([5; 32]),
+                &[
+                    ClockExchange {
+                        client_send: 10.into(),
+                        host_receive: 20.into(),
+                        host_send: 21.into(),
+                        client_receive: 31.into(),
+                    },
+                    ClockExchange {
+                        client_send: 110.into(),
+                        host_receive: 120.into(),
+                        host_send: 121.into(),
+                        client_receive: 131.into(),
+                    },
+                    ClockExchange {
+                        client_send: 210.into(),
+                        host_receive: 220.into(),
+                        host_send: 221.into(),
+                        client_receive: 231.into(),
+                    },
+                ],
+                11.into(),
                 [4; 16],
             )
             .unwrap();
         assert!(!format!("{connection:?}").contains(&format!("{:?}", connection.key)));
+    }
+
+    #[test]
+    fn clock_relation_rejects_cross_sample_offset_discontinuity() {
+        let exchanges = [
+            ClockExchange {
+                client_send: 100.into(),
+                host_receive: 120.into(),
+                host_send: 125.into(),
+                client_receive: 150.into(),
+            },
+            ClockExchange {
+                client_send: 1_100.into(),
+                host_receive: 2_120.into(),
+                host_send: 2_125.into(),
+                client_receive: 1_150.into(),
+            },
+            ClockExchange {
+                client_send: 2_100.into(),
+                host_receive: 2_120.into(),
+                host_send: 2_125.into(),
+                client_receive: 2_150.into(),
+            },
+        ];
+        assert_eq!(
+            estimate_clock_relation(&exchanges, [7; 16]).unwrap_err().reason(),
+            CompanionRejectReason::InvalidClockRelation,
+        );
     }
 }

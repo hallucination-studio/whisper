@@ -111,19 +111,29 @@ fn persist_artifact_inner(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
-        .map_err(|_| artifact_persistence_error())?;
+        .map_err(ArtifactImportError::database)?;
     if let Some((kind, artifact_id, revision, retained_origin)) = existing {
-        let kind = ArtifactKind::from_code(kind).ok_or_else(artifact_persistence_error)?;
+        let kind = ArtifactKind::from_code(kind).ok_or_else(|| {
+            ArtifactImportError::new(
+                ArtifactRejectReason::Persistence,
+                "persisted artifact kind is invalid",
+            )
+        })?;
         let origin = match retained_origin.as_str() {
             "local" => ArtifactOrigin::Local,
             "companion" => ArtifactOrigin::Companion,
-            _ => return Err(artifact_persistence_error()),
+            _ => {
+                return Err(ArtifactImportError::new(
+                    ArtifactRejectReason::Persistence,
+                    "persisted artifact origin is invalid",
+                ));
+            }
         };
         return Ok(ImportedArtifact::from_parts(digest, kind, artifact_id, revision, origin));
     }
     let count: usize = connection
         .query_row("SELECT count(*) FROM spatial_artifacts", [], |row| row.get(0))
-        .map_err(|_| artifact_persistence_error())?;
+        .map_err(ArtifactImportError::database)?;
     if count >= limits.max_artifacts() {
         return Err(ArtifactImportError::new(
             ArtifactRejectReason::LimitExceeded,
@@ -138,7 +148,7 @@ fn persist_artifact_inner(
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|_| artifact_persistence_error())?;
+            .map_err(ArtifactImportError::database)?;
         let Some(scene_bytes) = scene_bytes else {
             return Err(ArtifactImportError::new(
                 ArtifactRejectReason::MissingScene,
@@ -147,14 +157,21 @@ fn persist_artifact_inner(
         };
         let scene = SealedArtifact::parse(scene_bytes)
             .and_then(|sealed| sealed.decode())
-            .map_err(|_| artifact_persistence_error())?;
+            .map_err(ArtifactImportError::invalid_artifact)?;
         let Artifact::Scene(scene) = scene else {
-            return Err(artifact_persistence_error());
+            return Err(ArtifactImportError::new(
+                ArtifactRejectReason::Persistence,
+                "persisted scene row contains another artifact kind",
+            ));
         };
         artifact.validate_against_scene(&scene, limits)?;
     }
-    let imported_utc_ns =
-        i64::try_from(imported_utc_ns).map_err(|_| artifact_persistence_error())?;
+    let imported_utc_ns = i64::try_from(imported_utc_ns).map_err(|_| {
+        ArtifactImportError::new(
+            ArtifactRejectReason::Persistence,
+            "artifact import time exceeds the Store range",
+        )
+    })?;
     let revision = i64::from(artifact.revision());
     let insert = connection.execute(
         "INSERT INTO spatial_artifacts
@@ -186,12 +203,8 @@ fn persist_artifact_inner(
                 "artifact identity and revision already contain different bytes",
             ))
         }
-        Err(_) => Err(artifact_persistence_error()),
+        Err(error) => Err(ArtifactImportError::database(error)),
     }
-}
-
-fn artifact_persistence_error() -> ArtifactImportError {
-    ArtifactImportError::new(ArtifactRejectReason::Persistence, "artifact Store operation failed")
 }
 
 fn load_replay_states_from_path(

@@ -24,17 +24,20 @@ pub use admission::{
 };
 #[doc(inline)]
 pub use artifact::{
-    Artifact, ArtifactDigest, ArtifactError, ArtifactImportError, ArtifactKind, ArtifactLimits,
-    ArtifactOrigin, ArtifactRejectReason, CalibrationBundle, CoordinateTransform, DepthQuality,
-    GeometryElement, GeometryKind, ImportedArtifact, JointLabel, LabelScope, PersonLabel,
-    PhaseCondition, PortCondition, SceneSnapshot, SealedArtifact, SourceIdentity,
-    SupervisionSample, SupervisionSegment, TrackingQuality,
+    ArrayCondition, Artifact, ArtifactDigest, ArtifactError, ArtifactImportError, ArtifactKind,
+    ArtifactLimits, ArtifactLimitsBuilder, ArtifactMetadata, ArtifactOrigin, ArtifactRejectReason,
+    CalibrationBundle, CalibrationEpoch, ClockErrorNanoseconds, ClockOffsetNanoseconds,
+    CoherenceScope, CoordinateTransform, CoverageCell, DepthQuality, GeometryElement, GeometryKind,
+    HostNanoseconds, ImportedArtifact, JointLabel, LabelScope, MetersPerSecond, PersonLabel,
+    PhoneNanoseconds, PhoneTimeRelation, PortCondition, SceneSnapshot, SealedArtifact,
+    SourceIdentity, SupervisionSample, SupervisionSegment, TrackingEpoch, TrackingQuality,
+    UtcNanoseconds,
 };
 #[doc(inline)]
 pub use companion::{
-    ClockExchange, CompanionChunk, CompanionClockRelation, CompanionConnection, CompanionError,
-    CompanionRejectReason, CompanionServerIdentity, PairingId, PairingOffer, UploadId,
-    UploadProgress,
+    ClientNonce, ClockExchange, CompanionChunk, CompanionClockRelation, CompanionConnection,
+    CompanionEntropy, CompanionError, CompanionRejectReason, CompanionServerIdentity, PairingCode,
+    PairingId, PairingOffer, SystemCompanionEntropy, UploadId, UploadProgress,
 };
 #[doc(inline)]
 pub use host::{

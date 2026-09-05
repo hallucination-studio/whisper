@@ -14,6 +14,8 @@ use rusqlite::{Connection, OpenFlags, params};
 const DATABASE_NAME: &str = "facts.sqlite3";
 /// Cooperative process-ownership marker beside the database.
 const LEASE_NAME: &str = ".whisper.lease";
+/// Store-private Ed25519 signing seed for the companion server identity.
+const COMPANION_IDENTITY_NAME: &str = ".whisper.companion-identity";
 /// SQLite application identifier (`WRF1`) written at header offset 68. Changing
 /// it makes all existing Stores intentionally unrecognizable.
 const STORE_APPLICATION_ID: u32 = 0x5752_4631;
@@ -35,9 +37,8 @@ const ROOT_MODE: u32 = 0o700;
 /// Owner read/write Unix file permission bits required by the host trust
 /// policy. Changing them alters which Store-owned mutable files are trusted.
 const FILE_MODE: u32 = 0o600;
-/// Kernel CSPRNG byte source on supported Unix hosts. Replacing it changes the
-/// Store-identity entropy trust boundary and must preserve blocking/error semantics.
-const RANDOM_SOURCE: &str = "/dev/urandom";
+/// Diagnostic identity for the platform CSPRNG capability.
+const RANDOM_SOURCE: &str = "operating-system-randomness";
 /// SQLite WAL header width in bytes. Changing this file-format value would
 /// shift frame validation and misclassify WAL companions.
 const WAL_HEADER_BYTES: usize = 32;
@@ -138,7 +139,7 @@ impl Entropy for SystemEntropy {
     }
 
     fn fill(&self, bytes: &mut [u8]) -> io::Result<()> {
-        File::open(RANDOM_SOURCE)?.read_exact(bytes)
+        getrandom::fill(bytes).map_err(io::Error::other)
     }
 }
 
@@ -158,12 +159,6 @@ impl fmt::Display for StoreId {
             write!(formatter, "{byte:02x}")?;
         }
         Ok(())
-    }
-}
-
-impl StoreId {
-    pub(crate) const fn as_bytes(&self) -> &[u8; STORE_ID_BYTES] {
-        &self.0
     }
 }
 
@@ -316,11 +311,22 @@ impl std::error::Error for StoreOpenError {
 }
 
 /// An exclusively leased RF world-model Store ready for Host ownership.
-#[derive(Debug)]
 pub struct Store {
     root: PathBuf,
     id: StoreId,
+    companion_identity: [u8; 32],
     lease: File,
+}
+
+impl fmt::Debug for Store {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Store")
+            .field("root", &self.root)
+            .field("id", &self.id)
+            .field("companion_identity", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) struct StoreSnapshot {
@@ -374,10 +380,12 @@ impl Store {
             set_root_permissions(root)?;
             let lease = acquire_lease(root, true)?;
             let id = random_store_id(entropy)?;
+            let companion_identity = random_bytes(entropy)?;
+            write_companion_identity(root, &companion_identity)?;
             let database_path = root.join(DATABASE_NAME);
             initialize_database(&database_path, id)?;
             sync_directory(root)?;
-            Ok(Self { root: root.to_owned(), id, lease })
+            Ok(Self { root: root.to_owned(), id, companion_identity, lease })
         })();
 
         if result.is_err() {
@@ -409,6 +417,7 @@ impl Store {
             validate_root(root)?;
             let database_path = root.join(DATABASE_NAME);
             recognize_database_header(&database_path)?;
+            let companion_identity = read_companion_identity(root)?;
             let lease = acquire_lease(root, false)?;
             let wal_path = database_path.with_extension("sqlite3-wal");
             let shm_path = database_path.with_extension("sqlite3-shm");
@@ -417,7 +426,7 @@ impl Store {
             validate_wal_shape(&wal_path)?;
             validate_shm_shape(&shm_path, wal_path.exists())?;
             let id = validate_database_snapshot(&database_path, &wal_path, &shm_path, entropy)?;
-            Ok(Self { root: root.to_owned(), id, lease })
+            Ok(Self { root: root.to_owned(), id, companion_identity, lease })
         })()
         .map_err(|source| StoreOpenError {
             root: root.to_owned(),
@@ -434,6 +443,10 @@ impl Store {
 
     pub(crate) fn database_path(&self) -> PathBuf {
         self.root.join(DATABASE_NAME)
+    }
+
+    pub(crate) const fn companion_identity(&self) -> &[u8; 32] {
+        &self.companion_identity
     }
 
     pub(crate) fn database_snapshot(&self) -> io::Result<StoreSnapshot> {
@@ -679,6 +692,33 @@ fn random_bytes<const N: usize>(entropy: &dyn Entropy) -> Result<[u8; N], StoreE
     let mut bytes = [0_u8; N];
     entropy.fill(&mut bytes).map_err(|source| io_error(entropy.source_path(), source))?;
     Ok(bytes)
+}
+
+fn write_companion_identity(root: &Path, identity: &[u8; 32]) -> Result<(), StoreError> {
+    let path = root.join(COMPANION_IDENTITY_NAME);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(FILE_MODE).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = options.open(&path).map_err(|source| io_error(&path, source))?;
+    use std::io::Write;
+    file.write_all(identity).map_err(|source| io_error(&path, source))?;
+    set_file_permissions(&path)?;
+    file.sync_all().map_err(|source| io_error(&path, source))
+}
+
+fn read_companion_identity(root: &Path) -> Result<[u8; 32], StoreError> {
+    let path = root.join(COMPANION_IDENTITY_NAME);
+    validate_regular_file(&path)?;
+    let mut identity = [0_u8; 32];
+    let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
+    file.read_exact(&mut identity).map_err(|_| StoreError::from(StoreErrorKind::Unrecognized))?;
+    let mut trailing = [0_u8; 1];
+    match file.read(&mut trailing) {
+        Ok(0) => Ok(identity),
+        Ok(_) => Err(StoreErrorKind::Unrecognized.into()),
+        Err(source) => Err(io_error(&path, source)),
+    }
 }
 
 #[cfg(unix)]

@@ -31,6 +31,45 @@ pub(super) fn query_artifact(
         .transpose()
 }
 
+pub(super) fn query_artifact_receipt(
+    path: &Path,
+    digest: ArtifactDigest,
+) -> Result<Option<ImportedArtifact>, ArtifactImportError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(ArtifactImportError::database)?;
+    let row: Option<(u8, String, u32, String)> = connection
+        .query_row(
+            "SELECT kind, artifact_id, revision, origin FROM spatial_artifacts WHERE digest = ?1",
+            [digest.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(ArtifactImportError::database)?;
+    row.map(|(kind, artifact_id, revision, origin)| {
+        let kind = ArtifactKind::from_code(kind).ok_or_else(|| {
+            ArtifactImportError::new(
+                ArtifactRejectReason::Persistence,
+                "persisted artifact kind is invalid",
+            )
+        })?;
+        let origin = match origin.as_str() {
+            "local" => ArtifactOrigin::Local,
+            "companion" => ArtifactOrigin::Companion,
+            _ => {
+                return Err(ArtifactImportError::new(
+                    ArtifactRejectReason::Persistence,
+                    "persisted artifact origin is invalid",
+                ));
+            }
+        };
+        Ok(ImportedArtifact::from_parts(digest, kind, artifact_id, revision, origin))
+    })
+    .transpose()
+}
+
 pub(super) fn query_raw(path: &Path, limit: usize) -> Result<Vec<RawFact>, HostError> {
     let connection = Connection::open_with_flags(
         path,

@@ -4,7 +4,6 @@ use std::backtrace::Backtrace;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
-use std::io::Read;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,8 +20,9 @@ use crate::artifact::{
     ArtifactRejectReason, ImportedArtifact, SealedArtifact,
 };
 use crate::companion::{
-    ClockExchange, CompanionChunk, CompanionConnection, CompanionError, CompanionRejectReason,
-    CompanionServerIdentity, CompanionState, PairingOffer, UploadProgress,
+    ClockExchange, CompanionChunk, CompanionConnection, CompanionEntropy, CompanionError,
+    CompanionRejectReason, CompanionServerIdentity, CompanionState, PairingOffer,
+    SystemCompanionEntropy, UploadProgress,
 };
 use crate::key::{EpochKey, SecretStoreError, load_epoch_key};
 use crate::native_frame::{Header, authenticate_datagram, parse_header};
@@ -285,6 +285,7 @@ impl Host {
             network: Arc::new(SystemNetwork),
             threads: Arc::new(SystemThreads),
             clock: Arc::new(SystemClock),
+            companion_entropy: Arc::new(SystemCompanionEntropy),
         }
     }
 }
@@ -301,6 +302,7 @@ pub struct HostBuilder {
     network: Arc<dyn Network>,
     threads: Arc<dyn Threads>,
     clock: Arc<dyn Clock>,
+    companion_entropy: Arc<dyn CompanionEntropy>,
 }
 
 impl fmt::Debug for HostBuilder {
@@ -314,6 +316,7 @@ impl fmt::Debug for HostBuilder {
             .field("ingress_capacity", &self.ingress_capacity)
             .field("artifact_limits", &self.artifact_limits)
             .field("known_rf_identities", &self.known_rf_identities)
+            .field("companion_entropy", &"cryptographic entropy capability")
             .finish_non_exhaustive()
     }
 }
@@ -347,6 +350,13 @@ impl HostBuilder {
         self
     }
 
+    /// Replaces the companion cryptographic entropy capability.
+    #[must_use]
+    pub fn companion_entropy(mut self, entropy: impl CompanionEntropy + 'static) -> Self {
+        self.companion_entropy = Arc::new(entropy);
+        self
+    }
+
     /// Starts the UDP reader, sole writer, and independent lifecycle supervisor.
     ///
     /// # Errors
@@ -355,7 +365,7 @@ impl HostBuilder {
     /// startup failure, or failure to open the Store writer.
     pub fn start(self) -> Result<HostRuntime, HostError> {
         validate_builder(&self)?;
-        let companion_server_identity = CompanionServerIdentity::derive(self.store.id().as_bytes());
+        let companion_identity = *self.store.companion_identity();
         let database_path = self.store.database_path();
         let replay_snapshot = self.store.database_snapshot().map_err(|source| {
             HostError::io_during(
@@ -384,6 +394,7 @@ impl HostBuilder {
         let artifact_limits = self.artifact_limits;
         let known_rf_identities = self.known_rf_identities.clone();
         let runtime_clock = Arc::clone(&self.clock);
+        let companion_entropy = Arc::clone(&self.companion_entropy);
         let supervisor_stop = Arc::clone(&stop);
         let supervisor_completion = Arc::clone(&completion);
         let supervisor_rejections = Arc::clone(&rejections);
@@ -432,7 +443,8 @@ impl HostBuilder {
             artifact_limits,
             known_rf_identities,
             clock: runtime_clock,
-            companion: Arc::new(Mutex::new(CompanionState::new(companion_server_identity))),
+            companion: Arc::new(Mutex::new(CompanionState::new(companion_identity))),
+            companion_entropy,
         })
     }
 }
@@ -449,6 +461,7 @@ pub struct HostRuntime {
     known_rf_identities: BTreeSet<String>,
     clock: Arc<dyn Clock>,
     companion: Arc<Mutex<CompanionState>>,
+    companion_entropy: Arc<dyn CompanionEntropy>,
 }
 
 impl fmt::Debug for HostRuntime {
@@ -530,18 +543,11 @@ impl HostRuntime {
                 "sealed artifact byte limit exceeded",
             ));
         }
-        let sealed = SealedArtifact::parse(bytes).map_err(|_| {
-            ArtifactImportError::new(
-                ArtifactRejectReason::InvalidArtifact,
-                "sealed artifact is invalid or unsupported",
-            )
-        })?;
-        let artifact = sealed.decode().map_err(|_| {
-            ArtifactImportError::new(
-                ArtifactRejectReason::InvalidArtifact,
-                "sealed artifact payload is invalid",
-            )
-        })?;
+        let sealed = SealedArtifact::parse(bytes).map_err(ArtifactImportError::invalid_artifact)?;
+        if let Some(receipt) = query_artifact_receipt(&self.database_path, sealed.digest())? {
+            return Ok(receipt);
+        }
+        let artifact = sealed.decode().map_err(ArtifactImportError::invalid_artifact)?;
         let imported_utc_ns = utc_now_ns(self.clock.as_ref()).map_err(|_| {
             ArtifactImportError::new(
                 ArtifactRejectReason::Persistence,
@@ -617,10 +623,10 @@ impl HostRuntime {
         let now = utc_now_ns(self.clock.as_ref()).map_err(|_| companion_clock_error())?;
         let duration = u64::try_from(valid_for.as_nanos()).map_err(|_| companion_clock_error())?;
         let expires = now.checked_add(duration).ok_or_else(companion_clock_error)?;
-        let id = secure_random::<16>()?;
-        let code = secure_random::<16>()?;
+        let id = secure_random::<16>(self.companion_entropy.as_ref())?;
+        let code = secure_random::<16>(self.companion_entropy.as_ref())?;
         let mut companion = self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        companion.offer(now, id, code, expires)
+        companion.offer(now.into(), id, code, expires.into())
     }
 
     /// Returns the Store-stable public identity companion clients must pin.
@@ -639,15 +645,17 @@ impl HostRuntime {
         &self,
         offer: &PairingOffer,
         pinned_server_identity: CompanionServerIdentity,
+        client_nonce: crate::companion::ClientNonce,
         clock_exchanges: &[ClockExchange],
     ) -> Result<CompanionConnection, CompanionError> {
         let now = utc_now_ns(self.clock.as_ref()).map_err(|_| companion_clock_error())?;
-        let session_id = secure_random::<16>()?;
+        let session_id = secure_random::<16>(self.companion_entropy.as_ref())?;
         self.companion.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).connect(
             offer,
             pinned_server_identity,
+            client_nonce,
             clock_exchanges,
-            now,
+            now.into(),
             session_id,
         )
     }
@@ -670,16 +678,36 @@ impl HostRuntime {
             .companion
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .accept_chunk(chunk, now, self.artifact_limits.max_artifact_bytes())?;
+            .accept_chunk(chunk, now.into(), self.artifact_limits.max_artifact_bytes())?;
+        if let Some(receipt) = &assembled.completed_receipt {
+            return Ok(UploadProgress::Imported(receipt.clone()));
+        }
         if assembled.bytes.is_empty() {
             return Ok(UploadProgress::Pending {
                 received_chunks: assembled.received_chunks,
                 total_chunks: assembled.total_chunks,
             });
         }
-        self.import_artifact_from(&assembled.bytes, ArtifactOrigin::Companion)
-            .map(UploadProgress::Imported)
-            .map_err(CompanionError::from_artifact)
+        let uploaded = SealedArtifact::parse(&assembled.bytes)
+            .and_then(|sealed| sealed.decode())
+            .map_err(ArtifactImportError::invalid_artifact)
+            .map_err(CompanionError::from_artifact)?;
+        if let Artifact::Supervision(segment) = uploaded
+            && segment.time_relation != assembled.clock_relation
+        {
+            return Err(CompanionError::from_artifact(ArtifactImportError::new(
+                ArtifactRejectReason::InvalidRelation,
+                "supervision clock relation differs from its authenticated companion session",
+            )));
+        }
+        let receipt = self
+            .import_artifact_from(&assembled.bytes, ArtifactOrigin::Companion)
+            .map_err(CompanionError::from_artifact)?;
+        self.companion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_completed(&assembled, receipt.clone())?;
+        Ok(UploadProgress::Imported(receipt))
     }
 
     /// Parses and accepts one encrypted companion transport frame.
@@ -1233,7 +1261,7 @@ use ingress::reader_loop;
 mod persistence;
 use persistence::writer_loop;
 mod query;
-use query::{query_artifact, query_raw, query_raw_losses};
+use query::{query_artifact, query_artifact_receipt, query_raw, query_raw_losses};
 fn utc_now_ns(clock: &dyn Clock) -> Result<u64, HostError> {
     let elapsed = clock
         .wall_now()
@@ -1260,16 +1288,11 @@ fn finish_completion(completion: &(Mutex<Completion>, Condvar), failure: Option<
     changed.notify_all();
 }
 
-fn secure_random<const N: usize>() -> Result<[u8; N], CompanionError> {
+fn secure_random<const N: usize>(
+    entropy: &dyn CompanionEntropy,
+) -> Result<[u8; N], CompanionError> {
     let mut bytes = [0_u8; N];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut bytes))
-        .map_err(|_| {
-            CompanionError::new(
-                CompanionRejectReason::AuthenticationFailed,
-                "secure randomness for companion pairing is unavailable",
-            )
-        })?;
+    entropy.fill(&mut bytes).map_err(CompanionError::entropy)?;
     Ok(bytes)
 }
 
