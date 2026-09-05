@@ -1414,6 +1414,24 @@ impl EvidenceBlockIdentity {
             signal_paths: signal_paths.into_boxed_slice(),
         })
     }
+
+    /// Returns the exact source, context, window, and qualification epoch.
+    #[must_use]
+    pub const fn scope(&self) -> &EvidenceScope {
+        &self.scope
+    }
+
+    /// Returns the immutable facts assigned to this block.
+    #[must_use]
+    pub fn members(&self) -> &[EvidenceMemberIdentity] {
+        &self.members
+    }
+
+    /// Returns the exact source-native signal paths present in the block.
+    #[must_use]
+    pub fn signal_paths(&self) -> &[SignalPath] {
+        &self.signal_paths
+    }
 }
 
 /// Source, capture context, window, and qualification revision of one evidence block.
@@ -1436,6 +1454,30 @@ impl EvidenceScope {
     ) -> Self {
         Self { source, context, window, epoch }
     }
+
+    /// Returns the authenticated source instance.
+    #[must_use]
+    pub const fn source(&self) -> &SourceInstance {
+        &self.source
+    }
+
+    /// Returns the exact capture context.
+    #[must_use]
+    pub const fn context(&self) -> MeasurementContext {
+        self.context
+    }
+
+    /// Returns the source-native evidence window.
+    #[must_use]
+    pub const fn window(&self) -> TickRange {
+        self.window
+    }
+
+    /// Returns the qualification continuity epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> QualificationEpoch {
+        self.epoch
+    }
 }
 
 /// One transmitter-stream and receiver-chain signal path present in a block.
@@ -1450,6 +1492,18 @@ impl SignalPath {
     #[must_use]
     pub const fn new(tx_stream: u16, rx_chain: u16) -> Self {
         Self { tx_stream, rx_chain }
+    }
+
+    /// Returns the source-native transmitter stream.
+    #[must_use]
+    pub const fn tx_stream(self) -> u16 {
+        self.tx_stream
+    }
+
+    /// Returns the source-native receiver chain.
+    #[must_use]
+    pub const fn rx_chain(self) -> u16 {
+        self.rx_chain
     }
 }
 
@@ -1475,6 +1529,18 @@ impl EvidenceBlock {
             return Err(MeasurementError::new("evidence quality count does not match members"));
         }
         Ok(Self { identity, quality: quality.into_boxed_slice() })
+    }
+
+    /// Returns the exact block identity and physical signal paths.
+    #[must_use]
+    pub const fn identity(&self) -> &EvidenceBlockIdentity {
+        &self.identity
+    }
+
+    /// Returns one explicit acquisition state per immutable member.
+    #[must_use]
+    pub fn quality(&self) -> &[EvidenceQuality] {
+        &self.quality
     }
 }
 
@@ -1541,6 +1607,30 @@ impl TimeRequirement {
         }
         Ok(Self { source_clock, target_clock, fit, maximum_error })
     }
+
+    /// Returns the required source clock domain.
+    #[must_use]
+    pub fn source_clock(&self) -> &str {
+        &self.source_clock
+    }
+
+    /// Returns the required target clock domain.
+    #[must_use]
+    pub fn target_clock(&self) -> &str {
+        &self.target_clock
+    }
+
+    /// Returns the required clock-fit identity.
+    #[must_use]
+    pub const fn fit(&self) -> FitIdentity {
+        self.fit
+    }
+
+    /// Returns the maximum admitted timing error.
+    #[must_use]
+    pub const fn maximum_error(&self) -> ErrorBound {
+        self.maximum_error
+    }
 }
 
 /// Required phase reference, coherence interval, and maximum phase error.
@@ -1561,6 +1651,24 @@ impl PhaseRequirement {
     ) -> Self {
         Self { reference, coherence, maximum_error }
     }
+
+    /// Returns the required phase-reference identity.
+    #[must_use]
+    pub const fn reference(self) -> PhaseReferenceIdentity {
+        self.reference
+    }
+
+    /// Returns the required coherent source interval.
+    #[must_use]
+    pub const fn coherence(self) -> TickRange {
+        self.coherence
+    }
+
+    /// Returns the maximum admitted phase error.
+    #[must_use]
+    pub const fn maximum_error(self) -> ErrorBound {
+        self.maximum_error
+    }
 }
 
 /// Required physical mapping for one block signal path.
@@ -1576,6 +1684,24 @@ impl PortRequirement {
     #[must_use]
     pub const fn new(path: SignalPath, tx_antenna: u16, rx_antenna: u16) -> Self {
         Self { path, tx_antenna, rx_antenna }
+    }
+
+    /// Returns the required source-native signal path.
+    #[must_use]
+    pub const fn path(self) -> SignalPath {
+        self.path
+    }
+
+    /// Returns the required physical transmitter antenna.
+    #[must_use]
+    pub const fn tx_antenna(self) -> u16 {
+        self.tx_antenna
+    }
+
+    /// Returns the required physical receiver antenna.
+    #[must_use]
+    pub const fn rx_antenna(self) -> u16 {
+        self.rx_antenna
     }
 }
 
@@ -1610,6 +1736,30 @@ impl GeometryRequirement {
             return Err(MeasurementError::new("geometry requirements must be nonempty"));
         }
         Ok(Self { source_frame, target_frame, pose, maximum_error })
+    }
+
+    /// Returns the required source coordinate frame.
+    #[must_use]
+    pub fn source_frame(&self) -> &str {
+        &self.source_frame
+    }
+
+    /// Returns the required target coordinate frame.
+    #[must_use]
+    pub fn target_frame(&self) -> &str {
+        &self.target_frame
+    }
+
+    /// Returns the required quantized pose identity.
+    #[must_use]
+    pub const fn pose(&self) -> Pose {
+        self.pose
+    }
+
+    /// Returns the maximum admitted geometry error.
+    #[must_use]
+    pub const fn maximum_error(&self) -> ErrorBound {
+        self.maximum_error
     }
 }
 
@@ -1679,6 +1829,36 @@ impl ModelRequirements {
             return Err(MeasurementError::new("physical requirements do not match operator"));
         }
         Ok(Self { operator, artifact, physical })
+    }
+
+    /// Returns the physical operation these requirements qualify.
+    #[must_use]
+    pub const fn operator(&self) -> PhysicalOperator {
+        self.operator
+    }
+
+    /// Returns the exact timing requirement.
+    #[must_use]
+    pub const fn time_requirement(&self) -> &TimeRequirement {
+        &self.physical.time
+    }
+
+    /// Returns the coherent phase requirement, when consumed by the operator.
+    #[must_use]
+    pub const fn phase_requirement(&self) -> Option<&PhaseRequirement> {
+        self.physical.phase.as_ref()
+    }
+
+    /// Returns exact physical port requirements.
+    #[must_use]
+    pub fn port_requirements(&self) -> &[PortRequirement] {
+        &self.physical.ports
+    }
+
+    /// Returns the geometry requirement, when consumed by the operator.
+    #[must_use]
+    pub const fn geometry_requirement(&self) -> Option<&GeometryRequirement> {
+        self.physical.geometry.as_ref()
     }
 }
 

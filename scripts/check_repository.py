@@ -36,6 +36,11 @@ RETIRED_PRODUCTION_PATTERNS = (
     ("legacy compatibility alias", r"\b(?:legacy_alias|compatibility_alias)\b"),
     ("dual write", r"\bdual_write\b"),
     ("shadow old system", r"\b(?:shadow_legacy|shadow_old_system)\b"),
+    ("ordinary ESP AoA", r"\b(?:OrdinaryEspAoa|ordinary_esp_aoa)\b"),
+    ("cross-array phase fusion", r"\b(?:CrossArrayPhaseFusion|cross_array_phase_fusion)\b"),
+    ("array path as person position", r"\b(?:ArrayPersonPosition|array_person_position)\b"),
+    ("permanent static-path deletion", r"\b(?:delete_static_path|DeleteStaticPath)\b"),
+    ("second path interpreter", r"\b(?:SecondPathInterpreter|second_path_interpreter)\b"),
 )
 PRODUCTION_ROOTS = ("src", "scripts", "firmware", "web", "browser", "app", "mobile")
 PRODUCTION_SUFFIXES = {".c", ".cc", ".cpp", ".css", ".h", ".html", ".js", ".mjs", ".py", ".rs", ".swift", ".ts"}

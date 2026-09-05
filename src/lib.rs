@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+pub mod array_adapter;
 pub mod artifact;
 pub mod companion;
 mod host;
