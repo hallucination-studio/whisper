@@ -133,6 +133,14 @@ fn calibration_and_supervision_round_trip_with_conditions_masks_and_joint_uncert
     invalid_geometry.array_geometry.minimum_frequency_hz =
         invalid_geometry.array_geometry.maximum_frequency_hz + 1;
     assert!(SealedArtifact::seal(Artifact::Calibration(Box::new(invalid_geometry))).is_err());
+
+    let mut empty_geometry_frame = calibration(scene_digest);
+    empty_geometry_frame.array_geometry.device_to_array.source_coordinate_system.clear();
+    assert!(SealedArtifact::seal(Artifact::Calibration(Box::new(empty_geometry_frame))).is_err());
+
+    let mut non_finite_geometry = calibration(scene_digest);
+    non_finite_geometry.array_geometry.device_to_array.matrix[3] = f64::NAN;
+    assert!(SealedArtifact::seal(Artifact::Calibration(Box::new(non_finite_geometry))).is_err());
 }
 
 #[test]
@@ -470,8 +478,8 @@ fn paired_encrypted_companion_upload_resumes_and_uses_shared_candidate_import() 
     let conflicting_chunk =
         connection.seal_upload(reused_id, second_content.bytes(), 64).unwrap().remove(0);
     assert_ne!(
-        &first_chunk.bytes()[88..],
-        &conflicting_chunk.bytes()[88..],
+        &first_chunk.bytes()[92..],
+        &conflicting_chunk.bytes()[92..],
         "reusing an upload id for different content must not reuse the AES-GCM key/nonce pair",
     );
     assert!(matches!(
@@ -483,12 +491,54 @@ fn paired_encrypted_companion_upload_resumes_and_uses_shared_candidate_import() 
         CompanionRejectReason::UploadConflict,
     );
 
+    let layout_content = vec![7_u8; 1_000];
+    let layout_id = UploadId::from_bytes([13; 16]);
+    let chunks_100 = connection.seal_upload(layout_id, &layout_content, 100).unwrap();
+    let chunks_101 = connection.seal_upload(layout_id, &layout_content, 101).unwrap();
+    assert_eq!(chunks_100.len(), chunks_101.len());
+    assert_ne!(
+        &chunks_100[0].bytes()[92..],
+        &chunks_101[0].bytes()[92..],
+        "the canonical layout must change the AES-GCM key/nonce domain",
+    );
+    assert!(matches!(
+        host.upload_companion_bytes(chunks_100[0].bytes()).unwrap(),
+        UploadProgress::Pending { .. }
+    ));
+    assert_eq!(
+        host.upload_companion_bytes(chunks_101[0].bytes()).unwrap_err().reason(),
+        CompanionRejectReason::UploadConflict,
+    );
+
+    let mut forged_layout =
+        connection.seal_upload(UploadId::from_bytes([14; 16]), &layout_content, 100).unwrap()[0]
+            .bytes()
+            .into_vec();
+    forged_layout[44..48].copy_from_slice(&101_u32.to_le_bytes());
+    let forged_layout_error = host.upload_companion_bytes(&forged_layout).unwrap_err();
+    assert_eq!(forged_layout_error.reason(), CompanionRejectReason::AuthenticationFailed);
+    assert!(
+        forged_layout_error.to_string().contains("authenticate and decrypt companion upload chunk")
+    );
+
+    let mut noncanonical_layout =
+        connection.seal_upload(UploadId::from_bytes([15; 16]), &layout_content, 100).unwrap()[0]
+            .bytes()
+            .into_vec();
+    noncanonical_layout[44..48].copy_from_slice(&99_u32.to_le_bytes());
+    assert_eq!(
+        host.upload_companion_bytes(&noncanonical_layout).unwrap_err().reason(),
+        CompanionRejectReason::LimitExceeded,
+    );
+
     host.shutdown().unwrap();
     fs::remove_dir_all(parent).unwrap();
 }
 
 #[test]
 fn companion_transport_rejects_tampered_ciphertext_without_importing() {
+    use std::error::Error as _;
+
     let parent = temporary_directory("artifact-companion-tamper");
     let root = parent.join("world-store");
     let host = start_host(&parent, &root);
@@ -502,10 +552,10 @@ fn companion_transport_rejects_tampered_ciphertext_without_importing() {
     let mut tampered = chunk.bytes().into_vec();
     *tampered.last_mut().unwrap() ^= 1;
 
-    assert_eq!(
-        host.upload_companion_bytes(&tampered).unwrap_err().reason(),
-        CompanionRejectReason::AuthenticationFailed
-    );
+    let error = host.upload_companion_bytes(&tampered).unwrap_err();
+    assert_eq!(error.reason(), CompanionRejectReason::AuthenticationFailed);
+    assert!(error.to_string().contains("authenticate and decrypt companion upload chunk"));
+    assert!(error.source().and_then(std::error::Error::source).is_some());
     assert!(host.query_artifact(sealed.digest()).unwrap().is_none());
 
     host.shutdown().unwrap();
@@ -559,6 +609,8 @@ fn companion_pairing_expires_and_clock_round_trip_is_bounded() {
 
 #[test]
 fn pairing_secret_is_absent_from_wire_and_wrong_tampered_or_replayed_proofs_fail() {
+    use std::error::Error as _;
+
     let parent = temporary_directory("companion-secret-establishment");
     let root = parent.join("world-store");
     let host = start_host(&parent, &root);
@@ -590,10 +642,10 @@ fn pairing_secret_is_absent_from_wire_and_wrong_tampered_or_replayed_proofs_fail
             responses.clone(),
         )
         .unwrap();
-    assert_eq!(
-        host.connect_companion(wrong_request).unwrap_err().reason(),
-        CompanionRejectReason::AuthenticationFailed,
-    );
+    let wrong_code_error = host.connect_companion(wrong_request).unwrap_err();
+    assert_eq!(wrong_code_error.reason(), CompanionRejectReason::AuthenticationFailed);
+    assert!(wrong_code_error.to_string().contains("verify companion pairing-code proof"));
+    assert!(wrong_code_error.source().and_then(std::error::Error::source).is_some());
 
     let (request, pending) = invitation
         .begin_handshake(

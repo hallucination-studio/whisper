@@ -1518,6 +1518,11 @@ fn validate_source(source: &SourceIdentity) -> Result<(), ArtifactError> {
 
 fn validate_affine_transform(transform: &CoordinateTransform) -> Result<(), ArtifactError> {
     let matrix = &transform.matrix;
+    require_text(&transform.source_coordinate_system)?;
+    require_text(&transform.target_coordinate_system)?;
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return Err(ArtifactError::new("coordinate transform must contain finite values"));
+    }
     if matrix[12] != 0.0 || matrix[13] != 0.0 || matrix[14] != 0.0 || matrix[15] != 1.0 {
         return Err(ArtifactError::new("coordinate transform is not affine homogeneous"));
     }
