@@ -344,7 +344,9 @@ fn persist_fragment_in_transaction(
         } else {
             mark_open_fragments(transaction, path, close.key(), disposition)?;
         }
-        let trigger = (close.key() == &trigger_key).then_some(fragment_id);
+        let trigger = (close.key() == &trigger_key
+            && close.reason() != AssemblyCloseReason::WaitLimit)
+            .then_some(fragment_id);
         persist_close(transaction, path, close, trigger)?;
     }
     Ok(closes)

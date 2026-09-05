@@ -814,6 +814,20 @@ impl MeasurementAssembler {
         fragment: MeasurementFragment,
         arrival: SourceTick,
     ) -> Result<(), MeasurementError> {
+        if fragment.position.expected > self.limits.capacity.fragments {
+            return Err(MeasurementError::new(
+                "persisted open fragment count exceeds configured capacity",
+            ));
+        }
+        let restored_bytes = self
+            .open
+            .get(&fragment.key)
+            .map_or(0, |open| open.total_bytes)
+            .checked_add(u64::from(fragment.fact.bytes.get()))
+            .ok_or_else(|| MeasurementError::new("persisted open byte count overflowed"))?;
+        if restored_bytes > self.limits.capacity.bytes {
+            return Err(MeasurementError::new("persisted open bytes exceed configured capacity"));
+        }
         let closes = self.ingest_inner(fragment, arrival, false)?;
         if closes.is_empty() {
             Ok(())
@@ -1650,9 +1664,15 @@ impl ModelRequirements {
         artifact: ArtifactScope,
         physical: PhysicalRequirements,
     ) -> Result<Self, MeasurementError> {
-        let angle_inputs =
-            physical.phase.is_some() && !physical.ports.is_empty() && physical.geometry.is_some();
-        if (operator == PhysicalOperator::AngleDelay) != angle_inputs {
+        let input_presence =
+            (physical.phase.is_some(), !physical.ports.is_empty(), physical.geometry.is_some());
+        let valid = match operator {
+            PhysicalOperator::AngleDelay => input_presence == (true, true, true),
+            PhysicalOperator::AbsoluteResponse | PhysicalOperator::FastChange => {
+                input_presence == (false, false, false)
+            }
+        };
+        if !valid {
             return Err(MeasurementError::new("physical requirements do not match operator"));
         }
         Ok(Self { operator, artifact, physical })

@@ -142,7 +142,7 @@ fn native_csi_closes_one_persisted_measurement_and_relations_round_trip() {
 }
 
 #[test]
-fn heterogeneous_partial_assembly_survives_restart_and_late_data_cannot_reopen_it() {
+fn heterogeneous_restart_and_exact_duplicate_at_wait_boundary_preserve_closes() {
     let parent = temporary_directory("host-general-measurement");
     let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
     let secret_root = create_secret_root(&parent);
@@ -344,10 +344,10 @@ fn heterogeneous_partial_assembly_survives_restart_and_late_data_cannot_reopen_i
     let after_deadline = reopened
         .persist_measurement_fragment(
             MeasurementFragment::new(
-                waited_key,
-                FragmentPosition::new(1, 2).unwrap(),
+                waited_key.clone(),
+                FragmentPosition::new(0, 2).unwrap(),
                 FragmentFact::new(
-                    [13; 32],
+                    [12; 32],
                     FragmentBytes::new(1).unwrap(),
                     EvidenceQuality::Captured,
                 ),
@@ -360,12 +360,19 @@ fn heterogeneous_partial_assembly_survives_restart_and_late_data_cannot_reopen_i
         [AssemblyCloseReason::WaitLimit, AssemblyCloseReason::LateFragment]
     );
     assert!(!after_deadline.iter().any(|close| close.reason() == AssemblyCloseReason::Complete));
-    let reasons = reopened
-        .query_measurement_closes(16)
-        .unwrap()
-        .into_iter()
-        .map(|close| close.reason())
-        .collect::<Vec<_>>();
+    assert_eq!(after_deadline[0].missing_ordinals(), [1]);
+    assert_eq!(after_deadline[0].members()[0].fact_digest(), [12; 32]);
+    let persisted_closes = reopened.query_measurement_closes(16).unwrap();
+    let waited_closes =
+        persisted_closes.iter().filter(|close| close.key() == &waited_key).collect::<Vec<_>>();
+    assert_eq!(waited_closes.len(), 2);
+    let persisted_wait = waited_closes
+        .iter()
+        .find(|close| close.reason() == AssemblyCloseReason::WaitLimit)
+        .unwrap();
+    assert_eq!(persisted_wait.missing_ordinals(), [1]);
+    assert_eq!(persisted_wait.members()[0].fact_digest(), [12; 32]);
+    let reasons = persisted_closes.into_iter().map(|close| close.reason()).collect::<Vec<_>>();
     for reason in [
         AssemblyCloseReason::WaitLimit,
         AssemblyCloseReason::CountLimit,
@@ -438,9 +445,20 @@ fn measurement_query_rejects_same_width_tampering_for_every_close_reason() {
     host.persist_measurement_fragment(fragment(8, 0, 2, 11, 1), SourceTick::new(7)).unwrap();
     host.persist_measurement_fragment(fragment(8, 0, 2, 11, 1), SourceTick::new(8)).unwrap();
     host.persist_measurement_fragment(fragment(9, 0, 2, 12, 1), SourceTick::new(8)).unwrap();
-    host.persist_measurement_fragment(fragment(9, 0, 2, 13, 1), SourceTick::new(9)).unwrap();
+    host.persist_measurement_fragment(fragment(9, 0, 3, 13, 1), SourceTick::new(9)).unwrap();
     host.persist_measurement_fragment(fragment(1, 0, 1, 14, 1), SourceTick::new(9)).unwrap();
-    assert_eq!(host.query_measurement_closes(32).unwrap().len(), 10);
+    let closes = host.query_measurement_closes(32).unwrap();
+    assert_eq!(closes.len(), 10);
+    let declared_count_conflict = closes
+        .iter()
+        .find(|close| {
+            close.key() == &key_for_event(9)
+                && close.reason() == AssemblyCloseReason::ConflictingDuplicate
+        })
+        .unwrap();
+    assert_eq!(declared_count_conflict.expected_fragments(), 2);
+    assert_eq!(declared_count_conflict.members().len(), 1);
+    assert_eq!(declared_count_conflict.missing_ordinals(), [1]);
     host.shutdown().unwrap();
 
     let mutations = [
@@ -576,6 +594,115 @@ fn resource_limit_close_remains_closed_across_restart() {
     assert!(closes.iter().any(|close| close.reason() == AssemblyCloseReason::LateFragment));
     reopened.shutdown().unwrap();
     fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn restart_rejects_open_fragment_count_or_byte_limit_tampering() {
+    for (label, mutation) in [
+        ("count", "UPDATE measurement_fragments SET expected_fragments=5"),
+        ("bytes", "UPDATE measurement_fragments SET payload_bytes=5 WHERE ordinal=1"),
+    ] {
+        let parent = temporary_directory(&format!("host-open-assembly-{label}-tamper"));
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+        let secret_root = create_secret_root(&parent);
+        let store_root = parent.join("world-store");
+        let limits = AssemblyLimits::new(
+            AssemblyCapacity::new(2, 4, 8).unwrap(),
+            WaitTicks::new(5).unwrap(),
+        );
+        let host = start_host_with_measurement_limits(
+            Store::initialize(&store_root).unwrap(),
+            &sender,
+            &secret_root,
+            limits,
+        );
+        let key = AssemblyKey::new(
+            SourceInstance::new(
+                SensorId::try_from("restore-rx").unwrap(),
+                DeviceId::new(94),
+                KeyEpoch::new(3).unwrap(),
+                BootGeneration::new(8).unwrap(),
+            ),
+            EventIdentity::new(
+                TransmitterIdentity::new([1; 32]),
+                NativeEventIdentity::new([2; 32]),
+                None,
+            ),
+            MeasurementContext::new(
+                ProfileIdentity::new([3; 32]),
+                RadioIdentity::new([4; 32]),
+                ChannelIdentity::new([5; 32]),
+            ),
+        );
+        host.persist_measurement_fragment(
+            MeasurementFragment::new(
+                key,
+                FragmentPosition::new(0, if label == "bytes" { 3 } else { 2 }).unwrap(),
+                FragmentFact::new(
+                    [6; 32],
+                    FragmentBytes::new(4).unwrap(),
+                    EvidenceQuality::Captured,
+                ),
+            ),
+            SourceTick::new(1),
+        )
+        .unwrap();
+        if label == "bytes" {
+            host.persist_measurement_fragment(
+                MeasurementFragment::new(
+                    AssemblyKey::new(
+                        SourceInstance::new(
+                            SensorId::try_from("restore-rx").unwrap(),
+                            DeviceId::new(94),
+                            KeyEpoch::new(3).unwrap(),
+                            BootGeneration::new(8).unwrap(),
+                        ),
+                        EventIdentity::new(
+                            TransmitterIdentity::new([1; 32]),
+                            NativeEventIdentity::new([2; 32]),
+                            None,
+                        ),
+                        MeasurementContext::new(
+                            ProfileIdentity::new([3; 32]),
+                            RadioIdentity::new([4; 32]),
+                            ChannelIdentity::new([5; 32]),
+                        ),
+                    ),
+                    FragmentPosition::new(1, 3).unwrap(),
+                    FragmentFact::new(
+                        [7; 32],
+                        FragmentBytes::new(4).unwrap(),
+                        EvidenceQuality::Captured,
+                    ),
+                ),
+                SourceTick::new(2),
+            )
+            .unwrap();
+        }
+        host.shutdown().unwrap();
+        let database = rusqlite::Connection::open(store_root.join("facts.sqlite3")).unwrap();
+        database.execute(mutation, []).unwrap();
+        drop(database);
+        let route = NativeFrameRoute::load(
+            sender.local_addr().unwrap().ip(),
+            device_id(),
+            key_epoch(),
+            admission_limits(1_000),
+            decoded_route(non_ht_radio()),
+            &secret_root,
+        )
+        .unwrap();
+        Host::builder(
+            Store::open(&store_root).unwrap(),
+            deployment("lab"),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .route(route)
+        .measurement_limits(limits)
+        .start()
+        .expect_err("tampered open assembly must fail closed during restore");
+        fs::remove_dir_all(parent).unwrap();
+    }
 }
 
 #[test]

@@ -124,24 +124,48 @@ fn partial_timeout_and_late_data_are_separate_immutable_facts() {
 }
 
 #[test]
-fn source_profile_radio_and_channel_boundaries_never_mix() {
+fn boot_profile_radio_and_channel_boundaries_never_mix() {
     let mut assembler = MeasurementAssembler::new(limits(8, 4, 64, 5));
     let first = fragment(1, 8, 0, 2);
-    let mut different = first.key().clone();
-    different = AssemblyKey::new(
-        different.source().clone(),
-        different.event(),
+    let base = first.key().clone();
+    let contexts = [
         MeasurementContext::new(
             ProfileIdentity::new([9; 32]),
-            different.context().radio(),
-            different.context().channel(),
+            base.context().radio(),
+            base.context().channel(),
         ),
-    );
+        MeasurementContext::new(
+            base.context().profile(),
+            RadioIdentity::new([9; 32]),
+            base.context().channel(),
+        ),
+        MeasurementContext::new(
+            base.context().profile(),
+            base.context().radio(),
+            ChannelIdentity::new([9; 32]),
+        ),
+    ];
     assembler.ingest(first, SourceTick::new(0)).unwrap();
+    for context in contexts {
+        assembler
+            .ingest(
+                MeasurementFragment::new(
+                    AssemblyKey::new(base.source().clone(), base.event(), context),
+                    FragmentPosition::new(1, 2).unwrap(),
+                    FragmentFact::new(
+                        [2; 32],
+                        FragmentBytes::new(12).unwrap(),
+                        EvidenceQuality::Captured,
+                    ),
+                ),
+                SourceTick::new(1),
+            )
+            .unwrap();
+    }
     assembler
         .ingest(
             MeasurementFragment::new(
-                different,
+                AssemblyKey::new(source(2), base.event(), base.context()),
                 FragmentPosition::new(1, 2).unwrap(),
                 FragmentFact::new(
                     [2; 32],
@@ -152,8 +176,9 @@ fn source_profile_radio_and_channel_boundaries_never_mix() {
             SourceTick::new(1),
         )
         .unwrap();
-    let closes = assembler.expire(&source(1), SourceTick::new(6));
-    assert_eq!(closes.len(), 2);
+    let mut closes = assembler.expire(&source(1), SourceTick::new(6));
+    closes.extend(assembler.expire(&source(2), SourceTick::new(6)));
+    assert_eq!(closes.len(), 5);
     assert!(closes.iter().all(|close| close.members().len() == 1));
 }
 
@@ -237,6 +262,55 @@ fn requirements(operator: PhysicalOperator, activation: TickRange) -> ModelRequi
         .unwrap(),
     )
     .unwrap()
+}
+
+#[test]
+fn model_requirements_reject_every_partial_operator_input_combination() {
+    for operator in [
+        PhysicalOperator::AbsoluteResponse,
+        PhysicalOperator::FastChange,
+        PhysicalOperator::AngleDelay,
+    ] {
+        for mask in 0_u8..8 {
+            let physical = PhysicalRequirements::new(
+                TimeRequirement::new(
+                    "sensor-clock",
+                    "model-clock",
+                    FitIdentity::new([1; 32]),
+                    ErrorBound::new(3, ErrorUnit::Nanoseconds),
+                )
+                .unwrap(),
+                (mask & 1 != 0).then_some(PhaseRequirement::new(
+                    PhaseReferenceIdentity::new([2; 32]),
+                    range(0, 10),
+                    ErrorBound::new(3, ErrorUnit::Milliradians),
+                )),
+                (mask & 2 != 0).then_some(PortRequirement::new(SignalPath::new(0, 0), 2, 1)),
+                (mask & 4 != 0)
+                    .then(|| {
+                        GeometryRequirement::new(
+                            "sensor",
+                            "room",
+                            Pose::new([0; 7]),
+                            ErrorBound::new(3, ErrorUnit::Millimetres),
+                        )
+                    })
+                    .transpose()
+                    .unwrap(),
+            )
+            .unwrap();
+            let result = ModelRequirements::new(
+                operator,
+                ArtifactScope::new(range(0, 10), QualificationEpoch::new(4), key(1, 1).context()),
+                physical,
+            );
+            let accepted = match operator {
+                PhysicalOperator::AngleDelay => mask == 7,
+                PhysicalOperator::AbsoluteResponse | PhysicalOperator::FastChange => mask == 0,
+            };
+            assert_eq!(result.is_ok(), accepted, "operator={operator:?}, mask={mask:03b}");
+        }
+    }
 }
 
 #[test]
@@ -365,22 +439,6 @@ fn eligibility_reports_exact_physical_mismatches_without_accepting_unrelated_inp
 
 #[test]
 fn eligibility_rejects_profile_radio_or_channel_crossing() {
-    let identity = EvidenceBlockIdentity::new(
-        EvidenceScope::new(
-            source(1),
-            MeasurementContext::new(
-                ProfileIdentity::new([99; 32]),
-                RadioIdentity::new([5; 32]),
-                ChannelIdentity::new([6; 32]),
-            ),
-            range(5, 6),
-            QualificationEpoch::new(4),
-        ),
-        [EvidenceMemberIdentity::new([1; 32])],
-        [],
-    )
-    .unwrap();
-    let evidence = EvidenceBlock::new(identity, [EvidenceQuality::Captured]).unwrap();
     let qualification = Qualification::new(
         Some(
             TimeRelation::new(
@@ -395,7 +453,170 @@ fn eligibility_rejects_profile_radio_or_channel_crossing() {
         None,
         None,
     );
-    let gaps = qualification
-        .eligibility(&evidence, &requirements(PhysicalOperator::AbsoluteResponse, range(0, 10)));
-    assert!(gaps.gaps().contains(&QualificationGap::MeasurementContext));
+    for context in [
+        MeasurementContext::new(
+            ProfileIdentity::new([99; 32]),
+            RadioIdentity::new([5; 32]),
+            ChannelIdentity::new([6; 32]),
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new([4; 32]),
+            RadioIdentity::new([99; 32]),
+            ChannelIdentity::new([6; 32]),
+        ),
+        MeasurementContext::new(
+            ProfileIdentity::new([4; 32]),
+            RadioIdentity::new([5; 32]),
+            ChannelIdentity::new([99; 32]),
+        ),
+    ] {
+        let identity = EvidenceBlockIdentity::new(
+            EvidenceScope::new(source(1), context, range(5, 6), QualificationEpoch::new(4)),
+            [EvidenceMemberIdentity::new([1; 32])],
+            [],
+        )
+        .unwrap();
+        let evidence = EvidenceBlock::new(identity, [EvidenceQuality::Captured]).unwrap();
+        let gaps = qualification.eligibility(
+            &evidence,
+            &requirements(PhysicalOperator::AbsoluteResponse, range(0, 10)),
+        );
+        assert!(gaps.gaps().contains(&QualificationGap::MeasurementContext));
+    }
+}
+
+#[test]
+fn eligibility_reports_each_relation_identity_validity_and_mapping_gap() {
+    let evidence = block(range(5, 6), EvidenceQuality::Captured);
+    let required = requirements(PhysicalOperator::AngleDelay, range(0, 10));
+    let exact_time =
+        TimeRelation::new(validity(10), "sensor-clock", "model-clock", FitIdentity::new([1; 32]))
+            .unwrap();
+    let exact_phase =
+        PhaseRelation::new(validity(10), PhaseReferenceIdentity::new([2; 32]), range(0, 10))
+            .unwrap();
+    let exact_port = PortMapping::new(validity(10), [PortMapEntry::new(0, 0, Some(2), 1)]).unwrap();
+    let exact_geometry = Geometry::new(validity(10), "sensor", "room", Pose::new([0; 7])).unwrap();
+    let cases = [
+        (
+            QualificationGap::TimeClockDomains,
+            Qualification::new(
+                Some(
+                    TimeRelation::new(
+                        validity(10),
+                        "other-clock",
+                        "model-clock",
+                        FitIdentity::new([1; 32]),
+                    )
+                    .unwrap(),
+                ),
+                Some(exact_phase.clone()),
+                Some(exact_port.clone()),
+                Some(exact_geometry.clone()),
+            ),
+        ),
+        (
+            QualificationGap::TimeFit,
+            Qualification::new(
+                Some(
+                    TimeRelation::new(
+                        validity(10),
+                        "sensor-clock",
+                        "model-clock",
+                        FitIdentity::new([9; 32]),
+                    )
+                    .unwrap(),
+                ),
+                Some(exact_phase.clone()),
+                Some(exact_port.clone()),
+                Some(exact_geometry.clone()),
+            ),
+        ),
+        (
+            QualificationGap::TimeScope,
+            Qualification::new(
+                Some(
+                    TimeRelation::new(
+                        validity(4),
+                        "sensor-clock",
+                        "model-clock",
+                        FitIdentity::new([1; 32]),
+                    )
+                    .unwrap(),
+                ),
+                Some(exact_phase.clone()),
+                Some(exact_port.clone()),
+                Some(exact_geometry.clone()),
+            ),
+        ),
+        (
+            QualificationGap::PhaseCoherence,
+            Qualification::new(
+                Some(exact_time.clone()),
+                Some(
+                    PhaseRelation::new(
+                        validity(10),
+                        PhaseReferenceIdentity::new([2; 32]),
+                        range(0, 4),
+                    )
+                    .unwrap(),
+                ),
+                Some(exact_port.clone()),
+                Some(exact_geometry.clone()),
+            ),
+        ),
+        (
+            QualificationGap::PortMapping,
+            Qualification::new(
+                Some(exact_time.clone()),
+                Some(exact_phase.clone()),
+                None,
+                Some(exact_geometry.clone()),
+            ),
+        ),
+        (
+            QualificationGap::GeometryPose,
+            Qualification::new(
+                Some(exact_time.clone()),
+                Some(exact_phase.clone()),
+                Some(exact_port.clone()),
+                Some(Geometry::new(validity(10), "sensor", "room", Pose::new([1; 7])).unwrap()),
+            ),
+        ),
+        (
+            QualificationGap::TimeError,
+            Qualification::new(
+                Some(
+                    TimeRelation::new(
+                        validity_with_error(10, ErrorBound::new(3, ErrorUnit::Millimetres)),
+                        "sensor-clock",
+                        "model-clock",
+                        FitIdentity::new([1; 32]),
+                    )
+                    .unwrap(),
+                ),
+                Some(exact_phase),
+                Some(exact_port),
+                Some(exact_geometry),
+            ),
+        ),
+    ];
+    for (expected, qualification) in cases {
+        let gaps = qualification.eligibility(&evidence, &required);
+        assert!(gaps.gaps().contains(&expected), "missing {expected:?}: {:?}", gaps.gaps());
+    }
+
+    let expired_epoch_identity = EvidenceBlockIdentity::new(
+        EvidenceScope::new(source(1), key(1, 1).context(), range(5, 6), QualificationEpoch::new(5)),
+        [EvidenceMemberIdentity::new([1; 32])],
+        [SignalPath::new(0, 0)],
+    )
+    .unwrap();
+    let expired_epoch =
+        EvidenceBlock::new(expired_epoch_identity, [EvidenceQuality::Captured]).unwrap();
+    let gaps = Qualification::new(Some(exact_time), None, None, None).eligibility(
+        &expired_epoch,
+        &requirements(PhysicalOperator::AbsoluteResponse, range(0, 10)),
+    );
+    assert!(gaps.gaps().contains(&QualificationGap::ArtifactActivation));
 }

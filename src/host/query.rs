@@ -1024,20 +1024,19 @@ fn validate_close_integrity(
             isolated
                 && uncertainty == AssociationUncertainty::ExactNativeIdentity
                 && metrics.attempted_fragments() >= 2
-                && metrics.attempted_bytes() > total
                 && trigger_is_member
         }
         AssemblyCloseReason::ConflictingDuplicate => {
             uncertainty == AssociationUncertainty::ConflictingFacts
                 && metrics.attempted_fragments()
                     == u32::try_from(members.len()).unwrap_or(u32::MAX).saturating_add(1)
-                && metrics.attempted_bytes() > total
                 && trigger.as_ref().is_some_and(|fact| {
-                    fact.expected == expected
-                        && members.iter().any(|member| member.ordinal() == fact.ordinal)
-                        && members.iter().all(|member| {
-                            member.ordinal() != fact.ordinal || member.fact_digest() != fact.digest
-                        })
+                    (fact.expected != expected
+                        || (members.iter().any(|member| member.ordinal() == fact.ordinal)
+                            && members.iter().all(|member| {
+                                member.ordinal() != fact.ordinal
+                                    || member.fact_digest() != fact.digest
+                            })))
                         && metrics.attempted_bytes() == total.saturating_add(u64::from(fact.bytes))
                 })
         }
