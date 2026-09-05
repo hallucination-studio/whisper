@@ -1,6 +1,7 @@
 #if os(iOS) && canImport(SwiftUI) && canImport(RoomPlan) && canImport(RealityKit)
 import SwiftUI
 import UIKit
+import ARKit
 import RealityKit
 import RoomPlan
 import WhisperPhoneClient
@@ -8,7 +9,7 @@ import WhisperPhoneClient
 @available(iOS 17.0, *)
 @main
 struct WhisperPhoneClientApp: App {
-    var body: some Scene {
+    var body: some SwiftUI.Scene {
         WindowGroup {
             PhoneCaptureRootView()
         }
