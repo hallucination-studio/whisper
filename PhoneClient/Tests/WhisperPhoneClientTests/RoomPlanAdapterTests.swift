@@ -4,7 +4,7 @@ import RoomPlan
 import XCTest
 @testable import WhisperPhoneClient
 
-@available(iOS 16.0, *)
+@available(iOS 17.0, *)
 @MainActor
 final class RoomPlanAdapterTests: XCTestCase {
     func testRoomPlanAndARKitRetainOneSharedSession() {

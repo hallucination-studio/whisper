@@ -5,6 +5,7 @@ import RealityKit
 import RoomPlan
 import WhisperPhoneClient
 
+@available(iOS 17.0, *)
 @main
 struct WhisperPhoneClientApp: App {
     var body: some Scene {
@@ -14,7 +15,7 @@ struct WhisperPhoneClientApp: App {
     }
 }
 
-@available(iOS 16.0, *)
+@available(iOS 17.0, *)
 struct PhoneCaptureRootView: View {
     @StateObject private var model = PhoneCaptureViewModel()
 
@@ -147,7 +148,7 @@ struct PhoneCaptureRootView: View {
 
 /// Displays the same ARSession that RoomCaptureSession owns, keeping the camera
 /// preview and RoomPlan's coordinate frame connected.
-@available(iOS 16.0, *)
+@available(iOS 17.0, *)
 private struct RoomPlanCameraView: UIViewRepresentable {
     let session: ARSession
 
@@ -165,7 +166,7 @@ private struct RoomPlanCameraView: UIViewRepresentable {
     }
 }
 
-@available(iOS 16.0, *)
+@available(iOS 17.0, *)
 @MainActor
 final class PhoneCaptureViewModel: ObservableObject {
     @Published var phase: ScanPhase = .idle

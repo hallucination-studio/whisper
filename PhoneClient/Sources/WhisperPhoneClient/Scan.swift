@@ -634,7 +634,7 @@ import CoreVideo
 import simd
 
 /// RoomPlan/ARKit adapter that owns one shared session and turns delegate frames into artifacts.
-@available(iOS 16.0, *)
+@available(iOS 17.0, *)
 @MainActor
 public final class RoomPlanCaptureController: NSObject, RoomCaptureSessionDelegate, ARSessionDelegate {
     /// The one AR session supplied to RoomPlan and retained for RGB/depth/pose capture.
@@ -858,7 +858,7 @@ public final class RoomPlanCaptureController: NSObject, RoomCaptureSessionDelega
         let elements = roomGeometry(room)
         guard !elements.isEmpty else { throw PhoneClientError.invalidArtifact("RoomPlan did not produce structured geometry") }
         let pose = try transform(frame.camera.transform, source: "camera", target: worldCoordinateSystem, error: trackingQuality == .normal ? 0.1 : 0.75)
-        let cells = elements.map { CoverageCell(positionM: $0.verticesM[0], covered: true) }
+        let cells = elements.map { CoverageCell(positionM: $0.0.verticesM[0], covered: true) }
         let validity = elements.map { $0.1 }
         let geometry = elements.map { $0.0 }
         return ScanFrame(worldCoordinateSystem: worldCoordinateSystem, geometry: geometry, geometryValidityMask: validity, coverageMask: cells, scanCoverage: Double(cells.filter(\.covered).count) / Double(cells.count), mapErrorM: trackingQuality == .normal ? 0.1 : 0.75, cameraToWorld: pose, trackingEpoch: trackingEpoch, trackingQuality: trackingQuality, depthQuality: frame.sceneDepth == nil ? .missing : .measured)
