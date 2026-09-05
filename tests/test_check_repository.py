@@ -1,6 +1,8 @@
 """Behavior tests for the repository policy check entry point."""
 
 from pathlib import Path
+import hashlib
+import json
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +19,32 @@ class RepositoryPolicyCheckTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def write_check_failure_receipt(self, root: Path, *, log_digest: str | None = None) -> Path:
+        receipt_directory = root / "docs" / "evidence" / "receipts" / "check-entry-a331dd5"
+        receipt_directory.mkdir(parents=True)
+        log = b"controlled failure\n"
+        (receipt_directory / "intentional-domain-failure.log").write_bytes(log)
+        receipt = {
+            "schema": "whisper-check-failure-receipt-v1",
+            "repository_revision": "a331dd5519b5bb4565aa59454c251803ebae7585",
+            "environment": {"platform": "test-platform", "python": "test-python"},
+            "command": "make check",
+            "procedure": "controlled-domain-assertion-inversion-v1",
+            "controlled_mutation": "assertion inversion",
+            "started_at_utc": "2026-09-05T07:04:06+00:00",
+            "finished_at_utc": "2026-09-05T07:04:18+00:00",
+            "outcome": "rejected-controlled-domain-regression",
+            "exit_status": 2,
+            "log_sha256": log_digest or hashlib.sha256(log).hexdigest(),
+            "observed": [
+                "package_has_no_legacy_host_binary_target ... FAILED",
+                "make: *** [check-rust]",
+            ],
+        }
+        path = receipt_directory / "receipt.json"
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        return path
 
     def test_rejects_broken_local_documentation_link(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -92,6 +120,31 @@ class RepositoryPolicyCheckTests(unittest.TestCase):
             self.assertIn("dual write", result.stderr)
             self.assertIn("shadow old system", result.stderr)
 
+    def test_build_named_production_directories_cannot_bypass_hard_cut(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rejected = (
+                root / "src" / "build" / "legacy.rs",
+                root / "scripts" / "build" / "serve.py",
+                root / "web" / "build" / "app.js",
+            )
+            for path in rejected:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("struct SessionTime;\n", encoding="utf-8")
+            actual_test = root / "firmware" / "esp32-native-frame" / "tests" / "legacy.c"
+            actual_generated = root / "firmware" / "esp32-native-frame" / "build" / "legacy.c"
+            for path in (actual_test, actual_generated):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("struct SessionTime;\n", encoding="utf-8")
+
+            result = self.run_checker(root, "hard-cut")
+
+            self.assertNotEqual(result.returncode, 0)
+            for path in rejected:
+                self.assertIn(str(path.relative_to(root)), result.stderr)
+            self.assertNotIn(str(actual_test.relative_to(root)), result.stderr)
+            self.assertNotIn(str(actual_generated.relative_to(root)), result.stderr)
+
     def test_rejects_missing_preserved_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_checker(Path(directory), "preserved-inputs")
@@ -99,6 +152,37 @@ class RepositoryPolicyCheckTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("DemoSmokeReceipt.json", result.stderr)
             self.assertIn("native-frame", result.stderr)
+
+    def test_rejects_check_failure_log_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_check_failure_receipt(root, log_digest="0" * 64)
+
+            result = self.run_checker(root, "preserved-inputs")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("log_sha256 does not match", result.stderr)
+
+    def test_rejects_missing_or_invalid_check_failure_receipt_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt_path = self.write_check_failure_receipt(root)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            del receipt["procedure"]
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            result = self.run_checker(root, "preserved-inputs")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("receipt schema fields", result.stderr)
+
+            receipt["procedure"] = "controlled-domain-assertion-inversion-v1"
+            receipt["exit_status"] = 0
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            result = self.run_checker(root, "preserved-inputs")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exit_status", result.stderr)
 
 
 if __name__ == "__main__":

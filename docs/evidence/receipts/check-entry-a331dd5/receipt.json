@@ -1,6 +1,10 @@
 {
   "command": "make check",
   "controlled_mutation": "assert!(option_env!(\"CARGO_BIN_EXE_whisper\").is_none()); -> assert!(option_env!(\"CARGO_BIN_EXE_whisper\").is_some());",
+  "environment": {
+    "platform": "macOS-26.6-arm64-arm-64bit-Mach-O",
+    "python": "3.14.6"
+  },
   "exit_status": 2,
   "finished_at_utc": "2026-09-05T07:04:18.597618+00:00",
   "log_sha256": "84d597af8d85eee9296f1703b85d3bf1f9db8bf1ef5da9383200428ce0dd94fe",
@@ -8,7 +12,9 @@
     "package_has_no_legacy_host_binary_target ... FAILED",
     "make: *** [check-rust]"
   ],
-  "platform": "macOS-26.6-arm64-arm-64bit-Mach-O",
+  "outcome": "rejected-controlled-domain-regression",
+  "procedure": "controlled-domain-assertion-inversion-v1",
   "repository_revision": "a331dd5519b5bb4565aa59454c251803ebae7585",
+  "schema": "whisper-check-failure-receipt-v1",
   "started_at_utc": "2026-09-05T07:04:06.519802+00:00"
 }

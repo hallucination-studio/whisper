@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -61,13 +62,16 @@ def main() -> int:
     log = arguments.output / "intentional-domain-failure.log"
     log.write_bytes(output)
     metadata = {
+        "schema": "whisper-check-failure-receipt-v1",
         "command": "make check",
         "controlled_mutation": f"{ORIGINAL_ASSERTION} -> {FAILING_ASSERTION}",
+        "environment": {"platform": platform.platform(), "python": sys.version},
         "exit_status": result.returncode,
         "finished_at_utc": finished_at.isoformat(),
         "log_sha256": hashlib.sha256(output).hexdigest(),
         "observed": [marker.decode() for marker in required],
-        "platform": platform.platform(),
+        "outcome": "rejected-controlled-domain-regression",
+        "procedure": "controlled-domain-assertion-inversion-v1",
         "repository_revision": revision,
         "started_at_utc": started_at.isoformat(),
     }

@@ -2,6 +2,9 @@
 """Check repository policies that are not expressed by language toolchains."""
 
 from argparse import ArgumentParser
+from datetime import datetime
+import hashlib
+import json
 from pathlib import Path
 import re
 import sys
@@ -36,6 +39,10 @@ RETIRED_PRODUCTION_PATTERNS = (
 )
 PRODUCTION_ROOTS = ("src", "scripts", "firmware", "web", "browser", "app", "mobile")
 PRODUCTION_SUFFIXES = {".c", ".cc", ".cpp", ".css", ".h", ".html", ".js", ".mjs", ".py", ".rs", ".swift", ".ts"}
+EXCLUDED_PRODUCTION_TREES = (
+    Path("firmware/esp32-native-frame/build"),
+    Path("firmware/esp32-native-frame/tests"),
+)
 RETIRED_PRODUCTION_PATHS = (
     "scripts/evidence-observer.mjs",
     "scripts/strict-json.mjs",
@@ -77,6 +84,27 @@ PRESERVED_INPUTS = (
     "tests/fixtures/native-frame/csi-non-ht-3-pairs.hex",
     "tests/fixtures/native-frame/health-v1.hex",
 )
+CHECK_FAILURE_RECEIPT_DIRECTORY = Path("docs/evidence/receipts/check-entry-a331dd5")
+CHECK_FAILURE_RECEIPT_FIELDS = {
+    "command",
+    "controlled_mutation",
+    "environment",
+    "exit_status",
+    "finished_at_utc",
+    "log_sha256",
+    "observed",
+    "outcome",
+    "procedure",
+    "repository_revision",
+    "schema",
+    "started_at_utc",
+}
+CHECK_FAILURE_REVISION = "a331dd5519b5bb4565aa59454c251803ebae7585"
+CHECK_FAILURE_MUTATION = 'assert!(option_env!("CARGO_BIN_EXE_whisper").is_none()); -> assert!(option_env!("CARGO_BIN_EXE_whisper").is_some());'
+CHECK_FAILURE_OBSERVED = [
+    "package_has_no_legacy_host_binary_target ... FAILED",
+    "make: *** [check-rust]",
+]
 
 
 def check_links(root: Path) -> list[str]:
@@ -114,8 +142,10 @@ def check_hard_cut(root: Path) -> list[str]:
                 for path in directory.rglob("*")
                 if path.is_file()
                 and path.suffix in PRODUCTION_SUFFIXES
-                and "tests" not in path.relative_to(root).parts
-                and "build" not in path.relative_to(root).parts
+                and not any(
+                    path.is_relative_to(root / excluded)
+                    for excluded in EXCLUDED_PRODUCTION_TREES
+                )
                 and path != root / "scripts" / "check_repository.py"
             )
     for production_file in sorted(production_files):
@@ -128,8 +158,66 @@ def check_hard_cut(root: Path) -> list[str]:
     return failures
 
 
+def check_failure_receipt(root: Path) -> list[str]:
+    directory = root / CHECK_FAILURE_RECEIPT_DIRECTORY
+    receipt_path = directory / "receipt.json"
+    log_path = directory / "intentional-domain-failure.log"
+    if not receipt_path.is_file() or not log_path.is_file():
+        return []
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        return [f"check failure receipt is malformed JSON: {error}"]
+    if not isinstance(receipt, dict) or set(receipt) != CHECK_FAILURE_RECEIPT_FIELDS:
+        return ["check failure receipt schema fields do not match the closed v1 schema"]
+
+    failures: list[str] = []
+    expected = {
+        "schema": "whisper-check-failure-receipt-v1",
+        "repository_revision": CHECK_FAILURE_REVISION,
+        "command": "make check",
+        "procedure": "controlled-domain-assertion-inversion-v1",
+        "controlled_mutation": CHECK_FAILURE_MUTATION,
+        "outcome": "rejected-controlled-domain-regression",
+        "exit_status": 2,
+        "observed": CHECK_FAILURE_OBSERVED,
+    }
+    for field, value in expected.items():
+        if receipt[field] != value:
+            failures.append(f"check failure receipt has invalid {field}")
+
+    environment = receipt["environment"]
+    if (
+        not isinstance(environment, dict)
+        or set(environment) != {"platform", "python"}
+        or not all(isinstance(environment[field], str) and environment[field] for field in environment)
+    ):
+        failures.append("check failure receipt has invalid environment")
+
+    timestamps: list[datetime] = []
+    for field in ("started_at_utc", "finished_at_utc"):
+        try:
+            timestamp = datetime.fromisoformat(receipt[field])
+            if timestamp.utcoffset() is None or timestamp.utcoffset().total_seconds() != 0:
+                raise ValueError
+            timestamps.append(timestamp)
+        except (TypeError, ValueError):
+            failures.append(f"check failure receipt has invalid {field}")
+    if len(timestamps) == 2 and timestamps[1] < timestamps[0]:
+        failures.append("check failure receipt finish precedes start")
+
+    digest = receipt["log_sha256"]
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        failures.append("check failure receipt has invalid log_sha256")
+    elif hashlib.sha256(log_path.read_bytes()).hexdigest() != digest:
+        failures.append("check failure receipt log_sha256 does not match the retained log")
+    return failures
+
+
 def check_preserved_inputs(root: Path) -> list[str]:
-    return [f"required preserved input is missing: {path}" for path in PRESERVED_INPUTS if not (root / path).is_file()]
+    failures = [f"required preserved input is missing: {path}" for path in PRESERVED_INPUTS if not (root / path).is_file()]
+    failures.extend(check_failure_receipt(root))
+    return failures
 
 
 def main() -> int:
