@@ -55,6 +55,13 @@ inside the request's immutable `manifest_hex`. Its required top-level fields are
 `paths`, and `map_grid`. JSON uses sorted keys, compact separators, UTF-8, and
 no non-finite numbers; the SHA-256 digest covers those exact bytes.
 
+`weights_digest` is the SHA-256 digest of the canonical `rf-feature-weights-v1`
+bundle configured for that worker. The bundle includes an encoding and digest
+for every numerical component (slow MLP, causal TCN, qualified-path encoder,
+scattering bias/noise head, and cross-source attention); changing any component
+configuration or parameter therefore invalidates a manifest before feature
+materialization.
+
 Each block names a unique `block_id`, source and boot identity, capture time,
 the raw `absolute_response`, `spectrum_shape`, `background_residual`, and
 `fast_values`, plus a shape-matched mask for every vector and the preprocessing
@@ -81,9 +88,10 @@ world-state position.
 
 The front-end also contains a small supervised scattering bias/noise head. It
 returns a three-coordinate foot/root-node bias, noise, and conservative
-propagated uncertainty; fitting is deterministic and bounded and does not claim
-real-world accuracy. Two-person inputs use order-independent sum and absolute
-difference features. Explicit map cells are fused once by deterministic
+propagated uncertainty; fitting is deterministic and bounded by its configured
+sample limit, consuming at most one item beyond that limit to reject overflow,
+and does not claim real-world accuracy. Two-person inputs use order-independent
+sum and absolute-difference features. Explicit map cells are fused once by deterministic
 cross-source attention, retaining source weights and masks rather than adding a
 second task vote. Materialization rejects oversized vectors/tensors and any
 NaN/Inf before returning the packed little-endian float32 tensor.

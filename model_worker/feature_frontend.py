@@ -15,15 +15,18 @@ import hashlib
 import json
 import math
 import struct
-from typing import Any
 
 
 MANIFEST_SCHEMA = "rf-feature-manifest-v1"
 FRONTEND_VERSION = "rf-feature-frontend-v1"
 PREPROCESSING_VERSION = "rf-feature-pre-v1"
+COMPONENT_SCHEMA = "rf-feature-component-v1"
+WEIGHTS_SCHEMA = "rf-feature-weights-v1"
 MAX_TEXT_BYTES = 128
 MAX_FEATURE_WIDTH = 256
 MAX_TCN_CONTEXT_NS = 2_000_000_000
+# Default supervised-example count; bounding n keeps ridge accumulation O(n * width²).
+MAX_SCATTERING_SAMPLES = 1_024
 PATH_CLASSES = 4
 
 
@@ -149,6 +152,38 @@ def _mapping(value: object, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise FeatureFrontendError("contract", f"{field} must be an object")
     return value
+
+
+def _float64_hex(value: float, field: str) -> str:
+    """Encode one finite parameter as canonical little-endian IEEE-754 binary64."""
+
+    if not math.isfinite(value):
+        raise FeatureFrontendError("non_finite", f"{field} is not finite")
+    return struct.pack("<d", value).hex()
+
+
+def _float64_sequence_hex(values: Sequence[float], field: str) -> str:
+    """Encode a finite numerical sequence without allowing platform float formatting."""
+
+    if any(not math.isfinite(value) for value in values):
+        raise FeatureFrontendError("non_finite", f"{field} contains a non-finite parameter")
+    return struct.pack(f"<{len(values)}d", *values).hex()
+
+
+def _component_bytes(component: str, parameters: Mapping[str, object]) -> bytes:
+    """Build the canonical identity bytes for one configured numerical component."""
+
+    return _canonical_json(
+        {
+            "schema": COMPONENT_SCHEMA,
+            "component": component,
+            "parameters": parameters,
+        }
+    )
+
+
+def _component_digest(encoded: bytes) -> str:
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _source_key(source_id: str, boot_id: str) -> str:
@@ -681,6 +716,24 @@ class SlowMLP:
             raise ValueError("hidden_width must be in 1..64")
         self.hidden_width = hidden_width
 
+    def canonical_bytes(self) -> bytes:
+        """Return canonical bytes for the configured slow branch."""
+
+        if isinstance(self.hidden_width, bool) or not isinstance(self.hidden_width, int) or not 1 <= self.hidden_width <= 64:
+            raise FeatureFrontendError("contract", "slow MLP hidden width is outside its supported bound")
+        return _component_bytes(
+            "slow_mlp",
+            {
+                "algorithm_version": "slow-mlp-v1",
+                "hidden_width": self.hidden_width,
+            },
+        )
+
+    def digest(self) -> str:
+        """Return the SHA-256 digest of the configured slow branch bytes."""
+
+        return _component_digest(self.canonical_bytes())
+
     def encode(self, block: FeatureBlock) -> SlowMLPOutput:
         values = (
             tuple(value if present else 0.0 for value, present in zip(block.absolute_response, block.absolute_mask)),
@@ -730,6 +783,24 @@ class CausalTCN:
         if isinstance(context_ns, bool) or not isinstance(context_ns, int) or not 1 <= context_ns <= MAX_TCN_CONTEXT_NS:
             raise ValueError(f"context_ns must be in 1..{MAX_TCN_CONTEXT_NS}")
         self.context_ns = context_ns
+
+    def canonical_bytes(self) -> bytes:
+        """Return canonical bytes for the configured causal temporal branch."""
+
+        if isinstance(self.context_ns, bool) or not isinstance(self.context_ns, int) or not 1 <= self.context_ns <= MAX_TCN_CONTEXT_NS:
+            raise FeatureFrontendError("contract", "causal TCN context is outside its supported bound")
+        return _component_bytes(
+            "causal_tcn",
+            {
+                "algorithm_version": "causal-tcn-v1",
+                "context_ns": self.context_ns,
+            },
+        )
+
+    def digest(self) -> str:
+        """Return the SHA-256 digest of the configured causal temporal branch bytes."""
+
+        return _component_digest(self.canonical_bytes())
 
     @staticmethod
     def _summary(block: FeatureBlock) -> tuple[float, float]:
@@ -790,6 +861,22 @@ class PathBranchOutput:
 
 class QualifiedPathEncoder:
     """Passes qualified angle-delay candidates into model features verbatim."""
+
+    def canonical_bytes(self) -> bytes:
+        """Return canonical bytes for the configured qualified-path branch."""
+
+        return _component_bytes(
+            "qualified_path_encoder",
+            {
+                "algorithm_version": "qualified-path-encoder-v1",
+                "path_classes": [path_class.value for path_class in PathClass],
+            },
+        )
+
+    def digest(self) -> str:
+        """Return the SHA-256 digest of the configured qualified-path branch bytes."""
+
+        return _component_digest(self.canonical_bytes())
 
     def encode(self, paths: Iterable[QualifiedPath]) -> PathBranchOutput:
         ordered = tuple(paths)
@@ -898,6 +985,34 @@ class ScatteringBiasNoiseHead:
         object.__setattr__(self, "bias_weights", bias)
         object.__setattr__(self, "noise_weights", noise)
 
+    def canonical_bytes(self) -> bytes:
+        """Return canonical bytes for every fitted scattering-head parameter."""
+
+        width = len(self.noise_weights)
+        if len(self.bias_weights) != 3 or not self.bias_weights or any(
+            len(row) != width for row in self.bias_weights
+        ):
+            raise FeatureFrontendError("contract", "scattering head weight shapes are invalid")
+        return _component_bytes(
+            "scattering_bias_noise_head",
+            {
+                "algorithm_version": "scattering-bias-noise-head-v1",
+                "bias_shape": [len(self.bias_weights), width],
+                "bias_weights_f64le_hex": [
+                    _float64_sequence_hex(row, "scattering bias weights") for row in self.bias_weights
+                ],
+                "noise_shape": [width],
+                "noise_weights_f64le_hex": _float64_sequence_hex(
+                    self.noise_weights, "scattering noise weights"
+                ),
+            },
+        )
+
+    def digest(self) -> str:
+        """Return the SHA-256 digest of the configured scattering-head bytes."""
+
+        return _component_digest(self.canonical_bytes())
+
     @classmethod
     def default(cls, feature_width: int = 5) -> ScatteringBiasNoiseHead:
         """Returns a deterministic untrained fixture head; real fitting is separate."""
@@ -916,10 +1031,28 @@ class ScatteringBiasNoiseHead:
         examples: Iterable[ScatteringExample],
         *,
         ridge: float = 1.0e-6,
+        max_samples: int = MAX_SCATTERING_SAMPLES,
     ) -> ScatteringBiasNoiseHead:
         """Fits the small supervised head with bounded deterministic ridge regression."""
 
-        examples = tuple(example for example in examples if example.mask)
+        if isinstance(max_samples, bool) or not isinstance(max_samples, int) or max_samples <= 0:
+            raise FeatureFrontendError("contract", "scattering sample limit must be a positive integer")
+        iterator = iter(examples)
+        collected: list[ScatteringExample] = []
+        for _ in range(max_samples):
+            try:
+                collected.append(next(iterator))
+            except StopIteration:
+                break
+        else:
+            try:
+                next(iterator)
+            except StopIteration:
+                pass
+            else:
+                raise FeatureFrontendError("limit", "scattering sample count exceeds its configured limit")
+
+        examples = tuple(example for example in collected if example.mask)
         if not examples:
             raise FeatureFrontendError("contract", "scattering training requires a masked example")
         width = len(examples[0].features)
@@ -1041,6 +1174,27 @@ class CrossSourceAttention:
         self.temperature = float(temperature)
         self.max_sources = max_sources
 
+    def canonical_bytes(self) -> bytes:
+        """Return canonical bytes for the configured cross-source attention branch."""
+
+        if not math.isfinite(self.temperature) or self.temperature <= 0.0:
+            raise FeatureFrontendError("contract", "attention temperature is outside its supported bound")
+        if isinstance(self.max_sources, bool) or not isinstance(self.max_sources, int) or self.max_sources <= 0:
+            raise FeatureFrontendError("contract", "attention source limit is outside its supported bound")
+        return _component_bytes(
+            "cross_source_attention",
+            {
+                "algorithm_version": "cross-source-attention-v1",
+                "temperature_f64le_hex": _float64_hex(self.temperature, "attention temperature"),
+                "max_sources": self.max_sources,
+            },
+        )
+
+    def digest(self) -> str:
+        """Return the SHA-256 digest of the configured attention branch bytes."""
+
+        return _component_digest(self.canonical_bytes())
+
     @staticmethod
     def _score(position: Sequence[float], values: Sequence[float], masks: Sequence[bool]) -> float:
         coefficients = (position[0], position[1], position[2], 1.0)
@@ -1131,6 +1285,36 @@ class FeatureFrontend:
         self.scattering_head = scattering_head or ScatteringBiasNoiseHead.default(5)
         self.attention = attention or CrossSourceAttention(max_sources=self.limits.max_sources)
 
+    def weights_canonical_bytes(self) -> bytes:
+        """Return canonical bytes binding every configured numerical component."""
+
+        configured = (
+            ("slow_mlp", self.slow_mlp.canonical_bytes()),
+            ("causal_tcn", self.causal_tcn.canonical_bytes()),
+            ("qualified_path_encoder", self.path_encoder.canonical_bytes()),
+            ("scattering_bias_noise_head", self.scattering_head.canonical_bytes()),
+            ("cross_source_attention", self.attention.canonical_bytes()),
+        )
+        return _canonical_json(
+            {
+                "schema": WEIGHTS_SCHEMA,
+                "frontend_version": FRONTEND_VERSION,
+                "components": [
+                    {
+                        "name": name,
+                        "encoding_hex": encoded.hex(),
+                        "encoding_digest": _component_digest(encoded),
+                    }
+                    for name, encoded in configured
+                ],
+            }
+        )
+
+    def weights_digest(self) -> str:
+        """Return the SHA-256 digest bound into a matching feature manifest."""
+
+        return hashlib.sha256(self.weights_canonical_bytes()).hexdigest()
+
     @staticmethod
     def _source_embedding(
         source_key: str,
@@ -1171,6 +1355,8 @@ class FeatureFrontend:
 
         if not isinstance(manifest, FeatureManifest):
             raise FeatureFrontendError("contract", "frontend input is not a feature manifest")
+        if manifest.weights_digest != self.weights_digest():
+            raise FeatureFrontendError("digest", "manifest weights digest differs from the configured frontend")
         manifest.validate(self.limits)
         if self.causal_tcn.context_ns != manifest.causal_context_ns:
             raise FeatureFrontendError("contract", "manifest causal context differs from the configured TCN")
@@ -1273,6 +1459,7 @@ class FeatureFrontendOperator:
                     "non_finite": "non_finite",
                     "qualification": "contract_mismatch",
                     "future": "contract_mismatch",
+                    "digest": "digest_mismatch",
                 }.get(error.reason, "malformed_request")
                 raise ContractFailure(status, str(error)) from error
             except ImportError:
@@ -1289,6 +1476,7 @@ __all__ = [
     "AttentionCell",
     "CausalTCN",
     "CausalTCNOutput",
+    "COMPONENT_SCHEMA",
     "CrossSourceAttention",
     "FeatureBlock",
     "FeatureFrontend",
@@ -1299,6 +1487,7 @@ __all__ = [
     "FeatureMaterialization",
     "FRONTEND_VERSION",
     "MANIFEST_SCHEMA",
+    "MAX_SCATTERING_SAMPLES",
     "MapCell",
     "MapGrid",
     "PathBranchOutput",
@@ -1314,4 +1503,5 @@ __all__ = [
     "SourceEmbedding",
     "SourceProvenance",
     "SymmetricPairFeatures",
+    "WEIGHTS_SCHEMA",
 ]

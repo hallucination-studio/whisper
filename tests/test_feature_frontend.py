@@ -20,6 +20,7 @@ from model_worker.feature_frontend import (
     QualifiedPath,
     ScatteringBiasNoiseHead,
     ScatteringExample,
+    SlowMLP,
     SourceEmbedding,
     SourceProvenance,
 )
@@ -101,7 +102,7 @@ def manifest(*, cutoff_ns: int = 1_500_000_000, blocks=None, paths=None) -> Feat
         epoch=4,
         cutoff_ns=cutoff_ns,
         preprocessing_version="rf-feature-pre-v1",
-        weights_digest="ab" * 32,
+        weights_digest=FeatureFrontend().weights_digest(),
         blocks=tuple(blocks),
         paths=tuple(paths),
         map_grid=MapGrid(
@@ -204,6 +205,55 @@ class FeatureFrontendTests(unittest.TestCase):
         with self.assertRaisesRegex(FeatureFrontendError, "tensor"):
             FeatureFrontend(FeatureLimits(max_tensor_bytes=8)).materialize(value)
 
+    def test_manifest_weights_bind_every_configured_component_before_materialization(self) -> None:
+        value = manifest()
+        baseline = FeatureFrontend()
+        baseline_result = baseline.materialize(value)
+
+        changed_slow = FeatureFrontend(slow_mlp=SlowMLP(hidden_width=9))
+        with self.assertRaisesRegex(FeatureFrontendError, "weights digest"):
+            changed_slow.materialize(value)
+        changed_slow_manifest = replace(value, weights_digest=changed_slow.weights_digest())
+        changed_slow_result = changed_slow.materialize(changed_slow_manifest)
+        self.assertNotEqual(changed_slow_manifest.digest(), value.digest())
+        self.assertNotEqual(changed_slow_result.feature_shape, baseline_result.feature_shape)
+        self.assertNotEqual(changed_slow_result.tensor_bytes, baseline_result.tensor_bytes)
+
+        default_head = ScatteringBiasNoiseHead.default(5)
+        changed_bias = tuple(
+            tuple(0.125 if row == 0 and column == 0 else weight for column, weight in enumerate(weights))
+            for row, weights in enumerate(default_head.bias_weights)
+        )
+        changed_head = ScatteringBiasNoiseHead(
+            bias_weights=changed_bias,
+            noise_weights=default_head.noise_weights,
+        )
+        changed_frontend = FeatureFrontend(scattering_head=changed_head)
+        with self.assertRaisesRegex(FeatureFrontendError, "weights digest"):
+            changed_frontend.materialize(value)
+        changed_manifest = replace(value, weights_digest=changed_frontend.weights_digest())
+        changed_result = changed_frontend.materialize(changed_manifest)
+        self.assertEqual(changed_result.feature_shape, baseline_result.feature_shape)
+        self.assertNotEqual(changed_result.tensor_bytes, baseline_result.tensor_bytes)
+
+        weights = json.loads(baseline.weights_canonical_bytes())
+        self.assertEqual(weights["schema"], "rf-feature-weights-v1")
+        self.assertEqual(
+            [component["name"] for component in weights["components"]],
+            [
+                "slow_mlp",
+                "causal_tcn",
+                "qualified_path_encoder",
+                "scattering_bias_noise_head",
+                "cross_source_attention",
+            ],
+        )
+        for component in weights["components"]:
+            self.assertEqual(
+                digest(bytes.fromhex(component["encoding_hex"])),
+                component["encoding_digest"],
+            )
+
     def test_supervised_scattering_head_propagates_known_bias_and_is_pair_symmetric(self) -> None:
         examples = tuple(
             ScatteringExample(
@@ -227,6 +277,55 @@ class FeatureFrontendTests(unittest.TestCase):
         self.assertEqual(left, right)
         self.assertEqual(left.sum_features, (4.0, 6.0))
         self.assertEqual(left.absolute_difference, (2.0, 2.0))
+
+    def test_scattering_fit_consumes_at_most_limit_plus_one_and_accepts_exact_boundary(self) -> None:
+        examples = tuple(
+            ScatteringExample(
+                features=(float(index),),
+                bias_target_m=(float(index), 0.0, 0.0),
+                noise_target_m=0.1,
+                provenance=f"bounded-{index}",
+            )
+            for index in range(3)
+        )
+
+        class CountingGenerator:
+            def __init__(self, values):
+                self.values = iter(values)
+                self.pulls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.pulls += 1
+                return next(self.values)
+
+        exact = CountingGenerator(examples)
+        head = ScatteringBiasNoiseHead.fit(exact, max_samples=3)
+        self.assertEqual(len(head.noise_weights), 2)
+        self.assertEqual(exact.pulls, 4)
+
+        overflow = CountingGenerator((*examples, examples[-1]))
+        with self.assertRaisesRegex(FeatureFrontendError, "sample count"):
+            ScatteringBiasNoiseHead.fit(overflow, max_samples=3)
+        self.assertEqual(overflow.pulls, 4)
+
+        class HostileGenerator:
+            def __init__(self):
+                self.pulls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.pulls += 1
+                return examples[0]
+
+        hostile = HostileGenerator()
+        with self.assertRaisesRegex(FeatureFrontendError, "sample count"):
+            ScatteringBiasNoiseHead.fit(hostile, max_samples=3)
+        self.assertEqual(hostile.pulls, 4)
 
     def test_map_query_attention_fuses_two_sources_without_a_second_vote(self) -> None:
         grid = MapGrid(
