@@ -1947,11 +1947,13 @@ fn rigid_pose(matrix: [f64; 16]) -> Option<crate::measurement::Pose> {
     let row_x = [matrix[0], matrix[1], matrix[2]];
     let row_y = [matrix[4], matrix[5], matrix[6]];
     let row_z = [matrix[8], matrix[9], matrix[10]];
-    let orthonormal = [row_x, row_y, row_z].iter().all(|row| (norm(*row) - 1.0).abs() <= 1.0e-9)
-        && dot(row_x, row_y).abs() <= 1.0e-9
-        && dot(row_x, row_z).abs() <= 1.0e-9
-        && dot(row_y, row_z).abs() <= 1.0e-9
-        && (dot(row_x, cross(row_y, row_z)) - 1.0).abs() <= 1.0e-9;
+    let orthonormal = [row_x, row_y, row_z]
+        .iter()
+        .all(|row| (norm(*row) - 1.0).abs() <= RIGID_POSE_ORTHONORMAL_EPSILON)
+        && dot(row_x, row_y).abs() <= RIGID_POSE_ORTHONORMAL_EPSILON
+        && dot(row_x, row_z).abs() <= RIGID_POSE_ORTHONORMAL_EPSILON
+        && dot(row_y, row_z).abs() <= RIGID_POSE_ORTHONORMAL_EPSILON
+        && (dot(row_x, cross(row_y, row_z)) - 1.0).abs() <= RIGID_POSE_ORTHONORMAL_EPSILON;
     if !orthonormal {
         return None;
     }
@@ -2011,6 +2013,11 @@ fn rigid_pose(matrix: [f64; 16]) -> Option<crate::measurement::Pose> {
 }
 
 const SPEED_OF_LIGHT_MPS: f64 = 299_792_458.0;
+/// Dimensionless tolerance for unit row norms, pairwise orthogonality, and a
+/// proper-rotation determinant. This v1 numerical guard admits floating-point
+/// roundoff while rejecting scaled, skewed, or reflected calibration poses;
+/// changing it changes which world-frame geometry qualifications are accepted.
+const RIGID_POSE_ORTHONORMAL_EPSILON: f64 = 1.0e-9;
 /// Minimum cross-product magnitude in square metres used to reject numerically
 /// collinear phase centres. This v1 numerical guard is below the documented
 /// millimetre geometry-error budget; changing it changes which arrays qualify.
