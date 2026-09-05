@@ -8,8 +8,9 @@ receipt.
 | --- | --- |
 | Repository software and policy checks | Run `make check` from the repository root. |
 | ESP-IDF build, parity, QEMU, provisioning, flash, verification, live smoke, or receipt retention | [Firmware operations](firmware.md) |
+| Local deterministic model-protocol fixture | Run `python3 -m model_worker --socket /new/path/worker.sock --operator deterministic-test`. |
 
-No host-runtime or browser operations runbook has been recovered. Any active
+No composed Host-runtime or browser operations runbook has been recovered. Any active
 need for one belongs in [GitHub Issues](../agents/issue-tracker.md) until a
 bounded documentation ticket creates a concrete owner.
 
@@ -30,3 +31,10 @@ LiDAR, RF-array, ESP hardware, trained-model accuracy, or 14-day acceptance.
 Those checks need their ticket-specific equipment and retained execution
 evidence. A future Python, Swift or browser package must add its build and
 behavior command to `make check` in the ticket that introduces the package.
+
+The deterministic worker operator validates protocol dispatch and failure
+handling only. It is not an RF model or accuracy result. The socket path must
+not already exist; the worker never deletes or replaces it. A production model
+integration must supply its frozen PyTorch evaluator and declare
+`production_gpu`; unavailable GPU execution fails explicitly rather than
+falling back to CPU.
