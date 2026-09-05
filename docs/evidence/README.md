@@ -1,13 +1,18 @@
 # Evidence index
 
-Load an evidence index to distinguish implementation facts, test source,
-executed receipts, WIP, accepted targets, and open evidence gaps. An index is
-not itself proof of a run; only a retained receipt identified there is executed
-evidence.
+A retained receipt proves only its identified revision, environment, procedure
+and result. A test file, closed ticket or design-review pass is not executed
+RF accuracy evidence. New implementation and acceptance work is tracked by
+[Spec #163](https://github.com/hallucination-studio/whisper/issues/163).
 
-| Trigger | Owner |
+| Evidence scope | Owner |
 | --- | --- |
-| Rust/native-frame, firmware build or QEMU, interoperability, board, flash, or live CSI evidence | [Firmware evidence](firmware.md) |
-| Configuration, session, SQLite, recovery, retention, or replay evidence | [Host persistence evidence](host-persistence.md) |
-| Timeline, conditioning, estimator, Engine, semantic replay, or evaluation evidence | [Temporal world runtime evidence](world-runtime.md) |
-| Query, HTTP, WebSocket, browser, disconnect/resync, or end-to-end UI evidence | [Query and UI evidence](query-ui.md) |
+| Unchanged native-frame, firmware build/provisioning, board and UDP acquisition | [Firmware evidence](firmware.md) |
+| Raw segments, A/B/C, request/checkpoint recovery, retention and independent history | [Host persistence evidence](host-persistence.md) |
+| Phone/calibration qualification, RF observability, joint state, training, prediction and comparative accuracy | [World-model evidence](world-runtime.md) |
+| Current/history queries, freshness/expiry, browser disconnect/resync and sustained delivery | [Query and browser evidence](query-ui.md) |
+
+Existing physical capture receipts remain bounded historical evidence. Their
+capture and verification payloads are unchanged; historical contract locators
+are pinned to the revision that owned those contracts. No prior Demo or
+Semantic Program classification satisfies the new RF world-model target.

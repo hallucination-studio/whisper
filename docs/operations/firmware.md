@@ -184,18 +184,20 @@ evidence package. Its JSON output is legacy private output, not a Program 1
 `ProvisioningOperationRecord` or `ProvisioningReceipt`, and this command cannot
 satisfy either artifact contract.
 
-## Program 1 provisioning
+## Historical Program 1 provisioning references
 
 The legacy command above cannot satisfy Program 1. Do not infer a replacement
 command from this runbook. Follow the Host validation contract in
-[persistence v1](../specs/persistence-v1.md#program-1-development-secret-store),
+[persistence v1](https://github.com/hallucination-studio/whisper/blob/671b39d4d518c3b6bbbc173352712b7af32ee7ad/docs/specs/persistence-v1.md#program-1-development-secret-store),
 the provisioning handoff contract in
 [native-frame v1](../specs/native-frame-v1.md#provisioning-and-image-compatibility),
 and the artifact contract in
-[development E2E v1](../specs/development-e2e-v1.md#provisioning-artifacts).
-Implementation status remains live in
-[#63](https://github.com/hallucination-studio/whisper/issues/63) and
-[#114](https://github.com/hallucination-studio/whisper/issues/114).
+[development E2E v1](https://github.com/hallucination-studio/whisper/blob/671b39d4d518c3b6bbbc173352712b7af32ee7ad/docs/specs/development-e2e-v1.md#provisioning-artifacts).
+These are fixed historical clauses, not active Program work. New RF
+implementation and evidence tasks are owned by
+[Spec #163](https://github.com/hallucination-studio/whisper/issues/163). Existing
+fixed-device acceptance does not execute flash, reprovisioning or configuration
+changes from this runbook.
 
 For the single-board development path, set both the firmware collector target
 and the Host capture listener to UDP port `9000`. The firmware target is the

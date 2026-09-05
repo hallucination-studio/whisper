@@ -11,4 +11,4 @@ changes. We therefore choose domain-behavior terminology for production
 compatibility identities while retaining delivery labels for planning and
 evidence scope. This accepts one explicit identity cutover in exchange for
 stable terminology across later maturity changes; exact behavior is owned by
-the [Demo Slice v2 specification](../specs/demo-slice-v2.md).
+the [Demo Slice v2 specification](https://github.com/hallucination-studio/whisper/blob/671b39d4d518c3b6bbbc173352712b7af32ee7ad/docs/specs/demo-slice-v2.md).

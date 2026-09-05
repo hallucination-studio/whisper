@@ -31,12 +31,12 @@ CSI observations for that Capture Session. Controlled Host shutdown reported
 3. Provision the board through
    [Fixed development Wi-Fi provisioning](../../../operations/firmware.md#fixed-development-wi-fi-provisioning).
 4. Initialize a fresh Store, start one Host capture session, and follow the
-   [read-only browser behavior](../../../specs/demo-slice-v2.md#read-only-browser-behavior):
+   [read-only browser behavior](https://github.com/hallucination-studio/whisper/blob/671b39d4d518c3b6bbbc173352712b7af32ee7ad/docs/specs/demo-slice-v2.md#read-only-browser-behavior):
    load installed Chrome once, leave the page unchanged, then stimulate a
    fresh physical CSI packet.
 5. Read the final topology and signals snapshots, stop the Host under control,
    and close the
-   [sanitized demo-smoke receipt](../../../specs/demo-slice-v2.md#sanitized-demo-smoke-receipt).
+   [sanitized demo-smoke receipt](https://github.com/hallucination-studio/whisper/blob/671b39d4d518c3b6bbbc173352712b7af32ee7ad/docs/specs/demo-slice-v2.md#sanitized-demo-smoke-receipt).
 
 ## Artifacts
 
