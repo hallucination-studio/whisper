@@ -6,11 +6,13 @@ RoomPlan and one shared `ARSession`: `RoomCaptureSession(arSession:)` owns the s
 for RGB, depth, and camera-pose delegates, so every retained observation remains in the RoomPlan
 world coordinate system.
 
-The workflow requires room dimensions and door confirmation, visible-marker RF registration,
-fixed-phone confirmation, and explicit relocalization after every tracking epoch reset. A partial
-camera view produces an unknown or visible-set label, never a whole-room empty label. The map and
-SwiftUI summaries keep visual scan coverage, RF-expected coverage, and field-calibration coverage
-separate.
+The workflow requires room dimensions and door confirmation, caller-supplied measured marker RF
+registration, fixed-phone confirmation, and explicit relocalization after every tracking epoch
+reset. Export remains disabled until that measured registration and an authenticated Host clock
+relation are both present; the app never synthesizes a transform, uncertainty, or time relation. A
+partial camera view produces an unknown or visible-set label, never a whole-room empty label. The
+map and SwiftUI summaries keep visual scan coverage, RF-expected coverage, and field-calibration
+coverage separate.
 
 `WhisperPhoneClientApp` supplies the connected scan preview and controls for stop/confirmation,
 fixed-device registration, fixed-phone confirmation, supervision pause/resume, and relocalization.

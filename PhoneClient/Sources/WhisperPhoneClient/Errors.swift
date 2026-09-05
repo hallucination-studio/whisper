@@ -10,6 +10,9 @@ public enum PhoneClientError: Error, Equatable, Sendable, LocalizedError {
     case transformError(String)
     case timeRelationError(String)
     case invitationExpired
+    case measuredRegistrationRequired
+    case companionRelationRequired
+    case exportPrerequisitesMissing
     case unknownRFIdentity(String)
     case errorBudgetExceeded
     case malformedWire(String)
@@ -32,6 +35,9 @@ public enum PhoneClientError: Error, Equatable, Sendable, LocalizedError {
         case let .transformError(message): return "coordinate transform error: \(message)"
         case let .timeRelationError(message): return "time relation error: \(message)"
         case .invitationExpired: return "companion invitation has expired"
+        case .measuredRegistrationRequired: return "measured RF registration is required before export"
+        case .companionRelationRequired: return "an authenticated companion clock relation is required before capture export"
+        case .exportPrerequisitesMissing: return "capture export prerequisites are incomplete"
         case let .unknownRFIdentity(identity): return "unknown RF identity: \(identity)"
         case .errorBudgetExceeded: return "spatial and time uncertainty exceeds the position budget"
         case let .malformedWire(message): return "malformed companion wire data: \(message)"

@@ -51,6 +51,21 @@ public struct CameraKeyframe: Codable, Equatable, Sendable {
     }
 }
 
+/// Authenticated prerequisites required before a phone capture can be exported.
+public struct PhoneExportPrerequisites: Equatable, Sendable {
+    public let measuredRegistration: MeasuredRFRegistrationInput
+    public let verifiedCompanionRelation: VerifiedCompanionTimeRelation
+
+    public init(
+        measuredRegistration: MeasuredRFRegistrationInput,
+        verifiedCompanionRelation: VerifiedCompanionTimeRelation
+    ) throws {
+        _ = try measuredRegistration.registration()
+        self.measuredRegistration = measuredRegistration
+        self.verifiedCompanionRelation = verifiedCompanionRelation
+    }
+}
+
 /// The complete local export consisting of three Host-importable artifacts and display assets.
 public struct PhoneCapturePackage: Equatable, Sendable {
     public let scene: SceneSnapshot
@@ -70,9 +85,11 @@ public struct PhoneCapturePackage: Equatable, Sendable {
         usdzData: Data,
         keyframes: [CameraKeyframe],
         media: [CaptureMedia],
+        exportPrerequisites: PhoneExportPrerequisites,
         limits: ArtifactLimits = ArtifactLimits(),
         knownRFIdentities: Set<String>
     ) throws {
+        try validatePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, limits: limits, knownRFIdentities: knownRFIdentities, exportPrerequisites: exportPrerequisites)
         self.scene = scene
         self.calibration = calibration
         self.supervision = supervision
@@ -80,7 +97,26 @@ public struct PhoneCapturePackage: Equatable, Sendable {
         self.media = media
         self.keyframes = keyframes
         self.limits = limits
-        try validatePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, limits: limits, knownRFIdentities: knownRFIdentities)
+    }
+
+    private init(
+        parsedScene scene: SceneSnapshot,
+        calibration: CalibrationBundle,
+        supervision: SupervisionSegment,
+        usdzData: Data,
+        keyframes: [CameraKeyframe],
+        media: [CaptureMedia],
+        limits: ArtifactLimits,
+        knownRFIdentities: Set<String>
+    ) throws {
+        try validatePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, limits: limits, knownRFIdentities: knownRFIdentities, exportPrerequisites: nil)
+        self.scene = scene
+        self.calibration = calibration
+        self.supervision = supervision
+        self.usdzData = usdzData
+        self.media = media
+        self.keyframes = keyframes
+        self.limits = limits
     }
 
     /// Returns the exact three WSA1 artifacts to upload or import through the Host.
@@ -183,7 +219,7 @@ public struct PhoneCapturePackage: Equatable, Sendable {
               case let .supervision(supervision) = try artifacts[2].decode() else {
             throw PhoneClientError.invalidArtifact("phone export artifacts are not scene/calibration/supervision")
         }
-        return try PhoneCapturePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, limits: limits, knownRFIdentities: knownRFIdentities)
+        return try PhoneCapturePackage(parsedScene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, limits: limits, knownRFIdentities: knownRFIdentities)
     }
 }
 
@@ -191,19 +227,25 @@ public struct PhoneCapturePackage: Equatable, Sendable {
 public struct PhoneArtifactExporter: Sendable {
     public let limits: ArtifactLimits
     public let knownRFIdentities: Set<String>
+    public let exportPrerequisites: PhoneExportPrerequisites
 
-    public init(limits: ArtifactLimits = ArtifactLimits(), knownRFIdentities: Set<String>) throws {
+    public init(
+        limits: ArtifactLimits = ArtifactLimits(),
+        knownRFIdentities: Set<String>,
+        exportPrerequisites: PhoneExportPrerequisites
+    ) throws {
         try limits.validate()
         self.limits = limits
         self.knownRFIdentities = knownRFIdentities
+        self.exportPrerequisites = exportPrerequisites
     }
 
     public func makePackage(scene: SceneSnapshot, calibration: CalibrationBundle, supervision: SupervisionSegment, usdzData: Data, keyframes: [CameraKeyframe], media: [CaptureMedia]) throws -> PhoneCapturePackage {
-        try PhoneCapturePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, limits: limits, knownRFIdentities: knownRFIdentities)
+        try PhoneCapturePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media, exportPrerequisites: exportPrerequisites, limits: limits, knownRFIdentities: knownRFIdentities)
     }
 }
 
-private func validatePackage(scene: SceneSnapshot, calibration: CalibrationBundle, supervision: SupervisionSegment, usdzData: Data, keyframes: [CameraKeyframe], media: [CaptureMedia], limits: ArtifactLimits, knownRFIdentities: Set<String>) throws {
+private func validatePackage(scene: SceneSnapshot, calibration: CalibrationBundle, supervision: SupervisionSegment, usdzData: Data, keyframes: [CameraKeyframe], media: [CaptureMedia], limits: ArtifactLimits, knownRFIdentities: Set<String>, exportPrerequisites: PhoneExportPrerequisites?) throws {
     try limits.validate()
     try scene.validate()
     try calibration.validate()
@@ -220,6 +262,12 @@ private func validatePackage(scene: SceneSnapshot, calibration: CalibrationBundl
     }
     guard knownRFIdentities.contains(calibration.rfDeviceIdentity) else {
         throw PhoneClientError.unknownRFIdentity(calibration.rfDeviceIdentity)
+    }
+    if let exportPrerequisites {
+        guard calibration.rfDeviceIdentity == exportPrerequisites.measuredRegistration.rfDeviceIdentity,
+              supervision.timeRelation == exportPrerequisites.verifiedCompanionRelation.relation else {
+            throw PhoneClientError.exportPrerequisitesMissing
+        }
     }
     guard calibration.worldTransform.targetCoordinateSystem == scene.worldCoordinateSystem else {
         throw PhoneClientError.transformError("calibration target does not match the scene")

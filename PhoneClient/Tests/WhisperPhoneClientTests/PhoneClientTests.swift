@@ -121,12 +121,13 @@ final class PhoneClientTests: XCTestCase {
         let usdzData = Data([0x55, 0x53, 0x44, 0x5a])
         let keyframes = [CameraKeyframe(reference: "pose/1", phoneTime: 500, pose: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: 1, trackingQuality: .normal, depthQuality: .missing)]
         let media = [try makeRGBMedia(), try makeDepthMedia()]
-        let unknownExporter = try PhoneArtifactExporter(knownRFIdentities: ["other-rf"])
+        let exportPrerequisites = try makeExportPrerequisites()
+        let unknownExporter = try PhoneArtifactExporter(knownRFIdentities: ["other-rf"], exportPrerequisites: exportPrerequisites)
         XCTAssertThrowsError(try unknownExporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdzData, keyframes: keyframes, media: media)) { error in
             XCTAssertEqual(error as? PhoneClientError, .unknownRFIdentity("rf-1"))
         }
 
-        let exporter = try PhoneArtifactExporter(knownRFIdentities: ["rf-1"])
+        let exporter = try PhoneArtifactExporter(knownRFIdentities: ["rf-1"], exportPrerequisites: exportPrerequisites)
         let package = try exporter.makePackage(
             scene: scene,
             calibration: calibration,
@@ -298,6 +299,24 @@ final class PhoneClientTests: XCTestCase {
         XCTAssertNotEqual(summaries[0].points, summaries[1].points)
     }
 
+    func testExportCannotOpenWithPlaceholderRegistrationOrMissingVerifiedClock() throws {
+        let placeholder = try? MeasuredRFRegistrationInput(
+            rfDeviceIdentity: "rf-1",
+            markerIdentity: "marker-1",
+            antennaReference: "antenna-1",
+            markerToAntenna: makeTransform(source: "marker-1", target: "antenna-1", error: 0),
+            errorM: 0,
+            measurementSource: SourceIdentity(namespace: "", identity: "")
+        )
+        XCTAssertNil(placeholder)
+
+        let readiness = PhoneExportReadiness(measuredRegistration: nil, verifiedCompanionRelation: nil)
+        XCTAssertFalse(readiness.canExport)
+        XCTAssertThrowsError(try readiness.requireReady()) { error in
+            XCTAssertEqual(error as? PhoneClientError, .measuredRegistrationRequired)
+        }
+    }
+
     func testRustAndSwiftSceneFixturesRoundTripThroughTheSameWSA1Codec() throws {
         for fixtureName in ["rust-scene-wsa1", "swift-scene-wsa1"] {
             let bytes = try fixture(named: fixtureName)
@@ -320,7 +339,7 @@ final class PhoneClientTests: XCTestCase {
         let usdz = Data([0x55, 0x53, 0x44, 0x5a])
         let keyframe = CameraKeyframe(reference: "pose/1", phoneTime: 500, pose: makeTransform(source: "camera", target: "arkit-world", error: 0.01), trackingEpoch: 1, trackingQuality: .normal, depthQuality: .missing)
         let media = [try makeRGBMedia()]
-        let exporter = try PhoneArtifactExporter(knownRFIdentities: ["rf-1"])
+        let exporter = try PhoneArtifactExporter(knownRFIdentities: ["rf-1"], exportPrerequisites: try makeExportPrerequisites())
         XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: Data(), keyframes: [keyframe], media: media))
         XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdz, keyframes: [], media: media))
         XCTAssertThrowsError(try exporter.makePackage(scene: scene, calibration: calibration, supervision: supervision, usdzData: usdz, keyframes: [keyframe], media: []))
@@ -468,6 +487,61 @@ private func makeFrame(epoch: UInt32, trackingQuality: TrackingQuality = .normal
 
 private func makeRegistration() -> RFDeviceRegistration {
     RFDeviceRegistration(rfDeviceIdentity: "rf-1", markerIdentity: "marker-1", antennaReference: "marker-to-array", markerToAntenna: makeTransform(source: "marker-1", target: "marker-to-array", error: 0.01), errorM: 0.01, source: SourceIdentity(namespace: "phone", identity: "registration-1"))
+}
+
+private func makeExportPrerequisites() throws -> PhoneExportPrerequisites {
+    let measured = try MeasuredRFRegistrationInput(
+        rfDeviceIdentity: "rf-1",
+        markerIdentity: "marker-1",
+        antennaReference: "marker-to-array",
+        markerToAntenna: CoordinateTransform(
+            sourceCoordinateSystem: "marker-1",
+            targetCoordinateSystem: "marker-to-array",
+            matrix: [1, 0, 0, 0.02, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            maxErrorM: 0.02
+        ),
+        errorM: 0.03,
+        measurementSource: SourceIdentity(namespace: "survey", identity: "registration-1")
+    )
+    let pairingID = try PairingID(bytes: Data(repeating: 41, count: 16))
+    let identity = try CompanionServerIdentity(bytes: Data(repeating: 42, count: 32))
+    let invitation = try CompanionInvitation(
+        pairingID: pairingID,
+        serverIdentity: identity,
+        expiresAtUTC: 10_000,
+        serverEphemeralPublicKey: Data(repeating: 43, count: 32),
+        serverProof: Data(repeating: 44, count: 64)
+    )
+    let clock = FixedWallClock(value: 9_999)
+    let nonce = try ClientNonce(bytes: Data(repeating: 45, count: 32))
+    var challenges: [ClockSampleChallenge] = []
+    for index in 0..<3 {
+        let challenge = try ClockSampleChallenge(
+            pairingID: pairingID,
+            clientNonce: nonce,
+            clientSend: UInt64(100 + index),
+            hostReceive: UInt64(101 + index),
+            hostSend: UInt64(102 + index),
+            serverProof: Data(repeating: 46, count: 64)
+        )
+        challenges.append(challenge)
+    }
+    let responses = challenges.map { ClockSampleResponse(challenge: $0, clientReceive: $0.clientSend + 1) }
+    let (_, pending) = try invitation.beginHandshake(
+        pairingCode: try PairingCode(bytes: Data(repeating: 47, count: 16)),
+        clientNonce: nonce,
+        clientEphemeralSecret: try ClientEphemeralSecret(bytes: Data(repeating: 48, count: 32)),
+        clockResponses: responses,
+        crypto: DeterministicCrypto(),
+        wallClock: clock
+    )
+    let handshake = try CompanionHandshakeResponse(
+        sessionID: Data(repeating: 49, count: 16),
+        clockRelation: try makePhoneRelation(),
+        serverProof: Data(repeating: 50, count: 64)
+    )
+    let connection = try pending.complete(handshake, wallClock: clock)
+    return try PhoneExportPrerequisites(measuredRegistration: measured, verifiedCompanionRelation: connection.verifiedTimeRelation)
 }
 
 private func makePhoneRelation() throws -> PhoneTimeRelation {

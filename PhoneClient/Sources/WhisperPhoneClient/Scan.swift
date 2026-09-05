@@ -102,6 +102,86 @@ public struct RFDeviceRegistration: Codable, Equatable, Sendable {
     }
 }
 
+/// Measured fixed-device registration input collected from a survey/marker workflow.
+///
+/// The phone client does not synthesize the marker transform, uncertainty, or provenance. A
+/// caller must provide all of them from a measurement source before this input can become a
+/// `RFDeviceRegistration` or satisfy the export gate.
+public struct MeasuredRFRegistrationInput: Codable, Equatable, Sendable {
+    public let rfDeviceIdentity: String
+    public let markerIdentity: String
+    public let antennaReference: String
+    public let markerToAntenna: CoordinateTransform
+    public let errorM: Double
+    public let measurementSource: SourceIdentity
+
+    public init(
+        rfDeviceIdentity: String,
+        markerIdentity: String,
+        antennaReference: String,
+        markerToAntenna: CoordinateTransform,
+        errorM: Double,
+        measurementSource: SourceIdentity
+    ) throws {
+        guard errorM.isFinite, errorM > 0, markerToAntenna.maxErrorM.isFinite, markerToAntenna.maxErrorM > 0 else {
+            throw PhoneClientError.measuredRegistrationRequired
+        }
+        try requireText(rfDeviceIdentity, field: "RF device identity")
+        try requireText(markerIdentity, field: "marker identity")
+        try requireText(antennaReference, field: "antenna reference")
+        try markerToAntenna.validate()
+        guard markerToAntenna.sourceCoordinateSystem == markerIdentity,
+              markerToAntenna.targetCoordinateSystem == antennaReference else {
+            throw PhoneClientError.transformError("measured marker-to-antenna coordinates do not match the registration")
+        }
+        try measurementSource.validate()
+        self.rfDeviceIdentity = rfDeviceIdentity
+        self.markerIdentity = markerIdentity
+        self.antennaReference = antennaReference
+        self.markerToAntenna = markerToAntenna
+        self.errorM = errorM
+        self.measurementSource = measurementSource
+    }
+
+    /// Converts measured input into the canonical registration only after validation.
+    public func registration() throws -> RFDeviceRegistration {
+        let registration = RFDeviceRegistration(
+            rfDeviceIdentity: rfDeviceIdentity,
+            markerIdentity: markerIdentity,
+            antennaReference: antennaReference,
+            markerToAntenna: markerToAntenna,
+            errorM: errorM,
+            source: measurementSource
+        )
+        try registration.validate()
+        return registration
+    }
+}
+
+/// Export readiness derived from measured registration and authenticated Host time.
+public struct PhoneExportReadiness: Equatable, Sendable {
+    public let hasMeasuredRegistration: Bool
+    public let hasVerifiedCompanionRelation: Bool
+
+    public init(
+        measuredRegistration: MeasuredRFRegistrationInput?,
+        verifiedCompanionRelation: VerifiedCompanionTimeRelation?
+    ) {
+        hasMeasuredRegistration = measuredRegistration != nil
+        hasVerifiedCompanionRelation = verifiedCompanionRelation != nil
+    }
+
+    public var canExport: Bool {
+        hasMeasuredRegistration && hasVerifiedCompanionRelation
+    }
+
+    /// Fails closed until both physical and authenticated timing prerequisites exist.
+    public func requireReady() throws {
+        guard hasMeasuredRegistration else { throw PhoneClientError.measuredRegistrationRequired }
+        guard hasVerifiedCompanionRelation else { throw PhoneClientError.companionRelationRequired }
+    }
+}
+
 /// Separate map ranges shown by the UI for visual scan, RF observability, and field calibration.
 public struct MapCoverageRanges: Codable, Equatable, Sendable {
     public let visualScan: [CoverageCell]
@@ -567,6 +647,8 @@ public final class RoomPlanCaptureController: NSObject, RoomCaptureSessionDelega
     public private(set) var latestObservation: PhoneCaptureObservation?
     public private(set) var observations: [PhoneCaptureObservation] = []
     public private(set) var usdzData: Data?
+    public private(set) var measuredRegistration: MeasuredRFRegistrationInput?
+    public private(set) var verifiedCompanionRelation: VerifiedCompanionTimeRelation?
     public var onObservation: ((PhoneCaptureObservation) -> Void)?
     public var onError: ((Error) -> Void)?
     private var latestRoom: CapturedRoom?
@@ -609,7 +691,21 @@ public final class RoomPlanCaptureController: NSObject, RoomCaptureSessionDelega
     public func requestDimensionConfirmation() throws { try coordinator.requestConfirmation() }
     public func confirmDimensions() throws { try coordinator.confirmDimensions() }
     public func confirmDoors() throws { try coordinator.confirmDoors() }
-    public func registerRF(_ registration: RFDeviceRegistration) throws { try coordinator.registerRF(registration) }
+    /// Registers only a caller-supplied measured marker survey; no transform or error is guessed.
+    public func registerMeasuredRF(_ input: MeasuredRFRegistrationInput) throws {
+        try coordinator.registerRF(input.registration())
+        measuredRegistration = input
+    }
+
+    /// Installs the clock relation only after the companion handshake has verified the Host.
+    public func attachCompanionConnection(_ connection: CompanionConnection) {
+        verifiedCompanionRelation = connection.verifiedTimeRelation
+    }
+
+    public var exportReadiness: PhoneExportReadiness {
+        PhoneExportReadiness(measuredRegistration: measuredRegistration, verifiedCompanionRelation: verifiedCompanionRelation)
+    }
+
     public func confirmPhoneFixed() throws { try coordinator.confirmPhoneFixed() }
 
     /// Completes a tracking reset only after ARKit reports a normal camera state.
@@ -620,9 +716,12 @@ public final class RoomPlanCaptureController: NSObject, RoomCaptureSessionDelega
     }
 
     /// Converts one captured observation into a canonical supervision sample.
-    public func makeSupervisionSample(input: SupervisionLabelInput, timeRelation: PhoneTimeRelation) throws -> SupervisionSample {
+    public func makeSupervisionSample(input: SupervisionLabelInput, verifiedTimeRelation: VerifiedCompanionTimeRelation) throws -> SupervisionSample {
         guard let observation = latestObservation else { throw PhoneClientError.invalidState("no RGB/depth/pose observation is available") }
         let timestamp = observation.keyframe.phoneTime
+        guard verifiedTimeRelation.relation.error(at: timestamp) != nil else {
+            throw PhoneClientError.companionRelationRequired
+        }
         guard let rgb = observation.media.first(where: { $0.kind == .rgb }) else {
             throw PhoneClientError.invalidArtifact("capture observation has no RGB media")
         }
@@ -635,7 +734,7 @@ public final class RoomPlanCaptureController: NSObject, RoomCaptureSessionDelega
             rgbTime: timestamp,
             depthTime: depthTime,
             poseTime: timestamp,
-            maximumTimeError: 0,
+            maximumTimeError: verifiedTimeRelation.relation.error(at: timestamp) ?? 0,
             trackingEpoch: observation.keyframe.trackingEpoch,
             relocalized: observation.keyframe.trackingQuality == .normal,
             trackingQuality: observation.keyframe.trackingQuality,

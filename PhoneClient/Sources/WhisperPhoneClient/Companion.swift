@@ -469,6 +469,22 @@ public struct PendingCompanionConnection: Sendable {
     }
 }
 
+/// A phone/Host clock relation that was authenticated by a completed companion handshake.
+///
+/// The initializer is intentionally private to this module. Callers obtain this value only from
+/// `CompanionConnection`, whose construction verifies the pinned Host signature first.
+public struct VerifiedCompanionTimeRelation: Equatable, Sendable {
+    public let relation: PhoneTimeRelation
+    public let sessionID: Data
+    public let serverIdentity: CompanionServerIdentity
+
+    fileprivate init(relation: PhoneTimeRelation, sessionID: Data, serverIdentity: CompanionServerIdentity) {
+        self.relation = relation
+        self.sessionID = sessionID
+        self.serverIdentity = serverIdentity
+    }
+}
+
 /// Established client half of a paired encrypted companion session.
 public struct CompanionConnection: Sendable {
     public let pairingID: PairingID
@@ -517,6 +533,11 @@ public struct CompanionConnection: Sendable {
             chunks.append(try CompanionChunk(sessionID: sessionID, uploadID: uploadID, index: UInt32(index), chunkCount: UInt32(chunkCount), chunkPlaintextBytes: UInt32(chunkBytes), totalBytes: totalBytes, fullDigest: digest, ciphertext: ciphertext))
         }
         return chunks
+    }
+
+    /// Returns the authenticated clock relation for candidate capture/export timestamps.
+    public var verifiedTimeRelation: VerifiedCompanionTimeRelation {
+        VerifiedCompanionTimeRelation(relation: clockRelation, sessionID: sessionID, serverIdentity: serverIdentity)
     }
 }
 
