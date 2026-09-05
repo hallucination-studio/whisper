@@ -14,6 +14,7 @@ from model_worker.feature_frontend import (
     FeatureFrontendOperator,
     FeatureLimits,
     FeatureManifest,
+    FeatureQuality,
     MapCell,
     MapGrid,
     PathClass,
@@ -24,10 +25,14 @@ from model_worker.feature_frontend import (
     SourceEmbedding,
     SourceProvenance,
 )
+from model_worker.worker import ContractFailure
 
 
 def digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+EXPECTED_FIXTURE_TENSOR_DIGEST = "ac0e6b2fedb0e1005ff2f9b11e74dd6a3d2f7ac99182f5e32b63caf9595007bf"
 
 
 def provenance(source_id: str, boot_id: str) -> SourceProvenance:
@@ -116,6 +121,39 @@ def manifest(*, cutoff_ns: int = 1_500_000_000, blocks=None, paths=None) -> Feat
     )
 
 
+def operator_request(value: FeatureManifest, frontend: FeatureFrontend | None = None) -> dict:
+    frontend = frontend or FeatureFrontend()
+    materialized = frontend.materialize(value)
+    weights = frontend.weights_canonical_bytes()
+    return {
+        "identity": {
+            "run_id": value.run_id,
+            "epoch": value.epoch,
+            "cutoff_ns": value.cutoff_ns,
+        },
+        "model_run": {
+            "run_id": value.run_id,
+            "preprocessing": value.preprocessing_version,
+            "weights_digest": frontend.weights_digest(),
+            "weights_hex": weights.hex(),
+            "output_shape": list(materialized.feature_shape),
+        },
+        "input_manifest": {
+            "run_id": value.run_id,
+            "epoch": value.epoch,
+            "cutoff_ns": value.cutoff_ns,
+            "preprocessing": value.preprocessing_version,
+            "manifest_digest": value.digest(),
+            "manifest_hex": value.canonical_bytes().hex(),
+            "tensor_digest": materialized.tensor_digest,
+            "tensor_hex": materialized.tensor_bytes.hex(),
+            "shape": list(materialized.feature_shape),
+            "source_count": len(value.source_provenance),
+            "clock_domain_count": len({item.clock_domain for item in value.source_provenance}),
+        },
+    }
+
+
 class FeatureFrontendTests(unittest.TestCase):
     def test_manifest_and_materialization_are_immutable_and_deterministic(self) -> None:
         value = manifest()
@@ -130,6 +168,7 @@ class FeatureFrontendTests(unittest.TestCase):
         self.assertEqual(first.manifest_digest, value.digest())
         self.assertEqual(first.tensor_bytes, second.tensor_bytes)
         self.assertEqual(first.tensor_digest, second.tensor_digest)
+        self.assertEqual(first.tensor_digest, EXPECTED_FIXTURE_TENSOR_DIGEST)
         self.assertEqual(first, second)
         payload = json.loads(value.canonical_bytes())
         self.assertEqual(payload["schema"], "rf-feature-manifest-v1")
@@ -254,6 +293,57 @@ class FeatureFrontendTests(unittest.TestCase):
                 component["encoding_digest"],
             )
 
+    def test_weights_digest_changes_for_each_configured_numeric_parameter(self) -> None:
+        baseline = FeatureFrontend()
+        slow = baseline.slow_mlp
+        tcn = baseline.causal_tcn
+        attention = baseline.attention
+        variants = (
+            FeatureFrontend(slow_mlp=replace(slow, hidden_width=9)),
+            FeatureFrontend(slow_mlp=replace(slow, hidden_bias=0.071)),
+            FeatureFrontend(slow_mlp=replace(slow, sinusoid_frequency=0.371)),
+            FeatureFrontend(slow_mlp=replace(slow, input_scale=0.081)),
+            FeatureFrontend(causal_tcn=replace(tcn, context_ns=tcn.context_ns - 1)),
+            FeatureFrontend(causal_tcn=replace(tcn, layers=3, delta_scales=(0.05, 0.03, 0.02))),
+            FeatureFrontend(causal_tcn=replace(tcn, max_lag=4)),
+            FeatureFrontend(causal_tcn=replace(tcn, current_scale=0.421)),
+            FeatureFrontend(causal_tcn=replace(tcn, layer_scale_step=0.041)),
+            FeatureFrontend(causal_tcn=replace(tcn, layer_bias=0.031)),
+            FeatureFrontend(causal_tcn=replace(tcn, lag_scale=0.191)),
+            FeatureFrontend(causal_tcn=replace(tcn, mask_scale=0.111)),
+            FeatureFrontend(causal_tcn=replace(tcn, delta_scales=(0.051, 0.03))),
+            FeatureFrontend(causal_tcn=replace(tcn, delta_scales=(0.05, 0.031))),
+            FeatureFrontend(attention=replace(attention, temperature=1.001)),
+            FeatureFrontend(attention=replace(attention, max_sources=15)),
+            FeatureFrontend(attention=replace(attention, score_bias=1.001)),
+            FeatureFrontend(attention=replace(attention, exponent_clamp_min=-59.0)),
+            FeatureFrontend(attention=replace(attention, exponent_clamp_max=59.0)),
+        )
+        self.assertTrue(all(frontend.weights_digest() != baseline.weights_digest() for frontend in variants))
+        for frontend in variants:
+            with self.assertRaisesRegex(FeatureFrontendError, "weights digest"):
+                frontend.materialize(manifest())
+
+        head = baseline.scattering_head
+        changed_bias = [list(row) for row in head.bias_weights]
+        changed_bias[0][0] += 0.001
+        changed_noise = list(head.noise_weights)
+        changed_noise[0] += 0.001
+        for changed in (
+            replace(head, bias_weights=tuple(tuple(row) for row in changed_bias)),
+            replace(head, noise_weights=tuple(changed_noise)),
+        ):
+            changed_frontend = FeatureFrontend(scattering_head=changed)
+            self.assertNotEqual(changed_frontend.weights_digest(), baseline.weights_digest())
+            with self.assertRaisesRegex(FeatureFrontendError, "weights digest"):
+                changed_frontend.materialize(manifest())
+
+        class ForgedSlowMLP(SlowMLP):
+            pass
+
+        with self.assertRaisesRegex(FeatureFrontendError, "built-in"):
+            FeatureFrontend(slow_mlp=ForgedSlowMLP()).weights_digest()
+
     def test_supervised_scattering_head_propagates_known_bias_and_is_pair_symmetric(self) -> None:
         examples = tuple(
             ScatteringExample(
@@ -353,12 +443,42 @@ class FeatureFrontendTests(unittest.TestCase):
         with self.assertRaisesRegex(FeatureFrontendError, "canonical"):
             FeatureManifest.from_bytes(json.dumps(value.to_dict()).encode())
 
-        candidate, shape, successor = FeatureFrontendOperator().evaluate(
-            {"input_manifest": {"manifest_hex": value.canonical_bytes().hex()}}
-        )
+        candidate, shape, successor = FeatureFrontendOperator().evaluate(operator_request(value))
         self.assertEqual(shape, (len(candidate) // 4,))
         self.assertEqual(len(successor), 32)
         self.assertEqual(len(candidate), shape[0] * 4)
+
+    def test_operator_binds_outer_tensor_and_rejects_causal_cutoff_bypass(self) -> None:
+        value = manifest()
+        operator = FeatureFrontendOperator()
+
+        altered_tensor = operator_request(value)
+        altered_tensor_bytes = bytearray.fromhex(altered_tensor["input_manifest"]["tensor_hex"])
+        altered_tensor_bytes[0] ^= 0x01
+        altered_tensor["input_manifest"]["tensor_hex"] = bytes(altered_tensor_bytes).hex()
+        altered_tensor["input_manifest"]["tensor_digest"] = digest(bytes(altered_tensor_bytes))
+        with self.assertRaisesRegex(ContractFailure, "canonical manifest materialization"):
+            operator.evaluate(altered_tensor)
+
+        bypassed = operator_request(replace(value, cutoff_ns=value.cutoff_ns - 1))
+        bypassed["identity"]["cutoff_ns"] = value.cutoff_ns
+        bypassed["input_manifest"]["cutoff_ns"] = value.cutoff_ns
+        with self.assertRaisesRegex(ContractFailure, "causal cutoff"):
+            operator.evaluate(bypassed)
+
+        class MustNotMaterialize(FeatureFrontend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.materialize_calls = 0
+
+            def materialize(self, manifest_value):
+                self.materialize_calls += 1
+                raise AssertionError("causal identity must be checked before materialization")
+
+        guarded = MustNotMaterialize()
+        with self.assertRaisesRegex(ContractFailure, "causal cutoff"):
+            FeatureFrontendOperator(guarded).evaluate(bypassed)
+        self.assertEqual(guarded.materialize_calls, 0)
 
     def test_metadata_only_blocks_remain_masked_and_do_not_create_attention_evidence(self) -> None:
         value = manifest()
@@ -373,6 +493,7 @@ class FeatureFrontendTests(unittest.TestCase):
                 spectrum_mask=tuple(False for _ in item.spectrum_mask),
                 residual_mask=tuple(False for _ in item.residual_mask),
                 fast_mask=tuple(False for _ in item.fast_mask),
+                quality=FeatureQuality.METADATA_ONLY,
             )
             for item in value.blocks
         )
@@ -380,6 +501,26 @@ class FeatureFrontendTests(unittest.TestCase):
         result = FeatureFrontend().materialize(empty)
         self.assertTrue(all(not cell.mask and cell.source_count == 0 for cell in result.attention))
         self.assertTrue(all(not mask for item in result.tcn_outputs for mask in item.masks))
+
+    def test_tcn_retains_distinct_quality_states_and_lost_quality_fixture(self) -> None:
+        value = manifest()
+        quality_blocks = (
+            replace(value.blocks[0], quality=FeatureQuality.LOST),
+            replace(value.blocks[1], quality=FeatureQuality.INVALID),
+            replace(value.blocks[2], quality=FeatureQuality.INTERPOLATED),
+            replace(value.blocks[3], quality=FeatureQuality.TRAINING_MASKED),
+        )
+        result = FeatureFrontend().materialize(manifest(blocks=quality_blocks, paths=()))
+
+        tcn_a = next(item for item in result.tcn_outputs if item.source_key == "array-a/boot-a")
+        self.assertEqual(
+            tcn_a.quality_states,
+            (FeatureQuality.LOST, FeatureQuality.INVALID, FeatureQuality.INTERPOLATED),
+        )
+        self.assertEqual(tcn_a.masks, (False, False, True))
+        tcn_b = next(item for item in result.tcn_outputs if item.source_key == "array-b/boot-b")
+        self.assertEqual(tcn_b.quality_states, (FeatureQuality.TRAINING_MASKED,))
+        self.assertEqual(tcn_b.masks, (False,))
 
 
 if __name__ == "__main__":

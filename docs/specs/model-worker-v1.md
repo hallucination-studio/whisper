@@ -46,6 +46,14 @@ clock-domain limits are checked before numerical execution. The worker receives
 all context explicitly, so a restart rematerializes the same input from the
 frozen request and has no hidden continuation state.
 
+The `FeatureFrontendOperator` additionally binds the nested feature manifest's
+run ID, epoch, causal cutoff, preprocessing version, and weights digest to the
+validated outer `identity`, `model_run`, and `input_manifest` fields. For this
+operator, the consumed input is the canonical float32 tensor produced from that
+manifest; the outer `tensor_hex`, digest, and shape must match those exact bytes
+and the declared output shape. A changed nested cutoff or unrelated outer tensor
+is rejected before materialization or result publication respectively.
+
 ## Feature front-end manifest
 
 The numerical front-end uses the canonical JSON identity `rf-feature-manifest-v1`
@@ -64,17 +72,21 @@ materialization.
 
 Each block names a unique `block_id`, source and boot identity, capture time,
 the raw `absolute_response`, `spectrum_shape`, `background_residual`, and
-`fast_values`, plus a shape-matched mask for every vector and the preprocessing
-version. Source provenance retains profile, radio, channel, clock-domain, and
-raw-record digest. Blocks are strictly ordered per source and cannot lie after
-the causal cutoff or repeat an identity.
+`fast_values`, plus a shape-matched mask for every vector, an explicit quality
+state (`valid`, `lost`, `invalid`, `interpolated`, `training_masked`, or
+`metadata_only`), and the preprocessing version. Source provenance retains
+profile, radio, channel, clock-domain, and raw-record digest. Blocks are
+strictly ordered per source and cannot lie after the causal cutoff or repeat an
+identity.
 
 The slow branch consumes the current absolute response, spectrum shape, and
 conditional background residual without centering away the absolute stationary
 level. The fast branch is a bounded causal TCN whose context is at most two
-seconds; it records actual block intervals and masks and never reads a future
-block. Missing or metadata-only values remain masked rather than becoming an
-empty-room conclusion.
+seconds; it records actual block intervals, masks, and the ordered quality
+state of every selected block and never reads a future block. Only `valid` and
+`interpolated` blocks contribute usable fast evidence; lost, invalid,
+training-masked, and metadata-only states remain distinct in the output tensor
+and do not become an empty-room conclusion.
 
 Each path must declare `qualified=true`, `operator=angle_delay`, and
 `adapter_kind=qualified_array`, with angle, delay, path class, uncertainty,

@@ -25,6 +25,8 @@ WEIGHTS_SCHEMA = "rf-feature-weights-v1"
 MAX_TEXT_BYTES = 128
 MAX_FEATURE_WIDTH = 256
 MAX_TCN_CONTEXT_NS = 2_000_000_000
+# Worker-compatible shape bound; it prevents large integer products at the seam.
+MAX_OPERATOR_SHAPE_DIMENSION = 65_536
 # Default supervised-example count; bounding n keeps ridge accumulation O(n * width²).
 MAX_SCATTERING_SAMPLES = 1_024
 PATH_CLASSES = 4
@@ -51,10 +53,12 @@ class FeatureLimits:
     max_feature_width: int = MAX_FEATURE_WIDTH
     max_tcn_context_ns: int = MAX_TCN_CONTEXT_NS
     max_tensor_bytes: int = 524_288
+    max_weights_bytes: int = 262_144
 
     def __post_init__(self) -> None:
         for field_name in (
             "max_manifest_bytes",
+            "max_weights_bytes",
             "max_blocks",
             "max_sources",
             "max_paths",
@@ -88,6 +92,32 @@ def _digest(value: object, field: str) -> str:
     ):
         raise FeatureFrontendError("contract", f"{field} must be canonical lowercase SHA-256 hex")
     return value
+
+
+def _hex_bytes(value: object, maximum: int, field: str) -> bytes:
+    """Decode bounded canonical lowercase hexadecimal without normalization."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) % 2
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise FeatureFrontendError("contract", f"{field} must be canonical lowercase hex")
+    if len(value) // 2 > maximum:
+        raise FeatureFrontendError("limit", f"{field} exceeds its configured byte limit")
+    try:
+        return bytes.fromhex(value)
+    except ValueError as error:
+        raise FeatureFrontendError("contract", f"{field} is not valid hexadecimal") from error
+
+
+def _check_content_digest(value: object, content: bytes, field: str) -> str:
+    """Validate a canonical digest and bind it to the exact supplied bytes."""
+
+    digest = _digest(value, field)
+    if digest != hashlib.sha256(content).hexdigest():
+        raise FeatureFrontendError("digest", f"{field} does not match content")
+    return digest
 
 
 def _floats(value: object, field: str) -> tuple[float, ...]:
@@ -186,6 +216,14 @@ def _component_digest(encoded: bytes) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _exact_component_bytes(component: object, expected_type: type[object], name: str) -> bytes:
+    """Reject overridable numerical components before their identity is accepted."""
+
+    if type(component) is not expected_type:
+        raise FeatureFrontendError("contract", f"{name} must use its built-in implementation")
+    return component.canonical_bytes()  # type: ignore[attr-defined]
+
+
 def _source_key(source_id: str, boot_id: str) -> str:
     return f"{source_id}/{boot_id}"
 
@@ -245,6 +283,22 @@ class SourceProvenance:
         )
 
 
+class FeatureQuality(str, Enum):
+    """Explicit quality state retained alongside each causal feature block."""
+
+    VALID = "valid"
+    LOST = "lost"
+    INVALID = "invalid"
+    INTERPOLATED = "interpolated"
+    TRAINING_MASKED = "training_masked"
+    METADATA_ONLY = "metadata_only"
+
+
+_USABLE_FEATURE_QUALITIES = frozenset(
+    (FeatureQuality.VALID, FeatureQuality.INTERPOLATED)
+)
+
+
 @dataclass(frozen=True, slots=True)
 class FeatureBlock:
     """One causal block containing uncentered slow, residual, and fast inputs."""
@@ -261,6 +315,7 @@ class FeatureBlock:
     residual_mask: tuple[bool, ...]
     fast_mask: tuple[bool, ...]
     preprocessing_version: str = PREPROCESSING_VERSION
+    quality: FeatureQuality = FeatureQuality.VALID
 
     def __post_init__(self) -> None:
         _text(self.block_id, "block ID")
@@ -284,6 +339,11 @@ class FeatureBlock:
             feature = getattr(self, feature_name)
             object.__setattr__(self, field_name, _mask(value, field_name, len(feature)))
         _text(self.preprocessing_version, "block preprocessing version")
+        if not isinstance(self.quality, FeatureQuality):
+            try:
+                object.__setattr__(self, "quality", FeatureQuality(self.quality))
+            except (TypeError, ValueError) as error:
+                raise FeatureFrontendError("contract", "feature block quality is not recognized") from error
 
     @property
     def source_key(self) -> str:
@@ -315,6 +375,7 @@ class FeatureBlock:
                 "fast": list(self.fast_mask),
             },
             "preprocessing_version": self.preprocessing_version,
+            "quality": self.quality.value,
         }
 
     @classmethod
@@ -335,6 +396,7 @@ class FeatureBlock:
             residual_mask=masks["residual"],
             fast_mask=masks["fast"],
             preprocessing_version=data["preprocessing_version"],
+            quality=data.get("quality", FeatureQuality.VALID.value),
         )
 
 
@@ -706,15 +768,31 @@ class SlowMLPOutput:
     residual_mask: tuple[bool, ...]
     absolute_level: float
     preprocessing_version: str
+    quality: FeatureQuality = FeatureQuality.VALID
 
 
+@dataclass(frozen=True, slots=True)
 class SlowMLP:
     """Small deterministic MLP that never removes absolute stationary response."""
 
-    def __init__(self, hidden_width: int = 8):
-        if isinstance(hidden_width, bool) or not isinstance(hidden_width, int) or not 1 <= hidden_width <= 64:
+    hidden_width: int = 8
+    hidden_bias: float = 0.07
+    sinusoid_frequency: float = 0.37
+    input_scale: float = 0.08
+
+    def __post_init__(self) -> None:
+        if isinstance(self.hidden_width, bool) or not isinstance(self.hidden_width, int) or not 1 <= self.hidden_width <= 64:
             raise ValueError("hidden_width must be in 1..64")
-        self.hidden_width = hidden_width
+        for value, field in (
+            (self.hidden_bias, "hidden_bias"),
+            (self.sinusoid_frequency, "sinusoid_frequency"),
+            (self.input_scale, "input_scale"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"{field} must be finite")
+        object.__setattr__(self, "hidden_bias", float(self.hidden_bias))
+        object.__setattr__(self, "sinusoid_frequency", float(self.sinusoid_frequency))
+        object.__setattr__(self, "input_scale", float(self.input_scale))
 
     def canonical_bytes(self) -> bytes:
         """Return canonical bytes for the configured slow branch."""
@@ -726,6 +804,11 @@ class SlowMLP:
             {
                 "algorithm_version": "slow-mlp-v1",
                 "hidden_width": self.hidden_width,
+                "hidden_bias_f64le_hex": _float64_hex(self.hidden_bias, "slow MLP hidden bias"),
+                "sinusoid_frequency_f64le_hex": _float64_hex(
+                    self.sinusoid_frequency, "slow MLP sinusoid frequency"
+                ),
+                "input_scale_f64le_hex": _float64_hex(self.input_scale, "slow MLP input scale"),
             },
         )
 
@@ -735,19 +818,24 @@ class SlowMLP:
         return _component_digest(self.canonical_bytes())
 
     def encode(self, block: FeatureBlock) -> SlowMLPOutput:
+        usable = block.quality in _USABLE_FEATURE_QUALITIES
         values = (
-            tuple(value if present else 0.0 for value, present in zip(block.absolute_response, block.absolute_mask)),
-            tuple(value if present else 0.0 for value, present in zip(block.spectrum_shape, block.spectrum_mask)),
-            tuple(value if present else 0.0 for value, present in zip(block.background_residual, block.residual_mask)),
+            tuple(value if usable and present else 0.0 for value, present in zip(block.absolute_response, block.absolute_mask)),
+            tuple(value if usable and present else 0.0 for value, present in zip(block.spectrum_shape, block.spectrum_mask)),
+            tuple(value if usable and present else 0.0 for value, present in zip(block.background_residual, block.residual_mask)),
         )
         flattened = tuple(number for group in values for number in group)
         embedding: list[float] = []
         for hidden in range(self.hidden_width):
-            total = 0.07 * (hidden + 1)
+            total = self.hidden_bias * (hidden + 1)
             for index, number in enumerate(flattened):
-                total += number * math.sin((hidden + 1) * (index + 1) * 0.37) * 0.08
+                total += number * math.sin((hidden + 1) * (index + 1) * self.sinusoid_frequency) * self.input_scale
             embedding.append(math.tanh(total))
-        present = [value for value, is_present in zip(block.absolute_response, block.absolute_mask) if is_present]
+        present = [
+            value
+            for value, is_present in zip(block.absolute_response, block.absolute_mask)
+            if usable and is_present
+        ]
         absolute_level = math.fsum(present) / len(present) if present else 0.0
         return SlowMLPOutput(
             source_key=block.source_key,
@@ -761,6 +849,7 @@ class SlowMLP:
             residual_mask=block.residual_mask,
             absolute_level=absolute_level,
             preprocessing_version=block.preprocessing_version,
+            quality=block.quality,
         )
 
 
@@ -774,26 +863,88 @@ class CausalTCNOutput:
     time_deltas_ns: tuple[int, ...]
     masks: tuple[bool, ...]
     embedding: tuple[float, ...]
+    quality_states: tuple[FeatureQuality, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
 class CausalTCN:
     """A tiny causal temporal convolution using real intervals and no future input."""
 
-    def __init__(self, context_ns: int = MAX_TCN_CONTEXT_NS):
-        if isinstance(context_ns, bool) or not isinstance(context_ns, int) or not 1 <= context_ns <= MAX_TCN_CONTEXT_NS:
+    context_ns: int = MAX_TCN_CONTEXT_NS
+    layers: int = 2
+    max_lag: int = 3
+    current_scale: float = 0.42
+    layer_scale_step: float = 0.04
+    layer_bias: float = 0.03
+    lag_scale: float = 0.19
+    mask_scale: float = 0.11
+    delta_scales: tuple[float, ...] = (0.05, 0.03)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.context_ns, bool) or not isinstance(self.context_ns, int) or not 1 <= self.context_ns <= MAX_TCN_CONTEXT_NS:
             raise ValueError(f"context_ns must be in 1..{MAX_TCN_CONTEXT_NS}")
-        self.context_ns = context_ns
+        for value, field in (
+            (self.layers, "layers"),
+            (self.max_lag, "max_lag"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{field} must be a positive integer")
+        raw_delta_scales = tuple(self.delta_scales)
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in raw_delta_scales
+        ):
+            raise ValueError("delta_scales must be numeric")
+        delta_scales = tuple(float(value) for value in raw_delta_scales)
+        if len(delta_scales) < self.layers:
+            raise ValueError("delta_scales must provide one value per TCN layer")
+        numeric = (
+            (self.current_scale, "current_scale"),
+            (self.layer_scale_step, "layer_scale_step"),
+            (self.layer_bias, "layer_bias"),
+            (self.lag_scale, "lag_scale"),
+            (self.mask_scale, "mask_scale"),
+        )
+        for value, field in numeric:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"{field} must be finite")
+        if any(not math.isfinite(value) for value in delta_scales):
+            raise ValueError("delta_scales must be finite")
+        object.__setattr__(self, "current_scale", float(self.current_scale))
+        object.__setattr__(self, "layer_scale_step", float(self.layer_scale_step))
+        object.__setattr__(self, "layer_bias", float(self.layer_bias))
+        object.__setattr__(self, "lag_scale", float(self.lag_scale))
+        object.__setattr__(self, "mask_scale", float(self.mask_scale))
+        object.__setattr__(self, "delta_scales", delta_scales)
 
     def canonical_bytes(self) -> bytes:
         """Return canonical bytes for the configured causal temporal branch."""
 
         if isinstance(self.context_ns, bool) or not isinstance(self.context_ns, int) or not 1 <= self.context_ns <= MAX_TCN_CONTEXT_NS:
             raise FeatureFrontendError("contract", "causal TCN context is outside its supported bound")
+        if isinstance(self.layers, bool) or not isinstance(self.layers, int) or self.layers <= 0:
+            raise FeatureFrontendError("contract", "causal TCN layer count is outside its supported bound")
+        if isinstance(self.max_lag, bool) or not isinstance(self.max_lag, int) or self.max_lag <= 0:
+            raise FeatureFrontendError("contract", "causal TCN lag count is outside its supported bound")
+        if len(self.delta_scales) < self.layers:
+            raise FeatureFrontendError("contract", "causal TCN delta scales are incomplete")
         return _component_bytes(
             "causal_tcn",
             {
                 "algorithm_version": "causal-tcn-v1",
                 "context_ns": self.context_ns,
+                "layers": self.layers,
+                "max_lag": self.max_lag,
+                "current_scale_f64le_hex": _float64_hex(self.current_scale, "TCN current scale"),
+                "layer_scale_step_f64le_hex": _float64_hex(
+                    self.layer_scale_step, "TCN layer scale step"
+                ),
+                "layer_bias_f64le_hex": _float64_hex(self.layer_bias, "TCN layer bias"),
+                "lag_scale_f64le_hex": _float64_hex(self.lag_scale, "TCN lag scale"),
+                "mask_scale_f64le_hex": _float64_hex(self.mask_scale, "TCN mask scale"),
+                "delta_scales_f64le_hex": _float64_sequence_hex(
+                    self.delta_scales, "TCN delta scales"
+                ),
             },
         )
 
@@ -804,10 +955,15 @@ class CausalTCN:
 
     @staticmethod
     def _summary(block: FeatureBlock) -> tuple[float, float]:
-        present = [value for value, is_present in zip(block.fast_values, block.fast_mask) if is_present]
-        if not present:
+        if block.quality not in _USABLE_FEATURE_QUALITIES:
             return 0.0, 0.0
-        return math.fsum(present) / len(present), len(present) / len(block.fast_values)
+        present_count = sum(1 for is_present in block.fast_mask if is_present)
+        if present_count == 0:
+            return 0.0, 0.0
+        present = tuple(
+            value for value, is_present in zip(block.fast_values, block.fast_mask) if is_present
+        )
+        return math.fsum(present) / present_count, present_count / len(block.fast_values)
 
     def encode(self, blocks: Sequence[FeatureBlock], cutoff_ns: int) -> CausalTCNOutput:
         if not blocks:
@@ -823,28 +979,30 @@ class CausalTCN:
         deltas = tuple(0 if index == 0 else timestamps[index] - timestamps[index - 1] for index in range(len(timestamps)))
         summaries = tuple(self._summary(item) for item in selected)
         layer = [summary[0] for summary in summaries]
-        for layer_index in range(2):
+        for layer_index in range(self.layers):
             next_layer: list[float] = []
             for index, current in enumerate(layer):
-                total = current * (0.42 - 0.04 * layer_index) + 0.03 * (layer_index + 1)
-                for lag in range(1, min(3, index + 1) + 1):
+                total = current * (self.current_scale - self.layer_scale_step * layer_index) + self.layer_bias * (layer_index + 1)
+                for lag in range(1, min(self.max_lag, index + 1) + 1):
                     earlier = index - lag
                     age = timestamps[index] - timestamps[earlier]
                     if age > self.context_ns:
                         continue
                     decay = math.exp(-age / self.context_ns)
-                    total += layer[earlier] * (0.19 / lag) * decay
-                total += summaries[index][1] * 0.11
-                total += (deltas[index] / 1_000_000_000.0) * (0.05 if layer_index == 0 else 0.03)
+                    total += layer[earlier] * (self.lag_scale / lag) * decay
+                total += summaries[index][1] * self.mask_scale
+                total += (deltas[index] / 1_000_000_000.0) * self.delta_scales[layer_index]
                 next_layer.append(math.tanh(total))
             layer = next_layer
-        masks = tuple(any(item.fast_mask) for item in selected)
+        quality_states = tuple(item.quality for item in selected)
+        masks = tuple(summary[1] > 0.0 for summary in summaries)
         return CausalTCNOutput(
             source_key=selected[-1].source_key,
             cutoff_ns=cutoff_ns,
             timestamps_ns=timestamps,
             time_deltas_ns=deltas,
             masks=masks,
+            quality_states=quality_states,
             embedding=(layer[-1], summaries[-1][0], summaries[-1][1], deltas[-1] / 1_000_000_000.0),
         )
 
@@ -859,6 +1017,7 @@ class PathBranchOutput:
     mean_uncertainty: float
 
 
+@dataclass(frozen=True, slots=True)
 class QualifiedPathEncoder:
     """Passes qualified angle-delay candidates into model features verbatim."""
 
@@ -974,14 +1133,18 @@ class ScatteringBiasNoiseHead:
     noise_weights: tuple[float, ...]
 
     def __post_init__(self) -> None:
-        bias = tuple(tuple(float(item) for item in row) for row in self.bias_weights)
-        noise = tuple(float(item) for item in self.noise_weights)
-        if len(bias) != 3 or not bias or len(noise) != len(bias[0]):
+        try:
+            raw_bias = tuple(self.bias_weights)
+        except TypeError as error:
+            raise FeatureFrontendError("contract", "scattering head weights are not numeric sequences") from error
+        bias = tuple(
+            _floats(row, f"scattering bias weights[{index}]") for index, row in enumerate(raw_bias)
+        )
+        noise = _floats(self.noise_weights, "scattering noise weights")
+        if len(bias) != 3 or not bias or not noise or len(noise) != len(bias[0]):
             raise FeatureFrontendError("contract", "scattering head weight shapes are invalid")
-        if any(len(row) != len(noise) for row in bias):
+        if any(not row or len(row) != len(noise) for row in bias):
             raise FeatureFrontendError("contract", "scattering head bias weights are ragged")
-        if any(not math.isfinite(item) for row in bias for item in row) or any(not math.isfinite(item) for item in noise):
-            raise FeatureFrontendError("non_finite", "scattering head weights are not finite")
         object.__setattr__(self, "bias_weights", bias)
         object.__setattr__(self, "noise_weights", noise)
 
@@ -1163,30 +1326,55 @@ class AttentionCell:
     source_count: int
 
 
+@dataclass(frozen=True, slots=True)
 class CrossSourceAttention:
     """Deterministic map-query attention over qualified source embeddings."""
 
-    def __init__(self, temperature: float = 1.0, max_sources: int = 16):
-        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(float(temperature)) or temperature <= 0.0:
+    temperature: float = 1.0
+    max_sources: int = 16
+    score_bias: float = 1.0
+    exponent_clamp_min: float = -60.0
+    exponent_clamp_max: float = 60.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.temperature, bool) or not isinstance(self.temperature, (int, float)) or not math.isfinite(float(self.temperature)) or self.temperature <= 0.0:
             raise ValueError("temperature must be finite and positive")
-        if isinstance(max_sources, bool) or not isinstance(max_sources, int) or max_sources <= 0:
+        if isinstance(self.max_sources, bool) or not isinstance(self.max_sources, int) or self.max_sources <= 0:
             raise ValueError("max_sources must be positive")
-        self.temperature = float(temperature)
-        self.max_sources = max_sources
+        for value, field in (
+            (self.score_bias, "score_bias"),
+            (self.exponent_clamp_min, "exponent_clamp_min"),
+            (self.exponent_clamp_max, "exponent_clamp_max"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"{field} must be finite")
+        if self.exponent_clamp_min > self.exponent_clamp_max:
+            raise ValueError("exponent clamp bounds are reversed")
+        object.__setattr__(self, "temperature", float(self.temperature))
+        object.__setattr__(self, "score_bias", float(self.score_bias))
+        object.__setattr__(self, "exponent_clamp_min", float(self.exponent_clamp_min))
+        object.__setattr__(self, "exponent_clamp_max", float(self.exponent_clamp_max))
 
     def canonical_bytes(self) -> bytes:
         """Return canonical bytes for the configured cross-source attention branch."""
 
-        if not math.isfinite(self.temperature) or self.temperature <= 0.0:
+        if isinstance(self.temperature, bool) or not math.isfinite(self.temperature) or self.temperature <= 0.0:
             raise FeatureFrontendError("contract", "attention temperature is outside its supported bound")
         if isinstance(self.max_sources, bool) or not isinstance(self.max_sources, int) or self.max_sources <= 0:
             raise FeatureFrontendError("contract", "attention source limit is outside its supported bound")
+        if self.exponent_clamp_min > self.exponent_clamp_max:
+            raise FeatureFrontendError("contract", "attention exponent clamp bounds are reversed")
         return _component_bytes(
             "cross_source_attention",
             {
                 "algorithm_version": "cross-source-attention-v1",
                 "temperature_f64le_hex": _float64_hex(self.temperature, "attention temperature"),
                 "max_sources": self.max_sources,
+                "score_bias_f64le_hex": _float64_hex(self.score_bias, "attention score bias"),
+                "exponent_clamp_f64le_hex": [
+                    _float64_hex(self.exponent_clamp_min, "attention exponent lower clamp"),
+                    _float64_hex(self.exponent_clamp_max, "attention exponent upper clamp"),
+                ],
             },
         )
 
@@ -1195,9 +1383,8 @@ class CrossSourceAttention:
 
         return _component_digest(self.canonical_bytes())
 
-    @staticmethod
-    def _score(position: Sequence[float], values: Sequence[float], masks: Sequence[bool]) -> float:
-        coefficients = (position[0], position[1], position[2], 1.0)
+    def _score(self, position: Sequence[float], values: Sequence[float], masks: Sequence[bool]) -> float:
+        coefficients = (position[0], position[1], position[2], self.score_bias)
         return math.fsum(
             value * coefficients[index % len(coefficients)] if masks[index] else 0.0
             for index, value in enumerate(values)
@@ -1227,7 +1414,12 @@ class CrossSourceAttention:
                 continue
             scores = tuple(self._score(cell.position_m, item.values, item.mask) / self.temperature for item in available)
             maximum = max(scores)
-            exponents = tuple(math.exp(max(-60.0, min(60.0, score - maximum))) for score in scores)
+            exponents = tuple(
+                math.exp(
+                    max(self.exponent_clamp_min, min(self.exponent_clamp_max, score - maximum))
+                )
+                for score in scores
+            )
             denominator = math.fsum(exponents)
             weights = tuple(exponent / denominator for exponent in exponents)
             fused = tuple(
@@ -1279,21 +1471,34 @@ class FeatureFrontend:
         attention: CrossSourceAttention | None = None,
     ):
         self.limits = limits or FeatureLimits()
-        self.slow_mlp = slow_mlp or SlowMLP()
-        self.causal_tcn = causal_tcn or CausalTCN()
-        self.path_encoder = path_encoder or QualifiedPathEncoder()
-        self.scattering_head = scattering_head or ScatteringBiasNoiseHead.default(5)
-        self.attention = attention or CrossSourceAttention(max_sources=self.limits.max_sources)
+        self.slow_mlp = slow_mlp if slow_mlp is not None else SlowMLP()
+        self.causal_tcn = causal_tcn if causal_tcn is not None else CausalTCN()
+        self.path_encoder = path_encoder if path_encoder is not None else QualifiedPathEncoder()
+        self.scattering_head = (
+            scattering_head if scattering_head is not None else ScatteringBiasNoiseHead.default(5)
+        )
+        self.attention = (
+            attention if attention is not None else CrossSourceAttention(max_sources=self.limits.max_sources)
+        )
 
     def weights_canonical_bytes(self) -> bytes:
         """Return canonical bytes binding every configured numerical component."""
 
         configured = (
-            ("slow_mlp", self.slow_mlp.canonical_bytes()),
-            ("causal_tcn", self.causal_tcn.canonical_bytes()),
-            ("qualified_path_encoder", self.path_encoder.canonical_bytes()),
-            ("scattering_bias_noise_head", self.scattering_head.canonical_bytes()),
-            ("cross_source_attention", self.attention.canonical_bytes()),
+            ("slow_mlp", _exact_component_bytes(self.slow_mlp, SlowMLP, "slow MLP")),
+            ("causal_tcn", _exact_component_bytes(self.causal_tcn, CausalTCN, "causal TCN")),
+            (
+                "qualified_path_encoder",
+                _exact_component_bytes(self.path_encoder, QualifiedPathEncoder, "qualified path encoder"),
+            ),
+            (
+                "scattering_bias_noise_head",
+                _exact_component_bytes(self.scattering_head, ScatteringBiasNoiseHead, "scattering head"),
+            ),
+            (
+                "cross_source_attention",
+                _exact_component_bytes(self.attention, CrossSourceAttention, "cross-source attention"),
+            ),
         )
         return _canonical_json(
             {
@@ -1337,13 +1542,23 @@ class FeatureFrontend:
                 math.fsum(item.uncertainty for item in paths) / len(paths) if paths else 0.0,
             ),
         )
-        slow_valid = bool(slow.absolute_mask or slow.spectrum_mask or slow.residual_mask) and any(
-            (*slow.absolute_mask, *slow.spectrum_mask, *slow.residual_mask)
+        slow_valid = (
+            slow.quality in _USABLE_FEATURE_QUALITIES
+            and sum(
+                1
+                for present in (*slow.absolute_mask, *slow.spectrum_mask, *slow.residual_mask)
+                if present
+            )
+            > 0
         )
-        tcn_valid = any(tcn.masks)
+        slow_absolute_valid = (
+            slow.quality in _USABLE_FEATURE_QUALITIES
+            and sum(1 for present in slow.absolute_mask if present) > 0
+        )
+        tcn_valid = sum(1 for mask in tcn.masks if mask) > 0
         masks = (
             (slow_valid,) * len(slow.embedding)
-            + (any(slow.absolute_mask),)
+            + (slow_absolute_valid,)
             + (tcn_valid,) * 4
             + (bool(paths),) * len(counts)
             + (bool(paths), bool(paths))
@@ -1399,9 +1614,16 @@ class FeatureFrontend:
         values: list[float] = []
         for slow, tcn in zip(slow_outputs, tcn_outputs):
             values.extend(slow.embedding)
-            values.extend((slow.absolute_level, float(sum(slow.absolute_mask)) / len(slow.absolute_mask)))
+            absolute_mask_ratio = (
+                float(sum(slow.absolute_mask)) / len(slow.absolute_mask)
+                if slow.quality in _USABLE_FEATURE_QUALITIES
+                else 0.0
+            )
+            values.extend((slow.absolute_level, absolute_mask_ratio))
             values.extend(tcn.embedding)
             values.extend(float(mask) for mask in tcn.masks)
+            for quality_state in tcn.quality_states:
+                values.extend(float(quality_state == quality) for quality in FeatureQuality)
         for item in path_output.paths:
             values.extend((item.angle_radians, item.delay_seconds, item.normalized_power, item.uncertainty, item.coverage))
             values.extend(float(item.path_class == path_class) for path_class in PathClass)
@@ -1440,16 +1662,128 @@ class FeatureFrontendOperator:
         self.frontend = frontend or FeatureFrontend()
 
     def evaluate(self, request: Mapping[str, object]) -> tuple[bytes, tuple[int, ...], bytes]:
-        """Reads only frozen manifest bytes and returns tensor plus successor material."""
+        """Validate one WMW request and consume its manifest-derived tensor exactly.
+
+        The feature operator's consumed input is the canonical tensor produced by
+        materializing the frozen feature manifest.  The outer WMW tensor is still
+        validated and must contain the exact same bytes, so callers cannot replace
+        the manifest's causal input with an unrelated tensor.
+        """
 
         try:
-            manifest_hex = request["input_manifest"]["manifest_hex"]  # type: ignore[index]
-            if not isinstance(manifest_hex, str) or len(manifest_hex) % 2 or any(
-                character not in "0123456789abcdef" for character in manifest_hex
-            ):
-                raise FeatureFrontendError("contract", "manifest bytes are not canonical lowercase hex")
-            manifest = FeatureManifest.from_bytes(bytes.fromhex(manifest_hex), self.frontend.limits)
+            request_data = _mapping(request, "worker request")
+            identity = _mapping(request_data.get("identity"), "worker identity")
+            model_run = _mapping(request_data.get("model_run"), "worker model run")
+            input_manifest = _mapping(request_data.get("input_manifest"), "worker input manifest")
+
+            run_id = _text(identity.get("run_id"), "worker identity run ID")
+            model_run_id = _text(model_run.get("run_id"), "worker model run ID")
+            input_run_id = _text(input_manifest.get("run_id"), "worker input run ID")
+            if run_id != model_run_id or run_id != input_run_id:
+                raise FeatureFrontendError("contract", "worker run identity differs across request")
+
+            epoch = _unsigned(identity.get("epoch"), "worker identity epoch")
+            input_epoch = _unsigned(input_manifest.get("epoch"), "worker input epoch")
+            if epoch != input_epoch:
+                raise FeatureFrontendError("contract", "worker epoch differs across request")
+            cutoff_ns = _unsigned(identity.get("cutoff_ns"), "worker identity cutoff")
+            input_cutoff_ns = _unsigned(input_manifest.get("cutoff_ns"), "worker input cutoff")
+            if cutoff_ns != input_cutoff_ns:
+                raise FeatureFrontendError("contract", "worker causal cutoff differs across request")
+
+            preprocessing = _text(model_run.get("preprocessing"), "model preprocessing")
+            input_preprocessing = _text(input_manifest.get("preprocessing"), "input preprocessing")
+            if preprocessing != input_preprocessing:
+                raise FeatureFrontendError("contract", "worker preprocessing differs across request")
+
+            expected_weights = self.frontend.weights_canonical_bytes()
+            if len(expected_weights) > self.frontend.limits.max_weights_bytes:
+                raise FeatureFrontendError("limit", "configured frontend weights exceed their byte limit")
+            weights = _hex_bytes(
+                model_run.get("weights_hex"),
+                self.frontend.limits.max_weights_bytes,
+                "model weights",
+            )
+            weights_digest = _check_content_digest(
+                model_run.get("weights_digest"), weights, "model weights digest"
+            )
+            expected_weights_digest = hashlib.sha256(expected_weights).hexdigest()
+            if weights != expected_weights or weights_digest != expected_weights_digest:
+                raise FeatureFrontendError(
+                    "digest", "model weights are not the configured frontend canonical bytes"
+                )
+
+            manifest_bytes = _hex_bytes(
+                input_manifest.get("manifest_hex"),
+                self.frontend.limits.max_manifest_bytes,
+                "manifest bytes",
+            )
+            _check_content_digest(
+                input_manifest.get("manifest_digest"), manifest_bytes, "manifest digest"
+            )
+            tensor_bytes = _hex_bytes(
+                input_manifest.get("tensor_hex"),
+                self.frontend.limits.max_tensor_bytes,
+                "tensor bytes",
+            )
+            tensor_digest = _check_content_digest(
+                input_manifest.get("tensor_digest"), tensor_bytes, "tensor digest"
+            )
+            input_shape = self._shape(input_manifest.get("shape"), "input tensor shape")
+            if len(tensor_bytes) % 4:
+                raise FeatureFrontendError("shape", "input tensor byte count is not float32-aligned")
+            input_elements = math.prod(input_shape)
+            if input_elements > self.frontend.limits.max_tensor_bytes // 4:
+                raise FeatureFrontendError("limit", "input tensor element count exceeds its configured limit")
+            if input_elements * 4 != len(tensor_bytes):
+                raise FeatureFrontendError("shape", "input tensor bytes do not match its shape")
+            if any(not math.isfinite(value) for value in struct.unpack(f"<{input_elements}f", tensor_bytes)):
+                raise FeatureFrontendError("non_finite", "input tensor contains NaN or Inf")
+
+            output_shape = self._shape(model_run.get("output_shape"), "model output shape")
+            if math.prod(output_shape) > self.frontend.limits.max_tensor_bytes // 4:
+                raise FeatureFrontendError("limit", "model output element count exceeds its configured limit")
+            if input_shape != output_shape:
+                raise FeatureFrontendError(
+                    "shape", "feature operator input and output shapes must be identical"
+                )
+            source_count = _unsigned(input_manifest.get("source_count"), "input source count", 32)
+            clock_domain_count = _unsigned(
+                input_manifest.get("clock_domain_count"), "input clock-domain count", 32
+            )
+
+            manifest = FeatureManifest.from_bytes(manifest_bytes, self.frontend.limits)
+            if manifest.run_id != run_id:
+                raise FeatureFrontendError("contract", "feature manifest run identity differs from worker request")
+            if manifest.epoch != epoch:
+                raise FeatureFrontendError("contract", "feature manifest epoch differs from worker request")
+            if manifest.cutoff_ns != cutoff_ns:
+                raise FeatureFrontendError("contract", "feature manifest causal cutoff differs from worker request")
+            if manifest.preprocessing_version != preprocessing:
+                raise FeatureFrontendError(
+                    "contract", "feature manifest preprocessing differs from worker request"
+                )
+            if manifest.weights_digest != weights_digest or manifest.weights_digest != expected_weights_digest:
+                raise FeatureFrontendError(
+                    "digest", "feature manifest weights differ from the configured frontend"
+                )
+            if source_count != len(manifest.source_provenance):
+                raise FeatureFrontendError("contract", "feature source count differs from worker request")
+            manifest_clock_domains = {item.clock_domain for item in manifest.source_provenance}
+            if clock_domain_count != len(manifest_clock_domains):
+                raise FeatureFrontendError(
+                    "contract", "feature clock-domain count differs from worker request"
+                )
+
             result = self.frontend.materialize(manifest)
+            if tensor_bytes != result.tensor_bytes or tensor_digest != result.tensor_digest:
+                raise FeatureFrontendError(
+                    "digest", "outer tensor bytes differ from the canonical manifest materialization"
+                )
+            if input_shape != result.feature_shape:
+                raise FeatureFrontendError("shape", "outer tensor shape differs from materialized features")
+            if output_shape != result.feature_shape:
+                raise FeatureFrontendError("shape", "model output shape differs from materialized features")
         except FeatureFrontendError as error:
             try:
                 from .worker import ContractFailure
@@ -1460,6 +1794,8 @@ class FeatureFrontendOperator:
                     "qualification": "contract_mismatch",
                     "future": "contract_mismatch",
                     "digest": "digest_mismatch",
+                    "shape": "invalid_shape",
+                    "contract": "contract_mismatch",
                 }.get(error.reason, "malformed_request")
                 raise ContractFailure(status, str(error)) from error
             except ImportError:
@@ -1470,6 +1806,28 @@ class FeatureFrontendOperator:
             + result.tensor_bytes
         ).digest()
         return result.tensor_bytes, result.feature_shape, successor
+
+    @staticmethod
+    def _shape(value: object, field: str) -> tuple[int, ...]:
+        """Validate a positive bounded shape before any tensor allocation."""
+
+        if isinstance(value, (str, bytes, bytearray)):
+            raise FeatureFrontendError("shape", f"{field} must be a positive integer sequence")
+        try:
+            dimensions = tuple(value)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise FeatureFrontendError("shape", f"{field} must be a positive integer sequence") from error
+        if not dimensions or len(dimensions) > 8:
+            raise FeatureFrontendError("shape", f"{field} rank is outside the worker limit")
+        if any(
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or item <= 0
+            or item > MAX_OPERATOR_SHAPE_DIMENSION
+            for item in dimensions
+        ):
+            raise FeatureFrontendError("shape", f"{field} dimensions must be positive integers")
+        return dimensions
 
 
 __all__ = [
@@ -1485,6 +1843,7 @@ __all__ = [
     "FeatureLimits",
     "FeatureManifest",
     "FeatureMaterialization",
+    "FeatureQuality",
     "FRONTEND_VERSION",
     "MANIFEST_SCHEMA",
     "MAX_SCATTERING_SAMPLES",
