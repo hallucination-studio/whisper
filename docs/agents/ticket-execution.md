@@ -8,12 +8,14 @@
 
 | 工作性质 | Work默认选择 | Standards review | Spec review |
 | --- | --- | --- | --- |
-| 范围明确的机械删除、脚本或文档小改 | `gpt-5.6-sol` / `low` | `gpt-5.6-sol` / `low` | `gpt-5.6-sol` / `medium` |
-| 验收明确的普通功能、适配、UI及测试 | `gpt-5.6-luna` / `max` | `gpt-5.6-sol` / `low` | `gpt-5.6-sol` / `medium` |
-| 跨入口集成、手机/Host组合、性能调度 | `gpt-5.6-sol` / `medium` | `gpt-5.6-sol` / `medium` | `gpt-5.6-sol` / `high` |
-| 事务恢复、RF物理资格、联合递推或评测有效性 | `gpt-5.6-sol` / `high` | `gpt-5.6-sol` / `medium` | `gpt-5.6-sol` / `high` |
+| 范围明确的机械删除、脚本或文档小改 | `gpt-6-astra` / `low` | `gpt-6-astra` / `low` | `gpt-6-astra` / `medium` |
+| 验收明确的普通功能、适配、UI及测试 | `gpt-5.6-luna` / `max` | `gpt-6-astra` / `low` | `gpt-6-astra` / `medium` |
+| 跨入口集成、手机/Host组合、性能调度 | `gpt-6-astra` / `medium` | `gpt-6-astra` / `medium` | `gpt-6-astra` / `high` |
+| 事务恢复、RF物理资格、联合递推或评测有效性 | `gpt-6-astra` / `high` | `gpt-6-astra` / `medium` | `gpt-6-astra` / `high` |
 
-具体票中的配置优先于默认表。高风险行为由Spec review的Sol high覆盖；Standards review按Rust与项目规范审查范围采用Sol medium，不将风格检查等同于第二次算法审查。验收明确的普通功能默认使用Luna max；Sol low承担机械工作和普通规范审查，Sol medium承担集成及普通目标审查，Sol high用于明确高风险工作。不得把所有票统一升级为高成本配置；不使用Astra或隐式max/ultra。表中是调度决策，不声称模型能力排名由实验认证。
+具体票中的配置优先于默认表，已有票的冻结配置不会因默认表变化而自动替换。高风险行为由Spec review的Astra high覆盖；Standards review按Rust与项目规范审查范围采用Astra medium，不将风格检查等同于第二次算法审查。验收明确的普通功能默认使用Luna max；Astra low承担机械工作和普通规范审查，Astra medium承担集成及普通目标审查，Astra high用于明确高风险工作。保留任务分工和明确的reasoning档位，不统一升档或隐式使用max/ultra。表中是调度决策，不声称模型能力排名由实验认证。
+
+项目级Codex默认配置位于[`.codex/config.toml`](../../.codex/config.toml)，使用`gpt-6-astra` / `medium`。该默认值不替代票内Work与review配置。Codex仅在信任项目时加载[项目配置](https://developers.openai.com/codex/config-basic)；模型ID与保留现有有效reasoning档位的依据见[OpenAI迁移说明](https://developers.openai.com/api/docs/guides/latest-model#gpt-6-astra-update-api-and-model-parameters)。
 
 Work完成后，两个review分别启动独立subagent；可复用模型，但不能复用实现者上下文作为自己的独立审查。review不能启动前自动覆盖Work设定，也不能以主代理总结代替两个审查者读diff、规格和测试。
 
