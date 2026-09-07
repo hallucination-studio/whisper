@@ -31,12 +31,17 @@ A ticket is ready only when all blocking issues are closed. Claim work with
 
 ## RF world-model execution
 
-The active parent is [Spec #163](https://github.com/hallucination-studio/whisper/issues/163).
-The previous open graph was closed as not planned, without transferring status
-or blocking edges. Only the new native child/dependency graph determines order.
+[Spec #163](https://github.com/hallucination-studio/whisper/issues/163) and its
+20 unfinished child tickets were withdrawn as not planned at the maintainer's
+request. The graph is historical and must not be used to claim new work.
+Previously completed tickets retain their status; withdrawal is not completion
+or RF acceptance evidence. No replacement execution graph has been selected.
+Create explicitly scoped new tickets for subsequent work without inheriting
+the withdrawn graph's blockers or completion credit.
 
 Every new ticket freezes Work, independent Standards review, independent Spec
 review, and the applicable RF algorithm under [execution rules](ticket-execution.md).
 Use `ready-for-agent` only on a specified slice whose blockers are all closed;
-blocked slices need no triage label. The aggregate specification stays open
-until its implementation and real acceptance children complete.
+blocked slices need no triage label. An active aggregate specification stays
+open until its implementation and real acceptance children complete, unless
+the maintainer explicitly withdraws it as not planned.

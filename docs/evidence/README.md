@@ -2,8 +2,10 @@
 
 A retained receipt proves only its identified revision, environment, procedure
 and result. A test file, closed ticket or design-review pass is not executed
-RF accuracy evidence. New implementation and acceptance work is tracked by
-[Spec #163](https://github.com/hallucination-studio/whisper/issues/163).
+RF accuracy evidence. The former implementation and acceptance graph,
+[Spec #163](https://github.com/hallucination-studio/whisper/issues/163), was
+withdrawn. Subsequent work requires new tickets through
+[issue tracking](../agents/issue-tracker.md).
 
 | Evidence scope | Owner |
 | --- | --- |

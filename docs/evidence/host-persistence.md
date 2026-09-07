@@ -2,8 +2,9 @@
 
 The accepted target is [RF world-model v1](../specs/rf-world-model-v1.md).
 No new-model implementation or RF-accuracy receipt has been produced by the
-architecture reset. New executed evidence belongs to the
-[active issue graph](https://github.com/hallucination-studio/whisper/issues/163).
+architecture reset. The [former issue graph](https://github.com/hallucination-studio/whisper/issues/163)
+was withdrawn; subsequent evidence work requires new tickets through
+[issue tracking](../agents/issue-tracker.md).
 
 The retained [physical demo-smoke receipt](receipts/demo-smoke-e151145/README.md)
 proves only its original bounded hardware-to-browser path at its identified

@@ -2,7 +2,7 @@
 
 状态：接受的重构目标；当前实现和已执行证据分别记录，不改变本规范要求。本规范从用户冻结的《Whisper RF 持续感知世界模型：最终实施计划》派生，不修改该原件、不另选总体路线。基准文件 SHA-256：`fa485d3e052bbb0444036b2815bef8236147252d98f08d79feca0d612a75991e`。
 
-职责与依赖归 [架构](../architecture/rf-world-model.md)，硬切决策归 [ADR 0020](../adr/0020-rf-world-model-hard-rebuild.md)，执行顺序和状态归 GitHub 新 issue 图，代理配置归 [ticket 执行规则](../agents/ticket-execution.md)。本规范取代旧 Host Demo / Semantic Program 的目标合同；现有 [native-frame v1](native-frame-v1.md) 是保留的设备输入合同。
+职责与依赖归 [架构](../architecture/rf-world-model.md)，硬切决策归 [ADR 0020](../adr/0020-rf-world-model-hard-rebuild.md)，执行顺序和状态归 [issue tracker](../agents/issue-tracker.md)，代理配置归 [ticket 执行规则](../agents/ticket-execution.md)。本规范取代旧 Host Demo / Semantic Program 的目标合同；现有 [native-frame v1](native-frame-v1.md) 是保留的设备输入合同。
 
 ## 1. 交付范围与硬切
 

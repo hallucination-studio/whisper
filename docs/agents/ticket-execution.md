@@ -1,6 +1,6 @@
 # Ticket work 与 review 执行规则
 
-这些规则适用于 RF 世界模型新 issue 图；每张 ticket 是一个可独立验证的切片。GitHub 原生 blocker 全部关闭且交付物可用后才可领取。旧票直接以 not_planned 关闭，新票不继承旧依赖或完成状态。
+这些规则适用于新建的实现与验收 ticket；每张 ticket 是一个可独立验证的切片。原 RF 任务图已撤销，后续工作按 [issue tracker](issue-tracker.md) 重新立项。GitHub 原生 blocker 全部关闭且交付物可用后才可领取。撤销票以 not_planned 关闭，新票不继承旧依赖或完成状态。
 
 ## 创建时冻结代理配置
 
@@ -29,7 +29,7 @@ Review–Standards检查Rust/项目惯例、资源与错误边界、删除后的
 
 Rust代码按适用AGENTS执行fmt/check、行为测试；实质代码另跑Clippy，公开API/文档跑rustdoc；跨crate/配置/CI改变跑全workspace。手机、Python和浏览器改变执行对应构建及行为检查。无真实硬件的fixture不能关闭物理效果票；设备缺失不阻断可用fixture实现票。
 
-每票关闭需要：范围完整、适用检查通过、两个独立review问题关闭、证据与限制清楚；代码合入不是硬件/准确率验收的替代。父规格在所有必需切片和真实验收完成前保持open。
+每票以 completed 关闭需要：范围完整、适用检查通过、两个独立review问题关闭、证据与限制清楚；代码合入不是硬件/准确率验收的替代。父规格在所有必需切片和真实验收完成前保持open，维护者明确撤销时以 not_planned 关闭。
 
 ## 领取与复核
 

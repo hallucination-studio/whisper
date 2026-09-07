@@ -10,8 +10,10 @@ two operative scopes; all other former Host target specifications are removed.
 | Canonical locally coherent array-capture bytes and qualified path-adapter behavior | [Array capture v1](array-capture-v1.md) |
 | Versioned local Python worker and Rust numerical-client boundary | [Model worker protocol v1](model-worker-v1.md) |
 
-The RF specification is the accepted direct-rebuild target. Its implementations
-and any narrower byte/schema artifacts are owned by the new
-[issue graph](https://github.com/hallucination-studio/whisper/issues/163).
+The RF specification records the accepted direct-rebuild target. Its former
+[issue graph](https://github.com/hallucination-studio/whisper/issues/163) has been
+withdrawn; new implementation work requires separately scoped tickets through
+[issue tracking](../agents/issue-tracker.md). Withdrawal does not certify the
+target as implemented or change its byte/schema contracts.
 No old Store or API migration is supported. An old database must be rejected
 before mutation; hard-deleting code does not authorize runtime data erasure.

@@ -1,7 +1,7 @@
 # Documentation authority router
 
 Select the kind of claim before selecting a document. The accepted RF world
-model is one architecture with one implementation graph; the retired Demo and
+model defines one architecture; execution status is owned by GitHub Issues. The retired Demo and
 Semantic Program are not alternative delivery routes.
 
 | Claim | Canonical owner |
@@ -32,8 +32,9 @@ Semantic Program are not alternative delivery routes.
   removed Host contracts have no compatibility entry point, migration graph,
   schema importer or parallel production implementation.
 - [Spec #163](https://github.com/hallucination-studio/whisper/issues/163) and its
-  native child/blocking graph own execution. Old closed tickets are not carried
-  forward as prerequisites or proof of the new target.
+  unfinished child tickets were withdrawn as not planned. The retained graph
+  is historical; see [issue tracking](agents/issue-tracker.md) for subsequent
+  work. Closed tickets are not prerequisites or proof of unfulfilled targets.
 
 The user-frozen final design file is unchanged; its digest is recorded in the
 new specification. This router does not copy that plan or create a competing

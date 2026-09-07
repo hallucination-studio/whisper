@@ -1,8 +1,9 @@
 # Future scope beyond the first RF room
 
 The accepted first-room implementation is defined by
-[RF world-model v1](specs/rf-world-model-v1.md), with its only live execution graph
-in [Spec #163](https://github.com/hallucination-studio/whisper/issues/163).
+[RF world-model v1](specs/rf-world-model-v1.md). Its former execution graph,
+[Spec #163](https://github.com/hallucination-studio/whisper/issues/163), has been
+withdrawn; subsequent work requires new tickets under [issue tracking](agents/issue-tracker.md).
 Phone initialization, heterogeneous fixed RF, array calibration, joint0–2-person
 state, history, prediction and persistent service are already in that target;
 they are not separate speculative programs.

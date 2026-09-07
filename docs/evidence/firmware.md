@@ -17,9 +17,10 @@ queue.
 
 New raw/typed-CSI acceptance uses the already deployed device and unchanged
 firmware, configuration, UDP and position. It does not require reflashing or
-reprovisioning. The new [RF issue graph](https://github.com/hallucination-studio/whisper/issues/163)
-owns that execution and any missing input evidence; retired issues supply no
-blockers or completion credit.
+reprovisioning. The former [RF issue graph](https://github.com/hallucination-studio/whisper/issues/163)
+was withdrawn. Subsequent execution and missing-input evidence require new
+tickets through [issue tracking](../agents/issue-tracker.md); retired issues
+supply no blockers or completion credit.
 
 The external contract is [native-frame v1](../specs/native-frame-v1.md).
 [Firmware procedures](../operations/firmware.md) remain available for the
