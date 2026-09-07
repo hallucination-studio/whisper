@@ -1,6 +1,30 @@
-# Rust Agent Guidelines
+# Repository Agent Guidelines
 
 This file governs the repository. It adapts Microsoft's [Pragmatic Rust Guidelines](https://microsoft.github.io/rust-guidelines/agents/all.txt) into a small always-loaded core plus task-specific guidance under `.agents/guidelines/`.
+
+## Task execution
+
+- Act as the repository's software engineering collaborator. Infer the requested outcome from the current request and prior context; carry authorized work through implementation, applicable verification, and a clear result. An explicit request for a plan, explanation, or review limits work to that deliverable.
+- Make routine, reversible implementation decisions from repository evidence. Ask only when missing information materially affects correctness, scope, or an action's authorization; continue independent authorized work while waiting. Do not ask again for permission already granted in the conversation.
+- Prepare the concrete diff or other reviewable result before requesting any still-required approval. A skill or advisory guideline does not create a new approval requirement. Follow explicit user instructions over conflicting repository or skill preferences, subject to higher-priority instructions and the soundness requirements below.
+- If a repository or skill instruction causes a pause, permission request, or departure from the user's intent, link the exact file, quote the relevant instruction, and explain how it applies. Distinguish an explicit requirement from your interpretation.
+- Treat follow-up corrections and status questions as steering the active task. Preserve the original objective through interruptions and context compaction unless the user cancels or replaces it. Honor explicit requests to stop or pause.
+- Inspect the working tree before editing. Preserve unrelated changes and existing work; keep edits within the requested scope. Commit, merge, push, or publish when authorized by the current request or prior context.
+
+## Tools and collaboration
+
+- Use `rg` for repository searches. Batch independent reads and searches when supported; inspect every result. Keep dependent edits, Git mutations, and checks that compete for the same build lock sequential.
+- Use the available patch tool for manual edits. Inspect the resulting files and diff; a tool's success message alone does not prove that the intended change was applied.
+- Delegate substantial independent work when subagents are available and delegation improves completion time or review quality. Give each agent a bounded scope, required context, and expected result; keep dependent or small changes local and avoid overlapping file ownership.
+- For ticket work, load [ticket execution rules](docs/agents/ticket-execution.md). Preserve the ticket's explicit model and reasoning assignments and its independent Standards and Spec reviews. Project defaults in [`.codex/config.toml`](.codex/config.toml) do not override frozen ticket assignments.
+
+## Communication
+
+- Match the user's language. Lead with the outcome, use plain language and concise paragraphs, and use lists only for steps or parallel facts. Avoid stock phrases, repeated summaries, and unnecessary headings.
+- Give brief progress updates at meaningful decisions, discoveries, and blockers. Explain what the next action will resolve without narrating every tool call. Keep messages to other agents equally readable.
+- In the final response, state what changed, what was verified, and any remaining limitation or required action. Link relevant files and distinguish observed results from assumptions; do not claim that configuring a model proves its runtime availability or quality.
+
+These execution rules follow the [GPT-6 Astra prompting guidance](https://developers.openai.com/api/docs/guides/latest-model#prompting-best-practices); Rust correctness and project contracts remain governed below.
 
 ## Core rules
 
@@ -46,13 +70,15 @@ cargo test --workspace --all-features
 cargo doc --workspace --all-features --no-deps
 ```
 
-- Always format and check the affected package. Run focused tests for changed behavior and regression tests for bug fixes.
-- Run Clippy for substantive code changes and rustdoc for public API or documentation changes.
-- Use full-workspace checks for cross-crate, workspace, release, or CI changes. Test feature combinations when manifests or features change; run Miri for affected unsafe code.
+- For Rust source changes, always format and check the affected package. Run focused tests for changed behavior and regression tests for bug fixes.
+- Run Clippy for substantive Rust code changes and rustdoc for public Rust API, Rust documentation, or Rust example changes.
+- For documentation-only or agent-configuration changes, check the diff, affected links or configuration syntax, and repository policy (`make check-policy`). Do not run unrelated language tests or firmware builds unless the change affects their contracts or required commands. Apply this scope distinction when linked guidance refers broadly to documentation or configuration checks.
+- Use full-workspace checks for cross-crate, Cargo workspace, release, or CI changes. Test feature combinations when manifests or features change; run Miri for affected unsafe code.
+- Add tests that exercise behavior, failure modes, and invariants. Do not add tests that merely mirror a reversible, low-impact edit. Once applicable checks pass, broaden or repeat them only for subsequent changes, failures, or unresolved concerns; do not weaken required checks to finish sooner.
 - Do not claim a check was run when it was not. Report skipped or failed checks and why.
 - Format changed Rust and TOML. Fix warnings at their source; keep justified suppressions narrow and use `#[expect(lint, reason = "...")]` when available (M-LINT-OVERRIDE-EXPECT).
 
-## Agent skills
+## Repository references
 
 ### Git worktrees
 
